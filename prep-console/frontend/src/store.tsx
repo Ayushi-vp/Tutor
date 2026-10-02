@@ -34,8 +34,10 @@ interface Api {
 const Ctx = createContext<Api | null>(null);
 
 async function call(method: string, url: string, body?: unknown) {
+  const headers: Record<string, string> = { "X-Prep-Client": "1" };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
   const r = await fetch(url, {
-    method, headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    method, headers, credentials: "same-origin",
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`${method} ${url}: ${r.status}`);

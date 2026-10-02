@@ -27,7 +27,7 @@ export default defineConfig({
   resolve: { alias: { "@content": content } },
   server: {
     port: 5173,
-    proxy: { "/api": "http://127.0.0.1:5000" },
+    proxy: { "/api": "http://127.0.0.1:5000", "/auth": "http://127.0.0.1:5000" },
     fs: { allow: [".", content] },   // content/ sits beside frontend/
   },
 });

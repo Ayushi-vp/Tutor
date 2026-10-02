@@ -269,6 +269,23 @@ def test_unknown_provider_is_404(app):
     assert app.test_client().get("/auth/login/google").status_code == 404
 
 
+# ---------------------------------------------------------------- backups
+
+def test_backup_copies_data_and_prunes(app, client, tmp_path):
+    import backup
+    client.put("/api/items/ml1", json={"status": "done"}, headers=H)
+    out = tmp_path / "backups"
+    for i in range(3):
+        (out / f"prep-2000010{i}-000000.db").parent.mkdir(exist_ok=True)
+        (out / f"prep-2000010{i}-000000.db").write_bytes(b"")
+    made = backup.backup(Path(app.config["DB_PATH"]), out, keep=2)
+    files = sorted(p.name for p in out.glob("prep-*.db"))
+    assert len(files) == 2 and made.name in files
+    c = sqlite3.connect(made)
+    assert c.execute("SELECT id, status FROM items").fetchall() == [("ml1", "done")]
+    c.close()
+
+
 # ---------------------------------------------------------------- migration from the single-user schema
 
 def test_first_admin_claims_pre_accounts_progress(tmp_path):

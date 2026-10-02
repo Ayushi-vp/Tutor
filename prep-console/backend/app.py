@@ -317,13 +317,15 @@ def _today() -> str:
 if __name__ == "__main__":
     # Listens on localhost only. Remote access goes through a proxy on this machine
     # (Tailscale Funnel, Caddy, nginx) — see the README.
+    # HOST=0.0.0.0 is only for containers, where the proxy reaches us over the container network.
     port = int(os.environ.get("PORT", 5000))
+    host = os.environ.get("HOST", "127.0.0.1")
     application = create_app()
     print(f"Prep Console on http://localhost:{port}")
     if application.config["DEV_LOGIN"]:
         print("DEV_LOGIN is on: anyone on this machine can sign in as any invited email.")
     if os.environ.get("FLASK_DEBUG"):
-        application.run(host="127.0.0.1", port=port, debug=True)
+        application.run(host=host, port=port, debug=True)
     else:
         from waitress import serve
-        serve(application, host="127.0.0.1", port=port, threads=8)
+        serve(application, host=host, port=port, threads=8)

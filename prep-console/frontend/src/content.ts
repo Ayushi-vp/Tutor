@@ -137,7 +137,7 @@ export const NAV: { g: string; items: NavItem[] }[] = [
     { v: "roadmap", n: "8-week plan", i: "RM", count: ROADMAP_IDS.length },
     { v: "mock", n: "Mock interview", i: "MI" },
     { v: "cards", n: "Flashcards", i: "FC", count: BANK.length },
-    { v: "data", n: "Your data", i: "DB" } ] },
+    { v: "account", n: "Account & data", i: "AC" } ] },
   { g: "Drill", items: [
     { v: "dsa", n: "DSA problems", i: "DS", count: DSA.length },
     { v: "mlc", n: "ML coding", i: "MC", count: DESIGNS.mlc.length },

@@ -11,13 +11,12 @@ export function Overview() {
   const reviewCount = Object.values(state.items).filter(v => v === "rev").length;
 
   const pillars = PILLARS.map(p => ({ p, g: progressOf(p.ids) }));
-  const maxN = Math.max(...pillars.map(x => x.g.n));
-  const tickStep = maxN > 600 ? 200 : 100;
+  // Pillar sizes differ by 100x (the bank vs ML coding), so bars show the share done, not raw counts.
   const cover = fig({
     title: "Coverage by pillar",
-    sub: "Everything tracked here. The bar behind each one is the full curriculum for that pillar.",
-    body: barsH({ w: 660, rh: 28, labelW: 118, max: maxN, ticks: Array.from({ length: Math.floor(maxN / tickStep) + 1 }, (_, i) => i * tickStep),
-      rows: pillars.map(({ p, g }) => ({ label: p.n, value: g.d, max: g.n, color: p.color, right: `${g.d}/${g.n}`, tip: `${g.p}% complete — ${g.n - g.d} left` })) }),
+    sub: "Share of each pillar completed. The count on the right is items done out of the pillar's total.",
+    body: barsH({ w: 660, rh: 28, labelW: 118, max: 100, ticks: [0, 20, 40, 60, 80, 100],
+      rows: pillars.map(({ p, g }) => ({ label: p.n, value: g.p, max: 100, color: p.color, right: `${g.d}/${g.n}`, tip: `${g.p}% complete — ${g.n - g.d} left` })) }),
     table: tableOf(["Pillar", "Done", "Total", "%"], pillars.map(({ p, g }) => [p.n, g.d, g.n, g.p + "%"])),
   });
 
@@ -54,7 +53,7 @@ export function Overview() {
     <div className="wrap">
       <div className="eyebrow">Interview readiness</div>
       <h1 className="page-h">Where you stand today</h1>
-      <p className="lede">A working surface for an AI-engineer loop: algorithms and ML coding, machine learning, LLM internals, multimodal and reasoning models, GPU performance, time series, engineering and system design. Mark things off as you go — progress is saved to your local database.</p>
+      <p className="lede">A working surface for an AI-engineer loop: algorithms and ML coding, machine learning, LLM internals, multimodal and reasoning models, GPU performance, time series, engineering and system design. Mark things off as you go — progress is saved to your account.</p>
       <div className="grid g4" style={{ marginTop: 20 }}>
         <div className="stat lead"><span className="k">Readiness</span><span className="v">{total.p}<small>%</small></span><span className="d">{total.d} of {total.n} items complete</span></div>
         <div className="stat"><span className="k">Streak</span><span className="v">{streak()}<small> d</small></span><span className="d">{doneToday ? `${doneToday} done today` : "nothing logged today"}</span></div>
@@ -78,7 +77,7 @@ export function Overview() {
       <div className="sec">
         <div className="rowh"><div><h2 className="sec-h">Start anywhere</h2><p className="sec-s">Each track stands on its own.</p></div></div>
         <div className="grid g3">
-          {NAV.flatMap(g => g.items).filter(i => i.v !== "overview" && i.v !== "data").map(i => {
+          {NAV.flatMap(g => g.items).filter(i => i.v !== "overview" && i.v !== "account").map(i => {
             const ids = idsForView(i.v);
             const g = ids ? progressOf(ids) : null;
             return (

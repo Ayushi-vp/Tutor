@@ -1,7 +1,10 @@
-/* Progress store. The Flask API (SQLite) is the source of truth; every change
-   is applied optimistically here and then sent to the server. If the server is
-   unreachable the app keeps working from a localStorage copy and says so. */
+/* Progress store. For a signed-in user the Flask API (SQLite) is the source of truth;
+   every change is applied optimistically here and then sent to the server. If the
+   server is unreachable the app keeps working from a localStorage copy and says so.
+   Each user has their own localStorage copy, cleared on sign-out. */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ApiError, call } from "./api";
+import { progressKey, useAuth } from "./auth";
 import { pct, todayKey } from "./util";
 
 export type Status = "done" | "rev";
@@ -16,7 +19,6 @@ export interface State {
 export type Mode = "loading" | "server" | "local";
 
 const EMPTY: State = { items: {}, days: {}, srs: {}, notes: {}, logs: [] };
-const LS_KEY = "apc.progress.v2";
 
 interface Api {
   state: State;
@@ -27,43 +29,52 @@ interface Api {
   setSrs(id: string, box: number, due: string): void;
   addMock(round: string, used: number, notes: string): void;
   importState(data: unknown): Promise<string>;
+  resetProgress(): Promise<void>;
   progressOf(ids: string[]): { d: number; n: number; p: number };
   streak(): number;
 }
 
 const Ctx = createContext<Api | null>(null);
 
-async function call(method: string, url: string, body?: unknown) {
-  const headers: Record<string, string> = { "X-Prep-Client": "1" };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const r = await fetch(url, {
-    method, headers, credentials: "same-origin",
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(`${method} ${url}: ${r.status}`);
-  return r.json();
+function readLocal(key: string): State {
+  try { return { ...EMPTY, ...JSON.parse(localStorage.getItem(key) || "{}") }; } catch { return EMPTY; }
 }
 
-function readLocal(): State {
-  try { return { ...EMPTY, ...JSON.parse(localStorage.getItem(LS_KEY) || "{}") }; } catch { return EMPTY; }
+/** Progress saved in this browser before accounts existed (or while the server was down). */
+export function browserCopy(): State | null {
+  const s = readLocal(progressKey(null));
+  const n = Object.keys(s.items).length + Object.keys(s.srs).length + s.logs.length;
+  return n ? s : null;
 }
 
 export function ProgressProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<State>(readLocal);
-  const [mode, setMode] = useState<Mode>("loading");
-  const modeRef = useRef<Mode>("loading");
+  const auth = useAuth();
+  const uid = auth.status === "signed-in" && auth.user ? auth.user.id : null;
+  const key = progressKey(uid);
+  const [state, setState] = useState<State>(() => readLocal(key));
+  const [mode, setMode] = useState<Mode>(uid === null ? "local" : "loading");
+  const modeRef = useRef<Mode>(mode);
   modeRef.current = mode;
+  const { expired } = auth;
+
+  const fail = useCallback((e: unknown) => {
+    if (e instanceof ApiError && e.status === 401) expired();
+    else setMode("local");
+  }, [expired]);
 
   useEffect(() => {
-    call("GET", "/api/state").then((s: State) => { setState(s); setMode("server"); }).catch(() => setMode("local"));
-  }, []);
-  useEffect(() => { try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch { /* private mode */ } }, [state]);
+    setState(readLocal(key));
+    if (uid === null) { setMode("local"); return; }
+    setMode("loading");
+    call<State>("GET", "/api/state").then(s => { setState(s); setMode("server"); }).catch(fail);
+  }, [uid, key, fail]);
+  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(state)); } catch { /* private mode */ } }, [key, state]);
 
   /** Send a change to the server; on failure drop to local mode rather than losing it. */
   const send = useCallback((method: string, url: string, body: unknown) => {
     if (modeRef.current !== "server") return;
-    call(method, url, body).catch(() => setMode("local"));
-  }, []);
+    call(method, url, body).catch(fail);
+  }, [fail]);
 
   const setStatus = useCallback((id: string, status: Status | null) => {
     setState(s => {
@@ -92,10 +103,14 @@ export function ProgressProvider({ children }: { children: ReactNode }) {
       send("POST", "/api/mocks", { round, used, notes });
     },
     importState: async data => {
-      const r = await call("POST", "/api/import", data);
+      const r = await call<{ state: State; imported: Record<string, number> }>("POST", "/api/import", data);
       setState(r.state); setMode("server");
       const c = r.imported;
       return `Imported ${c.items} statuses, ${c.srs} flashcard schedules, ${c.days} activity days, ${c.logs} mock sessions.`;
+    },
+    resetProgress: async () => {
+      if (mode === "server") setState(await call<State>("DELETE", "/api/progress"));
+      else setState(EMPTY);
     },
     progressOf: ids => {
       let d = 0; for (const i of ids) if (state.items[i] === "done") d++;

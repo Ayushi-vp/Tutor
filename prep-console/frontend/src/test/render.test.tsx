@@ -7,7 +7,7 @@ import { mountViz, VIZ, vizHTML } from "../legacy/viz.js";
 
 afterEach(cleanup);
 
-const routes = ["/", "/roadmap", "/mock", "/cards", "/data", "/dsa", "/bank", "/search?q=attention",
+const routes = ["/", "/roadmap", "/mock", "/cards", "/account", "/data", "/admin", "/dsa", "/bank", "/search?q=attention",
   "/ml", "/dl", "/llm", "/aieng", "/ts", "/swe", "/gpu", "/rs", "/mm", "/net", "/scale", "/py", "/classic", "/infra", "/hld", "/lld", "/mlc"];
 
 describe("pages", () => {

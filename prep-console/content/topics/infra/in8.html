@@ -1,0 +1,380 @@
+<!-- topic source for infra/in8; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "in8",
+  "t": "Design a coordination service (ZooKeeper, etcd)",
+  "tag": "Consensus",
+  "sum": "A small, strongly consistent store that other systems trust for leader election, locks, configuration and membership: a replicated log agreed by Raft or ZAB, terms and randomized election timeouts, the majority commit rule, linearizable and stale reads, sessions and leases with ephemeral keys, watches, recipes that avoid herds, fencing tokens, and what Google learned running Chubby.",
+  "prereq": [
+    ["sc9", "Consensus lets replicas agree on one value or one leader despite failures; a majority quorum of 2f+1 nodes tolerates f failures; linearizability means every operation appears to happen at one instant."],
+    ["sc6", "Leader-follower replication streams a log from one leader; failover promotes a follower."],
+    ["in1", "Kafka's metadata quorum (KRaft) is a Raft group; leader epochs act as fencing tokens."],
+    ["in5", "Leases with expiry give failover, not mutual exclusion; fencing tokens checked by the resource make stale holders harmless."],
+    ["sc12", "Timeouts can't distinguish a slow process from a dead one."]
+  ],
+  "myths": [
+    ["More nodes make a coordination cluster more available.", "Availability depends on keeping a majority alive, and every write must reach a majority. Five nodes tolerate two failures; seven tolerate three but every write now waits for four acknowledgements, so latency and failure exposure rise. Even sizes are worse: four nodes still tolerate only one failure. Clusters are almost always 3 or 5 voters, with non-voting learners or observers added for read capacity."],
+    ["Reads from a coordination service are always up to date.", "Only linearizable reads are. ZooKeeper serves reads from whichever server the client is connected to, which may lag the leader (it guarantees order per client, not freshness; call sync first if you need the latest). etcd defaults to linearizable reads but offers serializable reads from any member that can be stale. Choose per read."],
+    ["A lock from ZooKeeper or etcd guarantees only one process acts at a time.", "The lock service guarantees only one session holds the lock in its own state. A holder paused by garbage collection longer than its session timeout loses the lock without knowing and may keep acting. Safety needs the protected resource to check a fencing token, such as Chubby's sequencers or etcd's revision numbers."],
+    ["You should store application data in the coordination service because it is so reliable.", "It is designed for small metadata: etcd's default request limit is 1.5 MiB and storage quota 2 GiB (8 GiB suggested maximum); ZooKeeper's default per-node limit is just under 1 MB. Every write goes through consensus and every byte is held by every replica. Large or high-volume data belongs elsewhere, with only pointers here."],
+    ["Raft and Paxos are fundamentally different algorithms.", "They solve the same problem with the same core idea — a leader proposes log entries that commit once a majority accepts them, with terms or ballots to reject stale leaders. Raft's contribution is understandability: it combines leader election with log replication and restricts which servers can become leader so committed entries are never lost. ZooKeeper's ZAB is in the same family."],
+    ["When the leader fails, the cluster is unavailable for many seconds.", "Raft's paper measured a median of 287 ms with only 5 ms of timeout randomness, and 35 ms on average with a 12–24 ms election timeout, though it recommends conservative 150–300 ms timeouts. Production systems often see a few seconds because of session and lease timeouts layered on top (Chubby reported elections of 4–6 s, sometimes up to 30 s)."]
+  ],
+  "recap": [
+    "A coordination service is a small, highly available, strongly consistent store used for leader election, locks, configuration, service discovery and group membership.",
+    "Its replicas run a consensus protocol (Raft in etcd, ZAB in ZooKeeper, Paxos in Chubby) that agrees on an ordered log of writes applied to an in-memory tree or key-value store.",
+    "A cluster of 2f+1 voting nodes tolerates f failures; 3 or 5 nodes is typical because every write waits for a majority.",
+    "In Raft, followers that hear nothing from a leader for a randomized election timeout become candidates, increment the term and ask for votes; a candidate with votes from a majority of the full cluster becomes leader.",
+    "Voters only grant votes to candidates whose log is at least as up to date as theirs, which guarantees a new leader holds every committed entry.",
+    "A log entry is committed once stored on a majority, and a leader only counts replicas toward committing entries from its own term.",
+    "Linearizable reads must confirm leadership (a ReadIndex round or a leader lease); cheaper reads from followers can be stale.",
+    "Clients hold sessions or leases kept alive by heartbeats; ephemeral keys vanish when the session expires, which turns client liveness into data other clients can watch.",
+    "Recipes such as locks and leader election use sequential ephemeral keys where each waiter watches only its predecessor, avoiding a thundering herd, and expose a fencing token for the protected resource to check.",
+    "Chubby served tens of thousands of clients per cell, was used most heavily as a name service, saw 61 outages in about 700 cell-days with most under 15 seconds, and lost data six times in a few dozen cell-years — never from hardware."
+  ],
+  "glossary": [
+    ["Candidate", "In Raft, a server that has started an election and is asking others for votes."],
+    ["Commit index", "The highest log position known to be stored on a majority and therefore safe to apply."],
+    ["Consensus", "Getting a group of machines to agree on the same sequence of values even when some fail."],
+    ["Ephemeral node (key)", "An entry tied to a client session or lease that is deleted automatically when the session ends."],
+    ["Election timeout", "How long a follower waits without hearing from a leader before starting an election."],
+    ["Fencing token", "An increasing number issued with a lock or leadership that the protected resource checks so a stale holder's actions are rejected."],
+    ["Follower", "In Raft, a passive server that accepts log entries from the leader and votes in elections."],
+    ["Heartbeat", "A periodic message proving liveness; in Raft, an empty AppendEntries from the leader."],
+    ["Leader", "The one server that accepts writes and replicates the log in the current term."],
+    ["Lease", "A time-limited grant, renewed by keep-alives, after which the holder's ephemeral state is removed."],
+    ["Learner (observer)", "A non-voting replica that receives the log for read scaling or catch-up but doesn't count toward quorum."],
+    ["Linearizable read", "A read guaranteed to reflect every write that completed before it started."],
+    ["Lock-delay", "Chubby's rule that a lock released by a failed holder can't be re-acquired for a short period, protecting unmodified resources from stale holders."],
+    ["Log compaction (snapshot)", "Replacing a prefix of the replicated log with a snapshot of the state it produced, so the log doesn't grow forever."],
+    ["Majority quorum", "More than half of the voting members; any two majorities share at least one member."],
+    ["ReadIndex", "Raft's method for linearizable reads: the leader records its commit index, confirms it is still leader with a heartbeat round, then serves the read once that index is applied."],
+    ["Revision (etcd)", "A cluster-wide counter that increases with every change; usable as a version and as a fencing token."],
+    ["Sequencer (Chubby)", "An opaque token describing a lock and its generation that a client passes to servers so they can check the lock is still valid."],
+    ["Session", "A client's connection-level relationship with the service, kept alive by heartbeats, that owns its ephemeral nodes and locks."],
+    ["Split vote", "An election in which no candidate gets a majority, forcing another election."],
+    ["Term", "Raft's logical clock: a number that increases with each election; messages from older terms are rejected."],
+    ["Watch", "A client's subscription to changes on a key or node, delivered as events."],
+    ["ZAB", "ZooKeeper Atomic Broadcast: ZooKeeper's leader-based protocol for ordering and replicating writes."]
+  ],
+  "qa": [
+    ["E", "What is a coordination service used for?", "Small, critical, strongly consistent state that many processes must agree on: who the leader is, who holds a lock, the current configuration, which servers are alive and where they are. Building that agreement correctly is hard, so systems delegate it to ZooKeeper, etcd or Chubby rather than reinventing consensus.", "Follow-up: Name systems that depend on one. — Kubernetes stores all cluster state in etcd; Kafka used ZooKeeper and now its own Raft quorum; Google's GFS and Bigtable used Chubby to elect masters."],
+    ["E", "Why 3 or 5 nodes and not 4 or 10?", "A cluster of n tolerates (n−1)/2 failures rounded down, so 4 tolerates 1 like 3 does while needing 3 acknowledgements per write instead of 2. More voters means slower writes and more nodes that can fail; 5 tolerates 2 failures, enough to lose one during maintenance and one unexpectedly.", "Follow-up: How do you scale reads then? — Add non-voting learners or observers, or serve stale-tolerant reads from followers."],
+    ["E", "What is an ephemeral node and why is it useful?", "A node that exists only as long as the client session that created it; if the client dies or is partitioned long enough for the session to expire, the node disappears. Other clients watching it learn the client is gone, which is how membership lists and leader election detect failure without custom heartbeats.", "Follow-up: What decides how fast it disappears? — The session timeout: shorter means faster failover but more false expirations during pauses."],
+    ["M", "Walk through a Raft leader election.", "A follower that hears no heartbeat for its randomized election timeout increments its term, votes for itself and sends RequestVote to all others. Each server grants at most one vote per term, and only if the candidate's log is at least as up to date as its own. A candidate with votes from a majority becomes leader and immediately sends heartbeats; if votes split, timeouts expire again at random times and a new term starts.", "Follow-up: Why randomized timeouts? — So one server usually times out first and wins before others start; in the Raft paper, without randomness elections took over 10 seconds due to repeated split votes."],
+    ["M", "When is a Raft log entry committed?", "When the leader has stored it on a majority of servers — and, for safety, the leader only directly commits entries from its own current term; earlier-term entries become committed indirectly once a current-term entry after them is. Then every server can apply it to its state machine, and the client is answered.", "Follow-up: Why the current-term restriction? — An entry from an old term can sit on a majority and still be overwritten by a later leader that never had it; the paper's Figure 8 shows the exact sequence."],
+    ["M", "How do you get a linearizable read?", "Send it to the leader, which must confirm it is still leader before answering — otherwise a deposed leader in a minority partition could serve stale data. Raft's ReadIndex records the commit index, exchanges a heartbeat round with a majority, waits for that index to be applied, then reads. Lease-based reads skip the round trip by trusting a time bound, which depends on bounded clock drift.", "Follow-up: What does ZooKeeper do by default? — Serves reads locally on any server; clients that need the latest call sync first."],
+    ["M", "Describe the ZooKeeper lock recipe and why it avoids a herd.", "Each client creates an ephemeral sequential node under /lock; the one with the lowest sequence number holds the lock. Every other client watches only the node immediately before its own, so when the holder releases or dies, exactly one client is notified. Watching the parent instead would wake every waiter on each change: a thundering herd.", "Follow-up: What happens if a waiter in the middle dies? — Its node vanishes, the next waiter's watch fires, it re-checks the children and watches its new predecessor."],
+    ["M", "What does a coordination service's write latency look like across zones and regions?", "One round trip from the leader to the fastest majority plus a durable log write on each: within a data centre, a few milliseconds; across three zones in a region, a few more; across regions, tens to hundreds of milliseconds, because the majority must include a remote replica. That's why clusters usually live within one region.", "Follow-up: How do global systems handle this? — A cluster per region for local coordination, and a separate global cluster only for rare, critical decisions."],
+    ["H", "A leader holding an etcd-based lock pauses for 14 seconds with a 10-second lease. What happens and how do you make it safe?", "The lease expires, etcd deletes the key, another instance acquires the lock and starts writing; then the paused process resumes, unaware, and writes too — two leaders. Make the protected resource check a fencing token (the etcd revision of the lock key or a counter) and reject older ones; make writes idempotent; and don't rely on lengthening the lease, which only delays failover.", "Follow-up: What did Chubby offer for resources that can't check tokens? — Lock-delay: after a holder fails, the lock can't be re-acquired for up to a minute, giving the old holder's in-flight requests time to drain."],
+    ["H", "Why must a Raft voter refuse candidates with shorter logs?", "To guarantee leader completeness: a committed entry is on a majority, and any new leader needs votes from a majority, so the two sets overlap; if voters refuse candidates whose logs are less up to date (by last term, then length), the winner must have every committed entry. Without the rule, a stale server could win and overwrite committed data.", "Follow-up: How is 'up to date' compared? — Higher last-entry term wins; with equal terms, the longer log wins."],
+    ["H", "Watches on a key read by 50,000 clients: what happens on a change?", "The service must send 50,000 notifications and then serve up to 50,000 re-reads, a burst that can overload the leader or the servers clients connect to. Mitigations: spread clients across followers for watches and reads, use proxies or caches that fan out on the service's behalf (Chubby used proxies), batch or rate-limit config changes, and make clients add jitter before re-reading.", "Follow-up: How did Chubby keep 90,000 clients from overwhelming a master? — Client-side caching with invalidation, longer KeepAlive lease times under load, proxies, and many cells."],
+    ["H", "You're running a fleet of LLM inference workers and want exactly one 'model router' instance to own each model's traffic plan. Design it with etcd.", "Each router candidate campaigns for /routers/{model}/leader with a lease of, say, 10 s kept alive every 3 s; the winner publishes its address and plan under keys others watch. Every action it takes (pushing weights to workers, updating routing tables) carries the leadership revision, and workers reject commands with a lower revision than they've seen. Losing the lease makes the router stop and re-campaign; config changes are written with compare-and-swap on revision.", "Follow-up: The etcd cluster is in us-east and routers run globally. — Run a cluster per region and have each region elect its own routers; global decisions go through a slower, separate path."]
+  ],
+  "refs": [
+    ["paper", "The Chubby lock service for loosely-coupled distributed systems (OSDI 2006)", "Burrows — Google's Paxos-based lock and naming service, with production statistics, outage causes and the lessons quoted here.", "https://static.googleusercontent.com/media/research.google.com/en//archive/chubby-osdi06.pdf"],
+    ["paper", "In Search of an Understandable Consensus Algorithm (Raft)", "Ongaro and Ousterhout — leader election, log replication, safety, membership changes, and the election-timing measurements used in the lab.", "https://raft.github.io/raft.pdf"],
+    ["paper", "ZooKeeper: Wait-free coordination for Internet-scale systems (USENIX ATC 2010)", "Hunt, Konar, Junqueira and Reed — znodes, watches, ordering guarantees and the recipes built on them.", "https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf"],
+    ["docs", "ZooKeeper recipes and solutions", "Locks, leader election, barriers and queues, written to avoid the herd effect.", "https://zookeeper.apache.org/doc/current/recipes.html"],
+    ["docs", "etcd system limits", "Request size and storage quota defaults that show what a coordination store is (and isn't) for.", "https://etcd.io/docs/v3.5/dev-guide/limit/"],
+    ["tool", "Raft visualisation and resources", "Interactive Raft visualisation and links to implementations.", "https://raft.github.io/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Imagine you run three copies of a payments reconciliation service, and exactly one of them must be the "primary" that writes the daily ledger; the others wait as hot standbys. How do they decide which one is primary? The obvious answer — "the one with the lowest IP address" — breaks the first time the network splits: each side sees only itself and its neighbours, and two primaries write two ledgers. "Whoever grabs a row lock in the database" makes the database a single point of failure and doesn't help when a primary's process freezes while holding the lock. The same question appears everywhere in a distributed system: which replica of a database is the leader, which scheduler owns a partition, what the current feature-flag configuration is, which servers are alive and where they live.</p>
+<p>Every one of those answers needs <strong>agreement</strong>: all participants must see the same answer, even when machines crash, messages are delayed and networks split. Getting agreement right is one of the hardest problems in computing — it took decades of research to produce algorithms (Paxos, ZAB, Raft) that are provably correct and still practical, and implementations are notoriously easy to get subtly wrong. So instead of every team building agreement into every service, large systems build it once, as a small, extremely reliable service, and everyone else asks it.</p>
+<p>That is a coordination service. Google built Chubby for this; Yahoo built ZooKeeper; CoreOS built etcd, which now stores the entire state of every Kubernetes cluster. Its author at Google noted that its most popular use turned out to be as a name service, and that a single instance could see 90,000 clients talking directly to its master.</p>
+<p>This lesson designs a coordination service in interview order: requirements, estimates, API, data model and architecture, then deep dives into the consensus log (Raft's elections, terms, commit rule and safety), reads and their consistency, sessions and leases, watches, recipes for locks and leader election, and fencing. It ends with Chubby's production lessons and a lab that simulates Raft elections and shows why the timeouts are randomized.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a committee that keeps minutes</h4>
+<p>Picture a committee of five people responsible for a register of important facts: who is the current manager of each team, which meeting rooms are booked, what the office opening hours are. The rules are strict. One member is the chair. Anyone who wants to change the register asks the chair; the chair writes the proposed change as the next numbered line in the minutes and reads it to the others; once at least three of the five (a majority) have written it into their own copy, the change is official and the chair announces it. If the chair stops showing up, after a while some member calls for a new chair; whoever gets three votes first takes over, and a new "term" of the committee begins.</p>
+<p>Why three of five? Because any two groups of three from five people must share at least one person. So whatever the previous chair got approved, at least one member of any future majority knows about it — and the rules for electing a new chair make sure that member's knowledge isn't lost. That overlap is the whole trick of <strong>majority quorums</strong>, and it's why the committee survives two absent members but not three.</p>
+<p>The register itself is small and the changes are rare compared with ordinary business; what matters is that everyone agrees exactly. Members also keep a "who's here" list: anyone who wants to be on it must check in every few seconds, and if they stop checking in, their name is struck off automatically — which other people can watch for. Where the analogy breaks: real machines don't just "stop showing up"; they pause, come back and believe they are still chair. The design spends much of its care on making a returning ex-chair harmless.</p>
+
+<h4>What clients actually do with it</h4>
+<p>Four uses cover almost everything. <strong>Leader election</strong>: many replicas of a service, one must be primary; they race to create a key, and the winner is the leader until its session dies. <strong>Locks</strong>: mutual exclusion around a shared resource, with a queue of waiters. <strong>Configuration</strong>: a small set of values (feature flags, shard maps, which database is primary) that many processes read and watch for changes. <strong>Membership and discovery</strong>: each live server registers an ephemeral key with its address; clients list the keys to find servers and watch them to notice arrivals and departures. All four need the same two properties — every client sees the same answer, and the answer updates promptly when a participant dies — which is exactly what a consensus log plus sessions provides.</p>
+
+<h4>The pieces</h4>
+<p>A <strong>replicated log</strong>: every change is an entry in an ordered log, copied to all servers. A <strong>consensus protocol</strong> decides the order and when an entry is safe (committed): Raft in etcd, ZAB (ZooKeeper Atomic Broadcast) in ZooKeeper, Paxos in Chubby. A <strong>state machine</strong> on each server applies committed entries, in order, to an in-memory data store: a tree of small nodes (ZooKeeper, Chubby) or a flat key-value map (etcd). <strong>Sessions or leases</strong> track live clients. <strong>Watches</strong> notify clients of changes. On top of these, clients build <strong>recipes</strong>: locks, leader election, membership, configuration.</p>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Coordination service architecture: clients with sessions talk to a 5-node cluster; the leader replicates log entries to followers; each server applies committed entries to an in-memory store; watches notify clients">
+  <defs><marker id="in8-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="40" width="110" height="170" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="65" y="62" text-anchor="middle" style="fill:var(--ink);font-weight:600">Clients</text>
+    <text x="65" y="84" text-anchor="middle" style="fill:var(--muted)">session / lease</text>
+    <text x="65" y="102" text-anchor="middle" style="fill:var(--muted)">keep-alives</text>
+    <text x="65" y="130" text-anchor="middle" style="fill:var(--ink-2)">write → leader</text>
+    <text x="65" y="148" text-anchor="middle" style="fill:var(--ink-2)">read → any</text>
+    <text x="65" y="166" text-anchor="middle" style="fill:var(--ink-2)">watch events ←</text>
+    <rect x="250" y="20" width="130" height="64" rx="6" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:2"/>
+    <text x="315" y="42" text-anchor="middle" style="fill:var(--ink);font-weight:600">Leader (term 7)</text>
+    <text x="315" y="60" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">log … 41 42 43</text>
+    <text x="315" y="76" text-anchor="middle" style="fill:var(--good);font-family:var(--mono)">commit = 42</text>
+    <rect x="160" y="150" width="80" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="200" y="172" text-anchor="middle" style="fill:var(--ink)">F1</text>
+    <text x="200" y="190" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">…43</text>
+    <rect x="255" y="150" width="80" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="295" y="172" text-anchor="middle" style="fill:var(--ink)">F2</text>
+    <text x="295" y="190" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">…42</text>
+    <rect x="350" y="150" width="80" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="390" y="172" text-anchor="middle" style="fill:var(--ink)">F3</text>
+    <text x="390" y="190" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">…40</text>
+    <rect x="445" y="150" width="80" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="485" y="172" text-anchor="middle" style="fill:var(--ink)">F4</text>
+    <text x="485" y="190" text-anchor="middle" style="fill:var(--crit)">down</text>
+    <line x1="290" y1="84" x2="210" y2="148" marker-end="url(#in8-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="310" y1="84" x2="298" y2="148" marker-end="url(#in8-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="330" y1="84" x2="385" y2="148" marker-end="url(#in8-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="350" y1="84" x2="475" y2="148" marker-end="url(#in8-arrow)" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="440" y="110" style="fill:var(--muted)">AppendEntries</text>
+    <line x1="120" y1="120" x2="248" y2="56" marker-end="url(#in8-arrow)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+    <text x="330" y="236" text-anchor="middle" style="fill:var(--ink-2)">Entry 42 is on leader, F1, F2 = 3 of 5 → committed. 43 is on 2 of 5 → not yet.</text>
+    <text x="560" y="40" style="fill:var(--muted)">each server applies</text>
+    <text x="560" y="56" style="fill:var(--muted)">committed entries</text>
+    <text x="560" y="72" style="fill:var(--muted)">to an in-memory</text>
+    <text x="560" y="88" style="fill:var(--muted)">tree / KV store</text>
+  </g>
+</svg>
+<figcaption>The core of every coordination service: a leader appends client writes to a log and replicates them; an entry is committed once a majority (3 of 5 here) has it, so F3 lagging and F4 being down don't block progress. Committed entries are applied in order to identical in-memory stores on every server.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–18</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">18–26</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">26–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> A hierarchical namespace (or flat key space) of small data items with create, read, update with compare-and-swap (only if the version is still X), delete, and list children. Ephemeral items tied to client sessions. Sequential items whose names get an increasing counter. Watches that notify clients of changes. Transactions over a few keys ("if A's version is 5 and B doesn't exist, write both"). Building blocks for locks, leader election, membership and configuration.</p>
+<p><strong>Non-functional.</strong> <strong>Correctness above all</strong>: writes are linearizable — once a write succeeds, every later read that asks for the latest state sees it — and no committed write is ever lost. High availability: survive the loss of any minority of servers, and fail over in seconds. Low write latency within a region (milliseconds). Support tens of thousands of clients, most of them mostly idle (holding a session, watching a few keys). Small data: kilobytes per item, megabytes to a few gigabytes in total.</p>
+<p><strong>Out of scope, said aloud:</strong> being a general database. High write throughput, large values and analytical queries are explicitly not goals — and saying so is part of the answer.</p>
+<p><strong>Clarifying questions.</strong> "Within one region or global?" (Consensus across regions costs a cross-region round trip per write.) "How many clients, and how many watches per key?" "Do readers need the latest value, or is a slightly stale view fine?"</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Scenario: the coordination service for a company's production region: <strong>50,000 client processes</strong>, <strong>200,000 keys</strong> averaging <strong>1 KB</strong>, a <strong>5-node</strong> cluster across three availability zones.</p>
+<p><strong>Data size.</strong> 200,000 × 1 KB = <strong>200 MB</strong> — fits in memory on every replica with room to spare, which is the design point: every server holds a full copy, in RAM, so reads are cheap. (Chubby's paper notes that its data "fits in RAM, so most operations are cheap".)</p>
+<p><strong>Session keep-alive load.</strong> 50,000 clients each renewing a session every 10 s = <strong>5,000 keep-alives/s</strong>. Chubby found exactly this: "KeepAlives are by far the dominant type of request", and failing to process them in time "is the typical failure mode of an overloaded server". Spread across 5 servers if sessions can attach to any server (ZooKeeper's model), that's 1,000/s each; if all go to one master (Chubby's model), 5,000/s on one machine, which is why Chubby could stretch lease times from 12 s to about 60 s under heavy load.</p>
+<p><strong>Writes.</strong> Locks taken and released, leader elections, configuration changes, membership changes as pods start and stop: suppose <strong>500 writes/s</strong>. Each write is one round trip from the leader to the two fastest followers needed for a majority of 5, plus a synchronous disk write (fsync) on each. Within one region across zones: round trip ~1 ms, fsync on SSD ~0.5–2 ms, so write latency is a few milliseconds and 500/s is far within capacity. If a replica sat in another region 70 ms away, it wouldn't be in the fastest majority, but losing a local replica would make every write wait 70 ms.</p>
+<p><strong>Watch fan-out.</strong> A global configuration key watched by all 50,000 clients: one change produces <strong>50,000 notifications</strong> and up to 50,000 follow-up reads. At even 20,000 notifications/s per server spread over 5 servers, that's half a second of saturated work — plan for it with caching proxies and jittered re-reads.</p>
+<p><strong>Failover.</strong> Election timeout 1 s (a common etcd setting, against heartbeats every 100 ms): leader crash → followers notice after ~1 s → election in one or two round trips → new leader within ~1–2 s. Client sessions must survive that pause, so session timeouts are set longer than election time (e.g. 10 s).</p>
+
+<h4>3 · API</h4>
+<pre>create(path, data, flags=[EPHEMERAL, SEQUENTIAL]) -&gt; actual_path   # /lock/req-0000000042
+get(path, watch=False)          -&gt; data, version (stat)
+set(path, data, expected_version) -&gt; new_version | BadVersion          # compare-and-swap
+delete(path, expected_version)
+children(path, watch=False)     -&gt; [names]
+multi([check(p, v), create(...), set(...)])                           # atomic, all or nothing
+sync(path)                      # ZooKeeper: catch this server up before the next read
+
+# etcd style
+put(key, value, lease=id) / get(key | prefix, revision=r) / delete
+txn(if=[mod_revision(k) == r], then=[...], else=[...])
+watch(key | prefix, start_revision=r)  -&gt; stream of events with revisions
+lease_grant(ttl) / lease_keepalive(id) / lease_revoke(id)</pre>
+<p>Everything is versioned: each node or key carries a version (or etcd's global <strong>revision</strong>, a counter that increases with every change in the cluster). That makes compare-and-swap possible — write only if nobody changed it since I read it — which is how recipes avoid races without locks inside the service.</p>
+
+<h4>4 · Data model</h4>
+<p>ZooKeeper and Chubby expose a tree, like a file system: <code>/services/payments/primary</code>, <code>/locks/ledger/req-0000000042</code>. Each node holds a small blob of data plus metadata: data version, children version, creation and modification transaction IDs, and, for ephemeral nodes, the owning session. etcd uses a flat key space ordered by key (so a prefix like <code>/services/payments/</code> acts like a directory) stored in a multi-version store: every revision of every key is kept until compaction, so a watcher can resume from revision r and miss nothing. Underneath, every server has the same three things: the replicated <strong>log</strong> on disk, periodic <strong>snapshots</strong> of the in-memory state (so the log can be truncated), and the in-memory state itself.</p>
+
+<h4>5 · High-level architecture</h4>
+<p>Five server processes, one per machine, spread over three zones (2-2-1) so a zone loss leaves 3 of 5. One is the <strong>leader</strong>; the rest are <strong>followers</strong>. Clients connect to any server. <strong>Writes</strong> are forwarded to the leader, which appends them to its log, replicates to followers, and once a majority have them durably, commits, applies them to its state and replies; followers apply committed entries in the same order. <strong>Reads</strong> are served from in-memory state — by the leader with a freshness check for linearizable reads, or by the local server for cheaper, possibly stale reads. <strong>Sessions</strong> are tracked through keep-alives; when one expires, the leader proposes deleting its ephemeral nodes, through the log like any other write. <strong>Watches</strong> are registered on the server the client is connected to and fire when that server applies a matching change. For read scaling, extra non-voting replicas (ZooKeeper observers, etcd learners) receive the log and serve reads without slowing writes.</p>
+
+<h4>6 · Deep dive: Raft leader election</h4>
+<p>Raft divides time into <strong>terms</strong>, numbered 1, 2, 3, …; each term begins with an election and has at most one leader. Terms act as a logical clock: every message carries the sender's term; a server that sees a higher term updates its own and, if it was leader or candidate, steps down; a message with a lower term is rejected. This is what makes a returning ex-leader harmless inside the cluster — its term is stale.</p>
+<p>Servers start as <strong>followers</strong>. The leader sends periodic heartbeats (empty AppendEntries messages). A follower that hears nothing for its <strong>election timeout</strong> assumes the leader is dead, becomes a <strong>candidate</strong>, increments the term, votes for itself, and sends RequestVote to everyone. Each server grants at most one vote per term, first come first served — with one restriction: it refuses candidates whose log is less up to date than its own (compared by the term of the last entry, then by length). A candidate that collects votes from a majority of the <em>full</em> cluster becomes leader and immediately sends heartbeats to stop other elections. If it hears from a leader with a term at least as high, it steps down.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Timeline of a Raft election: leader crashes, followers' randomized timers expire at different times, S3 times out first, requests votes, gets a majority and becomes leader in term 8 before others time out">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="80" y1="220" x2="620" y2="220" style="fill:none;stroke:var(--line-2)"/>
+    <text x="80" y="238" style="fill:var(--muted)">0 ms: leader S1 crashes</text>
+    <text x="400" y="238" style="fill:var(--muted)">timeouts drawn from 150–300 ms</text>
+    <text x="20" y="40" style="fill:var(--ink)">S2</text>
+    <rect x="80" y="28" width="370" height="16" style="fill:var(--s1);opacity:0.25"/>
+    <text x="455" y="41" style="fill:var(--muted)">would fire at 271 ms</text>
+    <text x="20" y="80" style="fill:var(--ink)">S3</text>
+    <rect x="80" y="68" width="218" height="16" style="fill:var(--s2);opacity:0.5"/>
+    <text x="304" y="81" style="fill:var(--accent)">fires at 164 ms → term 8, votes for itself</text>
+    <text x="20" y="120" style="fill:var(--ink)">S4</text>
+    <rect x="80" y="108" width="300" height="16" style="fill:var(--s1);opacity:0.25"/>
+    <text x="20" y="160" style="fill:var(--ink)">S5</text>
+    <rect x="80" y="148" width="410" height="16" style="fill:var(--s1);opacity:0.25"/>
+    <line x1="298" y1="88" x2="320" y2="112" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="298" y1="88" x2="320" y2="150" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="298" y1="84" x2="320" y2="36" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="330" y="125" style="fill:var(--ink-2)">RequestVote(term 8) → votes from S4, S5</text>
+    <text x="330" y="190" style="fill:var(--good)">~170 ms: S3 has 3 of 5 votes → leader, sends heartbeats;</text>
+    <text x="330" y="206" style="fill:var(--good)">other timers reset before they fire</text>
+  </g>
+</svg>
+<figcaption>Randomized timeouts make it likely that one follower times out well before the others, collects a majority, and starts heartbeating before anyone else becomes a candidate. With identical timeouts, several candidates split the vote over and over.</figcaption>
+</figure>
+<p><strong>Why randomize the timeout?</strong> If every follower used exactly 150 ms, they would all become candidates at nearly the same moment, each voting for itself, and no one would get a majority — a <strong>split vote</strong> — then all time out again together. The Raft paper measured this: with no randomness, elections "consistently took longer than 10 seconds" because of repeated split votes; adding just 5 ms of randomness gave a median downtime of 287 ms; with a 150–300 ms range they recommend, elections are rarely split. The lab reproduces the same shape: fixed timeouts gave a median of about 12.8 seconds, 150–155 ms gave about 313 ms, and 150–300 ms gave a median of 182 ms with a worst case of 529 ms over 1,000 trials.</p>
+<p><strong>Choosing the timeout.</strong> The paper states the timing requirement as <em>broadcastTime ≪ electionTimeout ≪ MTBF</em>: the time to send a message to every server and get replies (0.5–20 ms, depending on storage, since replies require an fsync) must be much smaller than the election timeout, which must be much smaller than the MTBF (mean time between failures) of a server — months. Too short and normal hiccups trigger needless elections; too long and failover is slow. The paper's suggestion of 10–500 ms is for a LAN; production etcd clusters typically use a 1-second election timeout with 100 ms heartbeats to tolerate network and disk jitter.</p>
+
+<h4>7 · Deep dive: log replication, commit and safety</h4>
+<p>The leader appends each client command to its log as an entry tagged with the current term and an index. It sends AppendEntries to each follower containing new entries plus the index and term of the entry just before them. A follower accepts only if it has a matching entry at that previous position — the <strong>log matching</strong> check. If not, it rejects, and the leader steps back one entry at a time (or faster, with hints) until they find the point where their logs agree; the follower then deletes anything after that point and takes the leader's entries. This is how a follower that missed entries or holds entries from a deposed leader is brought into exact agreement.</p>
+<p>An entry is <strong>committed</strong> once the leader knows it is stored on a majority. The leader then applies it and replies to the client; followers learn the new commit index in the next AppendEntries and apply it too. In the architecture figure, entry 42 is on the leader, F1 and F2 — 3 of 5 — so it's committed; entry 43 is only on the leader and F1, so it isn't, and if the leader crashed now, 43 might be lost, which is fine because no client was told it succeeded.</p>
+<p><strong>Why committed entries survive leader changes.</strong> A committed entry is on a majority. Any new leader needs votes from a majority. The two majorities share at least one server, and that server refuses to vote for a candidate whose log is less up to date than its own — so the winner must already hold the committed entry. This voting restriction plus majority overlap gives Raft's <strong>leader completeness</strong> property: every leader holds every entry committed in earlier terms.</p>
+<p>One subtle rule completes it: a leader only counts replicas toward committing entries <em>from its own current term</em>. The Raft paper's Figure 8 shows why: an entry from an older term can be on a majority and still be overwritten if a server that lacked it wins the next election (possible because that server has a newer last term). Once the leader commits an entry from its own term, every earlier entry before it is committed too, by the log matching property. In practice, a new leader immediately appends a no-op entry in its term to commit everything before it.</p>
+<p><strong>Snapshots and membership changes.</strong> The log can't grow forever: each server periodically snapshots its state and discards the log up to that point; a follower too far behind receives the snapshot instead of old entries. Adding or removing servers must avoid a moment where two different majorities could exist (old configuration and new); Raft does this with joint consensus (decisions need majorities of both configurations during the change) or by changing one server at a time, which can never create two disjoint majorities.</p>
+
+<h4>8 · Deep dive: reads and their consistency</h4>
+<p>Writes go through the log and are linearizable by construction. Reads are where systems differ. A leader can't simply answer from memory: it might have been deposed by a partition it doesn't know about, while a new leader on the majority side has committed newer writes. Three options:</p>
+<ul>
+<li><strong>Read through the log</strong>: append the read as a log entry and answer when it commits. Correct, but as expensive as a write.</li>
+<li><strong>ReadIndex</strong>: the leader notes its current commit index, sends a heartbeat round and waits for a majority to acknowledge (proving it's still leader), waits until its state machine has applied up to that index, then answers from memory. One round trip, no disk write. Followers can also serve linearizable reads by asking the leader for the read index.</li>
+<li><strong>Lease reads</strong>: the leader assumes that after a successful heartbeat round, no other leader can be elected for slightly less than an election timeout, and answers from memory within that window. No extra round trip, but correctness now depends on bounded clock drift — a time assumption Raft otherwise avoids. Chubby's master lease is this idea.</li>
+</ul>
+<p>Cheaper still are <strong>stale reads</strong> from whichever server the client is connected to. ZooKeeper does exactly this by default: reads are served locally and may lag, but each client sees its own writes in order and never goes backwards in time (if it reconnects to another server, that server must be at least as up to date as what the client has seen). A client that needs the latest value calls <code>sync</code> first, which makes its server catch up with the leader. etcd defaults to linearizable reads and offers <code>serializable</code> reads that any member answers from local state. The design answer: make the default safe, and let callers who can tolerate staleness opt in for speed and scale.</p>
+
+<h4>9 · Deep dive: sessions, leases and watches</h4>
+<p>A client opens a <strong>session</strong> (ZooKeeper, Chubby) or creates a <strong>lease</strong> (etcd) with a timeout, and sends keep-alives. As long as they arrive, the session lives; if they stop for longer than the timeout, the service expires it and deletes everything attached to it — ephemeral nodes, held locks. This turns "is that process alive?" into data in the store, which other clients can read and watch. The service, not each client, decides on expiry, so all observers agree on when a client is considered gone.</p>
+<p>Chubby's protocol shows the details that matter. A KeepAlive is held at the master until the client's lease is close to expiring, then answered with a new lease timeout (12 seconds by default), and the reply also carries events and cache invalidations, so one long-lived call does all the work. The client keeps a slightly conservative local copy of the lease. If it expires locally (perhaps the master is failing over), the client enters "jeopardy": it disables its cache and waits a grace period (45 seconds by default) for a new master before declaring the session lost — so a quick failover is invisible to applications.</p>
+<p><strong>Watches</strong> let clients react without polling. ZooKeeper's classic watches are one-time triggers: you set a watch with a read, you get one notification when the data changes, and you must read again (setting a new watch) to see the new value — so changes between the notification and the re-read aren't individually delivered, only the latest state. Persistent and recursive watches were added later. etcd watches are streams from a revision: "send me every change to keys under /config/ since revision 9,312", which can't miss intermediate events while the history is retained. Both have the same scaling problem — fan-out to many watchers — handled by spreading clients across servers, proxies that watch once on behalf of many clients, and jitter on re-reads.</p>
+
+<h4>10 · Deep dive: recipes — locks, leader election, fencing</h4>
+<p><strong>The naive lock</strong>: "create /lock as ephemeral; if it exists, watch it and retry when it's deleted". When the holder releases, every waiter's watch fires and every waiter rushes to create the node — a thundering herd for one winner. <strong>The ZooKeeper recipe</strong> uses ephemeral <em>sequential</em> nodes instead: each client creates <code>/lock/req-</code> and gets a unique increasing suffix (<code>req-0000000041</code>, <code>…42</code>, <code>…43</code>). The lowest number holds the lock. Every other client reads the children without a watch and sets a watch only on the node immediately below its own. When 41 is deleted (released, or its session expired), only 42 is notified; it checks that it is now lowest and takes the lock. Waiters form a queue, each watching one predecessor: fair, and one notification per handover. Leader election is the same recipe: the lowest node is the leader; the rest are standbys watching their predecessor.</p>
+<p><strong>Fencing.</strong> The service can only guarantee that one session holds the lock <em>in its own state</em>. The holder can be paused (garbage collection, a stalled VM) past its session timeout, lose the lock without knowing, and keep acting while the next holder also acts. Chubby addressed this two ways. A <strong>sequencer</strong> — an opaque string naming the lock, its mode and its generation number — is passed by the holder with each request to the resource, which checks it against Chubby or against the most recent sequencer it has seen and rejects stale ones. For resources that can't be changed to check sequencers, a <strong>lock-delay</strong>: if a holder fails or loses its session without releasing, the lock can't be re-acquired for a period (up to one minute) so the old holder's in-flight requests drain first. In etcd the natural fencing token is the lock key's creation revision, which increases with every acquisition. The drill traces exactly this failure with a 14-second pause.</p>
+
+<h4>11 · Failure modes and trade-offs</h4>
+<p><strong>Leader crash</strong>: writes pause for detection plus election (often 1–2 s in production); reads served locally may continue. <strong>Minority partition</strong>: the old leader, cut off with a minority, can't commit anything and should step down once it fails to hear from a majority; clients connected to the minority get errors or stale reads. <strong>Loss of quorum</strong> (3 of 5 down): no writes at all; recovery may require manually forcing a new cluster from a surviving replica and can lose committed writes — the worst operation you'll perform on this system. <strong>Slow disk on the leader</strong>: every write waits for the leader's fsync, so a slow disk slows the whole cluster; etcd's documentation stresses how sensitive it is to disk write latency. <strong>Overload from clients</strong>: keep-alive storms after a failover (every client reconnects at once), watch fan-out, or a buggy client issuing a flood of reads; Chubby's outages included overload, and its answers were caching, proxies and longer leases. <strong>Large values or too many keys</strong>: snapshots and replication slow down; enforce request and storage limits.</p>
+<p><strong>The trade-offs to state in the close:</strong> strong consistency and simplicity of reasoning in exchange for write throughput and cross-region latency; small clusters for fast writes in exchange for limited fault tolerance; short timeouts for fast failover in exchange for false elections; and the fact that a lock service can only make resources safe if they participate (fencing).</p>
+</section>
+
+<section data-field="deep">
+<h4>ZAB versus Raft</h4>
+<p>ZooKeeper's protocol predates Raft and differs in emphasis. ZAB is an atomic broadcast: the leader assigns each state change a transaction ID (zxid) made of an epoch (like a term) and a counter, and followers deliver changes in zxid order. On leader election, ZAB has an explicit synchronization phase in which the new leader makes sure a quorum of followers have exactly its history — including any proposals from the previous epoch that it must commit — before accepting new writes. Raft achieves the same outcome implicitly through the vote restriction and log matching. Both use a single leader, majority quorums and epochs/terms to reject stale leaders; both give linearizable writes; both rely on followers being brought into exact agreement with the leader's log. In an interview, it's enough to say they are the same family and why: leader-based, majority-committed, epoch-fenced logs.</p>
+
+<h4>Why the service is small on purpose</h4>
+<p>Every byte written goes through consensus — a majority round trip and an fsync on each replica — and every byte stored lives in RAM on every replica and in every snapshot. So the system's throughput is roughly that of one machine's disk, not the cluster's, and adding servers doesn't increase write capacity (it decreases it). That is why etcd caps requests at 1.5 MiB and storage at 2 GiB by default with 8 GiB as a suggested maximum, and ZooKeeper nodes default to just under 1 MB. The right pattern is to store pointers and small control state in the coordination service — "the primary for shard 17 is at 10.0.3.4, generation 42" — and keep bulk data in purpose-built stores. Chubby's authors list abuses they had to fight: clients using it as a high-volume storage system or a publish/subscribe bus.</p>
+
+<h4>Multi-region coordination</h4>
+<p>A five-node cluster spread across three regions (2-2-1) survives a region outage, but every write must reach a majority, which always includes at least one remote region: tens to over a hundred milliseconds per write. Elections are slower too. Most designs avoid this: a cluster per region for local coordination (leader election for regional services, local configuration), and only rare, global decisions — which region is primary for a tenant — go through a cross-region cluster or a manual process. Reads in remote regions can be served by learners/observers with bounded staleness.</p>
+
+<h4>Testing and the gap between paper and implementation</h4>
+<p>Consensus algorithms come with proofs; implementations come with bugs. Chubby's paper is candid that in a few dozen cell-years it lost data six times, due to database software errors (four) and operator error (two), with the operator errors ironically happening during upgrades meant to avoid the software errors; none involved hardware failure. Production consensus systems are tested with deterministic simulation, fault injection that partitions networks and pauses processes, and Jepsen-style histories checked against linearizability. If an interviewer asks how you'd gain confidence in your design, "a formal model of the protocol and fault-injection tests of the implementation" is the expected answer.</p>
+
+<h4>Read scaling with learners and observers</h4>
+<p>Because voters determine write latency and fault tolerance, you don't add voters to serve more reads. Instead, add non-voting replicas — ZooKeeper calls them observers, etcd calls them learners — that receive the committed log and apply it, but never vote and never count toward a write's majority. They can serve stale-tolerant reads and hold client sessions and watches close to the clients (for example, one in each zone or a remote region), absorbing the keep-alive and watch fan-out load that Chubby handled with proxies. A learner is also how a new member joins safely: it first catches up as a learner and is promoted to voter only once its log is current, so adding it never makes the cluster wait on a replica that is hours behind.</p>
+
+<h4>Coordination for AI infrastructure</h4>
+<p>Training and serving fleets lean on the same primitives. Distributed training jobs need a rendezvous — every worker must agree on the membership and ranks of the job before starting, and must agree again after a worker fails (elastic training frameworks use an etcd-backed or similar rendezvous for this). Model-serving routers elect a leader per model to plan placement and rollouts; feature-flag and prompt-version configuration is pushed through watches. The usual mistakes apply: putting large artifacts (weights, prompts with embedded data) into the store instead of pointers, and letting thousands of GPU workers each hold watches on hot keys without proxies.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: Google's Chubby (OSDI 2006)</h4>
+<p>Mike Burrows' paper describes the lock service Google built for "loosely-coupled distributed systems". A Chubby <strong>cell</strong> is typically five replicas, placed to reduce correlated failure (for example in different racks), running a Paxos-based consensus protocol to elect a master. The master holds a <strong>master lease</strong> — "a few seconds" during which the other replicas promise not to elect a different master — and serves all reads and writes; writes are acknowledged once they reach a majority. A failed master is replaced when its lease expires; "a new master will typically be elected in a few seconds. For example, two recent elections took 6s and 4s, but we see values as high as 30s." Clients find the master through DNS. A typical deployment used one cell per data centre of several thousand machines.</p>
+<p>The design deliberately exposes <strong>coarse-grained</strong> locks — held for hours or days, such as electing the master of GFS or Bigtable — rather than fine-grained ones held for milliseconds, because coarse locks put little load on the service and tolerate brief unavailability. Locks are advisory. Sequencers and lock-delay (up to one minute) handle the stale-holder problem described above.</p>
+<p>The production numbers are the paper's most quoted section. "We have seen 90,000 clients communicating directly with a Chubby master." A snapshot of one cell showed 22,000 direct clients plus 32,000 through proxies, 18 days since the last failover, a 14-second failover duration, and an RPC mix dominated by KeepAlives (93%). Most stored files were small: 90% under 1 KB. Usage surprised the designers: "we found that its most popular use was as a name server", because Chubby's explicit cache invalidation gave consistent naming where DNS time-to-live caching produced either stale answers or heavy load.</p>
+<p>Availability: on a sample of cells covering about 700 cell-days, the authors "recorded 61 outages over a period of a few weeks". Most were 15 s or less and 52 were under 30 s, short enough that most applications weren't significantly affected; the remaining nine were caused by network maintenance (4), suspected network connectivity problems (2), software errors (2) and overload (1). Data loss: "In a few dozen cell-years of operation, we have lost data on six occasions, due to database software errors (4) and operator error (2); none involved hardware error."</p>
+<p>The scaling techniques map directly onto the estimates in this lesson: more cells so clients use a nearby one; raising the lease time from 12 s up to about 60 s under heavy load to cut KeepAlive traffic; aggressive client-side caching with invalidation; and proxies that handle KeepAlives and reads for many clients. The meta-lesson the paper states is that the main challenge wasn't the consensus algorithm but managing how thousands of clients — and their developers' assumptions — used the service.</p>
+
+<h4>What goes wrong, and what to watch</h4>
+<p><strong>Leader changes</strong> — frequent elections mean timeouts are too tight for the environment (slow disks, network jitter, CPU starvation). <strong>Disk fsync latency</strong> on every member — the leading indicator for etcd instability. <strong>Proposal commit and apply lag</strong> — followers falling behind. <strong>Database size against quota</strong> — etcd stops accepting writes when the quota is hit. <strong>Number of watchers and keep-alive rate</strong> — reconnect storms after failovers. <strong>Snapshot duration</strong> — long snapshots stall the leader. And on the client side: session expirations and lock-loss events, each of which should be rare and investigated.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> simulate Raft leader election after a leader crash in a 5-node cluster, with message delays of 1–5 ms, and compare fixed and randomized election timeouts over 1,000 trials each; then print the quorum table. Python 3.12, standard library only, about 3 seconds.</p>
+<pre>"""Raft leader election after a leader crash: fixed vs randomized election
+timeouts, measured over many trials; plus quorum arithmetic.
+Python 3.12 stdlib only (a small discrete-event simulation)."""
+import heapq, random, statistics
+
+def elect(n, timeout_lo, timeout_hi, rng, delay=(1.0, 5.0)):
+    """Leader just crashed at t=0. Return (ms until a new leader, elections started)."""
+    term = [1] * n; voted = [None] * n; votes = [0] * n; role = ["follower"] * n
+    events, seq = [], 0                       # (time, seq, kind, node, data)
+    def push(t, kind, node, data=None):
+        nonlocal seq; seq += 1; heapq.heappush(events, (t, seq, kind, node, data))
+    deadline = [0.0] * n
+    def reset_timer(i, now):
+        deadline[i] = now + rng.uniform(timeout_lo, timeout_hi)
+        push(deadline[i], "timeout", i)
+    for i in range(1, n):                     # node 0 was the leader and is dead
+        # followers last heard a heartbeat at slightly different times
+        deadline[i] = rng.uniform(0, 2) + rng.uniform(timeout_lo, timeout_hi)
+        push(deadline[i], "timeout", i)
+    elections = 0
+    while events:
+        now, _, kind, i, data = heapq.heappop(events)
+        if kind == "timeout" and now == deadline[i] and role[i] != "leader":
+            term[i] += 1; role[i] = "candidate"; voted[i] = i; votes[i] = 1; elections += 1
+            for j in range(1, n):
+                if j != i: push(now + rng.uniform(*delay), "request_vote", j, (i, term[i]))
+            reset_timer(i, now)
+        elif kind == "request_vote":
+            cand, t = data
+            if t &gt; term[i]: term[i], voted[i], role[i] = t, None, "follower"
+            grant = t == term[i] and voted[i] in (None, cand)
+            if grant: voted[i] = cand; reset_timer(i, now)
+            push(now + rng.uniform(*delay), "vote", cand, (t, grant))
+        elif kind == "vote":
+            t, grant = data
+            if role[i] == "candidate" and t == term[i] and grant:
+                votes[i] += 1
+                if votes[i] &gt; n // 2: return now, elections   # majority of ALL n
+    return float("inf"), elections
+
+rng = random.Random(1)
+for lo, hi, label in [(150, 150.5, "fixed 150 ms"), (150, 155, "150-155 ms"),
+                      (150, 300, "150-300 ms (paper)"), (12, 24, "12-24 ms")]:
+    res = [elect(5, lo, hi, rng) for _ in range(1000)]
+    times = sorted(t for t, _ in res)
+    split = sum(1 for _, e in res if e &gt; 1) / len(res)
+    print(f"{label:20} median {statistics.median(times):6.0f} ms, "
+          f"worst {times[-1]:7.0f} ms, trials needing &gt;1 election {split:5.1%}")
+
+print("\nnodes  majority  failures tolerated")
+for n in (1, 2, 3, 4, 5, 7):
+    print(f"{n:5} {n // 2 + 1:9} {(n - 1) // 2:19}")</pre>
+<p><strong>Run it:</strong> save as <code>raft_lab.py</code> and run <code>python raft_lab.py</code>.</p>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li><strong>Fixed 150 ms timeouts:</strong> a median of about 12.8 seconds and every trial needing more than one election. Followers time out together, vote for themselves and split the vote, round after round — the paper's "longer than 10 seconds" result.</li>
+<li><strong>5 ms of randomness (150–155 ms):</strong> the median drops to about 313 ms, close to the paper's 287 ms, though most trials still needed a second election.</li>
+<li><strong>150–300 ms (the paper's recommendation):</strong> a median of about 182 ms, worst case about 529 ms, and only around 6% of trials needing more than one election. One follower usually wins before the others wake.</li>
+<li><strong>12–24 ms:</strong> a median of about 23 ms — fast, but the window is now comparable to message delays, so many trials split once. The paper warns that going this low breaks the timing requirement in real systems with heartbeats and disk writes.</li>
+<li>The quorum table: 4 nodes tolerate only 1 failure, the same as 3; 5 tolerate 2; 7 tolerate 3.</li>
+</ol>
+<p><strong>Try next:</strong> make one node's messages 50 ms slower (a remote replica) and see how often it wins; then implement the vote restriction (refuse candidates with shorter logs) and give one follower a stale log.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+    <p>A 5-node etcd cluster runs with a 1-second election timeout. A service uses it for leader election with a 10-second lease, renewed every 3 seconds. The elected leader writes to a shared database.</p>
+    <p>(a) How many node failures can the cluster survive, and what is the impact of each? (b) The leader's process pauses for 14 seconds in garbage collection. Walk through what happens. (c) How do you make this safe?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Fault tolerance.</strong> A majority of 5 is 3, so the cluster survives <strong>2 failures</strong>.</p>
+    <ul>
+    <li><em>One follower lost:</em> no impact. Writes still reach a majority of the remaining 4.</li>
+    <li><em>Two followers lost:</em> still working, but at the edge — 3 nodes remain and all 3 must acknowledge every write. Any further failure, including a routine restart, loses quorum. Latency also rises, because every write now waits for the slowest of three rather than the second-fastest follower of four.</li>
+    <li><em>The etcd leader lost:</em> no writes for roughly one election timeout plus the election — 1–2 seconds. Clients see write errors and must retry.</li>
+    <li><em>Three lost:</em> quorum is gone. Writes fail, and recovery requires manual intervention that may lose committed data. Operational implication: a rolling restart across 5 nodes must wait for each node to rejoin and catch up before touching the next, or you can create this state during routine maintenance.</li>
+    </ul>
+    <p><strong>(b) The 14-second GC pause.</strong> Trace it precisely:</p>
+    <ol>
+    <li><strong>t=0</strong> — the service leader pauses. It last renewed within the previous 3 seconds, so its lease has between 7 and 10 seconds left.</li>
+    <li><strong>t≈7–10</strong> — no keep-alive arrives. The lease expires and etcd deletes the leader-election key.</li>
+    <li><strong>t≈10</strong> — watchers are notified, a second instance acquires the key and <strong>believes it is the leader</strong>. It begins writing to the shared database. Correct behaviour — from etcd's view, the old leader is gone.</li>
+    <li><strong>t=14</strong> — the original process resumes. From its perspective <em>no time has passed</em>. It doesn't know it was paused, still thinks its lease is valid, and continues writing.</li>
+    <li><strong>t=14 onwards</strong> — <strong>two leaders are writing concurrently.</strong> Both behave correctly according to their own state. etcd hasn't malfunctioned. No error is logged anywhere.</li>
+    </ol>
+    <p>The essential insight: <em>a lease proves a node was reachable recently, not that it is dead now.</em> A paused, partitioned or swap-thrashing process is indistinguishable from a crashed one, and it can come back.</p>
+    <p><strong>(c) Making it safe</strong> — three layers, in order of strength:</p>
+    <ul>
+    <li><strong>Fencing tokens (the real fix).</strong> Each acquisition comes with an increasing number — the election key's etcd revision works directly. The leader includes it with every database write, and <em>the database rejects any write with a token lower than the highest it has seen</em>. The returning old leader carries 41, the database has seen 42, and its writes are refused. Note where enforcement lives: <strong>in the resource, not in etcd</strong>. A lock service can't protect a resource that doesn't check.</li>
+    <li><strong>Check-before-act with a short horizon.</strong> Before each batch of side effects, re-verify leadership and abort if lost. This narrows the window but doesn't close it — the process could pause between the check and the write. A useful mitigation, not a guarantee, and being clear about that matters.</li>
+    <li><strong>Idempotent writes.</strong> If every write is keyed so that applying it twice is harmless, two leaders are inefficient rather than incorrect. Often the most practical answer when you can't modify the resource to support fencing. (Chubby's lock-delay is the other option for unmodifiable resources: delay re-acquisition after a holder fails so in-flight requests drain.)</li>
+    </ul>
+    <p><strong>What not to do:</strong> lengthen the lease. It reduces the probability of a spurious expiry but increases failover time proportionally, trading availability for a risk you haven't eliminated — the pause could simply be longer. Tuning timeouts feels like a fix and isn't one.</p>
+    <p>The generalisation: <strong>every distributed lock is unsafe unless the protected resource participates.</strong> It's the same conclusion as the job scheduler's worker lease and the ticket-booking hold, and recognising it as one recurring principle rather than three separate problems is what the interview is looking for.</p></details>
+
+<b>Estimate it</b>
+    <p>A Kubernetes-style control plane stores 300,000 objects averaging 4 KB in etcd. 20,000 node agents each hold a watch on their own objects and send a lease keep-alive every 10 s; controllers write 800 updates per second. Is a 3-node etcd cluster with SSDs adequate, and what would you watch?</p>
+    <details><summary>Answer</summary>
+    <p>Data: 300,000 × 4 KB = 1.2 GB — under the 2 GiB default quota, but close enough that you'd raise the quota (to the 8 GiB suggested maximum) and compact old revisions regularly, since history multiplies size. Keep-alives: 20,000 ÷ 10 s = 2,000/s, cheap. Writes: 800/s × 4 KB = 3.2 MB/s through consensus, each needing a leader-plus-one-follower fsync — fine on SSDs with fsync around 1 ms, but disk latency is now the whole story, so watch fsync and commit latency percentiles. Watches: 20,000 is manageable if each agent watches only its own small prefix; a global watch by every agent would be a fan-out problem. Three nodes tolerate one failure; five would tolerate two at slightly higher write latency — choose five if a zone outage plus a node failure must be survivable. Monitor leader changes, database size versus quota, and apply lag.</p></details>
+</section>

@@ -1,0 +1,516 @@
+
+/* ============================================================
+   DATA — classic product system design, part two.
+   Continues CLASSICS from p07d.
+   ============================================================ */
+CLASSICS.push(
+
+{ id:"cd6", t:"Design a file sync service (Dropbox, Google Drive)", tag:"Storage", sum:"Chunking, deduplication, delta sync and the conflict resolution nobody plans for.",
+  primer:`<h4>Start here — sync is not upload</h4>
+  <p>Storing files is easy. The hard problem is that the <em>same</em> file exists on a laptop, a phone and a server, all of which can change it, some of which are offline, and all of which must eventually agree. That is a distributed consistency problem wearing a folder icon.</p>
+  <h4>Why the naive version fails</h4>
+  <p>"Watch the folder; when a file changes, upload it." Three failures, each of which drives a design decision:</p>
+  <ul>
+  <li><strong>You re-upload whole files.</strong> Changing one cell in a 50 MB spreadsheet re-sends 50 MB. Users on slow connections never finish.</li>
+  <li><strong>You cannot resume.</strong> A dropped connection at 90% starts again from zero.</li>
+  <li><strong>You have no answer for concurrent edits.</strong> Two devices edit the same file offline; whoever syncs last silently destroys the other's work.</li>
+  </ul>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Chunking</strong> — splitting a file into pieces (typically ~4 MB) that are stored and transferred independently. Enables resume, parallel upload, and per-chunk deduplication.</li>
+  <li><strong>Content-addressed storage</strong> — a chunk's identifier <em>is</em> the hash of its contents. Identical chunks are automatically the same object, so deduplication is free rather than a feature you build.</li>
+  <li><strong>Content-defined chunking</strong> — choosing chunk boundaries based on a rolling hash of the content rather than at fixed offsets. Critical: with fixed offsets, inserting one byte at the start of a file shifts every boundary and changes every chunk. With content-defined boundaries, only the chunks around the edit change.</li>
+  <li><strong>Delta sync</strong> — transferring only the chunks that differ, not the whole file.</li>
+  <li><strong>Metadata vs block storage</strong> — two separate systems. Metadata (the namespace: names, paths, versions, permissions) is small, transactional and hot. Blocks are large, immutable and cheap. They have almost nothing in common.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>Think of it as <strong>git for consumers</strong>: immutable content-addressed blobs, plus a mutable pointer structure describing which blobs form which file at which version. Once you frame it that way, deduplication, versioning, resume and delta sync all fall out of the same design rather than each needing its own mechanism.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["Data model","12–22"],["Architecture","22–32"],["Deep dive","32–48"],["Scale & failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> sync a folder across devices; upload and download; version history; share a folder with other users; work offline and reconcile on reconnect.</li>
+  <li><strong>Out of scope:</strong> real-time collaborative editing (that is the Google Docs design — name it and set it aside), search inside documents, previews.</li>
+  <li><strong>Non-functional:</strong> a change on one device appears on another within seconds when both are online; no silent data loss, ever; efficient on slow and metered connections.</li>
+  <li><strong>The clarifying question:</strong> "what should happen when two devices edit the same file offline?" Watch for the interviewer's answer — "last write wins" makes this a much simpler design, "never lose data" forces conflict copies and version trees. Do not assume.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>100M users, 20M daily active, average 50 GB stored each = <strong>5 EB raw</strong>. Deduplication and compression typically recover 30–50% across a consumer population, since users store enormous numbers of identical files — installers, shared documents, the same photos.</li>
+  <li>Change events: 20M active users × 200 file changes/day = 4B events/day ≈ <strong>46,000/s</strong>, peaking perhaps 150,000/s. Most are small metadata changes, not big uploads.</li>
+  <li>Bandwidth: if 5% of changes carry 1 MB of new chunks, that is 2,300 MB/s ≈ <strong>18 Gbps</strong> sustained ingest. Substantial but ordinary, especially since blocks go straight to object storage.</li>
+  <li>Metadata scale is the one to highlight: <strong>10 billion files</strong>, each needing a row with path, version, chunk list and permissions. That store is small in bytes and enormous in row count and query rate — it is the actual hard part, and saying so early is a good signal.</li></ul>
+
+  <h4>3 · Data model — 12–22 min</h4>
+  <pre>blocks     hash PK -&gt; bytes in object storage      (immutable, global dedup)
+files      file_id, namespace_id, path, version, block_hashes[], size, mtime
+            PRIMARY KEY ((namespace_id), path)
+journal    namespace_id, cursor (monotonic), file_id, op, version
+namespaces namespace_id, owner, members[]           (a folder or a share)</pre>
+  <p>Three points to make:</p>
+  <ul><li><strong>Blocks are global and immutable.</strong> A block hash means the same bytes everywhere in the system, for every user — that is where deduplication comes from, for free.</li>
+  <li><strong>The journal is the heart of sync.</strong> Every namespace has a monotonically increasing cursor. A client stores the last cursor it has seen and asks "what changed after N?". That single mechanism handles incremental sync, offline catch-up and new-device bootstrap identically — and it is exactly the same idea as the chat design's per-conversation sequence number.</li>
+  <li><strong>A version is a list of block hashes,</strong> so history costs only the blocks that actually changed. Reverting is repointing, not copying.</li></ul>
+
+  <h4>4 · Architecture — 22–32 min</h4>
+  ${flow([{t:"Client",d:"watcher + local db"},{t:"Metadata svc",d:"namespace, journal"},{t:"Block svc",d:"hash → object store"},{t:"Notification",d:"long-poll / push"},{t:"Object storage",d:"S3-class, replicated"}])}
+  <p>Upload: the client chunks the file, hashes each chunk, and asks the block service <em>which of these hashes you do not already have</em>. It uploads only those, then commits a new file version to the metadata service referencing all the hashes. Note the ordering — <strong>blocks first, metadata last</strong> — so metadata never references a block that does not exist.</p>
+  <p>Download: the client polls the journal (or is pushed a nudge), receives the changed file list with block hashes, fetches missing blocks, and assembles locally.</p>
+
+  <h4>5 · The deep dive — 32–48 min</h4>
+  <p><strong>Content-defined chunking.</strong> Slide a rolling hash window over the file and cut where the hash matches a pattern — say, where the low 13 bits are zero, giving an average 8 KB boundary spacing, then aggregate into larger chunks. The property that matters: inserting bytes near the start shifts content but the boundaries re-synchronise within one chunk, so only the affected chunks change. Fixed-size chunking would change every chunk after the insertion point. Draw this if you can; it is the clearest demonstration of understanding in the whole question.</p>
+  <p><strong>Deduplication has a security catch,</strong> and raising it unprompted is a strong move. Global cross-user dedup means the server can tell you already-have-this-chunk, which lets an attacker confirm whether a specific file exists in the system by uploading it and observing that nothing transferred. The mitigations are to dedupe only within a user or namespace, or to add a per-user salt to the hash — both of which cost storage. It is a real trade-off, not a bug to be fixed.</p>
+  <p><strong>Conflicts.</strong> Two devices edit the same file while offline. When the second syncs, its base version no longer matches the server's current version. Options: last-write-wins (simple, loses data, sometimes acceptable); a conflicted copy — <code>report (Anna's conflicted copy).xlsx</code> — which never loses data and pushes the decision to the human; or automatic merge, which only works for known formats and is out of scope for a general file sync. <strong>Take conflicted copies</strong> and say why: for arbitrary binary files, no correct automatic merge exists, so surfacing the conflict is the honest design.</p>
+  <p><strong>Move and rename</strong> is the operation that catches people. If files are keyed by path, renaming a 100,000-file folder is 100,000 metadata writes and the client re-downloads everything. Key files by a stable <code>file_id</code> and treat path as an attribute, so a rename is one write and the client moves local files rather than re-fetching. Volunteering this shows you have thought past the happy path.</p>
+
+  <h4>6 · Scale and failure — 48–56 min</h4>
+  <ul><li><strong>Shard metadata by namespace,</strong> so all of one user's or one shared folder's operations land on one shard and can be transactional. Cross-namespace moves are then the awkward case — handle them as a copy plus delete with a compensating cleanup.</li>
+  <li><strong>Blocks are immutable,</strong> so they replicate and cache trivially and never need invalidation. All the consistency difficulty is concentrated in metadata, which is why the split exists.</li>
+  <li><strong>Garbage collection</strong> is genuinely hard: a block is deletable only when no version of any file in any namespace references it. Use reference counting with a delay, or mark-and-sweep offline, and be conservative — deleting a still-referenced block is unrecoverable data loss, while keeping a dead one costs pennies.</li>
+  <li><strong>Client-side resilience:</strong> the client keeps a local database of file state and a queue of pending operations, so it works fully offline and resumes cleanly. A significant share of the engineering in a real product lives in the client, and saying so is accurate rather than a dodge.</li>
+  <li><strong>The pathological case</strong> is a user with a million small files, or one 100 GB file in a folder that syncs to ten devices. Rate-limit per namespace, batch small-file operations, and cap fan-out.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the two-store split — immutable content-addressed blocks where scale lives, mutable transactional metadata where correctness lives — and on the journal cursor as the one mechanism that makes incremental sync, offline catch-up and new-device setup the same operation. Then name the trade-off you took: conflicted copies over automatic merge, because silently losing a user's work is the only truly unacceptable failure in this product.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Causality, not clocks, decides what is a conflict.</strong> Comparing modification timestamps across devices is unreliable — clocks drift, time zones confuse, and a stale device can have a later clock. What you need is whether version B <em>knew about</em> version A: track a base version (or vector clock) per file, and a write whose base is not the current server version is by definition a conflict. Timestamps are for display; causality is for correctness. This distinction is the single most senior-sounding thing to say here.</li>
+  <li><strong>Sharing turns a tree into a graph, and that breaks assumptions.</strong> Once a folder is shared, it appears in several users' namespaces, has its own permission set, and can be nested inside folders with different permissions. "What can this user see?" stops being a path prefix check. Treat a shared folder as its own namespace mounted into each member's tree, so permissions and the journal live with the namespace rather than being inherited down a path — otherwise a permission change means rewriting every descendant.</li>
+  <li><strong>The notification channel is a scale problem in its own right.</strong> Twenty million clients must learn about changes within seconds. Polling every few seconds is 20M ÷ 3 ≈ 7M requests/s of mostly-empty responses. The standard answer is long-polling or a persistent connection carrying only a nudge — "your namespace changed, come and read the journal" — so the expensive read happens only when something actually changed. This is the same connection-registry problem as the chat design, at similar scale.</li>
+  <li><strong>Client-side selective sync is a requirement, not a nicety.</strong> A user with 2 TB in the cloud and a 256 GB laptop cannot hold everything. That means files can exist as metadata-only placeholders, hydrated on access — which requires filesystem integration (a file provider extension on macOS, cloud filter API on Windows), and it turns "open file" into a potentially slow network operation. This is where most of the real-world complexity and most of the bug reports live.</li>
+  <li><strong>Know the encryption trade-off.</strong> True end-to-end encryption means the server stores ciphertext, which destroys cross-user deduplication (identical plaintext encrypts differently per user), server-side preview generation, and server-side search. Convergent encryption — deriving the key from the content hash — restores dedup but re-introduces the confirmation-of-file attack and is vulnerable to dictionary attacks on low-entropy files. There is no free option; name the one you would ship and why.</li>
+  <li><strong>The failure that actually happens is a sync loop.</strong> Two clients each see the other's change as new, rewrite the file, and ping-pong forever, burning bandwidth and versions. Causes are usually subtle: a filesystem that normalises Unicode differently, or one that stores case-insensitively while the server is case-sensitive, so <code>Report.pdf</code> and <code>report.pdf</code> chase each other. Defend with loop detection (a client ignores echoes of its own writes by id) and explicit normalisation rules per platform.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A user edits a 200 MB video project file. The edit inserts 50 KB of data 30 MB into the file. Chunk size averages 4 MB.</p>
+    <p>(a) With fixed-size chunking, how much must be uploaded? (b) With content-defined chunking? (c) The same user then duplicates the folder to make a backup. What is stored?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Fixed-size chunking.</strong> The file is 50 chunks of 4 MB. Inserting 50 KB at offset 30 MB shifts every subsequent byte by 50 KB, so chunk boundaries at fixed offsets now fall on different content. Chunks 1–7 (0–28 MB) are unchanged. Chunk 8 contains the edit, and <em>every chunk after it</em> has shifted content and therefore a different hash. Upload: chunks 8 through 50 = <strong>43 chunks ≈ 172 MB</strong> for a 50 KB edit — an amplification of roughly <strong>3,500×</strong>.</p>
+    <p><strong>(b) Content-defined chunking.</strong> Boundaries are determined by a rolling hash over the content itself, so after the inserted region the hash window re-synchronises with the original content within one chunk. Chunks before the edit are identical. The chunk containing the edit changes, and typically one following chunk changes as the boundary re-aligns. Upload: <strong>~2 chunks ≈ 8 MB</strong>, and with smaller average chunk sizes, considerably less.</p>
+    <p>That is a <strong>20× reduction</strong> from one design choice, and it is the entire justification for the extra complexity of a rolling hash. Worth stating the cost honestly: chunk sizes become variable, you need a minimum and maximum to avoid pathological cases, and chunking is CPU work on the client.</p>
+    <p><strong>(c) Duplicating the folder.</strong> Every block already exists in content-addressed storage, so the client hashes the chunks, asks which the server lacks, and the answer is <em>none</em>. <strong>Zero bytes are uploaded and zero new blocks are stored.</strong> What <em>is</em> created is metadata: a new set of file rows pointing at the same block hashes — a few kilobytes for a folder that appears to consume another 200 MB of the user's quota.</p>
+    <p>This exposes a real product question worth raising: <strong>does the user's quota count logical bytes or physical bytes?</strong> Consumer products bill logical (you appear to use 400 MB) because billing on dedup would mean your bill changes when a stranger uploads the same file — which is both confusing and a privacy leak. It also means storage revenue and storage cost are decoupled, which is why dedup is so valuable to the provider. Noticing that the technical choice has a billing consequence is exactly the kind of connection senior candidates make.</p></details>`,
+
+  refs:[
+    ["post","Rewriting the heart of our sync engine","Dropbox on rebuilding sync from scratch — the section on why they moved to a strongly-consistent metadata model with explicit causality is directly relevant to the conflict discussion.","https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine"],
+    ["post","Streaming File Synchronization","Dropbox's account of delta sync and chunk-level transfer in production.","https://dropbox.tech/infrastructure/streaming-file-synchronization"],
+    ["paper","The rsync algorithm","Tridgell & Mackerras — the original rolling-checksum technique behind every delta-sync system since.","https://www.andrew.cmu.edu/course/15-749/READINGS/required/cas/tridgell96.pdf"],
+    ["docs","Rolling hash","The mechanism behind content-defined chunking, with the Rabin fingerprint construction the drill above depends on.","https://en.wikipedia.org/wiki/Rolling_hash"],
+    ["docs","Vector clocks","How to establish causality between versions without trusting device clocks — the basis of correct conflict detection.","https://en.wikipedia.org/wiki/Vector_clock"],
+    ["code","restic","A well-documented open-source backup tool using content-defined chunking and content-addressed storage. Read its design doc to see this architecture in ~5,000 words.","https://github.com/restic/restic"]
+  ]},
+
+{ id:"cd7", t:"Design a ticket booking system (Ticketmaster, BookMyShow)", tag:"Concurrency", sum:"The concurrency masterclass: seat holds, overselling, and surviving an on-sale spike.",
+  primer:`<h4>Start here — why this looks easy and is not</h4>
+  <p>A booking system has a small database, modest average traffic and a simple data model. It is asked because of one property: <strong>the inventory is finite, discrete and contested</strong>. Seat 14F either exists once or it does not. Sell it twice and you have a customer at the venue with no seat — a failure no retry, cache or eventual-consistency argument can repair.</p>
+  <p>And the load is pathological: a stadium tour goes on sale at 10:00 and 500,000 people arrive in the same second for 50,000 seats. Ninety percent of them will not get one. <strong>The system's real job is to disappoint 450,000 people fairly and without falling over.</strong></p>
+  <h4>Why the naive version fails</h4>
+  <p>"Check if the seat is free, then mark it sold." Between the check and the write, another request does the same thing. Both see it free, both sell it. This is a <em>check-then-act race</em>, and at 500,000 requests/s it does not happen occasionally — it happens constantly.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Optimistic concurrency</strong> — do not lock; write conditionally ("update seat where version = 7") and detect the conflict at write time. Cheap when conflicts are rare.</li>
+  <li><strong>Pessimistic locking</strong> — take a lock before reading. Correct under heavy contention, but the lock is a serialisation point and holding it across a user's think-time is disastrous.</li>
+  <li><strong>Hold / reservation</strong> — a seat is taken out of inventory for a few minutes while the user pays, then either confirmed or released. This is the mechanism that makes the product usable and the concurrency interesting.</li>
+  <li><strong>Idempotency key</strong> — a client-generated id that makes a retried payment request safe. Without it, a lost response plus a retry charges twice.</li>
+  <li><strong>Virtual waiting room</strong> — a queue in front of the whole system that admits users at a controlled rate. The industry-standard answer to the on-sale spike.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p><strong>Two systems with opposite requirements.</strong> Browsing events and viewing seat maps is read-heavy, cacheable, and perfectly happy being a few seconds stale. Claiming a seat is a tiny, strongly-consistent, transactional write. Most candidates design one system and try to make it do both. Separate them explicitly in your first diagram and the rest becomes tractable.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["Data model","12–20"],["Architecture","20–28"],["Deep dive","28–48"],["Scale & failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> browse events; view available seats; hold selected seats; pay; receive a ticket. Cancellation and refunds if time allows.</li>
+  <li><strong>Out of scope:</strong> the payment processor internals (gesture at the payments design), dynamic pricing, resale marketplace.</li>
+  <li><strong>Non-functional:</strong> a seat is never sold twice, under any failure; the seat map is allowed to be slightly stale; the system survives a 100× traffic spike at a known instant.</li>
+  <li><strong>The question that changes everything:</strong> "reserved seating or general admission?" General admission is a counter — decrement a number, far easier. Reserved seating is discrete contested inventory with a seat map. Assume reserved seating, because that is the interesting problem, but <em>ask</em>.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>Normal load: 10M users, browsing traffic maybe <strong>5,000 rps</strong>. Unremarkable.</li>
+  <li>On-sale spike: 500,000 users arriving within 60 seconds for a 50,000-seat venue. If each refreshes and clicks a few times, that is <strong>50,000–100,000 rps for a few minutes</strong>, against 5,000 normally — a <strong>20× spike at a time you know in advance</strong>. That foreknowledge is the most exploitable fact in the whole design.</li>
+  <li>Writes: only 50,000 seats can be sold, so successful writes total 50,000 over several minutes — a few hundred per second. <em>The write volume is tiny; the contention is enormous.</em> Say this contrast explicitly; it tells the interviewer you have identified the real problem.</li>
+  <li>Seat map reads: 500,000 users each polling a 50,000-seat map. If served naively from the database that is gigabytes per second of the same data — obviously a caching problem, not a database problem.</li></ul>
+
+  <h4>3 · Data model — 12–20 min</h4>
+  <pre>events(event_id PK, venue_id, starts_at, on_sale_at, status)
+seats(event_id, seat_id, section, row, price_tier,
+      state,            -- available | held | sold
+      hold_id, hold_expires_at, version)
+      PRIMARY KEY ((event_id), seat_id)
+holds(hold_id PK, user_id, event_id, seat_ids[], expires_at, state)
+orders(order_id PK, hold_id, user_id, amount, idempotency_key UNIQUE, state)</pre>
+  <p>Everything for one event is in one partition, so a multi-seat claim is a single-partition transaction. That is the decision that makes correctness achievable — say it deliberately rather than letting it be implicit.</p>
+
+  <h4>4 · Architecture — 20–28 min</h4>
+  ${flow([{t:"Waiting room",d:"admits N/s"},{t:"CDN / seat map",d:"cached, slightly stale"},{t:"Booking svc",d:"atomic hold"},{t:"Payment",d:"idempotent"},{t:"Expiry worker",d:"releases stale holds"}])}
+  <p>Read path and write path are physically separate. The seat map is a cached artefact regenerated every second or two and served from the edge; nobody queries the seat table to render a map. The booking service does one thing: turn a seat selection into an atomic hold, or fail.</p>
+
+  <h4>5 · The deep dive — 28–48 min</h4>
+  <p><strong>The atomic hold.</strong> This is the core. A conditional update that claims all requested seats or none:</p>
+  <pre>UPDATE seats
+   SET state = 'held', hold_id = :hid,
+       hold_expires_at = now() + interval '8 minutes',
+       version = version + 1
+ WHERE event_id = :eid
+   AND seat_id IN (:seats)
+   AND (state = 'available'
+        OR (state = 'held' AND hold_expires_at &lt; now()))
+-- then: if rows_affected != len(seats) -&gt; ROLLBACK, report which seats went</pre>
+  <p>Three things to point out about it. It is a <strong>single statement</strong>, so there is no window between check and act. It reclaims <strong>expired holds</strong> in the same predicate, so an abandoned checkout does not require the sweeper to have run first. And the <strong>row count check</strong> makes it all-or-nothing — a party of four does not want three seats together and one in the back.</p>
+  <p><strong>Why not a distributed lock?</strong> Because you would have to hold it across the user's payment — minutes of human time — and a lock held across a network call to a payment provider is a liveness disaster. The hold <em>is</em> the lock, but it lives in the database with a timeout and is therefore self-healing.</p>
+  <p><strong>Hold expiry</strong> needs belt and braces: the conditional update treats expired holds as available (so correctness never depends on a background job), <em>and</em> a sweeper periodically resets them so the seat map shows them free again. Relying only on the sweeper means seats sit invisible for however long it lags.</p>
+  <p><strong>Payment is the dangerous boundary.</strong> The hold expires in 8 minutes; the payment provider might take 30 seconds and then time out with an unknown outcome. Never release a hold while a payment is in flight — extend it, and reconcile against the provider. Every payment request carries an idempotency key so a retry cannot double-charge. If payment succeeds after the hold expired and the seat is gone, you must refund and apologise; design that path explicitly, because it <em>will</em> happen and an undesigned failure path is how people end up paying for nothing.</p>
+  <p><strong>The waiting room.</strong> The genuinely correct answer to the spike. Arriving users get a queue token and a position; a controller admits a few thousand per second into the real system. This converts an uncontrolled stampede into a flow you provisioned for, it is <em>fair</em> (first-come ordering rather than whoever has the fastest connection), and it is honest — showing position 340,000 of 500,000 is better than a spinner that fails. Say explicitly that the waiting room must be independently scalable and must not share infrastructure with booking, or it becomes the thing that falls over.</p>
+
+  <h4>6 · Scale and failure — 48–56 min</h4>
+  <ul><li><strong>Hot partition:</strong> one event is one partition and takes 100% of the spike. Accept it — the write volume is genuinely small — but isolate popular events onto their own shards so one on-sale cannot degrade unrelated events.</li>
+  <li><strong>Pre-scale on the known schedule.</strong> You know <code>on_sale_at</code>. Warm caches, scale out, and pre-generate seat maps minutes beforehand. Reactive autoscaling cannot respond to a 20× step in under a minute, and by then it is over.</li>
+  <li><strong>Bots</strong> are a first-class requirement here, not an afterthought: rate limits per account and per payment instrument, device attestation, purchase caps, and a queue token that is expensive to farm. A booking system without anti-bot measures loses its entire inventory to resellers in seconds.</li>
+  <li><strong>Seat map staleness</strong> is deliberate. A user may select a seat that was taken two seconds ago and get "that seat just went" on submit. Design that message properly — it is the common path during an on-sale, not an edge case — and immediately offer the nearest equivalent seats.</li>
+  <li><strong>Database failover</strong> mid-transaction: holds are committed rows, so a failover loses only in-flight uncommitted work. Users retry. No seat is double-sold because the conditional update is atomic within the partition.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the shape: reads are cached and stale by design, writes are a single conditional statement per event partition, the hold is a self-expiring lock that survives crashes, and the waiting room converts an unschedulable spike into a rate you control. Then name the honest trade-off — you chose to show users slightly stale availability and occasionally tell them a seat has gone, because the alternative is a system that is either slow for everyone or occasionally sells the same seat twice.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Optimistic versus pessimistic is decided by contention, and this system is both at once.</strong> For an ordinary event with plenty of seats, optimistic concurrency is right — conflicts are rare and locking would be pure overhead. For a sold-out stadium on-sale, nearly every request conflicts, and optimistic retry loops turn into a livelock where everybody retries and almost nobody progresses. The sophisticated answer is that the waiting room is what makes optimism viable: by admitting a controlled rate you keep the conflict probability low enough that conditional writes succeed. The concurrency strategy and the admission control are the same design decision.</li>
+  <li><strong>"Best available" is a different and better product than seat picking,</strong> and it is also far kinder to the system. If the user asks for "4 seats together, cheapest tier" rather than naming seats, the server chooses at claim time from what is actually free — so there is no stale-selection failure and no contention on any specific seat. Most high-demand on-sales work this way for exactly this reason. Suggesting it unprompted shows you can reshape the requirement instead of only optimising the implementation.</li>
+  <li><strong>Fairness is a stated requirement in this domain, not an implementation detail.</strong> Ticket on-sales are subject to consumer-protection scrutiny, and "whoever has the lowest latency wins" is a defensible engineering outcome but a poor social one. A FIFO waiting room, or a randomised lottery among everyone who arrived in the first N seconds, are both explicit fairness policies. A lottery is strictly better under extreme oversubscription because it removes the incentive to hammer the system, which reduces load — a rare case where the fairer design is also the cheaper one.</li>
+  <li><strong>Exactly-once does not exist across the payment boundary, so design for reconciliation.</strong> You can lose the response from the payment provider at any point, leaving the charge in an unknown state. The only correct pattern is an idempotency key plus an explicit reconciliation process that queries the provider for the true state and converges — with a durable outbox so that "payment succeeded" always eventually results in "ticket issued" even if your service crashed between the two. Candidates who say "wrap it in a transaction" have not understood that the provider is not in your database.</li>
+  <li><strong>The oversell decision is sometimes a business choice, and you should say so.</strong> Airlines deliberately oversell because no-shows are predictable and empty seats are pure loss; venues almost never do because a ticket is a physical promise for a specific seat. If asked "can you ever oversell?", the right answer is that it is a policy input to the system, and if enabled it needs a compensation workflow, not a relaxed database constraint. Distinguishing a policy decision from a correctness failure is a senior instinct.</li>
+  <li><strong>Watch out for the multi-venue, multi-currency, multi-timezone reality.</strong> <code>on_sale_at</code> is in the venue's local time with daylight-saving transitions; prices differ by region and tax regime; and a "day" for reporting is not the same day everywhere. None of this is glamorous, but a design that stores naive local timestamps will ship an on-sale an hour early somewhere, which in this product is a public incident.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A 60,000-seat stadium goes on sale at 10:00. 800,000 users arrive within the first 90 seconds. Your booking service can process 3,000 hold attempts/s. The average user takes 4 minutes to complete payment, and 25% abandon.</p>
+    <p>(a) Without a waiting room, what happens? (b) With a waiting room, at what rate should you admit? (c) How many seats are locked up in abandoned holds at any moment, and what does that do?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Without a waiting room.</strong> 800,000 users over 90 seconds is ~9,000 arrivals/s, and each will retry when it fails, so offered load is well above 20,000 attempts/s against a capacity of 3,000. The service saturates, latency climbs, requests time out, users refresh — which <em>increases</em> load. Meanwhile almost every attempt targets a seat someone else is also claiming, so the conditional updates conflict and the useful throughput is a fraction of even the 3,000. The observable outcome is a site that is down for everyone for several minutes, after which some seats have sold by luck. Worth naming: this is congestion collapse, the same failure as retry amplification in the resilient-client problem.</p>
+    <p><strong>(b) Admission rate.</strong> Work backwards from what the inventory can absorb, not from what the service can process. 60,000 seats at an average 2 seats per order = <strong>30,000 successful orders</strong>. If you admit faster than seats are actually claimed, you simply move the stampede inside the gate.</p>
+    <p>Each admitted user occupies a hold slot for up to 4 minutes. To sell out over roughly 20 minutes at a controlled pace, admit around <strong>1,500–2,000 users/s</strong> — comfortably under the 3,000/s capacity, leaving headroom for retries and browsing. At that rate the 800,000-person queue drains in about 7–9 minutes, well before it matters, since the seats will be gone long before the queue is.</p>
+    <p>The key insight to state: <em>the admission rate should be derived from inventory depletion, not from service capacity.</em> Running at 3,000/s just to use the capacity would admit 180,000 people in a minute to compete for 60,000 seats, recreating the contention you built the queue to remove.</p>
+    <p><strong>(c) Abandoned holds.</strong> At 1,500 admits/s with a 4-minute hold window, roughly 1,500 × 240 = 360,000 users are in-flight... which exceeds the 60,000 seats, so in practice inventory runs out first and admission should be throttled by <em>available seats</em>, not a fixed rate. Take the steady state instead: at most 60,000 seats can be held at once, and with 25% abandonment, about <strong>15,000 seats</strong> are sitting in holds that will never convert.</p>
+    <p>That is a quarter of the stadium invisible to everyone else for up to 8 minutes. The consequences are real: the seat map shows sold out while 15,000 seats are unsold, users leave, and the seats only return in a wave when holds expire — producing a confusing second rush. Mitigations, in order: <strong>shorten the hold window</strong> (4 minutes is generous; 2–3 is usually enough and halves the locked inventory), <strong>release immediately on explicit abandonment</strong> rather than waiting for the timer, <strong>sweep aggressively</strong> so returns are continuous rather than bursty, and <strong>show "seats may become available"</strong> instead of a flat sold-out, with a refresh that surfaces returns as they happen.</p>
+    <p>The deeper point worth making: hold duration is a direct trade-off between <em>conversion</em> (longer holds let slow users finish) and <em>effective inventory</em> (longer holds mean more seats invisible). It is a tunable business parameter, and the right value is measured against real abandonment data, not chosen by intuition.</p></details>`,
+
+  refs:[
+    ["docs","PostgreSQL transaction isolation","The mechanics behind the conditional update — read the difference between Read Committed and Serializable and what each one actually prevents.","https://www.postgresql.org/docs/current/transaction-iso.html"],
+    ["docs","Virtual Waiting Room on AWS","A reference implementation of the queue-in-front pattern, with the token issuance and admission-rate control spelled out.","https://aws.amazon.com/solutions/implementations/virtual-waiting-room-on-aws/"],
+    ["docs","Cloudflare Waiting Room","A production waiting-room implementation - read the queueing model and the session/admission parameters, which are the knobs the drill above tunes.","https://developers.cloudflare.com/waiting-room/"],
+    ["docs","Distributed locks with Redis","Including the honest section on what Redlock does and does not guarantee — useful for explaining why you put the hold in the database instead.","https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/"],
+    ["post","Designing robust and predictable APIs with idempotency","Stripe on idempotency keys and reconciliation across the payment boundary.","https://stripe.com/blog/idempotency"],
+    ["docs","Optimistic concurrency control","The version-check pattern the atomic hold uses, and the conditions under which it degrades into livelock.","https://en.wikipedia.org/wiki/Optimistic_concurrency_control"]
+  ]},
+
+{ id:"cd8", t:"Design a collaborative editor (Google Docs, Figma)", tag:"Consistency", sum:"Operational transformation versus CRDTs, and why concurrent editing is genuinely hard.",
+  primer:`<h4>Start here — why this is the hardest classic</h4>
+  <p>Two people type in the same document at the same moment. There is no server round trip fast enough to serialise them without the editor feeling laggy, so both edits are applied locally first and exchanged afterwards. The problem: <strong>the same edit means different things depending on what else has happened.</strong></p>
+  <p>Take a document containing <code>HELLO</code>. Anna inserts <code>!</code> at position 5. Simultaneously Ben deletes the character at position 0. If Ben's delete arrives at Anna's machine first, the document is <code>ELLO</code> — and Anna's "insert at 5" now points past the end. Apply both naively on each machine and the two users see <em>different documents</em>, permanently. That divergence is the whole problem.</p>
+  <h4>The two families of answer</h4>
+  <ul>
+  <li><strong>Operational transformation (OT).</strong> Keep operations as "insert at index", but <em>transform</em> incoming operations against the ones already applied locally. Ben's delete shifts Anna's insert from index 5 to index 4. It works, it is what Google Docs uses, and the transformation functions are famously difficult to get right — several published OT algorithms were later shown to be incorrect.</li>
+  <li><strong>CRDTs (conflict-free replicated data types).</strong> Change the data structure so conflicts cannot arise. Instead of positions, every character gets a unique, immutable identifier and a defined ordering. "Insert after character X" means the same thing regardless of what else happened, so operations commute and any order of application converges. No transformation needed, no central server required — at the cost of metadata per character.</li>
+  </ul>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Convergence</strong> — all replicas that have seen the same set of operations show the same document. The non-negotiable property.</li>
+  <li><strong>Intention preservation</strong> — the result also reflects what each user <em>meant</em>. Harder, less formal, and where both approaches get uncomfortable.</li>
+  <li><strong>Tombstone</strong> — a deleted character is marked rather than removed, because other operations may still reference it. This is why naive CRDT documents grow forever.</li>
+  <li><strong>Awareness / presence</strong> — cursors, selections, who is here. Ephemeral, never persisted, and a completely separate channel from document state.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>The document is <strong>not</strong> the current text — it is <strong>the ordered set of operations that produced it</strong>. The text is a rendering. Once you hold that, undo, history, offline editing and late-joining clients all become the same mechanism, and you stop trying to synchronise strings.</p>`,
+
+  body:`${clock([["Scope","0–5"],["The core problem","5–16"],["Pick an approach","16–28"],["Architecture","28–38"],["Deep dive","38–48"],["Scale & failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> multiple users editing one document concurrently; live cursors; edits converge; offline edits reconcile; version history; comments.</li>
+  <li><strong>Out of scope:</strong> rich rendering and pagination, spreadsheet formulas, permissions detail beyond read/write. Say it.</li>
+  <li><strong>Non-functional:</strong> local edits appear instantly (no server round trip in the typing path); remote edits appear within ~200 ms; all clients converge; no edit is ever lost.</li>
+  <li><strong>The question to ask:</strong> "how many simultaneous editors?" Three people in a document is a different problem from a Figma file with 80 people on one canvas. Also ask whether offline editing must work — if yes, that is a strong argument for CRDTs.</li></ul>
+
+  <h4>2 · Establish the core problem — 5–16 min</h4>
+  <p>Do not start drawing boxes. Spend ten minutes on the concurrency problem itself, because that is the entire question, and walk the <code>HELLO</code> example above on the whiteboard. Show the divergence concretely. An interviewer who sees you identify that "insert at position 5" is not a stable instruction has already seen the main thing they are checking for.</p>
+  <p>Then state the requirement precisely: the system must guarantee that any two replicas which have applied the same set of operations display identical content, <em>regardless of the order they arrived in</em>. That is commutativity, and it is either achieved by transforming operations (OT) or by designing operations that already commute (CRDT).</p>
+
+  <h4>3 · Pick an approach and defend it — 16–28 min</h4>
+  <table><thead><tr><th></th><th>OT</th><th>CRDT</th></tr></thead><tbody>
+  <tr><td>Needs a central server</td><td>Effectively yes, to order operations</td><td>No — works peer-to-peer</td></tr>
+  <tr><td>Per-character overhead</td><td>None</td><td>Identifier + tombstone metadata</td></tr>
+  <tr><td>Implementation risk</td><td>High — transformation functions are subtle</td><td>Moderate — use a library, do not write one</td></tr>
+  <tr><td>Offline for days</td><td>Painful</td><td>Natural</td></tr>
+  <tr><td>Proven at scale</td><td>Google Docs</td><td>Figma, Linear, Apple Notes</td></tr>
+  </tbody></table>
+  <p><strong>Take CRDTs</strong> for a new build, and say why in one sentence: the correctness burden moves from bespoke transformation logic you must prove, into a data structure whose convergence is proven once. Then immediately name the cost — metadata growth — and how you manage it, because an interviewer will probe exactly there.</p>
+  <p>A modern sequence CRDT does not store a tombstone per character forever. Identifiers are allocated so that runs of adjacent characters compress into a single block, and a garbage-collection pass removes tombstones once every replica has acknowledged seeing them. Knowing that naive CRDTs are not what anyone ships is the difference between having read a blog post and having thought about it.</p>
+
+  <h4>4 · Architecture — 28–38 min</h4>
+  ${flow([{t:"Editor",d:"local CRDT, optimistic"},{t:"WebSocket",d:"ops + awareness"},{t:"Doc server",d:"one per document"},{t:"Op log",d:"durable, append-only"},{t:"Snapshots",d:"periodic compaction"}])}
+  <p>Each open document is owned by exactly one server process (routed by document id through consistent hashing). That server holds the document in memory, broadcasts operations to connected clients, and appends to a durable log. It is <em>not</em> required for correctness — CRDT convergence does not need a central sequencer — but it makes delivery efficient, gives you a durability point, and provides a natural place to enforce permissions.</p>
+  <p><strong>Two channels, and keep them separate.</strong> Document operations are durable, ordered per replica, and must never be lost. Awareness (cursor position, selection, who is present) is ephemeral, high-frequency, and should be dropped under load rather than queued — a stale cursor is invisible, a lost edit is a bug.</p>
+
+  <h4>5 · The deep dive — 38–48 min</h4>
+  <p><strong>Persistence and loading.</strong> Storing every operation forever means a new client must replay millions of them. Snapshot periodically: serialise the CRDT state, store it, and keep only operations since the snapshot. A joining client loads the snapshot plus the tail. This is the same log-and-checkpoint pattern as any event-sourced system, and saying so connects it to things you already know.</p>
+  <p><strong>Undo is not "apply the inverse".</strong> In a collaborative document, undo must revert <em>your own</em> last change without reverting what others did since — so it is a selective undo over the operation history, generating a new operation that compensates for your earlier one. If Anna types a word and Ben then deletes half of it, Anna's undo cannot simply restore the old text. Interviewers love this question because it exposes whether you really hold the "document is a set of operations" model.</p>
+  <p><strong>Large-scale presence.</strong> With 50 people in a document, every cursor move broadcast to everyone is 50 × 50 messages per movement. Throttle to ~20 updates/s per user, batch all awareness into a single periodic frame, and drop rather than queue. Figma-scale canvases additionally cull by viewport — you do not need cursors for objects nobody is looking at.</p>
+  <p><strong>Access control</strong> is enforced at the document server on the write path. A read-only client receives operations but any it generates are rejected — and critically, the client must be told, so its optimistic local state can be rolled back rather than silently diverging from everyone else's.</p>
+
+  <h4>6 · Scale and failure — 48–56 min</h4>
+  <ul><li><strong>A document server dies.</strong> Clients reconnect, are routed to a new owner, which loads the latest snapshot plus tail from the log. Each client then sends operations the server has not seen. Because operations commute, out-of-order recovery converges — <em>this is the property you bought the CRDT for</em>, and it is worth saying that explicitly.</li>
+  <li><strong>Scaling is per-document,</strong> which is convenient: documents are independent, so you scale horizontally by document count. A single enormous document with hundreds of editors is the hard case, and the answer is usually to bound it rather than engineer for it.</li>
+  <li><strong>Network partition:</strong> both sides keep editing locally and converge on reconnect with no conflict dialog. This is the headline CRDT benefit; demonstrate that you know it is automatic, not something you implement.</li>
+  <li><strong>Metadata growth</strong> is the real long-term operational risk. A document edited heavily for years accumulates identifiers and tombstones. Monitor state size per document, run garbage collection, and have a rewrite path for pathological cases.</li>
+  <li><strong>Abuse case:</strong> a malicious client can send operations that are internally valid but semantically nonsense, or flood the op stream. Validate and rate-limit at the server; the CRDT guarantees convergence, not good behaviour.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the reframing: the document is the operation set, the text is a projection of it, and choosing a structure whose operations commute turns concurrency from a coordination problem into a data-structure property. Then be honest about the trade you took — CRDT metadata overhead and a less mature ecosystem, in exchange for convergence you do not have to prove yourself and offline support you get for free.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Convergence is not correctness, and the gap has a name.</strong> Two replicas can converge on an identical document that neither user wanted. The classic case: two people concurrently insert different words at the same position, and the merged result interleaves their characters into gibberish — perfectly convergent, completely wrong. Good sequence CRDTs mitigate this by keeping same-origin runs contiguous, but no algorithm fully solves intention preservation because "intention" is not formally definable. Being able to state that convergence is provable and intention is not is the single most sophisticated thing you can say in this interview.</li>
+  <li><strong>Rich text is much harder than plain text,</strong> and interviewers escalate to it. Formatting spans overlap characters, so "bold this range" and "delete part of that range" interact in ways plain-sequence CRDTs do not cover — and formatting is a <em>register</em> whose concurrent updates need a last-writer-wins or multi-value resolution, not a sequence. Structured documents add a tree (paragraphs, lists, tables) where concurrent moves can create cycles: A moved under B while B moved under A. Tree-move CRDTs are an active research area, and most production systems simply forbid or resolve moves conservatively. Knowing where the field's edge actually is beats pretending it is solved.</li>
+  <li><strong>Figma's architecture is a useful counterexample worth citing.</strong> A design canvas is not a text sequence, it is a tree of objects with properties, so they use a CRDT-<em>inspired</em> scheme rather than a text CRDT: last-writer-wins per object property, with a server assigning ordering. Concurrent edits to <em>different</em> properties of the same object both survive; concurrent edits to the same property resolve by server order. This is far simpler than a general CRDT and correct for their domain — the lesson being that the right algorithm follows from the data model, not from fashion.</li>
+  <li><strong>OT's real advantage is efficiency, and it is not small.</strong> OT sends compact operations with no per-character metadata, so documents stay small and loading is fast. For a server-mediated product where the server is present anyway, that is a genuine win, which is why Google Docs has not switched. The honest framing: CRDTs trade space and implementation-familiarity for a weaker coordination requirement. If you are always going to have a central server, you are paying for decentralisation you do not use.</li>
+  <li><strong>The op log is your audit trail and your product.</strong> Because you keep operations with author and timestamp, you get version history, per-user attribution, "restore this version", and the ability to replay a document's evolution — features that would otherwise each need their own machinery. Point out that these are consequences of the model rather than separate features; it demonstrates that you see the architecture paying for itself.</li>
+  <li><strong>Test convergence with randomised property testing, not examples.</strong> The bugs in this domain appear only under specific interleavings that no human writes as a test case. The technique that works is generating random operation sequences, applying them in randomly permuted orders across simulated replicas, and asserting all replicas end identical — thousands of times, in CI. Saying you would fuzz for convergence rather than unit-test transformations is a concrete, credible answer to "how do you know it works?".</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A document contains <code>CAT</code>. Three clients are connected. Anna inserts <code>S</code> at position 3 (making <code>CATS</code>). Simultaneously, Ben deletes position 1 (the <code>A</code>, making <code>CT</code>). The operations reach the third client, Chloe, in the order Ben-then-Anna, and reach Anna as Ben's arriving after her own.</p>
+    <p>(a) What goes wrong with naive index-based operations? (b) How does OT fix it? (c) How does a CRDT avoid the problem entirely?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Naive application diverges.</strong></p>
+    <table><thead><tr><th>Replica</th><th>Order applied</th><th>Result</th></tr></thead><tbody>
+    <tr><td>Anna</td><td>insert S at 3, then delete at 1</td><td><code>CATS</code> → delete index 1 → <code>CTS</code></td></tr>
+    <tr><td>Chloe</td><td>delete at 1, then insert S at 3</td><td><code>CT</code> → insert at index 3 → <strong>out of range</strong></td></tr>
+    </tbody></table>
+    <p>Chloe's document is only 2 characters long, so "insert at 3" is undefined — it either errors, or clamps to the end giving <code>CTS</code> by luck. Rely on luck and a slightly different example diverges: had Ben deleted position 2 instead, Anna would end with <code>CAS</code> and Chloe with <code>CAS</code> or <code>CSA</code> depending on clamping. <strong>The two users now see permanently different documents with no error raised anywhere</strong> — which is the defining failure of this problem.</p>
+    <p><strong>(b) OT transforms the incoming operation against what has already been applied.</strong> When Anna's <code>insert(S, 3)</code> arrives at Chloe, who has already applied <code>delete(1)</code>, the transformation function reasons: a deletion occurred at index 1, which is before index 3, so everything after it shifted left by one. It rewrites the operation to <code>insert(S, 2)</code>. Chloe applies it to <code>CT</code> and gets <code>CTS</code> — matching Anna. Convergence restored.</p>
+    <p>This works, and the difficulty is that you need a correct transformation function for every <em>pair</em> of operation types (insert against insert, insert against delete, delete against delete...), each handling ties and overlaps, and the whole set must satisfy formal convergence properties. With three or more concurrent clients you must also transform against chains of operations in the right order. Several published OT algorithms were later proven incorrect precisely here — this is not an exaggeration used to sell CRDTs, it is the documented history of the field.</p>
+    <p><strong>(c) A CRDT removes the premise.</strong> There are no indices. Each character has a unique immutable identifier, so the document is not <code>CAT</code> but something like:</p>
+    <pre>[C: id=a1] [A: id=a2] [T: id=a3]</pre>
+    <p>Anna's operation is not "insert at 3" but <strong>"insert S with id=b1, after a3"</strong>. Ben's is not "delete index 1" but <strong>"mark a2 deleted"</strong>. Now apply them in either order:</p>
+    <ul>
+    <li>Ben first: a2 is tombstoned → visible text <code>CT</code>. Then Anna: place b1 after a3 → <code>CTS</code>.</li>
+    <li>Anna first: b1 placed after a3 → <code>CATS</code>. Then Ben: tombstone a2 → <code>CTS</code>.</li>
+    </ul>
+    <p><strong>Identical, with no transformation logic anywhere.</strong> The operations commute because each one names the thing it acts on rather than a position that other operations can invalidate. Ben's delete cannot break Anna's insert because Anna's insert never mentioned a number that Ben's delete could shift.</p>
+    <p><strong>The cost, stated honestly:</strong> every character now carries an identifier (several bytes against one byte of content), and <code>a2</code> must be retained as a tombstone until every replica has acknowledged it — you cannot discard it, because a late operation might still reference it. For a document edited over years this metadata can exceed the content, which is why production CRDTs compress adjacent runs into blocks with a shared identifier range and garbage-collect tombstones once causally stable. That engineering is what separates the idea from something shippable.</p></details>`,
+
+  refs:[
+    ["post","I was wrong. CRDTs are the future","Joseph Gentle, who worked on OT for Google Wave — the most useful single article on why the field moved, written by someone with no incentive to oversell it.","https://josephg.com/blog/crdts-are-the-future/"],
+    ["paper","A comprehensive study of Convergent and Commutative Replicated Data Types","Shapiro et al., 2011 — the paper that named CRDTs and proved the convergence properties.","https://inria.hal.science/inria-00555588/"],
+    ["post","How Figma's multiplayer technology works","A real production system that is deliberately not a general CRDT, with the reasoning for each simplification. The best counterpoint to CRDT enthusiasm.","https://www.figma.com/blog/how-figmas-multiplayer-technology-works/"],
+    ["docs","Operational transformation","The mechanism and its history, including the published algorithms later shown to be incorrect.","https://en.wikipedia.org/wiki/Operational_transformation"],
+    ["code","Yjs","The CRDT implementation most production apps actually use. Its internals document explains run-length compression and tombstone GC concretely.","https://github.com/yjs/yjs"],
+    ["docs","Automerge","A well-documented CRDT library with an unusually clear explanation of the data model and its storage format.","https://automerge.org/"]
+  ]},
+
+{ id:"cd9", t:"Design a payment system (Stripe, PayPal)", tag:"Correctness", sum:"Idempotency, the double-entry ledger, and moving money you cannot un-move.",
+  primer:`<h4>Start here — the property that makes payments different</h4>
+  <p>In most systems, a bug means bad data and you fix it. In payments, a bug means <strong>someone's money is in the wrong place</strong>, possibly irreversibly, and there is a regulator, an auditor and an angry customer involved. So the design is dominated by one question that rarely matters elsewhere: <em>what happens when you do not know whether something succeeded?</em></p>
+  <p>You call a bank. The connection drops. Did the charge happen? You cannot know, you cannot simply retry (that might charge twice), and you cannot ignore it (that might lose the money). Every architectural decision here descends from that single uncertainty.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Idempotency key</strong> — a unique id the client generates and attaches to a request. Two requests with the same key produce one charge and the same response. This is the single most important concept in the design.</li>
+  <li><strong>Authorisation vs capture</strong> — authorisation reserves funds on a card (it can be released); capture actually moves them. Separating them is why an online order can be authorised at checkout and captured at dispatch.</li>
+  <li><strong>Double-entry ledger</strong> — the 500-year-old accounting technique where every transaction writes two entries that must sum to zero: money always comes <em>from</em> somewhere and goes <em>to</em> somewhere. It makes a whole class of bugs detectable, because the books simply stop balancing.</li>
+  <li><strong>Settlement vs authorisation</strong> — the card network confirms in seconds; the actual money moves in days. Your system must represent both states, because the customer sees "paid" long before the funds exist.</li>
+  <li><strong>Chargeback</strong> — the cardholder disputes a charge weeks or months later and the money is pulled back. Payments are therefore not final on success, which breaks most people's mental model.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>A payment system is <strong>an immutable append-only ledger with a state machine attached</strong>. You never update a balance — you append entries and derive the balance. You never delete or edit a transaction — you append a reversing one. If you take nothing else into the interview, take "the ledger is append-only and balances are derived", because it is the answer to a surprising number of follow-up questions.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–10"],["Ledger model","10–24"],["Architecture","24–34"],["Deep dive","34–48"],["Failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> charge a customer's card; record it correctly; handle refunds; pay out to merchants; survive partial failures without losing or duplicating money.</li>
+  <li><strong>Out of scope:</strong> fraud scoring (name the fraud design), PCI compliance detail, currency conversion rates. But <em>mention</em> that card numbers are tokenised and never stored — one sentence, and it signals domain awareness.</li>
+  <li><strong>Non-functional:</strong> no double charges, ever; no lost payments; the ledger always balances; every state is auditable years later; p99 under 2 s for the customer-facing call.</li>
+  <li><strong>The question to ask:</strong> "are we the processor or an orchestrator over one?" It changes the design substantially. Assume orchestrator — you hold the ledger and call out to acquirers — because that is the common case and the more interesting one.</li></ul>
+
+  <h4>2 · Numbers — 5–10 min</h4>
+  <p>Deliberately brief. Payments are low volume and high value, which is the opposite of most designs.</p>
+  <ul><li>10,000 payments/s at peak is a very large processor. That is <em>tiny</em> by web standards — a single well-tuned database can do it. Say this out loud: <strong>the difficulty here is correctness, not scale</strong>, and a candidate who spends 20 minutes on sharding has misread the question.</li>
+  <li>Ledger growth: 10,000/s × 2 entries × ~200 bytes = 4 MB/s ≈ <strong>125 TB/year</strong>, and it is retained for seven years for regulatory reasons. Append-only, immutable, mostly cold — so it partitions by time trivially.</li>
+  <li>The number that actually matters: <strong>the acceptable rate of money-losing errors is zero.</strong> Not five nines. Zero, with reconciliation to detect and correct anything that slips.</li></ul>
+
+  <h4>3 · The ledger model — 10–24 min</h4>
+  <p>Spend real time here; it is what the interview is about.</p>
+  <pre>accounts(account_id PK, type, currency, owner_id)
+    -- types: customer, merchant, platform_revenue, acquirer_clearing, fees
+
+entries(entry_id PK, transaction_id, account_id, amount_minor, currency, created_at)
+    -- amount is a SIGNED INTEGER in minor units (pence, cents). Never a float.
+    -- INVARIANT: for any transaction_id, SUM(amount_minor) = 0
+
+transactions(transaction_id PK, type, idempotency_key UNIQUE, state, metadata)
+payments(payment_id PK, transaction_id, psp_reference, state, ...)</pre>
+  <p>Three rules to state explicitly:</p>
+  <ul><li><strong>Integers in minor units, never floating point.</strong> 0.1 + 0.2 ≠ 0.3 in binary floating point, and in a payment system that is not a curiosity, it is a rounding error that compounds across millions of transactions and fails an audit.</li>
+  <li><strong>Entries are immutable.</strong> A refund is not an update to the original payment; it is a new transaction with entries in the opposite direction, linked to the original. The history of what actually happened is never rewritten.</li>
+  <li><strong>Balances are derived, not stored.</strong> Compute from entries; if that becomes slow, keep a materialised balance with the entry id it was computed to, and rebuild from the log. A stored balance that can drift from its entries is the bug the entire model exists to prevent.</li></ul>
+
+  <h4>4 · Architecture — 24–34 min</h4>
+  ${flow([{t:"API",d:"idempotency check"},{t:"Payment svc",d:"state machine"},{t:"Ledger",d:"double-entry, ACID"},{t:"PSP adapters",d:"acquirers, wallets"},{t:"Reconciler",d:"compares with PSP daily"},{t:"Payouts",d:"batched, scheduled"}])}
+  <p>The flow: request arrives with an idempotency key → the key is inserted into a unique index, so a duplicate is detected before anything happens → a transaction record is created in <code>pending</code> → the acquirer is called → on a definite response, ledger entries are written and the state advances, all in one database transaction → the response is stored against the idempotency key so a retry returns the identical answer.</p>
+
+  <h4>5 · The deep dive — 34–48 min</h4>
+  <p><strong>Idempotency done properly.</strong> Naively "check if the key exists, then process" is a race — two concurrent retries both find nothing and both charge. Instead <em>insert the key first</em> with a unique constraint; the loser gets a constraint violation and knows to wait for and return the winner's result. Store the response body against the key so a retry days later returns the same payment id, and scope the key to the API consumer so two merchants cannot collide. Also record a hash of the request: if the same key arrives with a <em>different</em> body, that is a client bug and must be rejected loudly, not silently treated as a duplicate.</p>
+  <p><strong>The unknown-outcome problem, which is the heart of it.</strong> You call the acquirer and time out. Three possibilities: it never arrived, it succeeded, or it succeeded and the response was lost. You must not guess. The correct pattern:</p>
+  <ul>
+  <li>Write your intent to the database <strong>before</strong> calling out, with a reference you generate. The record exists in <code>pending</code> with your idempotency key.</li>
+  <li>Pass <em>your</em> reference to the acquirer as <em>their</em> idempotency key, so a retry is safe at their end too.</li>
+  <li>On timeout, do not resolve it inline. Leave it pending and let a reconciliation worker query the acquirer for the true state and converge. The customer sees "processing", which is honest.</li>
+  <li>A daily file from the acquirer is compared against your ledger. Anything present on one side and not the other is an exception with a human workflow behind it. <strong>Reconciliation is not a safety net you add later; it is a core component</strong>, and saying so is a strong senior signal.</li>
+  </ul>
+  <p><strong>The dual-write problem.</strong> "Write to the database, then publish an event" is not atomic — a crash between them leaves the system inconsistent. Use the <strong>transactional outbox</strong>: write the event into an outbox table in the same transaction as the ledger entries, and a separate process publishes from the outbox. Now the event is guaranteed to be published at least once if and only if the ledger entry committed. This pattern comes up constantly and naming it is efficient.</p>
+  <p><strong>Multi-step flows</strong> — authorise, capture, split to merchant, deduct fees, schedule payout — cross service boundaries, so a single ACID transaction is unavailable. Use a saga: each step has a compensating action, and the orchestrator drives forward or compensates backward, durably, so it survives a crash mid-flow. Note the honest limitation: compensation is not rollback. A captured payment is refunded, not un-captured, and the customer sees both on their statement.</p>
+
+  <h4>6 · Failure and operations — 48–56 min</h4>
+  <ul><li><strong>Acquirer outage:</strong> route to a secondary, with a circuit breaker per provider. But never retry a charge across providers on an <em>unknown</em> outcome — that is exactly how you double-charge. Retry only on a definite failure.</li>
+  <li><strong>Your service crashes mid-flow:</strong> everything is recoverable because intent was persisted before the external call and the saga state is durable. A recovery worker picks up anything stuck in <code>pending</code> past a threshold.</li>
+  <li><strong>The ledger does not balance.</strong> This must be an automated, continuous check — sum entries per transaction and assert zero, and sum all accounts and assert zero. It should page someone. A balance check that runs monthly finds a problem a month late.</li>
+  <li><strong>Chargebacks and late refunds</strong> arrive weeks after the fact, so the system must be able to append reversing entries to a long-settled transaction. This is why entries are immutable and appendable rather than a mutable balance.</li>
+  <li><strong>Everything is audited.</strong> Who did what, when, from where, retained for years. Not optional, and it shapes the schema — so mention it while designing rather than bolting it on.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the three ideas that carry the whole design: idempotency keys inserted before work begins, so retries are safe; an immutable double-entry ledger, so balances are derived and errors are detectable; and reconciliation as a first-class component, because across a network you can never know an outcome for certain — you can only converge on it. Then state the trade-off you accepted: customers sometimes see "processing" rather than an instant answer, which is the correct choice, because a confident wrong answer about money is far worse than an honest delay.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Exactly-once does not exist, and saying so is the right answer.</strong> Across a network you get at-least-once delivery plus idempotent processing, which produces exactly-once <em>effects</em> — a meaningfully different and achievable claim. A candidate who says "I'd use exactly-once semantics" has stated something impossible; one who says "at-least-once delivery with idempotent handlers gives exactly-once effects" has stated the actual engineering. This distinction is worth making explicitly.</li>
+  <li><strong>Money has more types than an amount.</strong> A value needs an amount in minor units, a currency, and — for anything cross-border — a rate and the moment it was fixed. Currencies do not all have two decimal places (the Japanese yen has none, the Kuwaiti dinar has three), so hardcoding 100 as the minor-unit factor is a real bug. And conversion rounding must be handled deliberately and consistently, because the fractions of a penny you round away across millions of transactions are someone's money and must land in a named account rather than vanishing.</li>
+  <li><strong>The state machine must be explicit and irreversible-aware.</strong> <code>created → authorised → captured → settled</code>, with <code>failed</code>, <code>refunded</code> and <code>disputed</code> as branches. Transitions are guarded and logged. The critical property: some transitions cannot be undone, only compensated. An authorisation can be voided; a capture can only be refunded, and the customer will see both lines. Designing the compensating path with the same care as the happy path is what distinguishes this domain.</li>
+  <li><strong>Payouts are a scheduling and risk problem, not a payment one.</strong> Merchants are paid on a delay deliberately, because chargebacks arrive later and you must be able to claw back. That means a merchant balance has <em>available</em> and <em>pending</em> components, a reserve policy, and a negative-balance path when refunds exceed new sales. This is where a naive design loses real money, and raising it unprompted shows commercial understanding rather than only technical.</li>
+  <li><strong>Regulation shapes the architecture, not just the paperwork.</strong> PCI-DSS means card data lives in a tokenisation vault with a tiny audited surface and never touches your general services. Strong Customer Authentication in Europe means a payment can require an interactive challenge mid-flow, so the state machine must support suspending and resuming across a user round trip. Data residency may require regional ledgers. Naming one or two of these accurately is worth more than naming all of them vaguely.</li>
+  <li><strong>Why a single-node ledger is often correct.</strong> At 10,000 payments/s, one well-provisioned Postgres with synchronous replication handles the write volume with room to spare, and gives you real ACID transactions across the whole ledger — which is enormously valuable and very hard to recover once you shard. If you must shard, shard by account with all entries for a transaction in one shard, or accept two-phase commit. The mature answer is to defend not distributing the thing whose entire value is transactional integrity.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A customer pays £50 for an order. Your platform takes a 2.9% + 30p fee. Write the ledger entries for (a) the successful capture, and (b) a later full refund. Then (c): the acquirer call times out and you never learn the outcome. Walk through exactly what happens.</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) The capture.</strong> Fee = 5000 × 0.029 + 30 = 145 + 30 = <strong>175p</strong>. Merchant receives 5000 − 175 = <strong>4825p</strong>. All amounts in pence, all entries in one transaction, summing to zero:</p>
+    <table><thead><tr><th>Account</th><th>Amount</th><th>Meaning</th></tr></thead><tbody>
+    <tr><td>acquirer_clearing</td><td>+5000</td><td>money arriving from the card network</td></tr>
+    <tr><td>merchant:M1 (pending)</td><td>−4825</td><td>owed to the merchant</td></tr>
+    <tr><td>platform_revenue</td><td>−175</td><td>our fee</td></tr>
+    </tbody></table>
+    <p>Sum: 5000 − 4825 − 175 = <strong>0</strong>. The invariant holds, and note that <em>nothing was updated</em> — three rows were appended. Note also that the merchant balance is <em>pending</em>, not available: chargeback risk means it is not paid out yet.</p>
+    <p><strong>(b) The refund.</strong> A new transaction, linked to the first, with entries in the opposite direction. The interesting question is the fee, and it is a business policy you should ask about rather than assume. Most processors <em>keep</em> the fixed fee on a refund:</p>
+    <table><thead><tr><th>Account</th><th>Amount</th><th>Meaning</th></tr></thead><tbody>
+    <tr><td>acquirer_clearing</td><td>−5000</td><td>money returned to the cardholder</td></tr>
+    <tr><td>merchant:M1</td><td>+4825</td><td>clawed back from the merchant</td></tr>
+    <tr><td>platform_revenue</td><td>+175</td><td>fee returned...</td></tr>
+    </tbody></table>
+    <p>...if the policy is a full fee refund. If the platform keeps the 30p fixed fee, then platform_revenue is +145 and the merchant is debited 4855 instead, so the merchant bears the fixed fee. Either is defensible; what is <em>not</em> defensible is leaving it undefined, because then the books will not balance. <strong>The original entries are never touched</strong> — the refund is new rows, and the payment's history shows both events, which is exactly what an auditor needs.</p>
+    <p><strong>(c) The timeout.</strong> Walk it precisely, because this is the question:</p>
+    <ol>
+    <li><strong>Before</strong> calling the acquirer you already wrote a transaction row in state <code>pending</code>, with the idempotency key and your own reference. So the intent is durable regardless of what happens next.</li>
+    <li>The call times out. <strong>You write no ledger entries</strong> — you do not know whether money moved, and guessing in either direction is a money-losing bug. The transaction stays <code>pending</code>.</li>
+    <li>The customer sees <em>processing</em>, not success and not failure. This is honest and it is the correct product behaviour.</li>
+    <li>If the customer retries with the same idempotency key, the unique index returns the existing pending transaction rather than starting a second charge. <strong>This is the moment the idempotency key earns its place.</strong></li>
+    <li>A reconciliation worker picks up transactions pending past a threshold and <em>queries the acquirer</em> using your reference. Because you passed your own reference as their idempotency key, they can tell you authoritatively what happened.</li>
+    <li>On "succeeded", write the ledger entries and move to <code>captured</code>. On "never received", mark <code>failed</code> — and only now is a fresh attempt safe. If the acquirer also cannot say, escalate to a human with the daily settlement file as the tiebreaker.</li>
+    </ol>
+    <p><strong>The principle to state:</strong> the system never guesses about money. It records intent durably, converges on the truth through reconciliation, and shows the customer an honest intermediate state in the meantime. Every alternative — optimistically marking success, or retrying blind — trades a small amount of user-facing latency for a small probability of losing or duplicating real money, and that trade is never worth making.</p></details>`,
+
+  refs:[
+    ["post","Designing robust and predictable APIs with idempotency","Stripe Engineering — the canonical write-up of idempotency keys, including the insert-first race and storing the response.","https://stripe.com/blog/idempotency"],
+    ["docs","Stripe API: idempotent requests","The production contract: key scope, retention window, and behaviour when the same key arrives with a different body.","https://docs.stripe.com/api/idempotent_requests"],
+    ["docs","Double-entry bookkeeping","The 500-year-old invariant this ledger is built on. Short, and it makes the account-types table above obvious.","https://en.wikipedia.org/wiki/Double-entry_bookkeeping"],
+    ["docs","Transactional outbox pattern","The fix for the dual-write problem, with the trade-offs of polling versus log tailing.","https://microservices.io/patterns/data/transactional-outbox.html"],
+    ["docs","Saga pattern","Multi-step flows without distributed transactions, and why compensation is not rollback.","https://microservices.io/patterns/data/saga.html"],
+    ["docs","TigerBeetle: a financial transactions database","A purpose-built double-entry ledger database. Its design docs are an unusually clear statement of what this workload actually needs.","https://docs.tigerbeetle.com/"]
+  ]},
+
+{ id:"cd10", t:"Design a web crawler and search index (Google)", tag:"Scale", sum:"Politeness, deduplication and the inverted index — batch processing at planetary scale.",
+  primer:`<h4>Start here — a crawler is a distributed BFS with manners</h4>
+  <p>At its core: take a URL from a queue, download it, extract its links, add the new ones to the queue, repeat. That is breadth-first search over a graph with hundreds of billions of nodes. Every hard part comes from the scale and from the fact that <strong>the graph belongs to other people</strong> — you are consuming someone else's servers, and if you are impolite you will be blocked or you will take their site down.</p>
+  ${flow([{t:"Frontier",d:"URLs to fetch, prioritised"},{t:"Fetcher",d:"polite, per-host rate"},{t:"Parser",d:"extract text + links"},{t:"Dedup",d:"near-duplicate detection"},{t:"Indexer",d:"build inverted index"},{t:"Serving",d:"query → ranked results"}])}
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Frontier</strong> — the set of URLs discovered but not yet fetched. It is not one queue; it is a prioritised, per-host-partitioned structure, and its design is most of the crawler.</li>
+  <li><strong>Politeness</strong> — never more than one request in flight per host, with a delay between them, and obeying <code>robots.txt</code>. This is a hard constraint, not a nicety: it is the difference between crawling and denial of service.</li>
+  <li><strong>Inverted index</strong> — the map from term to the list of documents containing it, which is what makes search fast. A forward index (document → its words) is useless for querying; inverting it is the entire trick, and it is why the structure has that name.</li>
+  <li><strong>Posting list</strong> — for one term, the sorted list of document ids containing it, plus positions and frequencies. Query processing is intersecting posting lists.</li>
+  <li><strong>Shingling / SimHash</strong> — techniques for detecting <em>near</em>-duplicate pages. Exact hashing is useless because two copies of the same article differ by a timestamp or an advert.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>Two systems, separated by a batch boundary. The <strong>crawler</strong> is a politeness-constrained, I/O-bound producer running continuously. The <strong>indexer</strong> is a throughput-oriented batch job turning documents into an inverted index. The <strong>serving</strong> layer is a low-latency read system over an immutable index. They have different hardware profiles, different failure modes and different SLAs — and the batch boundary between crawling and serving is what makes the whole thing tractable.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–14"],["The frontier","14–26"],["Dedup & parse","26–34"],["The index","34–46"],["Scale & failure","46–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> discover and fetch web pages continuously; respect politeness; deduplicate; build a searchable index; serve ranked keyword queries.</li>
+  <li><strong>Out of scope:</strong> the ranking model itself beyond a sketch, images and video, JavaScript rendering (mention it as a major cost multiplier and move on), personalisation.</li>
+  <li><strong>Non-functional:</strong> crawl billions of pages; important pages refreshed within hours and the long tail within weeks; query p99 under 200 ms; never overload a site.</li>
+  <li><strong>The clarifying question:</strong> "whole web, or a bounded corpus?" A vertical crawler over 10,000 known sites is a completely different scale of problem, and it is often what is actually being asked — especially in an AI-engineering context where the goal is ingesting documents for retrieval.</li></ul>
+
+  <h4>2 · Numbers — 5–14 min</h4>
+  <ul><li>Target 50B pages, refreshed on average monthly: 50B ÷ 2.6M seconds ≈ <strong>19,000 pages/s sustained</strong>.</li>
+  <li>Bandwidth: at ~100 KB per page (HTML only) that is 1.9 GB/s ≈ <strong>15 Gbps</strong> of sustained ingest, every second, forever.</li>
+  <li>Storage: 50B × 100 KB = <strong>5 PB</strong> of raw HTML, compressing to maybe 1 PB. Extracted text is perhaps 10 KB per page = 500 TB. The inverted index is typically 20–30% of the text corpus, so <strong>100–150 TB</strong> — which does not fit on one machine, so the index is sharded, and that observation drives the serving design.</li>
+  <li>Politeness is the binding constraint, and this is the calculation that makes the design click: at one request per second per host, crawling 19,000 pages/s requires <strong>19,000 hosts being crawled concurrently</strong>. You are not limited by bandwidth or CPU — you are limited by <em>host parallelism</em>. That single number explains why the frontier is partitioned by host.</li></ul>
+
+  <h4>3 · The frontier — 14–26 min</h4>
+  <p>This is the heart of the crawler and where most candidates go thin. It must satisfy two conflicting goals simultaneously: fetch the <em>most important</em> URLs first, and never hit one host too fast.</p>
+  <p>The standard structure is two levels. A <strong>front set of priority queues</strong> where a URL's queue is chosen by its importance (a function of PageRank-like authority, update frequency, and how long since last fetch). A <strong>back set of per-host queues</strong>, each with a next-allowed-fetch timestamp, fed from the front queues. A heap over those timestamps tells a worker which host is ready next. The front layer decides <em>what</em> to crawl; the back layer decides <em>when</em>, and the separation is what lets you satisfy both constraints without either dominating.</p>
+  <p><strong>URL-seen deduplication.</strong> You discover the same URL constantly and must not re-enqueue it. 50 billion URLs at even 16 bytes of hash is 800 GB — too large for one machine's memory, so it is a sharded key-value store, fronted by a bloom filter to absorb the overwhelming majority of "have I seen this?" queries without a network call. False positives mean occasionally skipping a genuinely new URL, which is acceptable at this scale; false negatives are impossible, which is the direction that matters.</p>
+  <p><strong>Normalise before hashing</strong> or the dedup is worthless: lowercase the host, strip default ports and fragments, sort or strip tracking query parameters, resolve relative paths. Without this, one page appears as thousands of distinct URLs and the frontier fills with noise.</p>
+
+  <h4>4 · Fetching, parsing and duplicate content — 26–34 min</h4>
+  <p>Fetchers are I/O-bound, so a few thousand concurrent connections per machine is normal. Each checks and caches <code>robots.txt</code> per host, honours <code>crawl-delay</code>, follows a bounded number of redirects, and applies timeouts and size caps — a malicious or broken server will happily stream you infinite bytes.</p>
+  <p><strong>Trap detection</strong> deserves a mention because it is the practical failure: calendar pages generate infinite unique URLs, session ids create infinite variants of one page, and some sites deliberately generate link mazes. Defend with per-host page budgets, URL depth limits, and detecting when a host produces many URLs that all yield near-identical content.</p>
+  <p><strong>Near-duplicate detection.</strong> A large fraction of the web is duplicated — syndicated articles, mirrors, printer-friendly versions, the same page with a different advert. Exact hashing catches almost none of it. Use SimHash: produce a fingerprint such that similar documents have fingerprints within a small Hamming distance, then find near-neighbours among billions of fingerprints. Deduplicating here saves index space and, more importantly, stops the results page showing the same article eight times.</p>
+
+  <h4>5 · Building and serving the index — 34–46 min</h4>
+  <p>Indexing is a batch job over the document corpus, and it is the textbook MapReduce shape: map each document to <code>(term, doc_id, positions)</code> pairs, shuffle so all entries for a term land together, reduce into a sorted posting list. Compress aggressively — posting lists are sorted integers, so delta-encode the gaps and use variable-byte or similar. Compression here is not a nicety; it decides whether the index fits in memory, which decides query latency.</p>
+  <p><strong>Shard by document, not by term.</strong> This is the decision to defend. Sharding by term means a two-word query hits exactly two shards but those shards are wildly unbalanced (common terms have colossal posting lists) and intersection requires shipping huge lists across the network. Sharding by document means every query goes to every shard, each searches its own slice and returns its local top k, and a coordinator merges. More total work per query, but perfectly balanced, trivially parallel, and each shard's intersection is local. Everyone at scale does the latter.</p>
+  <p><strong>Serving:</strong> a query is parsed, terms are looked up, posting lists are intersected (skip lists let you jump rather than scanning), candidates are scored, and the top results are merged across shards and returned with snippets. Two-stage scoring mirrors the recommender funnel: a cheap scorer over many candidates, then an expensive model over the survivors.</p>
+  <p><strong>Freshness</strong> is the awkward part: a batch-built index is immutable and rebuilt periodically, but news must appear in minutes. The standard answer is a small, frequently-rebuilt fresh index queried alongside the large base index, with results merged. Say this — "one index" is the naive answer and the tiered version is what actually ships.</p>
+
+  <h4>6 · Scale and failure — 46–56 min</h4>
+  <ul><li><strong>Crawler failures are routine and must be boring:</strong> workers are stateless, URLs are leased from the frontier with a timeout so a dead worker's URLs return automatically, and everything is retried with backoff. Losing a fetch is free — you will come back to that page anyway.</li>
+  <li><strong>The index is immutable and versioned,</strong> so deployment is atomic: build a new version, verify it, swap traffic, keep the old one for rollback. This is a large operational advantage of the batch boundary.</li>
+  <li><strong>Replicate index shards</strong> for both availability and query throughput — every replica can serve any query for its shard, so scaling reads is just adding replicas.</li>
+  <li><strong>Adversarial content</strong> is a permanent condition: spam farms, cloaking (serving different content to crawlers than to users), and link schemes. This is why ranking cannot rely only on on-page signals and why link-graph authority mattered so much historically.</li>
+  <li><strong>Legal and ethical obligations:</strong> obey <code>robots.txt</code> and <code>noindex</code>, honour removal requests, respect rate limits even when unenforced. A crawler that ignores these gets blocked network-wide, which is an availability problem as well as an ethical one.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the two structural insights: the crawl is bounded by host parallelism rather than bandwidth, which is why the frontier is partitioned by host; and the index is sharded by document rather than by term, trading more work per query for balance and locality. Then name the extension you would expect next — JavaScript rendering, which multiplies per-page cost by an order of magnitude and forces you to decide <em>which</em> pages are worth rendering, turning a crawling problem into a budgeting one.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Recrawl scheduling is an optimisation problem, not a fixed interval.</strong> You have a finite crawl budget and pages change at wildly different rates — a news homepage changes hourly, an archived paper never. Estimate each page's change rate from its own history and allocate crawls to maximise index freshness per fetch, which means some pages are visited hourly and others annually. Framing this as "allocate a scarce budget against predicted value" rather than "crawl everything monthly" is the senior version of this answer, and it is directly transferable to any ingestion pipeline.</li>
+  <li><strong>The frontier is a distributed system in its own right,</strong> and it is where a naive design breaks. It holds tens of billions of URLs, takes writes from every parser and reads from every fetcher, and must maintain per-host ordering. It cannot be a queue in memory. Partition by host hash so all URLs for a host live on one partition (which also makes the politeness constraint local rather than requiring global coordination), persist it, and make leases the unit of work so failures self-heal.</li>
+  <li><strong>JavaScript rendering changes the economics by an order of magnitude.</strong> Fetching HTML is a network request costing milliseconds; rendering a page in a headless browser costs seconds of CPU and hundreds of megabytes of memory. At 19,000 pages/s you cannot render everything — so you crawl cheaply, detect which pages have meaningful content only after rendering, and spend the expensive budget selectively. This two-tier approach, cheap-first then expensive-on-signal, is the same pattern as retrieve-then-rerank and candidate-then-rank, and pointing out that recurrence is a strong move.</li>
+  <li><strong>Query latency is decided by tail behaviour, not average.</strong> Fanning out to 100 shards means a query is only as fast as the <em>slowest</em> shard, so a p99 of 200 ms per shard produces a p99 far worse than 200 ms overall — with 100 shards you hit the slow case almost every query. The standard mitigations are hedged requests (send to a second replica after a short delay and take whichever answers first) and tight per-shard deadlines with partial results. This tail-at-scale effect is counterintuitive, general, and impresses when volunteered.</li>
+  <li><strong>Know when this design is the wrong shape entirely.</strong> If the corpus is a few million documents rather than billions, the frontier, the sharded index and MapReduce are all overkill — a single Lucene index and a polite fetcher pool is correct and can be built in a week. If the goal is ingesting documents for RAG rather than serving keyword queries, the difficult parts shift completely: you care about extraction quality, chunking and freshness rather than posting-list compression. Identifying which of these problems you are actually solving is worth more than reciting the full architecture.</li>
+  <li><strong>Deduplication has second-order value people miss.</strong> Beyond saving index space, near-duplicate clustering tells you which page is <em>canonical</em> among many copies, which feeds ranking directly (prefer the original source over scrapers) and improves result diversity. A crawler that treats dedup as a storage optimisation misses that it is primarily a quality signal.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>You must crawl 20B pages and refresh them monthly. Politeness allows 1 request/second/host. Your corpus spans 200M distinct hosts, but the distribution is extreme: the top 1,000 hosts hold 40% of all pages.</p>
+    <p>(a) What crawl rate is needed and is politeness the binding constraint? (b) What happens to the top 1,000 hosts? (c) How do you fix it?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a)</strong> 20B ÷ 2.6M seconds = <strong>7,700 pages/s</strong>. At 1 req/s/host, sustaining that needs 7,700 hosts being fetched at any instant — out of 200M available. That is 0.004% of hosts active at once, so <em>in aggregate</em> politeness is not binding at all; bandwidth (~6 Gbps) and the frontier's throughput are the practical limits. But the aggregate is misleading, which part (b) shows.</p>
+    <p><strong>(b) The top 1,000 hosts.</strong> They hold 40% of 20B = <strong>8 billion pages</strong>. At 1 request/second/host, those 1,000 hosts can collectively yield 1,000 pages/s, so crawling 8B pages from them takes 8 × 10⁹ ÷ 1,000 = <strong>8 million seconds ≈ 92 days</strong>.</p>
+    <p>Your monthly refresh target is <strong>impossible by a factor of three</strong> for the pages that matter most — and these are the large, high-authority sites whose freshness users notice. Meanwhile the long tail of 200M small hosts finishes almost immediately and then sits idle. The politeness constraint is not a global limit, it is a <em>per-host</em> limit, and the page distribution is so skewed that a handful of hosts dominate the schedule entirely. This is the real insight of the question.</p>
+    <p><strong>(c) The fixes, in order of value:</strong></p>
+    <ul>
+    <li><strong>Negotiate a higher rate with large hosts.</strong> Major sites publish sitemaps, support <code>crawl-delay</code>, and often welcome faster crawling because they <em>want</em> to be indexed. Ten requests/second to a site serving millions of users daily is negligible load. This alone turns 92 days into 9. Recognising that politeness is a per-host <em>negotiated</em> parameter rather than a universal constant is the key move.</li>
+    <li><strong>Stop refreshing everything monthly.</strong> The uniform target is the actual error. Allocate crawl budget by predicted change rate and importance: a large site's homepage and section pages hourly, its active content daily, its decade-old archive annually. Most of those 8 billion pages have not changed since the last crawl, so re-fetching them is wasted budget.</li>
+    <li><strong>Use the cheap signals before spending a fetch.</strong> Sitemaps with <code>lastmod</code>, conditional requests with <code>If-Modified-Since</code>, and <code>ETag</code> headers let a host tell you nothing has changed for a fraction of the cost of a full fetch — a 304 response is a few hundred bytes and still counts against politeness, but it is far cheaper in bandwidth and parsing, and many large sites will permit a higher rate for conditional requests.</li>
+    <li><strong>Shard the frontier by host</strong> so these 1,000 hosts have dedicated, continuously-active per-host queues rather than competing for slots in a shared structure. Their crawlers should never be idle.</li>
+    </ul>
+    <p><strong>The transferable lesson:</strong> an averaged capacity calculation hid a constraint that only appears when you look at the distribution. 0.004% host utilisation looked like enormous headroom while the pages that mattered were three times over budget. Any system with a skewed key distribution — hot shards, celebrity fan-out, popular cache keys — has this same shape, and checking the tail rather than the mean is the habit worth carrying into every capacity question.</p></details>`,
+
+  refs:[
+    ["paper","The Anatomy of a Large-Scale Hypertextual Web Search Engine","Brin & Page, 1998 — the original Google paper. Read sections 4 and 5 for the crawler and index structures; remarkably readable.","https://snap.stanford.edu/class/cs224w-readings/Brin98Anatomy.pdf"],
+    ["paper","MapReduce: Simplified Data Processing on Large Clusters","Dean & Ghemawat, 2004 — the inverted-index build is the canonical example, worked through in the paper itself.","https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/"],
+    ["docs","RFC 9309: Robots Exclusion Protocol","robots.txt as an actual standard, including the parsing rules and caching behaviour a real crawler must implement.","https://datatracker.ietf.org/doc/html/rfc9309"],
+    ["docs","Bloom filter","The structure fronting the URL-seen check, and why its one-sided error is the right direction here.","https://en.wikipedia.org/wiki/Bloom_filter"],
+    ["docs","SimHash","Near-duplicate detection by Hamming distance over fingerprints — the technique that makes web-scale dedup tractable.","https://en.wikipedia.org/wiki/SimHash"],
+    ["post","The Tail at Scale","Dean & Barroso, CACM 2013 — why fanning out to many shards makes p99 latency worse than any single shard, and the hedged-request fix.","https://research.google/pubs/the-tail-at-scale/"],
+    ["docs","Apache Lucene","The inverted index everyone actually uses. Its file-format documentation is the clearest description of posting-list compression in practice.","https://lucene.apache.org/core/"]
+  ]}
+
+);

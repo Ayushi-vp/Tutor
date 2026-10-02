@@ -1,0 +1,823 @@
+<!-- topic source for lld/ld14; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld14",
+  "t": "Design a text editor with undo and redo",
+  "tag": "OOP",
+  "sum": "Edits as Command objects on two stacks: delete captures what it removed, a new edit clears redo, typing coalesces into word-sized undo steps, multi-edit operations become one composite step applied back to front, the cursor is restored, history is bounded, and the document itself is a piece table, the structure VS Code adopted for its text buffer.",
+  "prereq": [
+    [
+      "py2",
+      "Lists and strings: slicing and concatenation copy, so inserting into the middle of a large string is O(n)."
+    ],
+    [
+      "py6",
+      "Dataclasses and typing.Protocol for small command classes sharing one interface."
+    ],
+    [
+      "swe3",
+      "The Command pattern (actions as objects that can be executed and undone) and the Memento pattern (snapshots)."
+    ],
+    [
+      "ld11",
+      "Recording each move with what is needed to reverse it gives O(1) undo and free replay."
+    ]
+  ],
+  "myths": [
+    [
+      "Undo means saving a copy of the document before every change.",
+      "Snapshots (the Memento pattern) are simple but cost the whole document per edit: a 10 MB file with 1,000 edits is 10 GB. Commands record only what changed, a few bytes per keystroke, and are what real editors use, sometimes combined with occasional snapshots as checkpoints."
+    ],
+    [
+      "A delete command only needs a position and a length.",
+      "Undoing it means putting the text back, so the command must capture the removed text when it executes. It is not fully formed until it has run once."
+    ],
+    [
+      "Redo should survive a new edit.",
+      "Redo entries describe a future that grew from a state that no longer exists; replaying them onto the new text produces content the user never had. A new edit clears the redo stack. Keeping both branches is possible, an undo tree, but it is a different feature."
+    ],
+    [
+      "Every keystroke should be its own undo step.",
+      "Then undoing a sentence takes fifty presses. Editors coalesce consecutive typing into one step, breaking at word boundaries, cursor moves, deletions or pauses, so undo removes about a word at a time."
+    ],
+    [
+      "Replace-all is just many replace commands.",
+      "If each replacement is its own step, undoing a replace-all of 300 matches takes 300 presses, and applying them front to back shifts later positions. Group them in a composite command applied back to front, so one undo restores everything."
+    ],
+    [
+      "A Python string or an array of lines is a fine document buffer.",
+      "Inserting into the middle of a string copies everything after it, and an array of line objects carries per-line overhead: VS Code found a 35 MB file with 13.7 million lines took about 600 MB as line objects, which is why it moved to a piece table organised as a tree."
+    ]
+  ],
+  "recap": [
+    "Every edit is a command object with execute and undo; the editor keeps an undo stack and a redo stack of them.",
+    "Undo pops a command, reverses it and pushes it on the redo stack; redo does the opposite; any new edit clears the redo stack.",
+    "Insert undoes by deleting its text; delete must capture the removed text during execute so undo can reinsert it.",
+    "Consecutive typing is coalesced into one undo step, broken at spaces, newlines, cursor moves, deletions and undo.",
+    "Operations made of many edits, such as replace-all, are one composite command, applied back to front so earlier positions stay valid, and undone in reverse order.",
+    "Each history step records the cursor before and after, so undo and redo put the cursor where the user expects.",
+    "History is bounded by dropping the oldest steps, trading unlimited undo for bounded memory.",
+    "The document is a piece table: the original text is never copied, inserted text goes to an append-only buffer, and the document is a list of pieces pointing into the two buffers.",
+    "Production editors organise pieces in a balanced tree with cached lengths and line counts, so finding a position or a line is logarithmic; VS Code calls this a piece tree."
+  ],
+  "glossary": [
+    [
+      "Add buffer",
+      "In a piece table, an append-only buffer holding all text ever inserted."
+    ],
+    [
+      "Coalescing",
+      "Merging consecutive small edits, such as keystrokes, into one undo step."
+    ],
+    [
+      "Command pattern",
+      "Representing an action as an object with methods to perform and reverse it, so actions can be stored, undone, redone and replayed."
+    ],
+    [
+      "Composite command",
+      "A command made of other commands, executed in order and undone in reverse order, so a multi-part operation is one undo step."
+    ],
+    [
+      "CRDT",
+      "Conflict-free replicated data type: a data structure whose copies can be edited independently and always merge to the same result; used by some collaborative editors."
+    ],
+    [
+      "Cursor",
+      "The position in the document where typing inserts text."
+    ],
+    [
+      "Gap buffer",
+      "A document stored as one array with an empty gap at the cursor, making insertion at the cursor O(1) and moving the cursor far away expensive."
+    ],
+    [
+      "Journal",
+      "An append-only file recording each command as it happens, used for crash recovery and persistent undo."
+    ],
+    [
+      "Memento pattern",
+      "Saving snapshots of an object's state so it can be restored later."
+    ],
+    [
+      "Operational transformation",
+      "A technique for collaborative editing that adjusts each operation against concurrent ones so all copies converge."
+    ],
+    [
+      "Original buffer",
+      "In a piece table, the file's text as loaded, never modified."
+    ],
+    [
+      "Piece",
+      "A reference to a run of text in one of the piece table's buffers: which buffer, start and length."
+    ],
+    [
+      "Piece table",
+      "A document representation as a sequence of pieces pointing into an unchanging original buffer and an append-only add buffer."
+    ],
+    [
+      "Piece tree",
+      "VS Code's name for a piece table whose pieces are kept in a balanced (red-black) tree with cached lengths and line-break counts."
+    ],
+    [
+      "Red-black tree",
+      "A self-balancing binary search tree that keeps operations O(log n)."
+    ],
+    [
+      "Redo stack",
+      "The stack of undone commands that can be re-applied, cleared by any new edit."
+    ],
+    [
+      "Rope",
+      "A document representation as a balanced tree of string fragments, giving O(log n) insert and delete anywhere."
+    ],
+    [
+      "Undo stack",
+      "The stack of executed commands, most recent on top, that undo pops and reverses."
+    ],
+    [
+      "Undo tree",
+      "A history that keeps every branch created by editing after undo, instead of discarding the redo branch."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why use commands rather than snapshots for undo?",
+      "Memory and precision. A snapshot per edit costs the whole document each time; a command stores only what changed, a few bytes per keystroke. Commands also say what happened, which enables coalescing, grouping and replay. Snapshots are still useful occasionally as checkpoints."
+    ],
+    [
+      "E",
+      "Why must a delete command store the deleted text?",
+      "Because 'delete 6 characters at position 5' cannot be reversed without knowing which characters they were. The command records them during execute; undo inserts them back at the same position."
+    ],
+    [
+      "E",
+      "Why does a new edit clear the redo stack?",
+      "Redo entries were computed against a state that the new edit has replaced. Applying them to the new text would produce a document the user never had. Clearing redo keeps history linear; keeping the branch turns history into a tree, a different feature."
+    ],
+    [
+      "M",
+      "How do you coalesce typing into sensible undo steps?",
+      "When an insert happens exactly at the end of the previous insert and nothing else intervened, append its text to the previous command instead of pushing a new one. Break the run on a space or newline (so undo works word by word), on a cursor move, a deletion, an undo, or a pause longer than a second or so in a real editor."
+    ],
+    [
+      "M",
+      "How do you make replace-all one undo step?",
+      "Find all matches, build a delete and an insert for each, and wrap them in a composite command that executes them in order and undoes them in reverse. Apply them from the last match to the first, so each edit only shifts text that has already been processed and the remaining positions stay valid."
+    ],
+    [
+      "M",
+      "Where should the cursor go after undo and redo?",
+      "Back to where it was before the undone edit, and to where it was after the edit on redo. Record both positions with each history step; restoring the cursor is what makes undo feel right, and getting it wrong is a common complaint about hand-written editors."
+    ],
+    [
+      "M",
+      "How do you bound the memory of undo history?",
+      "Keep at most N steps (or a byte budget) and drop the oldest when the limit is exceeded. A long editing session then cannot exhaust memory, at the cost of not being able to undo back to the very beginning; editors usually make the limit configurable and keep the saved file as the floor."
+    ],
+    [
+      "M",
+      "What is a piece table?",
+      "A document represented by two buffers and a list of pieces. The original buffer holds the loaded file and is never modified; the add buffer is append-only and holds everything typed. Each piece says which buffer, where it starts and how long it is; the document is the pieces' text in order. Insert splits a piece and adds one pointing into the add buffer; delete trims or removes pieces; no text is ever copied."
+    ],
+    [
+      "H",
+      "Why did VS Code replace its line array with a piece tree?",
+      "Its text buffer stored one object per line, about 40 to 60 bytes each, so a 35 MB file with 13.7 million lines needed around 600 MB, roughly twenty times the file size, and splitting the file into lines slowed opening. A piece table stores only the text plus a small number of pieces; organising pieces in a red-black tree with cached line-break counts made line lookups fast again. They shipped it in VS Code 1.21 in March 2018."
+    ],
+    [
+      "H",
+      "Compare a gap buffer, a rope and a piece table.",
+      "A gap buffer is one array with a gap at the cursor: O(1) typing at the cursor, but moving the edit point far away copies the text in between; simple and used by Emacs. A rope is a balanced tree of string fragments: O(log n) edits anywhere, good for very large documents and concurrent operations. A piece table never moves original text, makes undo natural (pieces reference immutable buffers) and loads huge files quickly; as a tree it is also O(log n)."
+    ],
+    [
+      "H",
+      "How would undo work in a collaborative editor?",
+      "Each user expects to undo their own edits, not someone else's. Undo must therefore invert a user's own operation transformed against everything that happened since, using operational transformation or a CRDT, rather than popping a global stack. That is why collaborative editors treat undo as a new edit computed from history, not as rewinding the document."
+    ],
+    [
+      "H",
+      "How does the piece table make undo cheap?",
+      "Buffers are immutable or append-only, so a piece list is a complete, cheap description of a document version. An editor can undo by restoring an earlier piece list, or by storing inverse piece operations, without copying any text. The command approach in the solution works with any buffer; the piece table makes even snapshot-style undo affordable."
+    ],
+    [
+      "H",
+      "How would you implement a persistent undo history that survives restarts?",
+      "Store the original file and the sequence of commands (insert position and text, delete position and removed text, composite boundaries) in a sidecar file, appended as edits happen. On reopening, verify the file still matches the original (by hash), then rebuild the stacks. Vim's persistent undo works this way."
+    ]
+  ],
+  "refs": [
+    [
+      "post",
+      "VS Code: Text Buffer Reimplementation",
+      "Why VS Code 1.21 (March 2018) replaced its array of lines: a 35 MB file with 13.7 million lines took about 600 MB (around 20 times the file) at 40 to 60 bytes per line object; the replacement is a piece table kept in a red-black tree with cached line-break counts, the 'piece tree'.",
+      "https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation"
+    ],
+    [
+      "docs",
+      "Refactoring Guru: Command",
+      "Commands as objects with execute and undo, and macro commands for grouping.",
+      "https://refactoring.guru/design-patterns/command"
+    ],
+    [
+      "docs",
+      "Refactoring Guru: Memento",
+      "The snapshot alternative for undo and when its simplicity is worth the memory.",
+      "https://refactoring.guru/design-patterns/memento"
+    ],
+    [
+      "docs",
+      "Piece table",
+      "The data structure, its history in early word processors, and its operations.",
+      "https://en.wikipedia.org/wiki/Piece_table"
+    ],
+    [
+      "docs",
+      "Gap buffer",
+      "The cursor-centred alternative used by Emacs, and where it degrades.",
+      "https://en.wikipedia.org/wiki/Gap_buffer"
+    ],
+    [
+      "docs",
+      "Rope (data structure)",
+      "The balanced-tree-of-strings alternative for very large documents.",
+      "https://en.wikipedia.org/wiki/Rope_(data_structure)"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A user spends an hour editing a long document, pastes a block in the wrong place, and presses undo. The editor removes one character of the paste. They press undo forty more times. The paste is gone, but so is the sentence they typed just before it, and pressing redo does nothing because they typed a space by accident in between. Or worse: they open a 200 MB log file and the editor freezes for a minute, then crashes out of memory. Both experiences come from design decisions inside the editor, not from the user.</p>
+<p>The text editor with undo and redo is a classic machine-coding round because it is a pure test of modelling actions. Every change to the document must be representable as something that can be performed, reversed and performed again, consistently, in any order the user chooses. That is the <strong>Command pattern</strong>, and this problem is its textbook application. Undo and redo then become two stacks and a handful of rules, and the interesting questions are the rules: what a delete must remember, why a new edit throws away the redo history, how keystrokes are grouped so undo feels natural, how a replace-all of 300 matches becomes a single step, and where the cursor should land.</p>
+<p>Underneath sits a second question that strong candidates raise and interviewers love: how is the document itself stored? A Python string makes every insertion copy everything after it. An array of lines is what many editors start with, and Microsoft's VS Code team documented exactly why they abandoned it: one user could not open a 35 MB file with 13.7 million lines because the per-line objects needed about 600 MB of memory. They moved to a <strong>piece table</strong>, an old idea from early word processors in which the original text is never copied and every edit is a small record pointing into two buffers. The same property that saves memory also makes undo cheap.</p>
+<p>The round rewards reasoning about invariants. After any sequence of edits, undos and redos, undoing everything must return the original text exactly, and redoing everything must return the final text exactly. A test that does thousands of random operations and checks those two facts catches almost every bug in an undo system.</p>
+<p>It is also a problem that rewards small, careful classes over clever ones. The commands are a few lines each; the subtlety is in the rules connecting them, and in testing those rules against the one property users care about: undo must give back exactly what they had.</p>
+<p>This lesson follows the round: clarify the requirements, find the entities, draw the commands and stacks, try snapshots first and see why they fail, then build the design in stages (commands for insert and delete, the two stacks and their rules, coalescing, composite commands, cursor restoration, a history limit), then the piece table underneath, a full trace of the drill's sequence, testing, edge cases, extensions such as undo trees, collaboration and persistent history, complexity, and the VS Code write-up that motivates the data structure.</p>
+</section>
+
+<section data-field="primer">
+<h4>Actions as objects</h4>
+<p>The key idea is to stop thinking of an edit as something that happens and start thinking of it as a thing: an object that knows how to apply itself to the document and how to reverse itself. "Insert 'abc' at position 10" is such an object; applying it inserts the text, reversing it deletes three characters at position 10. "Delete 6 characters at position 5" is another; applying it removes them, and reversing it puts them back, which means it must remember what they were. This is the <strong>Command pattern</strong>. Once edits are objects, history is just a list of objects, and undo and redo are operations on that list.</p>
+<h4>Two stacks</h4>
+<p>The editor keeps an <strong>undo stack</strong> of commands it has executed, most recent on top, and a <strong>redo stack</strong> of commands it has undone. A new edit executes a command and pushes it on the undo stack. Undo pops the top command, reverses it and pushes it on the redo stack. Redo pops the top of the redo stack, executes it again and pushes it back on the undo stack. One more rule completes the system: a new edit clears the redo stack. After you undo three steps and type something new, the three undone steps no longer describe a possible future of this document, because they were computed against text that has now changed.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Undo and redo stacks over five actions on Hello world: delete world, type there, undo, undo, type exclamation. Undo moves the top command from the undo stack to the redo stack; a new edit pushes to undo and clears redo">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="18" style="fill:var(--ink);font-weight:600">Document and stacks after each action (top of stack on the right)</text>
+<text x="20" y="44" style="fill:var(--muted)">action</text><text x="190" y="44" style="fill:var(--muted)">document</text><text x="330" y="44" style="fill:var(--muted)">undo stack</text><text x="500" y="44" style="fill:var(--muted)">redo stack</text>
+<g style="font-family:var(--mono)">
+<text x="20" y="70" style="fill:var(--ink)">delete " world"</text><text x="190" y="70" style="fill:var(--ink)">Hello</text>
+<rect x="330" y="58" width="70" height="18" style="fill:var(--s1);opacity:0.45"/><text x="365" y="71" text-anchor="middle" style="fill:var(--ink)">Del(5)</text>
+<text x="20" y="102" style="fill:var(--ink)">type " there"</text><text x="190" y="102" style="fill:var(--ink)">Hello there</text>
+<rect x="330" y="90" width="70" height="18" style="fill:var(--s1);opacity:0.45"/><text x="365" y="103" text-anchor="middle" style="fill:var(--ink)">Del(5)</text>
+<rect x="404" y="90" width="80" height="18" style="fill:var(--s2);opacity:0.45"/><text x="444" y="103" text-anchor="middle" style="fill:var(--ink)">Ins(5)</text>
+<text x="20" y="134" style="fill:var(--ink)">undo</text><text x="190" y="134" style="fill:var(--ink)">Hello</text>
+<rect x="330" y="122" width="70" height="18" style="fill:var(--s1);opacity:0.45"/><text x="365" y="135" text-anchor="middle" style="fill:var(--ink)">Del(5)</text>
+<rect x="500" y="122" width="80" height="18" style="fill:var(--s2);opacity:0.45"/><text x="540" y="135" text-anchor="middle" style="fill:var(--ink)">Ins(5)</text>
+<text x="20" y="166" style="fill:var(--ink)">undo</text><text x="190" y="166" style="fill:var(--ink)">Hello world</text>
+<text x="330" y="167" style="fill:var(--muted)">(empty)</text>
+<rect x="500" y="154" width="70" height="18" style="fill:var(--s2);opacity:0.45"/><text x="535" y="167" text-anchor="middle" style="fill:var(--ink)">Ins(5)</text>
+<rect x="574" y="154" width="60" height="18" style="fill:var(--s1);opacity:0.45"/><text x="604" y="167" text-anchor="middle" style="fill:var(--ink)">Del(5)</text>
+<text x="20" y="198" style="fill:var(--ink)">type "!"</text><text x="190" y="198" style="fill:var(--ink)">Hello world!</text>
+<rect x="330" y="186" width="80" height="18" style="fill:var(--s3);opacity:0.45"/><text x="370" y="199" text-anchor="middle" style="fill:var(--ink)">Ins(11)</text>
+<text x="500" y="199" style="fill:var(--crit)">cleared</text>
+</g>
+<text x="20" y="234" style="fill:var(--ink-2)">The redo entries described edits to "Hello world"; after "!" they would produce text the user never had, so they are discarded.</text>
+</g>
+</svg>
+<figcaption>Undo moves commands from one stack to the other; redo moves them back. Any new edit starts a new future, so the old one on the redo stack is thrown away. This is exactly the drill's sequence, and the solution's test replays it.</figcaption>
+</figure>
+<h4>Why the Command pattern generalises</h4>
+<p>Undo is the famous use of commands, but treating actions as objects pays off in many other places, and mentioning them shows range. A macro recorder is a list of commands replayed later. A collaborative editor sends commands over the network. A database's write-ahead log is a sequence of commands that can be replayed after a crash. A job queue holds commands to be executed by workers. Photo editors, spreadsheets, CAD tools and game engines all use the same structure for history. Once actions are objects, they can be stored, sent, inspected, grouped, reversed and replayed, which a function call that just happens cannot.</p>
+<h4>How undo looks to the user</h4>
+<p>From the user's side, a good undo system has three properties. It is predictable: each press removes about one "thing I did", such as a word, a paste or a replace-all. It is exact: undoing everything returns precisely the text they started with. And it is reversible: redo restores what undo removed, until they start a new edit. Every rule in this lesson exists to deliver one of these three properties.</p>
+<h4>The analogy, and where it breaks</h4>
+<p>Think of a careful accountant's journal. Every change to the books is written as an entry that says exactly what was done, so it can be reversed by a matching entry. To go back a day, you reverse the day's entries in reverse order. The analogy fits commands well and breaks on redo: accountants never "redo" a reversed entry later after making new ones, because the books have moved on, which is precisely why an editor clears its redo stack on a new edit.</p>
+<h4>Where the document lives</h4>
+<p>Commands need a document to act on. The simplest is a Python string, but strings are immutable: inserting a character in the middle of a 10 MB string builds a new 10 MB string. A <strong>piece table</strong> avoids copying entirely. It keeps the file's original text in one buffer that is never changed, appends everything the user types to a second, <strong>add</strong> buffer, and describes the document as a list of <strong>pieces</strong>, each saying "take this many characters from that buffer starting here". Inserting text appends it to the add buffer and splits one piece into three; deleting text shortens or removes pieces. Neither ever moves existing text.</p>
+<h4>What the round expects</h4>
+<p>A command interface with execute and undo; insert and delete commands, with delete capturing its text; an editor with two stacks and the redo-clearing rule; coalesced typing; a composite command for replace-all; cursor restoration; and tests. Raising the document representation, and ideally implementing a simple piece table, is what separates a strong answer.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Commands &amp; stacks</span></div><div class="ck"><span class="ck-m">10–14</span><span class="ck-t">Snapshots first</span></div><div class="ck"><span class="ck-m">14–28</span><span class="ck-t">Commands, coalescing, composite</span></div><div class="ck"><span class="ck-m">28–38</span><span class="ck-t">Piece table, tests</span></div><div class="ck"><span class="ck-m">38–45</span><span class="ck-t">Extensions</span></div></div>
+<h4>1 · Clarify the requirements</h4>
+<p>Ask which operations exist (type at the cursor, delete or backspace, delete a selection, paste, replace-all, move the cursor), what one undo step should cover (a keystroke, a word, a paste), whether redo must survive new edits, whether undo history is unlimited or bounded, whether it must survive closing the file, how large files get, and whether several people edit the same document at once.</p>
+<p>A typical agreed scope: a single-user editor core with a cursor; type, backspace, delete a range and replace-all; undo and redo with typing grouped by word, a new edit clearing redo, multi-edit operations as one step, and the cursor restored; a configurable history limit; documents up to hundreds of megabytes; no persistence or collaboration in the code. The invariants to state: undoing every step from any point returns the original text exactly; redoing every step after that returns the latest text exactly; undo and redo never change text outside what the command describes.</p>
+<h4>2 · Entities and responsibilities</h4>
+<p><strong>PieceTable</strong> owns the text: insert, delete (returning what it removed), length and full text. The <strong>Command</strong> interface has <code>execute(doc)</code> and <code>undo(doc)</code>; <strong>Insert</strong>, <strong>Delete</strong> and <strong>Composite</strong> implement it. A <strong>Step</strong> pairs a command with the cursor positions before and after it. The <strong>Editor</strong> owns the document, the cursor, both stacks, the history limit and the coalescing state, and exposes the user actions. Separating the command objects from the editor means commands know nothing about cursors or stacks; they only know how to change a document and change it back.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Class diagram: Editor holds a PieceTable, a cursor, an undo stack and a redo stack of Steps; Step holds a Command and cursor before and after; Command protocol with execute and undo implemented by Insert, Delete (with removed text) and Composite (a list of commands)">
+<defs><marker id="ld14-tri" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--surface);stroke:var(--ink-2)"/></marker><marker id="ld14-dia" viewBox="0 0 12 12" refX="1" refY="6" markerWidth="10" markerHeight="10" orient="auto"><path d="M1,6 L6,1 L11,6 L6,11 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="20" y="10" width="230" height="112" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="135" y="28" text-anchor="middle" style="fill:var(--ink);font-weight:600">Editor</text>
+<text x="30" y="46" style="fill:var(--ink-2);font-family:var(--mono)">doc, cursor, max_history</text>
+<text x="30" y="62" style="fill:var(--ink-2);font-family:var(--mono)">undo_stack, redo_stack: [Step]</text>
+<text x="30" y="80" style="fill:var(--ink);font-family:var(--mono)">type · backspace · move</text>
+<text x="30" y="96" style="fill:var(--ink);font-family:var(--mono)">delete_range · replace_all</text>
+<text x="30" y="114" style="fill:var(--ink);font-family:var(--mono)">undo · redo</text>
+<rect x="300" y="10" width="160" height="56" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="380" y="28" text-anchor="middle" style="fill:var(--ink);font-weight:600">Step</text>
+<text x="310" y="46" style="fill:var(--ink-2);font-family:var(--mono)">cmd</text>
+<text x="310" y="60" style="fill:var(--ink-2);font-family:var(--mono)">cursor_before, cursor_after</text>
+<line x1="252" y1="40" x2="298" y2="40" marker-start="url(#ld14-dia)" style="fill:none;stroke:var(--ink-2)"/>
+<rect x="490" y="10" width="140" height="56" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="560" y="28" text-anchor="middle" style="fill:var(--ink);font-weight:600">«Protocol» Command</text>
+<text x="560" y="48" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">execute(doc)</text>
+<text x="560" y="62" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">undo(doc)</text>
+<line x1="462" y1="40" x2="488" y2="40" marker-start="url(#ld14-dia)" style="fill:none;stroke:var(--ink-2)"/>
+<rect x="380" y="110" width="80" height="46" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="420" y="128" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">Insert</text><text x="420" y="146" text-anchor="middle" style="fill:var(--muted)">pos, text</text>
+<rect x="470" y="110" width="80" height="46" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="510" y="128" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">Delete</text><text x="510" y="146" text-anchor="middle" style="fill:var(--muted)">pos, len, removed</text>
+<rect x="560" y="110" width="76" height="46" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="598" y="128" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">Composite</text><text x="598" y="146" text-anchor="middle" style="fill:var(--muted)">parts</text>
+<g style="fill:none;stroke:var(--ink-2)"><line x1="420" y1="108" x2="530" y2="68" marker-end="url(#ld14-tri)"/><line x1="510" y1="108" x2="555" y2="68" marker-end="url(#ld14-tri)"/><line x1="598" y1="108" x2="580" y2="68" marker-end="url(#ld14-tri)"/></g>
+<path d="M598,158 C598,190 520,190 520,160" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/><text x="560" y="200" text-anchor="middle" style="fill:var(--muted)">contains commands</text>
+<rect x="20" y="160" width="230" height="80" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="135" y="178" text-anchor="middle" style="fill:var(--ink);font-weight:600">PieceTable</text>
+<text x="30" y="196" style="fill:var(--ink-2);font-family:var(--mono)">orig (never changed), add (append-only)</text>
+<text x="30" y="212" style="fill:var(--ink-2);font-family:var(--mono)">pieces: [Piece(buf, start, length)]</text>
+<text x="30" y="230" style="fill:var(--ink);font-family:var(--mono)">insert · delete → removed · text</text>
+<line x1="135" y1="124" x2="135" y2="158" marker-start="url(#ld14-dia)" style="fill:none;stroke:var(--ink-2)"/>
+</g>
+</svg>
+<figcaption>Commands only know how to change a document and change it back; the editor knows about cursors, grouping and the two stacks. The document representation sits behind three methods, so a string, a piece table or a piece tree can be swapped without touching history.</figcaption>
+</figure>
+<h4>3 · Stage one: snapshots</h4>
+<pre>class SnapshotEditor:
+    def __init__(self, text=""):
+        self.text, self.undo_stack, self.redo_stack = text, [], []
+
+    def edit(self, new_text):
+        self.undo_stack.append(self.text)         # copy of the whole document
+        self.text, self.redo_stack = new_text, []
+
+    def undo(self):
+        self.redo_stack.append(self.text)
+        self.text = self.undo_stack.pop()</pre>
+<p>Snapshots (the Memento pattern) are correct and pleasantly simple: every state is stored whole, so undo and redo just swap strings. The cost is memory proportional to document size times history length. A 10 MB document with 1,000 edits is 10 GB of history, and every keystroke copies the document. It also loses information: a snapshot does not say what changed, so the editor cannot group keystrokes, show what an undo will do, or replay edits on another copy. Snapshots remain useful in a supporting role, for example a checkpoint every few hundred commands to speed up restoring very old states.</p>
+<h4>4 · Stage two: insert and delete commands</h4>
+<p><code>Insert(pos, text)</code> executes by inserting <code>text</code> at <code>pos</code> and undoes by deleting <code>len(text)</code> characters at <code>pos</code>. <code>Delete(pos, length)</code> executes by deleting and, crucially, storing the text it removed in <code>removed</code>; it undoes by inserting <code>removed</code> back at <code>pos</code>. A delete command is therefore not fully defined until it has executed once, which is fine because commands are always executed before they reach the undo stack. Both commands are tiny dataclasses. Their correctness rests on one assumption: undo is applied to exactly the document the command left behind. The stack discipline guarantees that, since only the most recent command can be undone.</p>
+<h4>5 · Stage three: the two stacks and their rules</h4>
+<p>The editor's private <code>_run(cmd, cursor_after)</code> executes a command, pushes a <code>Step</code> with the cursor before and after, trims the history to <code>max_history</code> by dropping the oldest step, clears the redo stack, and moves the cursor. <code>undo()</code> pops a step, calls <code>cmd.undo</code>, pushes the step on the redo stack and restores <code>cursor_before</code>. <code>redo()</code> pops from redo, calls <code>cmd.execute</code> again, pushes back on undo and sets <code>cursor_after</code>. Re-executing a delete recaptures the removed text, which is the same text because the document is in the same state as the first time.</p>
+<p>Why does redo re-execute the command rather than restore a stored result? Because the command already contains everything needed, and re-executing keeps one code path for "apply this edit", which is tested every time the user edits. It also keeps the delete's captured text honest: when redo runs, the delete records the removed text again from the current document, which matches because the stack discipline guarantees the document is in the same state it was in the first time. If it ever did not match, the round-trip test would catch it immediately.</p>
+<h4>6 · Stage four: coalescing typing</h4>
+<p>Typing "hello world" one key at a time would push eleven commands. Instead, <code>type</code> asks <code>_run</code> to merge when possible: if the top of the undo stack is an insert, the new insert starts exactly where that one ended, no other action intervened, and the new text does not begin with a space or newline, the new characters are appended to the existing command's text and its <code>cursor_after</code> is updated, with no new step. Anything else (moving the cursor, deleting, undoing) sets a flag that prevents the next keystroke from merging. The result is undo by words: "hello world" becomes two steps, "hello" and " world", which the test checks. Real editors also break the run after a pause of a second or so; the solution leaves time out to stay deterministic, but it is a one-line extension with an injected clock.</p>
+<h4>7 · Stage five: composite commands and replace-all</h4>
+<p>Replace-all finds every match, then builds a delete and an insert for each. Two details matter. The commands are created from the <em>last</em> match to the first, so each edit only changes text after the positions still to be processed; working front to back, the first replacement of "cat" with "tiger" would shift every later match by two characters and the stored positions would be wrong. And the whole list is wrapped in a <code>Composite</code>, which executes its parts in order and undoes them in reverse order, so it is one undo step. The test replaces three occurrences of "cat" with "dog", undoes once to restore all three, and redoes once to reapply them. The same composite serves paste-over-selection (a delete plus an insert) and automatic formatting.</p>
+<h4>8 · Stage six: the piece table</h4>
+<p>The document is a <code>PieceTable</code>. Construction stores the original text without copying and creates one piece covering it. To insert at position p, the table finds the piece containing p and the offset inside it, appends the new text to the add buffer, and either places a new piece before or after that piece or splits it into left, new and right pieces. As an optimisation, typing that continues at the end of the most recent add-buffer piece just extends that piece, so typing a paragraph creates one piece, not hundreds. To delete a range, it walks the pieces, keeps those outside the range, trims those that overlap it, and collects the removed text so the delete command can store it. The text of the document is the concatenation of each piece's slice of its buffer.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Piece table for original 'Hello world' after inserting ' there' at 5 and deleting ' world': original buffer unchanged, add buffer ' there', pieces: original 0 to 5 then add 0 to 6; document reads Hello there">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="20" style="fill:var(--ink);font-weight:600">Buffers (never rewritten)</text>
+<text x="20" y="46" style="fill:var(--muted)">original</text>
+<g style="font-family:var(--mono)">
+<rect x="90" y="32" width="220" height="22" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="100" y="48" style="fill:var(--ink)">H e l l o _ w o r l d</text>
+<text x="20" y="80" style="fill:var(--muted);font-family:var(--sans)">add</text>
+<rect x="90" y="66" width="130" height="22" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="100" y="82" style="fill:var(--ink)">_ t h e r e</text>
+</g>
+<text x="330" y="48" style="fill:var(--muted)">loaded file, read-only</text>
+<text x="330" y="82" style="fill:var(--muted)">everything ever typed, append-only</text>
+<text x="20" y="120" style="fill:var(--ink);font-weight:600">Pieces (the document is these, in order)</text>
+<rect x="20" y="132" width="180" height="40" rx="6" style="fill:var(--s1);opacity:0.35"/><text x="110" y="150" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">orig, start 0, len 5</text><text x="110" y="166" text-anchor="middle" style="fill:var(--ink-2)">"Hello"</text>
+<rect x="210" y="132" width="180" height="40" rx="6" style="fill:var(--s2);opacity:0.35"/><text x="300" y="150" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">add, start 0, len 6</text><text x="300" y="166" text-anchor="middle" style="fill:var(--ink-2)">" there"</text>
+<text x="410" y="150" style="fill:var(--ink)">→ "Hello there"</text>
+<text x="20" y="200" style="fill:var(--ink-2)">Delete " world" removed the piece covering orig[5:11]; insert " there" appended to add and added a piece.</text>
+<text x="20" y="218" style="fill:var(--muted)">Undo restores pieces; the characters themselves never move. VS Code keeps pieces in a red-black tree ("piece tree").</text>
+</g>
+</svg>
+<figcaption>Edits change only the small list of pieces. The original file's text is never copied, which is why piece tables open huge files quickly and use little memory, and why every earlier version of the document can be described by an earlier piece list.</figcaption>
+</figure>
+<p>The solution keeps pieces in a Python list, so locating a position is O(number of pieces). That is fine for an interview and for documents edited lightly; production editors keep pieces in a balanced tree whose nodes cache the total length (and line-break count) of their subtrees, so finding a position or a line number is O(log pieces). VS Code calls its version a piece tree: a piece table kept in a red-black tree, optimised for line lookups.</p>
+<h4>What goes into a command</h4>
+<p>A command should contain exactly what is needed to apply and reverse it, and nothing that can go stale. Positions and text, yes; references to the document object, no, because the command is applied to whatever document the editor passes in, which keeps commands reusable for replay on another copy or over the network. Cursor positions belong in the history step, not the command, because the same command can be part of different user gestures. Derived data such as line numbers should not be stored, because they change as other edits happen. Keeping commands minimal and pure also makes them easy to serialise for persistent undo or crash recovery: a command is a small record of plain values.</p>
+<h4>9 · A trace of the drill</h4>
+<table><thead><tr><th>Step</th><th>Action</th><th>Document</th><th>Undo stack (top last)</th><th>Redo stack</th></tr></thead><tbody>
+<tr><td>0</td><td>start</td><td>Hello world</td><td>[]</td><td>[]</td></tr>
+<tr><td>1</td><td>delete 6 characters at 5</td><td>Hello</td><td>[Del(5, " world")]</td><td>[]</td></tr>
+<tr><td>2</td><td>type " there" at 5 (six keys, one coalesced step)</td><td>Hello there</td><td>[Del, Ins(5, " there")]</td><td>[]</td></tr>
+<tr><td>3</td><td>undo</td><td>Hello</td><td>[Del]</td><td>[Ins]</td></tr>
+<tr><td>4</td><td>undo</td><td>Hello world</td><td>[]</td><td>[Ins, Del]</td></tr>
+<tr><td>5</td><td>type "!" at 11</td><td>Hello world!</td><td>[Ins(11, "!")]</td><td>[] (cleared)</td></tr>
+<tr><td>6</td><td>redo</td><td>Hello world!</td><td>[Ins(11, "!")]</td><td>[] (nothing to redo)</td></tr>
+</tbody></table>
+<p>Step 2's six keystrokes coalesce: the first, a space, starts a new step (a space breaks a run, but it can begin one), and "t", "h", "e", "r", "e" each continue exactly where the previous insert ended. After step 3 the cursor is back at 5, the position before the typing. Step 6 does nothing: the redo entries described edits to "Hello world" and were discarded at step 5. Re-applying Ins(5, " there") to "Hello world!" would give "Hello there world!", a document the user never had.</p>
+<h4>10 · Testing undo systems</h4>
+<p>The most powerful test is a round-trip property. The solution's random test performs 400 random actions (moving and typing, backspacing, replace-all with random strings including the empty string), then undoes until nothing is left, checking the document equals the original exactly, then redoes until nothing is left, checking it equals the final text exactly. Any command that fails to restore precisely what it changed, any wrong ordering inside a composite, any cursor-dependent mistake, breaks one of those two equalities. The piece table gets its own property test against a plain Python string as the reference: 3,000 random inserts and deletes, comparing length after every operation, every deleted substring, and the final text, plus a check that the original buffer was never copied. Named tests then pin the behaviours users notice: the drill's sequence, word-level coalescing, replace-all as one step, and the history limit.</p>
+<h4>11 · Talking through the design</h4>
+<p>"Every edit is a command with execute and undo. Delete records what it removed. The editor has two stacks: a new edit pushes and clears redo, undo moves a command to redo and reverses it, redo moves it back. Typing coalesces into word-sized steps; replace-all is a composite applied back to front so positions stay valid, and undone in reverse. Each step records the cursor before and after. History is bounded. The document is a piece table: the original text is never copied, typed text goes to an append-only buffer, and the document is a list of pieces, which in production becomes a balanced tree, as VS Code did when its array of lines ran out of memory on a 35 MB file. I test with a round trip: random edits, undo everything back to the original, redo everything back to the final text."</p>
+<h4>12 · The full solution</h4>
+<p>The file below contains the piece table, the three commands, the editor and six tests. Python 3.12, standard library only.</p>
+<pre>"""Text editor core: a piece table for the document, edits as Command objects with undo/redo
+stacks, typing coalesced into one undo step, composite commands for multi-edit operations,
+cursor restoration and a bounded history. Python 3.12, standard library only.
+Run: python editor.py"""
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass, field
+from typing import Protocol
+
+
+# ------------------------------------------------------------------ piece table
+@dataclass
+class Piece:
+    buf: str           # "orig" or "add"
+    start: int
+    length: int
+
+
+class PieceTable:
+    """The original text is never copied or modified; inserted text is appended to an add
+    buffer; the document is a list of pieces pointing into the two buffers."""
+
+    def __init__(self, text: str = "") -&gt; None:
+        self.orig, self.add = text, []                # add buffer as a list of chunks
+        self._add_len = 0
+        self.pieces: list[Piece] = [Piece("orig", 0, len(text))] if text else []
+        self.length = len(text)
+
+    def _buf(self, p: Piece) -&gt; str:
+        return self.orig if p.buf == "orig" else self._add_text()
+
+    def _add_text(self) -&gt; str:
+        if len(self.add) &gt; 1:                         # join lazily, keep one string
+            self.add = ["".join(self.add)]
+        return self.add[0] if self.add else ""
+
+    def _locate(self, pos: int) -&gt; tuple[int, int]:
+        """(piece index, offset inside it) for document position pos."""
+        for i, p in enumerate(self.pieces):
+            if pos &lt;= p.length:
+                return i, pos
+            pos -= p.length
+        return len(self.pieces), 0
+
+    def insert(self, pos: int, text: str) -&gt; None:
+        if not 0 &lt;= pos &lt;= self.length:
+            raise IndexError(pos)
+        if not text:
+            return
+        new = Piece("add", self._add_len, len(text))
+        self.add.append(text)
+        self._add_len += len(text)
+        i, off = self._locate(pos)
+        if i &lt; len(self.pieces):
+            p = self.pieces[i]
+            if off == 0:
+                self.pieces.insert(i, new)
+            elif off == p.length:
+                # extend the previous add-piece in place when typing continues at its end
+                if p.buf == "add" and p.start + p.length == new.start:
+                    p.length += new.length
+                else:
+                    self.pieces.insert(i + 1, new)
+            else:
+                left, right = Piece(p.buf, p.start, off), Piece(p.buf, p.start + off, p.length - off)
+                self.pieces[i:i + 1] = [left, new, right]
+        else:
+            last = self.pieces[-1] if self.pieces else None
+            if last and last.buf == "add" and last.start + last.length == new.start:
+                last.length += new.length
+            else:
+                self.pieces.append(new)
+        self.length += len(text)
+
+    def delete(self, pos: int, n: int) -&gt; str:
+        if n &lt; 0 or pos &lt; 0 or pos + n &gt; self.length:
+            raise IndexError((pos, n))
+        removed, out, cur = [], [], 0
+        for p in self.pieces:
+            a, b = cur, cur + p.length                # piece covers [a, b)
+            cur = b
+            lo, hi = max(a, pos), min(b, pos + n)
+            if lo &gt;= hi:
+                out.append(p)
+                continue
+            s = self._buf(p)
+            removed.append(s[p.start + lo - a: p.start + hi - a])
+            if lo &gt; a:
+                out.append(Piece(p.buf, p.start, lo - a))
+            if hi &lt; b:
+                out.append(Piece(p.buf, p.start + hi - a, b - hi))
+        self.pieces = out
+        self.length -= n
+        return "".join(removed)
+
+    def text(self) -&gt; str:
+        return "".join(self._buf(p)[p.start:p.start + p.length] for p in self.pieces)
+
+
+# ------------------------------------------------------------------ commands
+class Command(Protocol):
+    def execute(self, doc: PieceTable) -&gt; None: ...
+    def undo(self, doc: PieceTable) -&gt; None: ...
+
+
+@dataclass
+class Insert:
+    pos: int
+    text: str
+
+    def execute(self, doc: PieceTable) -&gt; None:
+        doc.insert(self.pos, self.text)
+
+    def undo(self, doc: PieceTable) -&gt; None:
+        doc.delete(self.pos, len(self.text))
+
+
+@dataclass
+class Delete:
+    pos: int
+    length: int
+    removed: str = ""                                 # captured when executed
+
+    def execute(self, doc: PieceTable) -&gt; None:
+        self.removed = doc.delete(self.pos, self.length)
+
+    def undo(self, doc: PieceTable) -&gt; None:
+        doc.insert(self.pos, self.removed)
+
+
+@dataclass
+class Composite:
+    """Several edits as one undo step (replace-all, paste-over-selection, auto-format)."""
+    parts: list = field(default_factory=list)
+
+    def execute(self, doc: PieceTable) -&gt; None:
+        for c in self.parts:
+            c.execute(doc)
+
+    def undo(self, doc: PieceTable) -&gt; None:
+        for c in reversed(self.parts):                # undo in reverse order
+            c.undo(doc)
+
+
+# ------------------------------------------------------------------ editor
+@dataclass
+class Step:
+    cmd: object
+    cursor_before: int
+    cursor_after: int
+
+
+class Editor:
+    def __init__(self, text: str = "", max_history: int = 1_000) -&gt; None:
+        self.doc = PieceTable(text)
+        self.cursor = 0
+        self.undo_stack: list[Step] = []
+        self.redo_stack: list[Step] = []
+        self.max_history = max_history
+        self._coalesce = True                         # broken by cursor moves, deletes, undo
+
+    def _run(self, cmd, cursor_after: int, merge_ok: bool = False) -&gt; None:
+        before = self.cursor
+        if (merge_ok and self._coalesce and self.undo_stack
+                and isinstance(self.undo_stack[-1].cmd, Insert) and isinstance(cmd, Insert)):
+            top = self.undo_stack[-1]
+            if top.cmd.pos + len(top.cmd.text) == cmd.pos and not cmd.text.startswith((" ", "\n")):
+                cmd.execute(self.doc)
+                top.cmd.text += cmd.text
+                top.cursor_after = cursor_after
+                self.cursor = cursor_after
+                self.redo_stack.clear()
+                return
+        cmd.execute(self.doc)
+        self.undo_stack.append(Step(cmd, before, cursor_after))
+        if len(self.undo_stack) &gt; self.max_history:
+            self.undo_stack.pop(0)                    # forget the oldest step
+        self.redo_stack.clear()                       # a new edit ends the redo branch
+        self.cursor = cursor_after
+        self._coalesce = True
+
+    # user actions
+    def move(self, pos: int) -&gt; None:
+        self.cursor = max(0, min(pos, self.doc.length))
+        self._coalesce = False
+
+    def type(self, text: str) -&gt; None:
+        self._run(Insert(self.cursor, text), self.cursor + len(text), merge_ok=True)
+
+    def backspace(self, n: int = 1) -&gt; None:
+        n = min(n, self.cursor)
+        if n:
+            self._run(Delete(self.cursor - n, n), self.cursor - n)
+            self._coalesce = False
+
+    def delete_range(self, pos: int, n: int) -&gt; None:
+        self._run(Delete(pos, n), pos)
+        self._coalesce = False
+
+    def replace_all(self, old: str, new: str) -&gt; int:
+        text = self.doc.text()
+        hits, i = [], text.find(old)
+        while i != -1 and old:
+            hits.append(i)
+            i = text.find(old, i + len(old))
+        if not hits:
+            return 0
+        parts = []
+        for pos in reversed(hits):                    # back to front: earlier offsets stay valid
+            parts += [Delete(pos, len(old)), Insert(pos, new)]
+        self._run(Composite(parts), min(self.cursor, len(text) + len(hits) * (len(new) - len(old))))
+        self._coalesce = False
+        return len(hits)
+
+    def undo(self) -&gt; bool:
+        if not self.undo_stack:
+            return False
+        step = self.undo_stack.pop()
+        step.cmd.undo(self.doc)
+        self.redo_stack.append(step)
+        self.cursor = step.cursor_before
+        self._coalesce = False
+        return True
+
+    def redo(self) -&gt; bool:
+        if not self.redo_stack:
+            return False
+        step = self.redo_stack.pop()
+        step.cmd.execute(self.doc)
+        self.undo_stack.append(step)
+        self.cursor = step.cursor_after
+        self._coalesce = False
+        return True
+
+    @property
+    def text(self) -&gt; str:
+        return self.doc.text()
+
+
+# ---------------------------------------------------------------- tests
+def test_piece_table_matches_string_reference() -&gt; None:
+    rng = random.Random(5)
+    original = "The quick brown fox jumps over the lazy dog. " * 20
+    pt, ref = PieceTable(original), original
+    for _ in range(3_000):
+        if rng.random() &lt; 0.6 or not ref:
+            pos = rng.randrange(len(ref) + 1)
+            s = rng.choice(["a", "XY", "hello ", "\n", "zz"])
+            pt.insert(pos, s)
+            ref = ref[:pos] + s + ref[pos:]
+        else:
+            pos = rng.randrange(len(ref))
+            n = rng.randrange(1, min(8, len(ref) - pos) + 1)
+            got = pt.delete(pos, n)
+            assert got == ref[pos:pos + n]
+            ref = ref[:pos] + ref[pos + n:]
+        assert pt.length == len(ref)
+    assert pt.text() == ref and pt.orig is original               # original never copied
+
+
+def test_drill_trace() -&gt; None:
+    e = Editor("Hello world")
+    e.delete_range(5, 6)                                          # remove " world"
+    assert e.text == "Hello"
+    e.move(5)
+    for ch in " there":
+        e.type(ch)
+    assert e.text == "Hello there" and len(e.undo_stack) == 2     # six keystrokes, one step
+    e.undo()
+    assert e.text == "Hello" and e.cursor == 5
+    e.undo()
+    assert e.text == "Hello world" and len(e.redo_stack) == 2
+    e.move(11)
+    e.type("!")
+    assert e.redo_stack == [] and e.redo() is False and e.text == "Hello world!"
+
+
+def test_typing_coalesces_into_words() -&gt; None:
+    e = Editor()
+    for ch in "hello world":
+        e.type(ch)
+    assert len(e.undo_stack) == 2                                 # "hello", " world"
+    e.undo()
+    assert e.text == "hello" and e.cursor == 5
+    e.move(0)
+    e.type("X")                                                   # cursor moved: new step
+    assert len(e.undo_stack) == 2 and e.text == "Xhello"
+
+
+def test_replace_all_is_one_undo_step() -&gt; None:
+    e = Editor("a cat sat on a cat mat with a cat")
+    assert e.replace_all("cat", "dog") == 3
+    assert e.text == "a dog sat on a dog mat with a dog"
+    e.undo()
+    assert e.text == "a cat sat on a cat mat with a cat"
+    e.redo()
+    assert e.text.count("dog") == 3
+
+
+def test_undo_redo_round_trip_random() -&gt; None:
+    rng = random.Random(9)
+    e = Editor("seed text")
+    history = [e.text]
+    for _ in range(400):
+        r = rng.random()
+        if r &lt; 0.5:
+            e.move(rng.randrange(len(e.text) + 1))
+            e.type(rng.choice(["a", "bc", " d", "\n"]))
+        elif r &lt; 0.8 and e.cursor &gt; 0:
+            e.backspace(rng.randint(1, 3))
+        else:
+            e.replace_all(rng.choice(["a", "b"]), rng.choice(["Q", "RR", ""]))
+        history.append(e.text)
+    final = e.text
+    while e.undo():
+        pass
+    assert e.text == "seed text"
+    while e.redo():
+        pass
+    assert e.text == final
+
+
+def test_history_is_bounded() -&gt; None:
+    e = Editor(max_history=10)
+    for i in range(50):
+        e.move(e.doc.length)
+        e.type(f" w{i}")
+    assert len(e.undo_stack) == 10
+    while e.undo():
+        pass
+    assert e.text.startswith(" w0") and e.text.count(" w") == 40  # only the last 10 undone
+
+
+if __name__ == "__main__":
+    for t in (test_piece_table_matches_string_reference, test_drill_trace, test_typing_coalesces_into_words,
+              test_replace_all_is_one_undo_step, test_undo_redo_round_trip_random, test_history_is_bounded):
+        t()
+        print("ok ", t.__name__)</pre>
+<h4>13 · Edge cases</h4>
+<p><strong>Undo or redo with an empty stack</strong>: return false, change nothing. <strong>Backspace at position 0</strong>: nothing to delete, no step recorded. <strong>Replace-all with no matches</strong>: no step recorded, so undo does not consume an empty action. <strong>Replace-all where the replacement contains the search text</strong> ("a" with "aa"): matches are found once on the original text, so the operation terminates. <strong>Empty search string</strong>: rejected or a no-op, never an infinite loop. <strong>History limit reached</strong>: the oldest steps are forgotten; undo stops at the oldest remaining one. <strong>Cursor beyond the end after an undo</strong>: clamp to the document length. <strong>Unicode</strong>: positions should count user-perceived characters consistently; Python strings index code points, which differs from what an editor shows for combined emoji or accents.</p>
+<h4>14 · Extensions the interviewer will ask for</h4>
+<p><strong>Undo tree</strong>: keep the discarded redo branch as a sibling, so the user can navigate every state ever reached, as Vim's undo tree allows. <strong>Persistent undo</strong>: append commands to a sidecar file and rebuild the stacks on reopen if the file is unchanged. <strong>Selection-aware commands</strong>: record selection ranges as well as the cursor. <strong>Multiple cursors</strong>: one composite per keystroke, with edits applied back to front. <strong>Collaborative editing</strong>: undo becomes "invert my operation, transformed against everything since", using operational transformation or CRDTs. <strong>Large files</strong>: a piece tree with cached line counts, lazy loading, and avoiding a full-text materialisation for display.</p>
+<h4>15 · Complexity</h4>
+<p>Undo and redo cost one command's undo or execute. With the list-based piece table, insert and delete are O(pieces) to locate plus O(pieces) to rebuild the list on delete; with a balanced piece tree both are O(log pieces). Coalescing keeps the number of steps and pieces proportional to editing actions, not keystrokes. Memory: the original text once, the add buffer (everything typed, never shrinking), the piece list, and the history, which holds positions and only the deleted text. Materialising the full text is O(document size) and should be avoided on every keystroke in a real editor; renderers ask the buffer only for the visible lines, which a piece tree with cached line counts answers in logarithmic time.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why a piece table, and why VS Code built a tree</h4>
+<p>The VS Code team's 2018 write-up explains the trade-off precisely. Their original buffer was an array of lines: simple, fast to look up by line number, and fine for typical files. But each line was an object of about 40 to 60 bytes, so a 35 MB file with 13.7 million lines used around 600 MB, about twenty times the file size, and building the array meant splitting the whole file into line strings, which slowed opening. A piece table stores just the text plus a few pieces, so memory is close to the file size. Its weakness is lookup by line number, which an editor does constantly (rendering, diagnostics, go to line). VS Code solved it by keeping pieces in a red-black tree whose nodes store the length and line-break count of their left subtree, so both "which piece holds offset X" and "which piece holds line N" are logarithmic. They called it a piece tree and shipped it in version 1.21 in March 2018. The post also describes engineering details that matter at scale, such as avoiding concatenating file chunks into one giant string.</p>
+<h4>Gap buffers and ropes</h4>
+<p>Two other structures are worth knowing. A <strong>gap buffer</strong> is one array with an empty gap at the cursor; typing fills the gap in O(1), and moving the cursor moves text across the gap, cheap for small moves and expensive for jumps across a large file. It is simple and well suited to one cursor; Emacs uses it. A <strong>rope</strong> is a balanced tree of string fragments: insert and delete anywhere are O(log n), concatenation is cheap, and fragments can be shared between versions, which suits very large documents and persistent (versioned) data. A piece table, especially as a tree, combines the rope's logarithmic edits with the property that original text never moves.</p>
+<h4>Undo as inverse operations versus restored states</h4>
+<p>The command approach stores inverse operations. An alternative, natural with immutable structures, stores versions: because piece tables never change their buffers, an earlier document version is fully described by an earlier piece list, so "undo" can restore that list. Persistent tree structures share unchanged subtrees between versions, making each version cost O(log n) memory. Both approaches are valid; commands are lighter and say what happened (useful for coalescing and collaboration), versions are simpler to make correct. Many editors mix them: commands for history, periodic checkpoints for fast navigation.</p>
+<h4>Grouping rules shape the user experience</h4>
+<p>What counts as one undo step is a product decision with surprising impact. Too fine (per keystroke) and undo is tedious; too coarse (per editing session) and undo throws away work the user wanted to keep. Common rules break a typing run at whitespace and punctuation, at cursor movement or selection changes, at a change of operation type (typing then deleting), after a pause, and around commands such as paste or replace-all that form their own step. Some editors let extensions open an explicit transaction so a multi-step automated change, such as a refactoring, becomes one undoable unit; that is exactly the composite command.</p>
+<h4>Selections and multiple cursors</h4>
+<p>Real editors restore not only the cursor but the selection, and many support several cursors at once. Both fit the command design with small extensions. A step records the selection ranges before and after, not just one position. Typing with five cursors produces five inserts per keystroke, wrapped in one composite and applied from the last cursor to the first, exactly like replace-all, so earlier insertions do not shift the positions of later ones. Coalescing then works per composite: five parallel runs of typing become one undo step. The pattern generalises: any operation that touches many positions is a composite applied back to front.</p>
+<h4>The add buffer only grows</h4>
+<p>A piece table never removes text from its add buffer, even when the user deletes what they typed, because undo may need it again and pieces may still point at it. Over a long session the add buffer accumulates every character ever typed or pasted. For normal editing that is small, a few megabytes even for heavy days, but a session that repeatedly pastes large blocks can grow it substantially. Editors handle this by compacting on save (write the current document as the new original and start a fresh add buffer, discarding history or keeping it as commands against the new original), or by bounding history so that unreachable text can be released.</p>
+<h4>Undo in collaborative editors</h4>
+<p>With several people editing, a global undo stack is wrong: pressing undo should revert my last edit, not my colleague's, and my edit's position may have moved because of theirs. Collaborative editors treat undo as generating a new operation: the inverse of my earlier operation, transformed against all operations that happened since, using operational transformation, or expressed directly in a CRDT's operations. That is considerably harder than single-user undo and a good place to show judgement: name the problem, explain why the simple stack fails, and point to the established techniques.</p>
+</section>
+
+<section data-field="prod">
+<h4>How editors fail</h4>
+<p>The visible failures are about trust. Undo that does not restore exactly the previous text, even once, makes users afraid to use it; the round-trip property test is the defence. Undo that removes too much (a whole paste plus the typing before it) or too little (one character) annoys users daily and is tuned through grouping rules. Cursors that jump to the wrong place after undo are a common complaint, fixed by recording cursor and selection with each step.</p>
+<p>The invisible failures are about resources. History that grows without limit during a long session, especially with large pastes or replace-alls on big files, can exhaust memory; bounded history and storing only deltas address it. Buffers that copy text on every edit make typing lag on large files. And opening very large files can fail outright, as VS Code's line array did, when the representation's per-line or per-character overhead multiplies the file size.</p>
+<h4>Autosave and crash recovery</h4>
+<p>Users expect not to lose work when an editor crashes. The command log is the natural recovery mechanism: append each command (or each coalesced step) to a journal file as it happens, and on restart, if the journal is newer than the saved file, replay it onto the original. Because commands are small, journalling costs little I/O. The same journal can provide persistent undo across sessions. The subtle part is consistency: the journal must be tied to a specific version of the file (by size, timestamp or hash), or replaying it onto a file changed by another program corrupts the text.</p>
+<h4>Large-file mode</h4>
+<p>Even with a piece table, some features scale with document size: syntax highlighting, search indexes, minimaps, word wrap. Editors detect very large files and switch them off or make them lazy, processing only the visible region. The text buffer's job is to make that possible by answering "give me lines 1,000,000 to 1,000,050" quickly without materialising the whole text, which is what VS Code's piece tree with cached line-break counts provides.</p>
+<h4>What to measure</h4>
+<p>Keystroke-to-render latency (typing must feel instant, so a few milliseconds is the budget), memory per megabyte of document, time to open large files, history memory, and crash reports involving large files. Editors also collect anonymous counts of undo and redo usage to tune grouping: many presses of undo in a row suggest steps are too small, and frequent redo right after undo suggests they are too large.</p>
+<h4>Knobs</h4>
+<p>Each of these has a sensible default that most users never change, and an escape hatch for the few who edit unusually large files or work in unusually long sessions. History depth or byte budget, the coalescing rules and pause threshold, checkpoint frequency for long histories, and thresholds at which the editor switches to a large-file mode (disabling expensive features such as full syntax analysis).</p>
+<h4>The real case: VS Code's text buffer reimplementation</h4>
+<p>In March 2018 the VS Code team published how and why they replaced the text buffer behind the editor. The original implementation, unchanged since the Monaco project began, used an array of lines: typing modified a line in place, and inserting a line spliced a new object into the array. It worked for typical documents, but reports of out-of-memory crashes kept arriving; one user could not open a 35 MB file because it had 13.7 million lines, each stored as an object of roughly 40 to 60 bytes, so the array took about 600 MB, around twenty times the file. Splitting the file into line strings also made opening slow. After reviewing data structures that need less metadata, they chose the piece table (original buffer, added buffer, list of nodes) and, to keep line lookups fast, organised the pieces in a red-black tree with each node caching its left subtree's length and line-break count, which they nicknamed the piece tree. It shipped in VS Code 1.21. For this interview problem the case shows two things: the document representation is a real design decision with measured consequences, and the piece table, introduced here as the store under undo, is what a widely used editor actually runs.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the editor, then break, measure and extend it. Python 3.12, standard library only.</p>
+<ol>
+<li>Save the full solution as <code>editor.py</code> and run it. Six tests print <code>ok</code>, including the round-trip property over 400 random actions.</li>
+<li><strong>Break it.</strong> Build replace-all's commands from the first match to the last instead of last to first. The replace-all test or the round-trip test fails, because earlier replacements shift later positions.</li>
+<li><strong>Break it again.</strong> Remove <code>self.redo_stack.clear()</code> from <code>_run</code>. Replay the drill and redo after typing "!": the document becomes text the user never had.</li>
+<li><strong>Measure it.</strong> Load a 10 MB string, then time 10,000 single-character inserts at random positions with a plain string (<code>s = s[:i] + c + s[i:]</code>) and with the piece table. Then do the same inserts all at the end, and count pieces in each case.</li>
+<li><strong>Extend it.</strong> Add a pause-based coalescing rule: inject a clock and break a typing run if more than one second passed since the last keystroke.</li>
+<li><strong>Extend it again.</strong> Turn the redo branch into an undo tree: when a new edit happens with a non-empty redo stack, keep that stack as a sibling branch, and add a command to switch branches.</li>
+</ol>
+<p>After every change, the round-trip test must still pass: undo everything gives the original, redo everything gives the final text. If a change makes it fail only occasionally, print the random seed and the failing action sequence, then shrink the sequence by hand until the bug is obvious; that is how undo bugs are usually found.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A document contains <code>Hello world</code>. The user performs: (1) delete the 6 characters starting at position 5 (" world"), (2) type " there" at position 5, (3) undo, (4) undo, (5) type "!" at the end, (6) redo.</p>
+<p>(a) Trace the document and both stacks after each step. (b) What does the redo in step 6 do, and why? (c) What memory does the history hold, compared with snapshots?</p>
+<details><summary>Answer</summary>
+<p><strong>(a) The trace.</strong> U is the undo stack, R the redo stack, top last.</p>
+<table><thead><tr><th>Step</th><th>Document</th><th>U</th><th>R</th></tr></thead><tbody>
+<tr><td>start</td><td><code>Hello world</code></td><td>[]</td><td>[]</td></tr>
+<tr><td>1 · delete</td><td><code>Hello</code></td><td>[Del(5, " world")]</td><td>[]</td></tr>
+<tr><td>2 · type " there"</td><td><code>Hello there</code></td><td>[Del, Ins(5, " there")]</td><td>[]</td></tr>
+<tr><td>3 · undo</td><td><code>Hello</code></td><td>[Del]</td><td>[Ins]</td></tr>
+<tr><td>4 · undo</td><td><code>Hello world</code></td><td>[]</td><td>[Ins, Del]</td></tr>
+<tr><td>5 · type "!"</td><td><code>Hello world!</code></td><td>[Ins(11, "!")]</td><td>[] (cleared)</td></tr>
+<tr><td>6 · redo</td><td><code>Hello world!</code></td><td>[Ins(11, "!")]</td><td>[]</td></tr>
+</tbody></table>
+<p>Step 2 does not merge with step 1: coalescing joins consecutive inserts, and a delete followed by an insert are different operations. Within step 2 the six keystrokes do coalesce into one <code>Ins(5, " there")</code>, because each continues where the previous ended. The full solution's test replays this sequence exactly.</p>
+<p><strong>(b) The redo does nothing</strong>, because step 5 cleared the redo stack. That is correct: after two undos, the two redo entries described edits to <code>Hello world</code>. Typing "!" created a new future from that state. Re-applying <code>Ins(5, " there")</code> to <code>Hello world!</code> would give <code>Hello there world!</code>, which the user never had and would not expect. Keeping the old branch is possible, as an undo tree, but it is a separate feature with its own interface.</p>
+<p><strong>(c) Memory.</strong> The history holds one small command: an insert of one character at position 11, a few dozen bytes. Before step 5 it held a delete with its six removed characters and an insert with six characters. Snapshots would have stored the whole document per step: tiny here, but for a 10 MB file every keystroke would cost 10 MB, and a thousand edits 10 GB. Commands store only what changed, which is why every real editor uses them, sometimes with an occasional snapshot as a checkpoint.</p>
+</details>
+</section>

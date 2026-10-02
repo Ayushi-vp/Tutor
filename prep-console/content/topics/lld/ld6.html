@@ -1,0 +1,801 @@
+<!-- topic source for lld/ld6; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld6",
+  "t": "A batching inference server queue",
+  "tag": "AI systems",
+  "sum": "Build a dynamic batcher in asyncio: futures that return each caller its own result, size and time triggers keyed to the oldest request, a bounded queue that rejects fast, per-request deadlines and cancellation, overlapping batches, poison-item isolation, graceful shutdown, and a simulator that sizes it with queueing arithmetic.",
+  "prereq": [
+    [
+      "py9",
+      "asyncio runs many coroutines on one thread; await yields control, tasks run concurrently, and asyncio.Queue and asyncio.Semaphore coordinate them."
+    ],
+    [
+      "py7",
+      "Exceptions propagate through await; a future can hold either a result or an exception."
+    ],
+    [
+      "swe12",
+      "Concurrency correctness: every shared resource needs an owner, and every waiting party must eventually be woken."
+    ],
+    [
+      "ld4",
+      "Deadlines bound total time, overload should be rejected fast, and retries amplify load."
+    ],
+    [
+      "lm13",
+      "Model servers batch requests because a GPU does nearly the same memory work for one request as for many; LLM servers go further with continuous batching."
+    ]
+  ],
+  "myths": [
+    [
+      "A longer batching window always raises throughput.",
+      "Only when the device is idle waiting for work. Under load, requests accumulate while the previous batch runs, so batches fill without any added delay. In this lesson's simulation at 100 requests per second, a 20 ms window and no window gave the same mean latency of about 60 ms. Triton's own tuning guide starts with no delay and adds one only if latency allows."
+    ],
+    [
+      "The batch deadline should start when the latest request arrives.",
+      "Then a steady trickle keeps resetting the timer and the first request waits indefinitely. The deadline belongs to the oldest request in the batch: its arrival time plus the maximum wait."
+    ],
+    [
+      "An unbounded queue is safer because it never rejects anyone.",
+      "Under overload it accepts work forever: memory grows, waits grow without limit, and requests are eventually served after their callers have given up. A bounded queue that rejects immediately with a retry hint is better for everyone, including the rejected caller."
+    ],
+    [
+      "Batching adds capacity.",
+      "Batching makes each unit of device time do more work, which raises the maximum throughput, but it cannot exceed it. If arrivals exceed batch size divided by batch time, the queue grows no matter how the triggers are tuned; the fixes are more concurrent batches or more replicas."
+    ],
+    [
+      "If the batched call fails, fail every request in the batch.",
+      "One malformed input then fails 31 innocent requests. Return per-item results where the model allows it, and when the whole call fails, split the batch and retry the halves to isolate the bad item."
+    ],
+    [
+      "Once the oldest request is overdue, flush it alone.",
+      "If more requests are already sitting in the queue, take them too: they cost nothing extra and waiting is over anyway. Flushing batches of one under backlog collapses throughput, a bug this lesson's own first draft had and its tests caught."
+    ]
+  ],
+  "recap": [
+    "A GPU does almost the same memory work for one request as for many, so a server groups concurrent requests into batches to raise throughput.",
+    "Each caller submits one item and awaits a future; a single assembler loop builds batches and resolves each future with that caller's own result.",
+    "A batch is flushed when it reaches the maximum size or when its oldest request has waited the maximum delay, and anything already queued is taken before flushing.",
+    "The queue is bounded and full means immediate rejection, so overload produces fast errors instead of unbounded waits.",
+    "Requests carry deadlines; expired and cancelled requests are dropped at dequeue so the device never works for callers who have gone.",
+    "A semaphore limits batches in flight, and assembly of the next batch overlaps execution of the current one.",
+    "If the batched call fails, the batch is bisected to isolate the poison item, and every future is resolved on every path.",
+    "Capacity is batch size divided by batch time per concurrent slot; when arrivals exceed it the queue grows without bound, and only more slots or replicas fix it.",
+    "Little's law (items in system equals arrival rate times time in system) turns latency targets into queue bounds."
+  ],
+  "glossary": [
+    [
+      "Backpressure",
+      "A signal from a busy stage to the stages feeding it to slow down or stop, such as a full queue rejecting new work."
+    ],
+    [
+      "Batch",
+      "A group of requests processed by one call to the model."
+    ],
+    [
+      "Bisection (poison isolation)",
+      "Splitting a failed batch in halves and retrying each half, recursively, until the failing item is alone."
+    ],
+    [
+      "Continuous batching",
+      "LLM serving technique where requests join and leave a running batch at each generation step instead of waiting for the whole batch to finish."
+    ],
+    [
+      "Discrete-event simulation",
+      "Modelling a system by jumping from event to event (arrival, batch start, batch end) in simulated time, without real waiting."
+    ],
+    [
+      "Dynamic batching",
+      "Grouping independently arriving requests into batches on the server, as opposed to clients sending pre-built batches."
+    ],
+    [
+      "Future",
+      "An object that stands for a result not yet available; one party awaits it, another sets its result or exception."
+    ],
+    [
+      "GPU",
+      "Graphics processing unit: the accelerator that runs neural network inference; its memory bandwidth, not arithmetic, usually limits small batches."
+    ],
+    [
+      "Graceful shutdown",
+      "Stopping a service by refusing new work, finishing work already accepted, then exiting."
+    ],
+    [
+      "HTTP 503",
+      "The status code meaning Service Unavailable, used to reject requests during overload, usually with a Retry-After header."
+    ],
+    [
+      "Little's law",
+      "In a stable system, the average number of items inside equals the arrival rate times the average time each spends inside (L = λW)."
+    ],
+    [
+      "Max queue delay",
+      "The longest a request may wait for companions before its batch is sent anyway; Triton calls it max_queue_delay_microseconds."
+    ],
+    [
+      "OSDI",
+      "USENIX Symposium on Operating Systems Design and Implementation, a leading systems research conference."
+    ],
+    [
+      "p99 latency",
+      "The latency that 99 percent of requests beat; the slowest 1 percent take longer."
+    ],
+    [
+      "Padding",
+      "Filling shorter inputs in a batch up to the longest one's length so they form a rectangular tensor; wasted compute."
+    ],
+    [
+      "Poison item",
+      "An input that makes the whole batched call fail."
+    ],
+    [
+      "Poisson arrivals",
+      "A model of requests arriving independently at random, with exponentially distributed gaps between them."
+    ],
+    [
+      "Semaphore",
+      "A counter that limits how many tasks may hold a resource at once; acquire waits when the count is zero."
+    ],
+    [
+      "Service rate",
+      "How many requests per second the server can complete; for a batcher, batch size divided by batch time, per concurrent slot."
+    ],
+    [
+      "Throughput",
+      "Completed requests per second."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why does a batching queue need both a size trigger and a time trigger?",
+      "Size alone hangs at low load: a lone request waits forever for companions that never arrive. Time alone wastes throughput and adds latency at high load, where a full batch is ready long before the timer. Together they adapt to the whole load range."
+    ],
+    [
+      "E",
+      "How does each caller get its own result back from a shared batch?",
+      "Each submission creates a future and puts it in the queue with the item. The caller awaits its future. After the batched call, the executor walks the requests and the results in the same order and sets each future's result, or exception, so each await returns exactly its own output."
+    ],
+    [
+      "E",
+      "Whose deadline does the batch timer track?",
+      "The oldest request in the batch: flush at its arrival time plus the maximum delay. Tracking the newest arrival resets the timer on every arrival, so under a steady trickle the first request waits indefinitely."
+    ],
+    [
+      "M",
+      "Why bound the queue, and what happens when it is full?",
+      "An unbounded queue turns overload into unbounded latency and memory: requests are eventually served after their callers have timed out, wasting the device on dead work. With a bound, submit fails immediately with an overload error, which the HTTP layer maps to 503 with Retry-After. Size the bound with Little's law: at 2,000 requests per second and a 100 ms acceptable wait, about 200 queued requests."
+    ],
+    [
+      "M",
+      "A request was cancelled by its caller while queued. What should the batcher do?",
+      "Skip it at dequeue, before it takes a slot in a batch: its future is already done (cancelled), so the assembler checks future.done() and drops it. The same check at execution time catches requests cancelled while the batch was assembling. Otherwise the device spends time on results nobody will read."
+    ],
+    [
+      "M",
+      "The batched model call raises an exception. What do you do?",
+      "Do not fail everyone. If the model returns per-item errors, set each future individually. If the whole call fails, bisect: retry each half, recursively, so the poison item ends up alone and fails while the rest succeed. That costs about log2 of the batch size extra calls per poison item. And make sure every future is resolved on every path, or callers hang until their timeouts."
+    ],
+    [
+      "M",
+      "What does max_inflight do and why is it a semaphore?",
+      "It limits how many batches run on the device at once. The assembler acquires a slot before dispatching, so when the device is saturated it stops pulling from the queue and the queue's bound turns into backpressure on callers. Dispatching as a task rather than awaiting lets the next batch assemble while the current one runs."
+    ],
+    [
+      "M",
+      "Your batching delay is 20 ms. Should it be?",
+      "Measure. Under load, requests already accumulate during the previous batch, so the delay adds latency without enlarging batches; in this lesson's simulation at 100 per second, no delay and 20 ms gave the same 60 ms mean. Triton's tuning guide starts with no delay and adds one only while latency stays within budget and throughput improves."
+    ],
+    [
+      "H",
+      "Batches are full but the queue keeps growing. Diagnose.",
+      "Arrivals exceed service rate, and no trigger setting fixes that. Service rate is batch size divided by batch time per slot: 32 items per 40 ms is 800 per second, so 2,000 per second is unstable; in simulation, mean latency climbed past 20 seconds. Fix with more concurrent slots or replicas (three slots give 2,400 per second, and simulation shows about 48 ms mean, 59 ms p99), a faster model, and meanwhile shed load with the bounded queue."
+    ],
+    [
+      "H",
+      "How is continuous batching for LLMs different from this design?",
+      "This batcher runs a batch to completion, which suits fixed-cost calls such as embeddings or classifiers. LLM generation takes a variable number of steps per request, so a static batch waits for its longest member. Continuous (iteration-level) batching, introduced by Orca and used by vLLM, schedules at every generation step: finished sequences leave and queued ones join, keeping the GPU full. The queue, deadlines, bounds and admission control from this design still apply at the front."
+    ],
+    [
+      "H",
+      "Inputs vary from 10 to 2,000 tokens. How does that change batching?",
+      "Batched tensors are padded to the longest input, so one long input makes every short one pay for 2,000 tokens. Bucket by length: keep separate queues for length ranges, or sort the queue window by length before cutting batches, and cap the batch by total tokens rather than item count. Watch fairness, since long requests can starve if their bucket rarely fills; give each bucket its own timer."
+    ],
+    [
+      "H",
+      "How would you add priorities, for example interactive versus batch traffic?",
+      "Use one queue per priority and have the assembler fill batches from the highest non-empty queue first, which is how Triton's priority_levels work. Protect the low priority from starvation with a minimum share or an age-based promotion, and give each level its own queue bound and timeout so a flood of batch work cannot fill the interactive queue."
+    ],
+    [
+      "H",
+      "Design graceful shutdown for this batcher during a deploy.",
+      "Stop accepting (submit raises an overload error so the load balancer sends traffic elsewhere), put a sentinel on the queue so the assembler flushes what is queued and exits, wait for in-flight batches, then fail anything left with a clear error. Bound the whole drain with a timeout shorter than the orchestrator's kill grace period."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "NVIDIA Triton Inference Server: Dynamic Batcher",
+      "A production dynamic batcher: batches as large as possible up to the maximum, no delay by default, max_queue_delay_microseconds, preferred_batch_size (rarely), priority_levels, and queue policies with max_queue_size and per-request timeouts; plus a recommended tuning process.",
+      "https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/batcher.html"
+    ],
+    [
+      "docs",
+      "Python asyncio: Queues",
+      "asyncio.Queue with maxsize, put_nowait raising QueueFull, get_nowait raising QueueEmpty: the primitives this design uses.",
+      "https://docs.python.org/3/library/asyncio-queue.html"
+    ],
+    [
+      "paper",
+      "Orca: A Distributed Serving System for Transformer-Based Generative Models",
+      "Yu et al., OSDI 2022: iteration-level scheduling, where requests join and leave the running batch at each step.",
+      "https://www.usenix.org/conference/osdi22/presentation/yu"
+    ],
+    [
+      "docs",
+      "Google SRE Book: Handling Overload",
+      "Why rejecting fast beats queueing deep, and client-side throttling.",
+      "https://sre.google/sre-book/handling-overload/"
+    ],
+    [
+      "post",
+      "Little's law",
+      "The queueing identity L = λW used for sizing queues and checking stability.",
+      "https://en.wikipedia.org/wiki/Little%27s_law"
+    ],
+    [
+      "docs",
+      "vLLM documentation",
+      "A continuous-batching LLM server whose scheduler admits and evicts sequences every step.",
+      "https://docs.vllm.ai/en/latest/"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team serves an embedding model behind an HTTP endpoint. Each request carries one sentence; the server runs the model on it and returns a vector. On a modern GPU one call takes about 10 milliseconds whether it embeds one sentence or thirty-two, because most of the time goes into reading the model's weights from memory, and that cost is paid once per call however many inputs ride along. At 50 requests per second the server keeps up. At 300 it does not: the GPU is "busy" every millisecond, but almost all of that is the same weights being read over and over for one sentence at a time. Throughput is capped at about 100 calls per second, and the queue grows.</p>
+<p>The fix is <strong>batching</strong>: hold incoming requests for a moment, run them through the model together, and hand each caller its own slice of the output. Thirty-two sentences per 10-millisecond call is 3,200 per second from the same GPU. Every serious model server does this, from NVIDIA's Triton, which calls it dynamic batching, to LLM servers such as vLLM, which take it further with continuous batching.</p>
+<p>Batching introduces its own problems, and they are concurrency problems. Callers arrive independently and each must get back exactly its own result. The first request into an empty batch must not wait forever for companions that never come, nor should a steady trickle keep postponing it. When load exceeds what the device can do, the queue must not grow without limit. A caller who gives up should not have its request computed anyway. One malformed input must not fail thirty-one others. And during a deploy, the server must finish what it accepted without taking more.</p>
+<p>Getting batching right is also a cost question. GPUs are expensive, and a server that batches poorly needs several times as many of them for the same traffic, so the difference between a naive and a careful batcher shows up directly in the infrastructure bill.</p>
+<p>That makes this a classic machine-coding round for AI infrastructure roles. There is no model to write: the "model" is a function that takes a list and returns a list. Everything interesting is in the queue, the timer, the futures, the error paths and the arithmetic that says whether the design can keep up.</p>
+<p>This lesson follows the round: the questions to ask, the entities, a naive version and its bugs, then the correct batcher built in stages (futures, dual triggers keyed to the oldest request, bounded queue, deadlines and cancellation, overlapping batches, poison isolation, shutdown), the full tested solution with a discrete-event simulator, edge cases, the extensions an interviewer will ask for (length bucketing, priorities, continuous batching), complexity, and how Triton's dynamic batcher configures the same ideas.</p>
+</section>
+
+<section data-field="primer">
+<h4>Why batching helps</h4>
+<p>A neural network forward pass multiplies inputs by large weight matrices. For small batches, the bottleneck is not arithmetic but memory bandwidth: the weights must stream from the GPU's memory into its compute units for every call. Reading 1 GB of weights takes the same time whether the input is one row or thirty-two, and the arithmetic for thirty-two rows still fits in that time. So up to a point, batch time is nearly flat in batch size, and throughput grows almost linearly with it. Beyond that point the GPU becomes compute-bound and batch time starts to grow. The lesson treats batch time as fixed, which is accurate for the region where batching pays.</p>
+<h4>The shape of the solution</h4>
+<p>Callers do not see batches. A caller calls <code>await batcher.submit(item)</code> and gets back its result. Inside, <code>submit</code> creates a <strong>future</strong>, an object representing a result that does not exist yet, puts the item and the future in a queue, and awaits the future. A single background loop, the <strong>assembler</strong>, takes items off the queue and groups them into a batch, calls the model with the list of items, and then sets each future's result from the corresponding position in the returned list. Each awaiting caller wakes with its own answer. That is the whole mechanism; the rest of the lesson is about getting its timing and failure behaviour right.</p>
+<h4>Futures, more concretely</h4>
+<p>A future has three possible states: pending, done with a result, or done with an exception (cancellation is a special exception). Exactly one party resolves it, exactly once; any number of parties can await it. Awaiting a pending future suspends the awaiting coroutine without blocking the thread, so thousands of callers can wait at once at almost no cost. That property is what lets one assembler and a handful of execution tasks serve thousands of concurrent callers on a single thread. The cost of the pattern is discipline: every future the batcher creates must be resolved on every path, including errors, shutdown and timeouts, or its caller waits forever.</p>
+<h4>The analogy: a shuttle bus</h4>
+<p>An airport shuttle seats 32. If the driver leaves only when the bus is full, the first passenger at 3 a.m. waits for hours. If the driver leaves on a fixed schedule regardless of passengers, buses run nearly empty at night and passengers queue at the kerb during the rush. A sensible rule is both: leave when full, or when the first passenger on board has waited ten minutes, whichever comes first. Note the "first passenger": if the timer restarted whenever someone new boarded, a steady trickle of passengers would keep the bus parked forever. The analogy breaks in a useful place. At rush hour, a bus returning from the terminal finds a crowd already waiting, so it fills instantly and the ten-minute rule never matters. That is exactly what happens in a loaded batcher: requests pile up while the previous batch runs, and the timer only matters at low traffic.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Two timelines. Low load: requests A, B, C arrive; the batch is flushed at A's arrival plus max_wait with 3 items. High load: 8 requests arrive quickly and the batch is flushed when it reaches max_batch 8, before the timer">
+<defs><marker id="ld6-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="20" style="fill:var(--ink);font-weight:600">Low load: the time trigger fires (max_batch 8, max_wait 20 ms)</text>
+<line x1="40" y1="70" x2="620" y2="70" marker-end="url(#ld6-arrow)" style="fill:none;stroke:var(--line-2)"/>
+<circle cx="80" cy="70" r="6" style="fill:var(--s1)"/><text x="80" y="52" text-anchor="middle" style="fill:var(--ink)">A</text>
+<circle cx="230" cy="70" r="6" style="fill:var(--s1)"/><text x="230" y="52" text-anchor="middle" style="fill:var(--ink)">B</text>
+<circle cx="390" cy="70" r="6" style="fill:var(--s1)"/><text x="390" y="52" text-anchor="middle" style="fill:var(--ink)">C</text>
+<line x1="480" y1="40" x2="480" y2="96" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<text x="480" y="112" text-anchor="middle" style="fill:var(--accent)">flush [A,B,C] at A + 20 ms</text>
+<path d="M80,84 L480,84" style="fill:none;stroke:var(--accent);stroke-dasharray:4 3"/>
+<text x="280" y="98" text-anchor="middle" style="fill:var(--muted)">timer starts at the oldest (A), not the newest</text>
+<text x="20" y="146" style="fill:var(--ink);font-weight:600">High load: the size trigger fires first</text>
+<line x1="40" y1="190" x2="620" y2="190" marker-end="url(#ld6-arrow)" style="fill:none;stroke:var(--line-2)"/>
+<g style="fill:var(--s2)"><circle cx="80" cy="190" r="6"/><circle cx="105" cy="190" r="6"/><circle cx="125" cy="190" r="6"/><circle cx="150" cy="190" r="6"/><circle cx="168" cy="190" r="6"/><circle cx="190" cy="190" r="6"/><circle cx="215" cy="190" r="6"/><circle cx="235" cy="190" r="6"/></g>
+<line x1="240" y1="160" x2="240" y2="214" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<text x="250" y="174" style="fill:var(--accent)">8th arrives → flush now (timer unused)</text>
+<line x1="480" y1="180" x2="480" y2="200" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+<text x="480" y="222" text-anchor="middle" style="fill:var(--muted)">A + 20 ms would have been here</text>
+</g>
+</svg>
+<figcaption>At low load batches are small and latency is bounded by the maximum wait measured from the oldest request. At high load batches fill before the timer, so the delay costs nothing. The same two rules cover both regimes.</figcaption>
+</figure>
+<h4>Capacity is arithmetic</h4>
+<p>One more idea frames everything. If a batch of up to B items takes S seconds and one batch runs at a time, the server can complete at most B / S requests per second: 32 / 0.04 = 800 per second for a 40 ms call. If requests arrive faster than that, the queue grows forever, whatever the triggers are. Batching raises this ceiling; it does not remove it. <strong>Little's law</strong> adds the other half: in a stable system the average number of requests inside equals the arrival rate times the average time each spends inside. At 2,000 requests per second and 50 ms per request, about 100 requests are in the system at any moment. Those two facts let you size queues and replicas before writing code, and the drill uses both.</p>
+<h4>What the round expects</h4>
+<p>An asyncio class with <code>submit(item, timeout)</code> and <code>close()</code>, a bounded queue, an assembler loop with the two triggers keyed to the oldest request, futures resolved on every path, cancellation and deadline handling, a limit on concurrent batches, and tests that check each property, plus the capacity arithmetic spoken aloud.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Entities &amp; API</span></div><div class="ck"><span class="ck-m">10–15</span><span class="ck-t">Naive batcher</span></div><div class="ck"><span class="ck-m">15–30</span><span class="ck-t">Triggers, bounds, futures</span></div><div class="ck"><span class="ck-m">30–38</span><span class="ck-t">Failures, overlap, tests</span></div><div class="ck"><span class="ck-m">38–45</span><span class="ck-t">Capacity &amp; extensions</span></div></div>
+<h4>1 · Clarify the requirements</h4>
+<p>Ask about the model call: does it take a list and return a list in the same order, how long does it take as a function of batch size, what is the largest batch it accepts, and can it report per-item errors? Ask about traffic: requests per second, burstiness, and whether inputs vary in size (token length, image size). Ask about latency: the target for typical and tail requests, and whether callers have their own timeouts. Ask about overload: should excess requests be rejected or queued, and how long may a queue wait be? And about operations: does the server need graceful shutdown for deploys, and are there priorities?</p>
+<p>A typical agreed scope: an async <code>submit</code> returning the caller's own result; batches of at most B items; no request waits more than T for companions; a bounded queue that rejects immediately when full; per-request deadlines; cancelled requests not computed; a failing item must not fail others; graceful shutdown. Non-functional requirements to state: never lose a request silently (every future resolved), and know the maximum sustainable throughput before deploying.</p>
+<h4>2 · Entities and responsibilities</h4>
+<p>A <strong>request record</strong> holds the item, its future, when it was enqueued and its deadline. The <strong>Batcher</strong> owns the bounded queue, the assembler loop, a semaphore limiting in-flight batches, the set of running batch tasks and simple statistics. The <strong>batch function</strong> is injected: an async callable from a list of items to a list of results (or exception objects) in the same order. Two exception types carry the policy outcomes: <code>Overloaded</code> when the queue is full or the batcher is shutting down, and <code>Expired</code> when a request's deadline passed in the queue.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Flow: many callers call submit, which creates a future and does put_nowait into a bounded asyncio.Queue or raises Overloaded; one assembler loop gets items, drops cancelled and expired, collects up to max_batch or until oldest plus max_wait, acquires a semaphore slot and creates an execute task; execute calls the batch function and resolves each future, bisecting on failure">
+<defs><marker id="ld6-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="10" y="30" width="110" height="120" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="65" y="50" text-anchor="middle" style="fill:var(--ink);font-weight:600">callers</text>
+<text x="65" y="74" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">await submit()</text>
+<text x="65" y="94" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">await submit()</text>
+<text x="65" y="114" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">await submit()</text>
+<text x="65" y="138" text-anchor="middle" style="fill:var(--muted)">each awaits its future</text>
+<rect x="150" y="60" width="120" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="210" y="84" text-anchor="middle" style="fill:var(--ink)">bounded Queue</text>
+<text x="210" y="102" text-anchor="middle" style="fill:var(--muted)">maxsize = max_queue</text>
+<line x1="120" y1="90" x2="148" y2="90" marker-end="url(#ld6-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<text x="130" y="176" style="fill:var(--crit)">full → Overloaded now</text>
+<line x1="135" y1="98" x2="135" y2="164" style="fill:none;stroke:var(--crit);stroke-dasharray:3 3"/>
+<rect x="300" y="40" width="150" height="100" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="375" y="60" text-anchor="middle" style="fill:var(--ink);font-weight:600">assembler loop</text>
+<text x="310" y="80" style="fill:var(--ink-2)">drop cancelled / expired</text>
+<text x="310" y="98" style="fill:var(--ink-2)">fill to max_batch or</text>
+<text x="310" y="116" style="fill:var(--ink-2)">until oldest + max_wait</text>
+<text x="310" y="134" style="fill:var(--ink-2)">acquire slot (semaphore)</text>
+<line x1="270" y1="90" x2="298" y2="90" marker-end="url(#ld6-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<rect x="480" y="30" width="150" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="555" y="52" text-anchor="middle" style="fill:var(--ink)">execute task #1</text>
+<text x="555" y="72" text-anchor="middle" style="fill:var(--muted)">fn(items) → results</text>
+<rect x="480" y="100" width="150" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="555" y="122" text-anchor="middle" style="fill:var(--ink)">execute task #2</text>
+<text x="555" y="142" text-anchor="middle" style="fill:var(--muted)">≤ max_inflight at once</text>
+<line x1="450" y1="70" x2="478" y2="60" marker-end="url(#ld6-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="450" y1="110" x2="478" y2="126" marker-end="url(#ld6-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<path d="M555,158 C555,230 70,230 65,152" marker-end="url(#ld6-a2)" style="fill:none;stroke:var(--good)"/>
+<text x="320" y="214" text-anchor="middle" style="fill:var(--good)">set_result / set_exception on each future (bisect on whole-batch failure)</text>
+</g>
+</svg>
+<figcaption>Three kinds of concurrency meet here: many callers, one assembler, and a few execution tasks. The queue bound pushes back on callers; the semaphore pushes back on the assembler; futures carry each answer home.</figcaption>
+</figure>
+<h4>3 · Stage one: a naive batcher and its bugs</h4>
+<pre>async def loop(self):
+    while True:
+        batch = []
+        deadline = time.monotonic() + self.max_wait          # bug 1: timer from now, not oldest
+        while len(batch) &lt; self.max_batch and time.monotonic() &lt; deadline:
+            try:
+                batch.append(self.q.get_nowait())
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.001)                    # bug 2: busy polling
+        if batch:
+            results = await self.fn([i for i, f in batch])    # bug 3: blocks the next assembly
+            for (i, f), r in zip(batch, results):             # bug 4: exception fails everyone,
+                f.set_result(r)                               #        futures left unresolved</pre>
+<p>Walk through what goes wrong. The timer starts when the loop wakes, not when the oldest request arrived, so a request that arrived just after a flush waits a full extra window. The loop polls every millisecond even when the server is idle, burning CPU. It awaits the model call before collecting the next batch, so assembly and execution never overlap and the device sits idle between batches. If <code>fn</code> raises, the exception escapes the loop, the loop dies, and every queued future is never resolved: every caller hangs until its own timeout, and every future caller hangs too. And with an unbounded <code>asyncio.Queue()</code>, overload means unbounded memory and latency. Each of these is fixed by one stage below.</p>
+<h4>4 · Stage two: futures and a blocking first get</h4>
+<p><code>submit</code> creates the future with <code>loop.create_future()</code>, wraps the item, the future, the current monotonic time and the deadline into a record, and puts it on the queue. The assembler starts each batch with <code>await self.q.get()</code>, which sleeps until there is work: no polling, no CPU when idle, and the batch clock starts from a real request. A detail worth knowing: when a caller's <code>await req.fut</code> is cancelled (for example because the HTTP client disconnected), asyncio cancels the future itself, so the assembler can detect abandoned requests with <code>fut.done()</code>.</p>
+<h4>5 · Stage three: the dual trigger, keyed to the oldest</h4>
+<p>After taking the first request, the assembler computes <code>flush_at = first.enqueued + max_wait</code>: the oldest request's arrival plus the maximum delay. It then keeps adding requests until the batch is full or <code>flush_at</code> passes. Each additional request is taken in one of two ways. If one is already waiting in the queue, take it immediately with <code>get_nowait()</code>. Only if the queue is empty, wait for the next arrival with <code>asyncio.wait_for(self.q.get(), flush_at - now)</code>, which either returns the next request or raises <code>TimeoutError</code> when the oldest request's time is up.</p>
+<p>The order of those two checks matters, and the full solution's own first draft got it wrong. That draft checked the deadline first and stopped as soon as <code>flush_at</code> had passed. Under backlog, the oldest queued request has always waited longer than <code>max_wait</code> by the time the assembler reaches it, so every batch was flushed with a single item. The throughput test caught it: batch sizes went 16, 16, 1, 1, 1, ... and 210 of 320 requests expired. The fix is the rule above: anything already queued is free to take, so take it, and consult the deadline only when deciding whether to wait for more. This is a good story to tell in an interview, because it shows the test caught a bug that reading the code did not.</p>
+<h4>A trace of one batch at low load</h4>
+<p>Follow three requests through the assembler with max_batch 8 and max_wait 20 ms, the device idle.</p>
+<table><thead><tr><th>Time</th><th>Event</th><th>Assembler state</th></tr></thead><tbody>
+<tr><td>0 ms</td><td>A submitted: future created, record queued</td><td>blocked in <code>await q.get()</code>, wakes with A; flush_at = 0 + 20 = 20 ms</td></tr>
+<tr><td>0 ms</td><td>queue empty</td><td><code>wait_for(q.get(), 20 ms)</code></td></tr>
+<tr><td>7 ms</td><td>B submitted</td><td>wakes with B; batch [A, B]; queue empty, wait 13 ms more</td></tr>
+<tr><td>15 ms</td><td>C submitted</td><td>wakes with C; batch [A, B, C]; wait 5 ms more</td></tr>
+<tr><td>20 ms</td><td>timeout: A's deadline reached</td><td>acquire slot, start task with [A, B, C], go back to <code>await q.get()</code></td></tr>
+<tr><td>60 ms</td><td>model returns three results</td><td>task sets A's, B's and C's futures; their callers wake</td></tr>
+</tbody></table>
+<p>A waited 20 ms for companions and 40 ms on the device; B and C waited less. Had B and C arrived at 18 and 19 ms instead, nothing would change for A: its clock was fixed when it arrived. With the newest-request bug, each arrival would have pushed the flush back by 20 ms.</p>
+<h4>6 · Stage four: a bounded queue, deadlines and cancellation</h4>
+<p>The queue is created with <code>maxsize</code>, and <code>submit</code> uses <code>put_nowait</code>, which raises <code>QueueFull</code> instead of waiting. The batcher converts that into <code>Overloaded</code>, which an HTTP layer maps to status 503 with a <code>Retry-After</code> header. Rejecting in a microsecond is better for the caller than accepting and answering in ninety seconds, and far better for the server, which otherwise spends its device time on requests whose callers have gone.</p>
+<p>Each request carries a deadline, from a <code>timeout</code> argument. When the assembler takes a request, it checks two things: if the future is already done, the caller cancelled, so the request is dropped; if the deadline has passed, the future gets an <code>Expired</code> exception and the request is dropped. The executor checks <code>fut.done()</code> once more just before calling the model, catching cancellations that happened while the batch was assembling. Under overload, this is what stops the server from entering a state where it only ever computes answers nobody is waiting for.</p>
+<h4>7 · Stage five: overlapping batches with a semaphore</h4>
+<p>Instead of awaiting the model call, the assembler acquires a slot from <code>asyncio.Semaphore(max_inflight)</code>, starts the batch as a separate task, and immediately begins assembling the next batch. The task releases the slot when it finishes, in a <code>finally</code> block so that a failure cannot leak a slot. With <code>max_inflight = 1</code> assembly still overlaps execution; with 2 or 3, several batches can be on the device at once if it has headroom, or spread across replicas. When all slots are taken the assembler waits at <code>acquire</code>, stops draining the queue, the queue fills, and <code>submit</code> starts rejecting: backpressure flows from the device to the callers with no extra code.</p>
+<figure>
+<svg viewBox="0 0 640 210" width="100%" role="img" aria-label="Timelines: serial loop alternates assemble then execute, leaving gaps; overlapped loop assembles batch 2 while batch 1 executes, and with two slots executes batches concurrently">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="20" style="fill:var(--ink);font-weight:600">Serial: assemble, then await execution, then assemble again</text>
+<rect x="40" y="32" width="40" height="22" style="fill:var(--s3)"/><rect x="80" y="32" width="100" height="22" style="fill:var(--accent)"/>
+<rect x="180" y="32" width="40" height="22" style="fill:var(--s3)"/><rect x="220" y="32" width="100" height="22" style="fill:var(--accent)"/>
+<rect x="320" y="32" width="40" height="22" style="fill:var(--s3)"/><rect x="360" y="32" width="100" height="22" style="fill:var(--accent)"/>
+<text x="480" y="48" style="fill:var(--ink-2)">device idle during assembly</text>
+<text x="20" y="86" style="fill:var(--ink);font-weight:600">Overlapped, 1 slot: next batch assembles while the device runs</text>
+<rect x="40" y="98" width="40" height="22" style="fill:var(--s3)"/><rect x="80" y="98" width="100" height="22" style="fill:var(--accent)"/>
+<rect x="140" y="124" width="40" height="14" style="fill:var(--s3)"/><rect x="180" y="98" width="100" height="22" style="fill:var(--accent)"/>
+<rect x="240" y="124" width="40" height="14" style="fill:var(--s3)"/><rect x="280" y="98" width="100" height="22" style="fill:var(--accent)"/>
+<rect x="340" y="124" width="40" height="14" style="fill:var(--s3)"/><rect x="380" y="98" width="100" height="22" style="fill:var(--accent)"/>
+<text x="500" y="114" style="fill:var(--ink-2)">device always busy</text>
+<text x="20" y="166" style="fill:var(--ink);font-weight:600">Overlapped, 2 slots (or 2 replicas): capacity doubles</text>
+<rect x="80" y="176" width="100" height="12" style="fill:var(--accent)"/><rect x="130" y="190" width="100" height="12" style="fill:var(--s2)"/>
+<rect x="180" y="176" width="100" height="12" style="fill:var(--accent)"/><rect x="230" y="190" width="100" height="12" style="fill:var(--s2)"/>
+<rect x="280" y="176" width="100" height="12" style="fill:var(--accent)"/><rect x="330" y="190" width="100" height="12" style="fill:var(--s2)"/>
+<text x="460" y="194" style="fill:var(--ink-2)">B / S per slot, summed</text>
+</g>
+</svg>
+<figcaption>Green-grey blocks are assembly, coloured blocks are batches on the device. Overlap removes idle gaps; more slots add capacity only if the device or extra replicas can really run batches concurrently.</figcaption>
+</figure>
+<h4>8 · Stage six: per-item errors and poison isolation</h4>
+<p>The batch function may return an exception object in a result position, meaning that item failed; the executor sets that future's exception and the others' results. If the whole call raises, the executor does not fail everyone. It splits the batch in half and calls each half separately, recursively, until a failing half has one item, whose future gets the exception. Every other item succeeds. With one poison item in a batch of 8, that is the original call plus up to six more (two per level for three levels), as the test checks. The executor also verifies that the function returned as many results as items, because a length mismatch would silently give callers each other's answers, the worst bug a batcher can have.</p>
+<h4>9 · Stage seven: graceful shutdown</h4>
+<p><code>close()</code> sets a flag so new <code>submit</code> calls raise <code>Overloaded</code>, puts a <code>None</code> sentinel on the queue, waits for the assembler to flush whatever was queued before the sentinel and exit, then waits for all in-flight batch tasks. Anything still in the queue afterwards gets an explicit error. The test submits ten requests, closes immediately, and checks that all ten completed and that a later submit is refused.</p>
+<h4>10 · Testing concurrent code without flakiness</h4>
+<p>Asynchronous code with timers is easy to test badly: assertions on exact timings fail on a busy machine, and tests that only check happy paths miss the hanging-future bugs that matter. The tests here follow three rules. First, assert on <em>structure</em> where possible: the batch sizes recorded in <code>stats.batches</code>, which items reached the model (the fake model records each list it receives), which futures hold which exceptions. Second, when timing is the property, assert generous bounds: the lone request must wait at least most of <code>max_wait</code> and well under ten times it, which holds even with Windows' coarse timer. Third, measure completion time with a done callback rather than after an <code>await</code> placed later in the test; the first version of the oldest-deadline test awaited the first request only after submitting all the others, and so measured the test's own loop instead of the batcher. Above all, use the injected batch function: a fake model that sleeps, records its inputs and can be told to fail on a particular item makes every failure path reproducible in milliseconds. For capacity questions, the discrete-event simulator replaces real time entirely, so a 30-second run at 2,000 requests per second takes a fraction of a second and gives the same answer every time.</p>
+<h4>11 · The full solution</h4>
+<p>The file below contains the batcher, a discrete-event simulator of the same policy, eight asyncio tests and a simulated version of the drill. Python 3.12, standard library only; the asyncio tests take a few seconds of real time because they use real sleeps of tens of milliseconds, with tolerances loose enough for Windows timer resolution.</p>
+<pre>"""A dynamic-batching inference queue (asyncio): size and time triggers keyed to the OLDEST
+request, a bounded queue that rejects fast, per-request deadlines, cancellation, overlapping
+batches, poison-item isolation and graceful shutdown. Plus a discrete-event simulator for
+sizing. Python 3.12, standard library only. Run: python batcher.py"""
+from __future__ import annotations
+
+import asyncio
+import heapq
+import random
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
+
+BatchFn = Callable[[list[Any]], Awaitable[list[Any]]]   # results (or Exception objects) in order
+
+
+class Overloaded(Exception):
+    """Queue full: reject now (HTTP 503 + Retry-After) instead of queueing work nobody will wait for."""
+
+
+class Expired(Exception):
+    """The request's own deadline passed while it waited in the queue."""
+
+
+@dataclass
+class _Req:
+    item: Any
+    fut: asyncio.Future
+    enqueued: float
+    deadline: float
+
+
+@dataclass
+class Stats:
+    batches: list[int] = field(default_factory=list)
+    rejected: int = 0
+    expired: int = 0
+
+
+class Batcher:
+    def __init__(self, fn: BatchFn, max_batch: int = 32, max_wait: float = 0.02,
+                 max_queue: int = 1_000, max_inflight: int = 2) -&gt; None:
+        self.fn, self.max_batch, self.max_wait = fn, max_batch, max_wait
+        self.q: asyncio.Queue[_Req] = asyncio.Queue(maxsize=max_queue)
+        self.slots = asyncio.Semaphore(max_inflight)    # batches allowed on the device at once
+        self.stats = Stats()
+        self._closing = False
+        self._inflight: set[asyncio.Task] = set()
+        self._loop_task = asyncio.create_task(self._run())
+
+    async def submit(self, item: Any, timeout: float = 5.0) -&gt; Any:
+        if self._closing:
+            raise Overloaded("shutting down")
+        now = time.monotonic()
+        req = _Req(item, asyncio.get_running_loop().create_future(), now, now + timeout)
+        try:
+            self.q.put_nowait(req)                       # never block the caller on a full queue
+        except asyncio.QueueFull:
+            self.stats.rejected += 1
+            raise Overloaded("queue full") from None
+        return await req.fut                             # cancelling this cancels req.fut too
+
+    def _usable(self, r: _Req, now: float) -&gt; bool:
+        if r.fut.done():                                 # caller gave up (cancelled)
+            return False
+        if now &gt;= r.deadline:
+            self.stats.expired += 1
+            r.fut.set_exception(Expired())
+            return False
+        return True
+
+    async def _run(self) -&gt; None:
+        while True:
+            first = await self.q.get()                   # sleep until there is work
+            if first is None:
+                break
+            if not self._usable(first, time.monotonic()):
+                continue
+            batch = [first]
+            flush_at = first.enqueued + self.max_wait    # the OLDEST request sets the clock
+            stop = False
+            while len(batch) &lt; self.max_batch:
+                try:
+                    r = self.q.get_nowait()              # already waiting: always take it
+                except asyncio.QueueEmpty:
+                    left = flush_at - time.monotonic()
+                    if left &lt;= 0:
+                        break                            # oldest is due and nothing else is queued
+                    try:
+                        r = await asyncio.wait_for(self.q.get(), left)
+                    except TimeoutError:
+                        break
+                if r is None:
+                    stop = True
+                    break
+                if self._usable(r, time.monotonic()):
+                    batch.append(r)
+            await self.slots.acquire()                   # backpressure from the device
+            t = asyncio.create_task(self._execute(batch))
+            self._inflight.add(t)
+            t.add_done_callback(self._inflight.discard)
+            if stop:
+                break
+
+    async def _execute(self, batch: list[_Req]) -&gt; None:
+        try:
+            live = [r for r in batch if not r.fut.done()]
+            if live:
+                self.stats.batches.append(len(live))
+                await self._call(live)
+        finally:
+            self.slots.release()
+
+    async def _call(self, reqs: list[_Req]) -&gt; None:
+        """Run the batch; if the whole call fails, bisect to isolate the poison item(s)."""
+        try:
+            results = await self.fn([r.item for r in reqs])
+            if len(results) != len(reqs):
+                raise RuntimeError(f"batch fn returned {len(results)} results for {len(reqs)} items")
+        except Exception as e:
+            if len(reqs) == 1:
+                if not reqs[0].fut.done():
+                    reqs[0].fut.set_exception(e)
+                return
+            mid = len(reqs) // 2
+            await self._call(reqs[:mid])
+            await self._call(reqs[mid:])
+            return
+        for r, res in zip(reqs, results):                # every future resolved on every path
+            if r.fut.done():
+                continue
+            if isinstance(res, Exception):
+                r.fut.set_exception(res)
+            else:
+                r.fut.set_result(res)
+
+    async def close(self) -&gt; None:
+        """Stop accepting, flush what is queued, wait for in-flight batches."""
+        self._closing = True
+        await self.q.put(None)                           # sentinel: assemble the last batch, then stop
+        await self._loop_task
+        if self._inflight:
+            await asyncio.gather(*self._inflight)
+        while not self.q.empty():                        # anything still queued after the sentinel
+            r = self.q.get_nowait()
+            if r is not None and not r.fut.done():
+                r.fut.set_exception(Overloaded("shut down"))
+
+
+# ---------------------------------------------------------------- discrete-event simulator
+def simulate(rate: float, max_batch: int, max_wait: float, service: float,
+             inflight: int = 1, seconds: float = 30.0, seed: int = 1) -&gt; dict[str, float]:
+    """Poisson arrivals into the same policy; returns mean batch size, mean latency, throughput."""
+    rng = random.Random(seed)
+    t, arrivals = 0.0, []
+    while t &lt; seconds:
+        t += rng.expovariate(rate)
+        arrivals.append(t)
+    free = [0.0] * inflight                               # when each device slot frees up
+    i, sizes, lat, done_at = 0, [], [], 0.0
+    while i &lt; len(arrivals):
+        slot_free = heapq.heappop(free)
+        oldest = arrivals[i]
+        start = max(oldest, slot_free)
+        # flush when full or when the oldest has waited max_wait, but never before a slot frees
+        j = i
+        while j &lt; len(arrivals) and j - i &lt; max_batch and arrivals[j] &lt;= max(start, oldest + max_wait):
+            j += 1
+        if j - i == max_batch:
+            flush = max(slot_free, arrivals[j - 1])
+        else:
+            flush = max(slot_free, oldest + max_wait)
+            while j &lt; len(arrivals) and j - i &lt; max_batch and arrivals[j] &lt;= flush:
+                j += 1
+        end = flush + service
+        sizes.append(j - i)
+        lat += [end - a for a in arrivals[i:j]]
+        heapq.heappush(free, end)
+        done_at = max(done_at, end)
+        i = j
+    return {"mean_batch": sum(sizes) / len(sizes), "mean_latency_ms": 1000 * sum(lat) / len(lat),
+            "p99_latency_ms": 1000 * sorted(lat)[int(0.99 * len(lat))],
+            "throughput": len(arrivals) / done_at}
+
+
+# ---------------------------------------------------------------- tests
+def fake_model(delay: float, seen: list | None = None, poison: str | None = None) -&gt; BatchFn:
+    async def fn(items: list[Any]) -&gt; list[Any]:
+        if seen is not None:
+            seen.append(list(items))
+        if poison is not None and poison in items:
+            raise ValueError("bad input in batch")
+        await asyncio.sleep(delay)
+        return [f"out:{x}" for x in items]
+    return fn
+
+
+async def test_size_trigger() -&gt; None:
+    b = Batcher(fake_model(0.01), max_batch=8, max_wait=1.0)
+    t0 = time.monotonic()
+    out = await asyncio.gather(*(b.submit(i) for i in range(8)))
+    assert out == [f"out:{i}" for i in range(8)] and b.stats.batches == [8]
+    assert time.monotonic() - t0 &lt; 0.5                   # did not wait for the 1 s timer
+    await b.close()
+
+
+async def test_time_trigger_lone_request() -&gt; None:
+    b = Batcher(fake_model(0.0), max_batch=32, max_wait=0.05)
+    t0 = time.monotonic()
+    assert await b.submit("x") == "out:x"
+    waited = time.monotonic() - t0
+    assert 0.04 &lt;= waited &lt; 0.3 and b.stats.batches == [1], waited
+    await b.close()
+
+
+async def test_deadline_belongs_to_oldest() -&gt; None:
+    b = Batcher(fake_model(0.0), max_batch=100, max_wait=0.06)
+    t0 = time.monotonic()
+    first = asyncio.create_task(b.submit("first"))
+    done_at: list[float] = []
+    first.add_done_callback(lambda _: done_at.append(time.monotonic()))
+    others = []
+    for k in range(10):                                  # a trickle that never fills the batch
+        await asyncio.sleep(0.02)
+        others.append(asyncio.create_task(b.submit(k)))
+    await first
+    waited = done_at[0] - t0
+    assert waited &lt; 0.15, waited                         # bounded by max_wait, not by the trickle
+    await asyncio.gather(*others)
+    await b.close()
+
+
+async def test_bounded_queue_rejects_fast() -&gt; None:
+    b = Batcher(fake_model(0.2), max_batch=4, max_wait=0.0, max_queue=8, max_inflight=1)
+    tasks = [asyncio.create_task(b.submit(i)) for i in range(40)]
+    res = await asyncio.gather(*tasks, return_exceptions=True)
+    rejected = sum(isinstance(r, Overloaded) for r in res)
+    assert rejected &gt; 0 and b.stats.rejected == rejected
+    assert all(r == f"out:{i}" for i, r in enumerate(res) if not isinstance(r, Exception))
+    await b.close()
+
+
+async def test_poison_item_isolated() -&gt; None:
+    seen: list = []
+    b = Batcher(fake_model(0.0, seen, poison="bad"), max_batch=8, max_wait=0.5)
+    res = await asyncio.gather(*(b.submit(x) for x in ["a", "b", "bad", "c", "d", "e", "f", "g"]),
+                               return_exceptions=True)
+    assert isinstance(res[2], ValueError)
+    assert [r for k, r in enumerate(res) if k != 2] == [f"out:{x}" for x in "abcdefg"]
+    assert len(seen) &lt;= 1 + 2 * 3                         # bisection: O(log n) extra calls per poison
+    await b.close()
+
+
+async def test_cancelled_and_expired_are_skipped() -&gt; None:
+    seen: list = []
+    b = Batcher(fake_model(0.0, seen), max_batch=8, max_wait=0.1)
+    gone = asyncio.create_task(b.submit("gone"))
+    stale = asyncio.create_task(b.submit("stale", timeout=0.0))
+    live = asyncio.create_task(b.submit("live"))
+    await asyncio.sleep(0)
+    gone.cancel()
+    assert await live == "out:live"
+    try:
+        await stale
+    except Expired:
+        pass
+    assert all("gone" not in s and "stale" not in s for s in seen) and b.stats.expired == 1
+    await b.close()
+
+
+async def test_overlap_raises_throughput() -&gt; None:
+    async def run(inflight: int) -&gt; float:
+        b = Batcher(fake_model(0.05), max_batch=16, max_wait=0.01, max_inflight=inflight)
+        t0 = time.monotonic()
+        await asyncio.gather(*(b.submit(i) for i in range(320)))
+        await b.close()
+        return 320 / (time.monotonic() - t0)
+    one, three = await run(1), await run(3)
+    print(f"    throughput with 1 batch in flight {one:.0f}/s, with 3 {three:.0f}/s")
+    assert three &gt; 1.8 * one
+
+
+async def test_graceful_close_drains() -&gt; None:
+    b = Batcher(fake_model(0.02), max_batch=4, max_wait=0.05)
+    tasks = [asyncio.create_task(b.submit(i)) for i in range(10)]
+    await asyncio.sleep(0)
+    await b.close()
+    assert [t.result() for t in tasks] == [f"out:{i}" for i in range(10)]
+    try:
+        await b.submit("late")
+    except Overloaded:
+        pass
+
+
+def test_simulated_drill() -&gt; None:
+    for rate in (100, 2_000):
+        for inflight in (1, 2):
+            s = simulate(rate, max_batch=32, max_wait=0.02, service=0.04, inflight=inflight)
+            print(f"    {rate:&gt;5}/s inflight={inflight}: batch {s['mean_batch']:.1f}, "
+                  f"mean {s['mean_latency_ms']:.0f} ms, p99 {s['p99_latency_ms']:.0f} ms, "
+                  f"throughput {s['throughput']:.0f}/s")
+    s = simulate(2_000, 32, 0.02, 0.04, inflight=1)
+    assert s["throughput"] &lt; 0.5 * 2_000                 # one slot caps at ~32/0.04 = 800/s: unstable
+
+
+async def main() -&gt; None:
+    for t in (test_size_trigger, test_time_trigger_lone_request, test_deadline_belongs_to_oldest,
+              test_bounded_queue_rejects_fast, test_poison_item_isolated,
+              test_cancelled_and_expired_are_skipped, test_overlap_raises_throughput,
+              test_graceful_close_drains):
+        await t()
+        print("ok ", t.__name__)
+    test_simulated_drill()
+    print("ok  test_simulated_drill")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())</pre>
+<h4>12 · Sizing it: what the simulator says</h4>
+<p>The simulator replays Poisson arrivals through the same policy in simulated time, with a 40 ms model call regardless of batch size, a maximum batch of 32 and a 20 ms maximum wait. At 100 requests per second with one slot, mean batch size is about 4.1 and mean latency about 60 ms (p99 about 80 ms): batches are bigger than the 2 requests that arrive in 20 ms, because requests also accumulate while the previous batch runs. At 2,000 requests per second with one slot, capacity is 32 / 0.04 = 800 per second, the queue grows without bound, and mean latency over a 30-second run passes 22 seconds. Two slots give 1,600 per second, still short. Three slots give 2,400 per second of capacity, and latency settles at about 48 ms mean and 59 ms p99 with full batches. That is the conversation the interviewer wants: the triggers set latency at low load, and only capacity, measured as batch size over batch time per slot, decides whether high load is survivable.</p>
+<h4>13 · Edge cases</h4>
+<p><strong>max_wait of zero</strong>: the batcher still batches whatever is already queued, which is Triton's default behaviour. <strong>A batch function that returns the wrong number of results</strong>: treated as a failure, never zipped silently. <strong>A request whose timeout is zero</strong>: expires at dequeue. <strong>Cancellation during execution</strong>: the result is computed but the future is already done, so setting it is skipped. <strong>Exceptions thrown by the assembler itself</strong>: must not kill the loop silently; in production wrap the loop body and log. <strong>Clock</strong>: use <code>time.monotonic</code>. <strong>Very slow batch function</strong>: deadlines expire queued requests, and a per-batch timeout should fail the batch rather than hold a slot forever.</p>
+<h4>14 · Extensions the interviewer will ask for</h4>
+<p><strong>Length bucketing</strong>: separate queues per input-length range, or sort a window of queued requests by length, so short inputs are not padded to long ones; cap batches by total tokens. <strong>Priorities</strong>: one queue per level, fill from the highest first, with anti-starvation. <strong>Continuous batching</strong> for LLM generation: schedule at every decoding step so finished sequences leave and new ones join, as Orca and vLLM do. <strong>Multiple models or devices</strong>: one batcher per model and device, behind a router. <strong>Metrics</strong>: batch size histogram, queue depth, wait time, rejections, expirations. <strong>Adaptive delay</strong>: tune <code>max_wait</code> from observed load, shrinking it when batches fill anyway.</p>
+<h4>15 · Complexity</h4>
+<p>Each request costs O(1) work in the batcher: one put, one get, one future resolution. A batch costs O(B) to assemble and resolve. Bisection on failure costs O(log B) extra calls per poison item. Memory is bounded by <code>max_queue</code> plus <code>max_inflight × max_batch</code> requests. Throughput is bounded by <code>max_inflight × max_batch / batch_time</code>, and latency at low load by <code>max_wait + batch_time</code>.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why a delay often buys nothing</h4>
+<p>It is tempting to think a longer delay always means bigger batches and more throughput. That is only true when the device would otherwise be idle. Under steady load with one slot, requests pile up in the queue during each 40 ms batch, so the next batch is already sizeable when the slot frees; the oldest waiting request has usually waited longer than any reasonable delay, so the delay is never what decides the flush. The simulator shows it: at 100 requests per second, a 20 ms delay and no delay both give about 60 ms mean latency and batches of about 4. A delay helps in a narrow band: when the device is idle, traffic is moderate, and the model's batch time really is flat, waiting a little lets a few more requests share the next call. Triton's tuning guide reflects this: enable dynamic batching with no delay first, measure, and only then try increasing the delay while latency stays within budget.</p>
+<h4>Queueing theory in three sentences</h4>
+<p>Utilisation is arrival rate divided by capacity; as it approaches 1, waiting time grows sharply, roughly in proportion to 1 / (1 - utilisation) for simple queues, which is why a server at 95 percent utilisation has far worse tail latency than one at 70 percent. Little's law (L = λW) turns a latency target into a queue bound: at 2,000 requests per second and an acceptable 100 ms wait, about 200 queued requests is the most that makes sense, and anything beyond is guaranteed to be late. Batching complicates the picture because capacity itself grows with batch size up to the maximum, which is what makes batchers stable over a wide load range and then fall off a cliff at B / S.</p>
+<h4>Continuous batching for generation</h4>
+<p>The batcher in this lesson runs each batch to completion, which is right for fixed-cost calls such as embeddings, classifiers or rerankers. Text generation is different: each request produces a different number of tokens, so a static batch is held hostage by its longest member, and requests that finish early leave their slots idle. Orca, published at OSDI 2022, introduced iteration-level scheduling: the server makes a scheduling decision at every decoding step, removing finished sequences and admitting waiting ones, so the batch stays full. vLLM combines this with paged management of the attention key-value cache, so admitting a request depends on free memory rather than a fixed batch size. The front end of such servers still needs everything here: a bounded queue, deadlines, cancellation, priorities and admission control.</p>
+<h4>Ordering and fairness</h4>
+<p>A single FIFO queue with one assembler serves requests in arrival order, which is fair and predictable. Overlapping batches break strict ordering of completions (a small later batch can finish before a large earlier one), which is fine for independent requests but matters for streams that expect ordered responses; Triton has a <code>preserve_ordering</code> option for that case. Bisection also reorders work: the items in a failing batch are retried after later batches may have started. When fairness across tenants matters, one FIFO is not enough: a single tenant flooding the queue fills every batch. Per-tenant queues drained round-robin, or a cap on each tenant's share of a batch, restore fairness at the cost of slightly smaller batches.</p>
+<h4>Padding and length bucketing</h4>
+<p>Models consume rectangular tensors, so a batch of inputs with lengths 10, 12 and 2,000 is padded to 2,000 each, and the two short inputs cost as much as the long one. For transformer models the attention cost grows with the square of length, so the waste can be worse than linear. Bucketing groups inputs of similar length: separate queues for, say, under 128, under 512 and under 2,048 tokens, each with its own batch cap measured in total tokens and its own timer. The cost is fairness and complexity: a rarely used bucket has small batches, and requests may wait longer for a bucket to fill, which is why each bucket keeps its own oldest-request deadline.</p>
+<h4>Choosing the maximum batch size</h4>
+<p>The maximum batch is bounded from above by device memory (activations grow with batch size) and by the shape of the batch-time curve: while the model is memory-bound, batch time is nearly flat and bigger batches are free throughput; once it becomes compute-bound, batch time grows roughly in proportion and bigger batches only add latency. Measure the curve once, batch sizes 1, 2, 4 and so on, and pick the knee. A bigger maximum also raises worst-case latency, because a full batch takes the longest, and raises the cost of a poison item, because bisection has more levels. Triton's advice to avoid preferred batch sizes for most models fits this picture: unless one size is specially optimised, any size up to the knee is fine.</p>
+<h4>The asyncio details that bite</h4>
+<p>A few behaviours of asyncio are easy to get wrong. <code>asyncio.wait_for</code> on a queue get either returns an item or raises <code>TimeoutError</code> (an alias of <code>asyncio.TimeoutError</code> since Python 3.11); cancellation of the inner get is handled for you. A task created with <code>create_task</code> and not referenced anywhere can be garbage-collected while running, which is why the batcher keeps in-flight tasks in a set and removes them in a done callback. Exceptions in a task that nobody awaits are only logged when the task is garbage-collected, so the assembler should never let exceptions escape silently. And everything here runs on one thread, so the batcher's own data structures need no locks; the model call must be truly asynchronous (or run in an executor), or it blocks the whole event loop and every caller with it.</p>
+</section>
+
+<section data-field="prod">
+<h4>How batchers fail in production</h4>
+<p>The most common failure is <strong>running past capacity without noticing</strong>. Arrivals creep above batch size over batch time, the queue grows, latency rises for everyone, and the first alert is a flood of client timeouts. The leading indicators are queue depth and queue wait time rising while batch sizes sit at the maximum: the batcher is doing all it can. Fix with more replicas or slots, and in the meantime let the bounded queue shed load rather than letting everything become slow.</p>
+<p>The second is <strong>hanging callers</strong>: a code path that does not resolve a future. A batch function that raises in an unexpected way, a length mismatch handled by <code>zip</code> (which silently truncates), or an assembler that dies on an exception leaves callers waiting until their own timeouts. Count futures created and resolved; the difference should be the number in flight, never growing.</p>
+<p>The third is <strong>padding waste</strong>, visible as GPU utilisation that is high while throughput is low. Mixed input lengths in the same batch spend compute on padding. Bucketing by length, or limiting batches by total tokens, is the fix.</p>
+<p>The fourth is <strong>head-of-line blocking by slow or huge requests</strong>: one enormous input makes its whole batch slow, delaying every small request that shared it. Separate queues by size class, cap input size, and give large requests their own path.</p>
+<h4>Autoscaling on the right signal</h4>
+<p>Replicas are the long-term answer to capacity, and autoscaling decides how many to run. Scaling on device utilisation is misleading for batchers: a GPU running batches of one can look 90 percent busy while delivering a fraction of its throughput, and a GPU running full batches looks the same. Better signals are queue depth or time spent queued per request, and the ratio of arrival rate to measured capacity. Scale out before the queue grows, because new replicas take time to start and load a model, often tens of seconds or minutes; during that time the bounded queue and fast rejection are what keep the service usable.</p>
+<h4>What to measure</h4>
+<p>Batch size distribution, queue depth and time spent queued, model call time by batch size, end-to-end latency percentiles, rejections and expirations per second, and device utilisation. Two derived numbers matter most: capacity (max batch over measured batch time, times slots) compared with the arrival rate, and the share of requests that expire in the queue, which should be essentially zero in healthy operation.</p>
+<h4>Knobs</h4>
+<p>Maximum batch size (bounded by device memory and the batch-time curve), maximum delay, queue bound, per-request timeout, number of in-flight batches or model instances per device, and length buckets. Tune them with a load generator replaying realistic traffic, not single requests: measure throughput and latency at increasing load until latency leaves the budget, as Triton's tuning process describes.</p>
+<h4>The real case: Triton's dynamic batcher</h4>
+<p>NVIDIA's Triton Inference Server documents its dynamic batcher with exactly this lesson's knobs. By default, enabling <code>dynamic_batching</code> creates batches as large as possible up to the model's maximum batch size and does not delay to form them. The <code>max_queue_delay_microseconds</code> setting allows a request to be delayed for a limited time so others can join; if a new arrival lets a maximum (or preferred) size batch form during the delay, the batch is sent immediately, and when the delay expires the batch is sent as is. A <code>preferred_batch_size</code> can be set but, the documentation says, should not be for most models, only when a particular size performs significantly better. <code>priority_levels</code> create separate queues so higher-priority requests bypass lower ones, with in-order processing within a level. Queue policies set a <code>max_queue_size</code> and per-request timeouts, with an action to reject or defer requests that wait too long. The recommended tuning process is to start with the defaults, measure latency and throughput with its performance analyser, and only then increase the maximum batch size or add a delay while latency stays within budget. Each of those settings has a counterpart in the hundred-line batcher in this lesson, which is the point of building it: after writing one, the production configuration reads as a list of decisions you already understand.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the batcher and simulator, then break, measure and extend them. Python 3.12, standard library only.</p>
+<ol>
+<li>Save the full solution as <code>batcher.py</code> and run it. Eight asyncio tests and the simulated drill print <code>ok</code>; note the measured throughput with one versus three batches in flight and the simulator's table.</li>
+<li><strong>Break it.</strong> In the assembler, restore the first-draft order: check <code>flush_at</code> first and stop if it has passed, before trying <code>get_nowait()</code>. Run the overlap test and print <code>b.stats.batches</code>: batches collapse to size 1 under backlog and requests expire.</li>
+<li><strong>Break it again.</strong> Change the timer to <code>time.monotonic() + max_wait</code> computed after each arrival (the newest-request bug) and run the oldest-deadline test.</li>
+<li><strong>Measure it.</strong> With the simulator, sweep the arrival rate from 100 to 2,400 per second for one, two and three slots, and plot mean and p99 latency. Find where each curve turns vertical and compare with 800 × slots.</li>
+<li><strong>Measure the delay.</strong> At 100 and 500 per second, compare <code>max_wait</code> of 0, 5 and 20 ms in the simulator. Does the delay change batch size or latency?</li>
+<li><strong>Audit the futures.</strong> Count futures created in <code>submit</code> and resolved in <code>_call</code>, <code>_usable</code> and <code>close</code>; after every test, the two counts must match.</li>
+<li><strong>Extend it.</strong> Add length buckets: a <code>size</code> argument to <code>submit</code>, one queue per bucket, and an assembler that serves the bucket whose oldest request is most overdue.</li>
+</ol>
+<p>Write down your prediction before each run, then compare. Judge every change by the same evidence: batch sizes, expirations, rejections and the futures audit, never by a single timing.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A batching server has max_batch = 32 and max_wait = 20 ms. The batched model call takes 40 ms regardless of batch size (from 1 to 32 items), and one batch runs at a time. Requests arrive at random (Poisson).</p>
+<p>(a) At 100 requests per second, what is the average batch size and latency? (b) At 2,000 per second? (c) What do you change so 2,000 per second is served within about 60 ms at p99?</p>
+<details><summary>Answer</summary>
+<p><strong>(a) 100 per second.</strong> The tempting answer is "2 requests arrive in 20 ms, so batches of 2". But requests also arrive during each 40 ms batch: about 4 of them. By the time the device is free, the oldest has usually waited more than 20 ms, so the batcher flushes immediately with whatever has accumulated. The simulator gives a mean batch of about <strong>4.1</strong> and mean latency of about <strong>60 ms</strong> (roughly 20 ms queued plus 40 ms on the device), p99 about 80 ms. Capacity is 800 per second, so utilisation is about 12 percent and everything is stable. Setting max_wait to 0 gives about the same numbers, because the queue, not the timer, is forming the batches.</p>
+<p><strong>(b) 2,000 per second.</strong> 32 requests arrive in 16 ms, so the size trigger fires and every batch is full. But one slot completes at most 32 / 0.04 = <strong>800 requests per second</strong>. Arrivals exceed capacity by 1,200 per second, so the queue grows by 1,200 every second, without bound. In a 30-second simulation, mean latency exceeded 22 seconds. No trigger setting can fix this, because batches are already full: this is a capacity problem, not a tuning problem. With a bounded queue, the batcher would instead reject the excess immediately, which at least keeps accepted requests fast.</p>
+<p><strong>(c) The fix.</strong> Add capacity. Two concurrent slots (or replicas) give 1,600 per second, still short. <strong>Three give 2,400</strong>, utilisation about 83 percent, and the simulator shows full batches with about <strong>48 ms mean and 59 ms p99</strong>. On real hardware, check whether one device really runs three batches concurrently without slowing each (often it does not, and you need three devices or a larger batch with a longer batch time). Keep the bounded queue and deadlines as protection for when traffic exceeds 2,400. Size the queue with Little's law: at 2,000 per second, a 50 ms queueing allowance means about 100 queued requests is the useful maximum.</p>
+<p><strong>The lesson to say aloud:</strong> triggers decide latency at low load; batch size over batch time, per slot, decides whether you survive high load; and the bounded queue decides how you fail when you do not.</p>
+</details>
+</section>

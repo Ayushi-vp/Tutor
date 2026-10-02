@@ -1,0 +1,389 @@
+<!-- topic source for infra/in5; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "in5",
+  "t": "Design a distributed job scheduler (cron at scale)",
+  "tag": "Scheduling",
+  "sum": "Running millions of one-off and recurring jobs on time, at least once and never twice in effect: a durable job store with a due-time index, partitioned dispatchers with leader leases, worker leases with heartbeats, fencing tokens, retries and dead letters, misfire and overlap policies, time zones and DST, spreading the midnight herd, and how Google's distributed cron records launches through Paxos.",
+  "prereq": [
+    ["sc10", "Queues hand work to a pool of workers; visibility timeouts and acknowledgements give at-least-once processing."],
+    ["sc11", "Idempotency keys make a repeated operation have the effect of one; this is what makes at-least-once execution safe."],
+    ["sc9", "Consensus (Paxos, Raft) lets replicas agree on a leader and on an ordered log of state changes despite failures."],
+    ["sc12", "Retries need backoff, jitter and limits; timeouts can't tell a slow process from a dead one."],
+    ["in1", "A log or queue delivers each message at least once; consumers must tolerate duplicates."],
+    ["sc1", "Little's law: items in a system = arrival rate × time each spends in it."]
+  ],
+  "myths": [
+    ["A lock or lease guarantees only one worker runs the job.", "A lease detects unreachability, not death. A worker paused by garbage collection, a stalled VM or a network partition looks dead, its lease expires and another worker starts — then the first one wakes up and continues. Leases give failover; only fencing tokens checked by the resource, or idempotent side effects, make the double run harmless."],
+    ["Exactly-once execution is a scheduler feature you can turn on.", "If a worker crashes after doing the work but before recording completion, the scheduler cannot know whether the work happened, so it must choose between running it again (at-least-once) or not (at-most-once). Exactly-once effect comes from the job: idempotent writes keyed by (job, scheduled time), or a lookup of the external system's state."],
+    ["Missed runs should always be caught up.", "Catching up depends on the job. A garbage-collection job every five minutes can skip a run; a monthly payroll must not be skipped but must not run twice either; a report for 09:00 is useless at 15:00. Schedulers need explicit misfire policies (run once now, run all missed, skip) and a starting deadline per job. Google's cron favours skipping over double launches where the infrastructure allows."],
+    ["Cron times are simple: run at 02:30 every day.", "With time zones, 02:30 doesn't exist on the spring daylight-saving day in many zones and happens twice on the autumn one. A scheduler must store a time zone per job, compute next run times in that zone, and define what happens in the gap and the overlap."],
+    ["The scheduler should poll the database for due jobs every second.", "A scan of 'WHERE next_run_at <= now' over millions of rows every second is expensive and becomes the bottleneck. Partition the due-time index, read only the current time bucket per partition, keep the next few minutes in memory (a heap or timing wheel), and let partitions be owned by different dispatchers."],
+    ["Everything should start exactly at midnight because that's what the user wrote.", "Thirty teams each launching a thousand-worker job at 00:00 is a self-inflicted thundering herd on shared clusters and databases. Google's cron added a '?' field that lets the system choose a value by hashing the job's configuration, spreading 'daily' jobs across the hour."]
+  ],
+  "recap": [
+    "A distributed scheduler stores jobs durably, finds the ones that are due, hands each to a worker, and makes sure each run happens at least once and has its effect only once.",
+    "Jobs live in a store indexed by next run time and partitioned, so each dispatcher scans only its own partition's current time bucket and keeps the next few minutes in memory.",
+    "Each partition has one active dispatcher, chosen by a leader lease from a coordination service, so two dispatchers don't launch the same run.",
+    "Workers claim a run with a lease that expires unless renewed by heartbeats; if the worker dies, the lease expires and another worker retries, which makes execution at-least-once.",
+    "A run is identified by (job ID, scheduled time); that identity is the idempotency key for the job's side effects and the name used to look up whether a launch already happened.",
+    "Fencing tokens that increase with every claim let the database reject writes from a stale worker whose lease expired while it was paused.",
+    "Failures get retries with exponential backoff and a cap, then a dead-letter queue; misfire, overlap and starting-deadline policies are set per job.",
+    "Schedules are computed in each job's time zone, with defined behaviour for daylight-saving gaps and repeats.",
+    "Spreading 'run daily' jobs with hashed start times removes the midnight thundering herd.",
+    "Google's distributed cron uses a Paxos group of replicas with a single leader that synchronously records the start and end of each launch, favours skipping over double launches, and fails over well within one minute."
+  ],
+  "glossary": [
+    ["At-least-once execution", "Every scheduled run is executed one or more times; a crash can cause a repeat but never a silent loss."],
+    ["Catch-up (backfill)", "Running the scheduled times that were missed while the scheduler or job was unavailable."],
+    ["Concurrency policy", "What happens when a run is due while the previous run is still going: allow both, skip the new one, or replace the old one."],
+    ["Cron expression", "A schedule written as fields for minute, hour, day of month, month and day of week, such as '0 9 * * 1-5'."],
+    ["Dead-letter queue (DLQ)", "Where runs go after exhausting their retries, for inspection and manual replay."],
+    ["Dispatcher", "The component that finds due runs in its partition and hands them to workers."],
+    ["Fencing token", "A number that increases with every lease grant; the resource rejects writes carrying a lower number than the latest it has seen."],
+    ["Heartbeat", "A periodic message from a worker that renews its lease and proves it is still making progress."],
+    ["Lease", "A lock with an expiry time: the holder has exclusive rights until it expires unless renewed."],
+    ["Leader election", "Choosing one replica to act (here, to dispatch a partition) so that others stand by."],
+    ["Little's law", "In a stable system, the average number of items inside equals the arrival rate times the average time each spends inside."],
+    ["Misfire", "A scheduled time that passed without the run starting, because the scheduler or workers were down or overloaded."],
+    ["Run (execution)", "One instance of a job for one scheduled time, identified by (job ID, scheduled time)."],
+    ["Starting deadline", "How late a run may start before it is skipped instead."],
+    ["Thundering herd", "Many jobs or clients acting at the same instant and overwhelming a shared resource."],
+    ["Timing wheel", "A circular array of time slots where each slot holds the timers due in it, giving constant-time insertion and expiry."],
+    ["Visibility timeout", "In a queue, how long a received message stays hidden from other consumers before it is redelivered if not deleted."],
+    ["DST", "Daylight saving time: the seasonal one-hour clock shift that creates skipped and repeated local times."]
+  ],
+  "qa": [
+    ["E", "Why is cron on one machine not enough?", "It is a single point of failure: if that machine is down at the scheduled time, the run is missed and nobody knows. It also can't spread work across many workers, has no record of runs, and can't fail over. A distributed scheduler replicates the schedule, tracks every launch and runs jobs on a worker pool.", "Follow-up: What does anacron add? — On restart it runs daily-or-rarer jobs that were missed while the machine was off, using a file of last-run timestamps."],
+    ["E", "What does at-least-once mean for a job, and what does the job have to do about it?", "The scheduler guarantees each run happens, but a crash after the work and before recording completion causes a repeat. So the job must be idempotent: identify the run by (job ID, scheduled time) and make side effects check or upsert by that key.", "Follow-up: Give an example. — A billing run inserts charges with a unique key (customer, billing period); a repeat finds them already present and does nothing."],
+    ["E", "What is a lease and why does it expire?", "A lease is a lock with a time limit: a worker that claims a run holds it until the expiry unless it renews with heartbeats. Expiry is what lets the system recover from a worker that died without releasing the lock.", "Follow-up: How long should it be? — Several heartbeat intervals long (e.g. 30 s lease, 10 s heartbeats), so one lost heartbeat doesn't trigger a takeover."],
+    ["M", "How do you find due jobs efficiently among 50 million?", "Index runs by next run time, partition the index (by hash of job ID into, say, 256 partitions), and have each partition's dispatcher read only the current minute's bucket, keeping the next few minutes in an in-memory heap or timing wheel. Avoid a global 'next_run_at <= now' scan every second.", "Follow-up: What about a job scheduled one second from now? — The API writes it to the store and also notifies the owning dispatcher, which inserts it into its in-memory structure."],
+    ["M", "How do you stop two dispatchers launching the same run?", "Give each partition a single owner using a leader lease from a coordination service (etcd, ZooKeeper), and make the launch itself idempotent by naming it with (job ID, scheduled time) and creating it with a conditional insert. If ownership flips mid-launch, the conditional insert prevents the duplicate.", "Follow-up: What if the old leader is paused and resumes? — Its lease epoch is old; writes carry the epoch as a fencing token and the store rejects them."],
+    ["M", "A worker is in a 45-second garbage-collection pause; its lease was 30 s. What happens?", "The lease expires, another worker claims the run and starts it, and then the first worker resumes and finishes too. Without protection both apply side effects. A fencing token (incremented on every claim) checked by the database on completion rejects the stale worker; an idempotent sink keyed by run ID also prevents the double effect.", "Follow-up: Why not just make the lease longer? — It delays recovery from real crashes, and some pause can always exceed it."],
+    ["M", "What should happen when the scheduler was down for two hours?", "Per-job misfire policy: skip runs whose starting deadline has passed, run once to catch up, or run every missed time in order. Kubernetes CronJob, for instance, has a starting deadline and refuses to start if more than 100 schedules were missed, asking the operator to intervene.", "Follow-up: Which default would you pick? — Run once if within the deadline, otherwise skip and alert; never silently run 120 copies of a per-minute job."],
+    ["M", "Estimate the worker fleet for 580 runs per second averaging 30 seconds each.", "By Little's law, runs in flight = 580 × 30 = 17,400. At 20 concurrent runs per worker host that's 870 hosts, plus headroom for peaks and retries. Heartbeats every 10 s add 1,740 writes per second to the job store.", "Follow-up: The average run grows to 60 s. — Concurrency doubles to 34,800 and the fleet doubles, even though the launch rate didn't change."],
+    ["H", "Why does Google's distributed cron record launches synchronously through Paxos before launching?", "So that a new leader knows exactly which launches started and which finished. If the leader launched first and recorded later, a crash in between would make the new leader launch the same run again. With a synchronous 'about to launch' record and a 'launch finished' record, open launches are known and can be resolved by idempotent retry or by looking up the job by its precomputed name.", "Follow-up: What must be true of the datacenter scheduler for that to work? — Launches must be idempotent, or their state must be lookupable by a name that includes the scheduled time."],
+    ["H", "How do you handle daylight saving time for a job at 02:30 local every day?", "Store the job's IANA time zone and compute next runs in local time. On the spring-forward day 02:30 doesn't exist: choose and document a rule, typically run at the next valid time (03:00). On the fall-back day 02:30 occurs twice: run only on the first occurrence by tracking the last run in UTC. Jobs that must run every N hours should be scheduled in UTC instead.", "Follow-up: What breaks if you store only UTC times? — A 09:00-local job drifts to 08:00 or 10:00 when the zone changes offset."],
+    ["H", "Design per-tenant fairness: one customer schedules 5 million jobs at 09:00.", "Admit runs into per-tenant queues and have dispatchers or workers pull with weighted fair queuing, so each tenant gets a share of worker capacity; cap each tenant's concurrency and rate; and spread that tenant's 09:00 burst over a window if their jobs allow it. Other tenants' runs then start on time while the big tenant's drain at their share.", "Follow-up: What do you show the big tenant? — Queue depth and expected start delay per tenant, plus a quota they can raise."],
+    ["H", "You're scheduling nightly LLM batch evaluation jobs and fine-tuning runs on a shared GPU cluster. What changes?", "Runs are long (hours), expensive and preemptible, so the scheduler must support checkpoints and resume rather than restart, gang scheduling (all GPUs for a run at once), priorities and preemption, and capacity-aware admission rather than launching at a fixed time. Idempotency becomes 'resume from the last checkpoint for this run ID'; leases are on the run's controller, with heartbeats from training progress.", "Follow-up: The eval job runs twice. Harm? — Wasted GPU hours, and duplicated rows in the results table unless results are keyed by (run ID, model, dataset, example)."],
+    ["H", "How would you make the scheduler itself highly available without a single point of failure?", "Keep the job store replicated (a consensus-backed or replicated database), run several dispatcher instances with partition ownership assigned by leases from a coordination service, let any instance take over a partition within seconds of a lease expiring, and make every action idempotent so overlaps during handover are harmless. Monitor launches against schedule, not just process health.", "Follow-up: How fast must failover be? — Faster than the most frequent schedule's tolerance; Google's cron aims well within one minute because many jobs run every minute."]
+  ],
+  "refs": [
+    ["book", "Distributed Periodic Scheduling with Cron (Site Reliability Engineering, chapter 24)", "Google's design of distributed cron: Paxos-replicated launch state, a single launching leader, partial-failure resolution with precomputed job names, and the '?' extension.", "https://sre.google/sre-book/distributed-periodic-scheduling/"],
+    ["post", "Asynchronous task scheduling at Dropbox", "Dropbox's ATF: a task store, store consumer, SQS queues, executors and a heartbeat controller, with at-least-once and no-concurrent-execution guarantees at about 9,000 tasks per second.", "https://dropbox.tech/infrastructure/asynchronous-task-scheduling-at-dropbox"],
+    ["docs", "Kubernetes CronJob", "Concrete semantics for concurrency policy, starting deadlines, missed schedules and time zones.", "https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/"],
+    ["post", "How to do distributed locking", "Martin Kleppmann on why lease-based locks need fencing tokens, with the paused-client scenario used in this lesson.", "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"],
+    ["paper", "Hashed and Hierarchical Timing Wheels (SOSP 1987)", "Varghese and Lauck — the data structure for managing very many timers in constant time.", "https://www.cs.columbia.edu/~nahum/w6998/papers/sosp87-timing-wheels.pdf"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Every company runs things on a timer. Invoices go out on the first of the month. Reports are rebuilt every night. Expired sessions are purged every five minutes. A reminder fires at 9 a.m. in the user's own time zone. An AI product re-indexes documents every hour, kicks off nightly evaluation runs, and lets users schedule an agent to "summarise my inbox every weekday at 8". The first implementation is always the Unix <code>cron</code> daemon on one server: a text file of schedules, a process that wakes up every minute and launches whatever is due.</p>
+<p>Then it fails in exactly the ways a single machine fails. The cron server is rebooted for a kernel patch at 00:59 and the 01:00 billing run never happens; nobody notices until customers ask why they weren't charged. The team adds a second cron server for redundancy, and now billing runs twice and customers are charged twice. A job that usually takes ten minutes takes three hours one night, and the next run starts on top of it. Thirty teams all wrote "run daily at midnight", and at 00:00 the shared database receives every heavy query at once. A user in Sydney complains that their 8 a.m. summary arrived at 7 a.m. after daylight saving ended.</p>
+<p>The core tension is the same one that runs through all distributed systems: <strong>a machine that has stopped responding might be dead or might just be slow</strong>. If you treat it as dead and re-run its work, you risk running twice; if you treat it as alive and wait, you risk never running. A scheduler has to choose, per job, and make the consequences of its choice safe.</p>
+<p>This lesson designs a scheduler that runs millions of one-off and recurring jobs: requirements, estimates by hand, API, data model and architecture, then deep dives into finding due jobs efficiently, keeping dispatchers from doubling up, worker leases and at-least-once execution, fencing and idempotency, and cron semantics (misfires, overlaps, time zones, the midnight herd). It ends with how Google runs cron at datacenter scale, and a lab where workers crash and pause while a fencing token keeps the side effects correct.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a shift supervisor with a sign-out sheet</h4>
+<p>Picture a factory with a wall calendar of tasks and a room of workers. A supervisor looks at the calendar, and when a task is due, writes it on a sign-out sheet: "Task: clean line 3, due 14:00. Taken by: Priya, at 14:00, back by 14:30." Priya does the task and ticks it off. If 14:30 passes and Priya hasn't ticked it or popped her head in to say "still working, give me another half hour", the supervisor assumes something went wrong — she went home sick, maybe — and gives the task to someone else.</p>
+<p>That sheet is the whole design in miniature. The calendar is the <strong>job store</strong>. The supervisor is the <strong>dispatcher</strong>. "Back by 14:30" is a <strong>lease</strong>, and "give me another half hour" is a <strong>heartbeat</strong>. Reassigning the task after the deadline is how the system survives a worker who disappears — and is also how the same task can get done twice, if Priya was not sick but merely stuck in a long phone call and comes back to finish it. Writing the task <em>with its due time</em> ("clean line 3, the 14:00 one") is what lets everyone tell this afternoon's cleaning from tomorrow's; that pair, job plus scheduled time, is the identity of a run.</p>
+<p>Where the analogy breaks: a factory has one supervisor, but a large scheduler needs many dispatchers for capacity and spares for failover, and then the dispatchers themselves can double up. And a real worker can be "stuck on a long phone call" — paused by garbage collection or a network partition — for longer than any deadline you choose. The design never gets to assume that a missing heartbeat means a dead worker.</p>
+
+<h4>Two kinds of job, one pipeline</h4>
+<p><strong>One-off jobs</strong> run once at a given time: "send this reminder at 09:00 tomorrow", "retry this webhook in 5 minutes". They are usually created by programs, in huge numbers. <strong>Recurring jobs</strong> run on a schedule, usually written as a <strong>cron expression</strong> — five fields for minute, hour, day of month, month and day of week, so <code>0 9 * * 1-5</code> means 09:00 on weekdays. A recurring job is really a generator of one-off runs: after each run is created, compute the next scheduled time and store it. So both kinds flow through the same pipeline, and the unit everything works with is the <strong>run</strong>: one execution of one job for one scheduled time.</p>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Scheduler architecture: API writes jobs to a partitioned store; dispatchers own partitions via leases; due runs go to a queue; workers claim runs with leases and heartbeats and record results">
+  <defs><marker id="in5-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="100" width="80" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="50" y="126" text-anchor="middle" style="fill:var(--ink)">API</text>
+    <rect x="115" y="80" width="130" height="84" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="180" y="100" text-anchor="middle" style="fill:var(--ink);font-weight:600">Job store</text>
+    <text x="180" y="118" text-anchor="middle" style="fill:var(--muted)">partitions P0…P255</text>
+    <text x="180" y="134" text-anchor="middle" style="fill:var(--muted)">index: next_run_at</text>
+    <text x="180" y="150" text-anchor="middle" style="fill:var(--muted)">runs + fence</text>
+    <rect x="270" y="30" width="120" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="330" y="54" text-anchor="middle" style="fill:var(--ink)">Coordination (leases)</text>
+    <rect x="270" y="100" width="120" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="330" y="119" text-anchor="middle" style="fill:var(--ink)">Dispatchers</text>
+    <text x="330" y="135" text-anchor="middle" style="fill:var(--muted)">one owner/partition</text>
+    <rect x="415" y="100" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="460" y="119" text-anchor="middle" style="fill:var(--ink)">Run queues</text>
+    <text x="460" y="135" text-anchor="middle" style="fill:var(--muted)">by priority</text>
+    <rect x="530" y="90" width="100" height="64" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="580" y="112" text-anchor="middle" style="fill:var(--ink)">Workers</text>
+    <text x="580" y="128" text-anchor="middle" style="fill:var(--muted)">lease + heartbeat</text>
+    <text x="580" y="144" text-anchor="middle" style="fill:var(--muted)">fence on write</text>
+    <rect x="415" y="200" width="90" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="460" y="222" text-anchor="middle" style="fill:var(--ink)">Dead letters</text>
+    <line x1="90" y1="122" x2="113" y2="122" marker-end="url(#in5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="245" y1="122" x2="268" y2="122" marker-end="url(#in5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="330" y1="70" x2="330" y2="98" marker-end="url(#in5-arrow)" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <line x1="390" y1="122" x2="413" y2="122" marker-end="url(#in5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="505" y1="122" x2="528" y2="122" marker-end="url(#in5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <path d="M 580 154 Q 580 200 245 160" marker-end="url(#in5-arrow)" style="fill:none;stroke:var(--accent);stroke-dasharray:4 3"/>
+    <text x="420" y="186" style="fill:var(--accent)">heartbeats, results</text>
+    <line x1="560" y1="154" x2="505" y2="210" marker-end="url(#in5-arrow)" style="fill:none;stroke:var(--crit)"/>
+  </g>
+</svg>
+<figcaption>The pipeline: jobs are stored with an index on their next run time; each partition has exactly one dispatcher at a time (by lease); due runs go to priority queues; workers claim runs with leases, heartbeat, and write results with a fencing token. Runs that keep failing go to dead letters.</figcaption>
+</figure>
+<p>The rest of the lesson fills in each box. The guiding principle to carry through: <strong>assume every step can happen twice, and make it harmless when it does</strong>.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–18</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">18–26</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">26–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> Create, update, pause and delete jobs. A job is either one-off (run at a time) or recurring (cron expression plus time zone). A job names what to run — an HTTP endpoint to call, a container image, or a task type that registered workers understand — and its payload. Per-job policies: retries and backoff, timeout, concurrency (may two runs of this job overlap?), misfire handling, priority. Query run history and status. Run on demand ("run now").</p>
+<p><strong>Non-functional.</strong> Runs start within a few seconds of their scheduled time under normal load. <strong>No silently missed runs</strong>: if a run can't start, it is retried or reported. <strong>No harmful double runs</strong>: execution is at-least-once, with tools that make duplicates harmless. Scale to tens of millions of jobs and thousands of runs per second. No single point of failure; a dispatcher failure costs seconds. Fair sharing between tenants.</p>
+<p><strong>Clarifying questions.</strong> "How precise must start times be — second, minute?" (Minute precision is far cheaper.) "Are jobs idempotent, or must the scheduler try hard to avoid double execution?" "Who runs the work — our worker fleet, or do we just call the user's endpoint?" "How long do runs take — seconds or hours?" Long runs change the lease and checkpoint design.</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Scenario: a platform scheduler for an AI product: <strong>50 million one-off runs a day</strong> (reminders, delayed emails, retries, scheduled agent tasks) plus <strong>1 million recurring jobs</strong>, most running daily.</p>
+<p><strong>Launch rate.</strong> One-off: 50 × 10<sup>6</sup> ÷ 86,400 ≈ <strong>580 runs/s</strong> on average. Recurring daily jobs add 1 × 10<sup>6</sup> ÷ 86,400 ≈ 12/s if spread evenly — but they are not spread evenly. If 30% of them say "midnight UTC", that is 300,000 runs in the minute 00:00: 300,000 ÷ 60 = <strong>5,000 runs/s</strong>, nearly ten times the average, all hitting whatever those jobs query. Spread over the hour with hashed minutes, the same 300,000 runs are 300,000 ÷ 3,600 ≈ <strong>83/s</strong>. That one number justifies the "spread the herd" deep dive.</p>
+<p><strong>Workers, by Little's law.</strong> The number of runs in progress equals the start rate times the average duration. At 580 runs/s averaging 30 s: 580 × 30 = <strong>17,400 concurrent runs</strong>. If one worker host runs 20 at once, that is 870 hosts before headroom. Note the lever: halving average duration halves the fleet without changing the launch rate.</p>
+<p><strong>Store writes.</strong> Each run is written several times: created, claimed, heartbeats, completed. Heartbeats every 10 s for 17,400 running runs: 1,740 writes/s. Claims and completions: 2 × 580 = 1,160/s. Creations: 580/s. Total around <strong>3,500 writes/s</strong> on average — modest for a partitioned database, but enough that one unpartitioned table with a hot index on <code>next_run_at</code> would struggle at the midnight peak.</p>
+<p><strong>Storage.</strong> Job definitions: 51 million × ~1 KB = 51 GB. Run history: 51 million runs/day × ~300 bytes = 15 GB/day; 30 days = 450 GB, kept in a time-partitioned table so old days are dropped whole.</p>
+<p><strong>Dispatcher scanning.</strong> 256 partitions, each holding ~200,000 jobs. Each partition's dispatcher reads only the runs due in the next minute: 580 × 60 ÷ 256 ≈ 136 runs per partition per minute on average. In-memory, that's trivial.</p>
+
+<h4>3 · API</h4>
+<pre>POST   /v1/jobs
+{
+  "job_id": "inbox-summary-u42",          # caller-chosen, makes creation idempotent
+  "schedule": {"cron": "0 8 * * 1-5", "time_zone": "Australia/Sydney"},
+                                          # or {"at": "2026-10-03T09:00:00Z"}
+  "target": {"type": "http", "url": "https://agents.internal/run", "timeout_s": 300},
+  "payload": {"user_id": "u42", "task": "summarise_inbox"},
+  "retry": {"max_attempts": 5, "backoff": "exponential", "base_s": 10},
+  "concurrency": "forbid",                # allow | forbid | replace
+  "misfire": {"policy": "run_once", "starting_deadline_s": 3600},
+  "priority": "normal", "tenant": "t_17"
+}
+PATCH  /v1/jobs/{id}          # change schedule or payload; pause / resume
+DELETE /v1/jobs/{id}
+POST   /v1/jobs/{id}:run      # run now (gets its own run ID)
+GET    /v1/jobs/{id}/runs     # history: scheduled_at, started, finished, attempts, status
+
+# worker side
+claim(worker_id, queues)               -&gt; run_id, scheduled_at, payload, lease_until, fence
+heartbeat(run_id, fence)               -&gt; new lease_until | LOST
+complete(run_id, fence, status, result) -&gt; ok | STALE</pre>
+<p>Each run is delivered to the job's target with its <strong>run ID</strong> — <code>(job_id, scheduled_at)</code> — so the target can use it as an idempotency key. Heartbeat and completion carry the <strong>fence</strong> number; a stale worker learns from <code>LOST</code> or <code>STALE</code> that someone else now owns the run.</p>
+
+<h4>4 · Data model</h4>
+<ul>
+<li><strong>jobs</strong>(job_id PK, tenant, schedule, time_zone, target, payload, policies, paused, next_run_at, version) — partitioned by hash(job_id) into 256 partitions.</li>
+<li><strong>runs</strong>(job_id, scheduled_at, state, attempt, worker_id, lease_until, fence, started_at, finished_at, error) with primary key (job_id, scheduled_at) — the uniqueness that makes run creation idempotent. States: <code>pending → claimed → running → succeeded | failed → retry_wait | dead</code>.</li>
+<li><strong>due index</strong> per partition: (partition, minute bucket, job_id) for runs to create or start in that minute.</li>
+<li><strong>partition owners</strong> in the coordination service: partition → dispatcher instance, with a lease and an epoch.</li>
+</ul>
+<p>Because <code>runs</code> has the primary key (job_id, scheduled_at), "create the 09:00 run of job X" can be attempted any number of times by any number of dispatchers and only one row results. That single constraint removes a whole class of double-launch bugs.</p>
+
+<h4>5 · High-level architecture</h4>
+<p><strong>The API</strong> validates schedules, computes the first <code>next_run_at</code> in the job's time zone, and writes the job. <strong>Dispatchers</strong> each own a set of partitions, assigned by leases from a coordination service such as etcd or ZooKeeper (the subject of in8; for now, a small replicated service that hands out leases and guarantees one holder at a time). Every few seconds, a dispatcher loads the runs due in the next few minutes for its partitions into an in-memory timer structure. When a run's time arrives, it inserts the run row (idempotently), advances the recurring job's <code>next_run_at</code>, and publishes the run to a <strong>run queue</strong> for its priority and tenant. <strong>Workers</strong> claim runs from the queues, take a lease on the run row with a new fence number, execute, heartbeat, and complete. A <strong>reaper</strong> in each dispatcher finds runs whose lease expired without completion and puts them back in the queue (or into retry_wait or dead letters according to policy). <strong>History and metrics</strong> come from the runs table and a stream of state changes.</p>
+<p>Why a queue between dispatchers and workers at all? It decouples finding due work from doing it, absorbs bursts (the 00:00 spike waits in the queue, not in the dispatcher), and lets worker pools for different priorities or tenants scale independently. Dropbox's Async Task Framework has the same shape — a task store, a "store consumer" that polls it for ready tasks and pushes them onto queues (Amazon SQS), executors, and a controller that serves claim, heartbeat and result calls.</p>
+
+<h4>6 · Deep dive: finding due runs without scanning everything</h4>
+<p>The naive query <code>SELECT * FROM jobs WHERE next_run_at &lt;= now()</code>, run every second, scans an index over 51 million rows and puts every dispatcher on the same hot index. Three ideas make it cheap. <strong>Partition</strong> the index by hash of job ID, so each dispatcher reads only its partitions. <strong>Bucket by time</strong>: store due entries under a minute key, so "what's due in 14:07" is a direct lookup of one bucket per partition. And <strong>look ahead into memory</strong>: every 30 seconds, load the next few minutes' entries into an in-memory structure that fires each one at its exact second.</p>
+<p>That structure is a min-heap keyed by time (insert and pop in O(log n)) or a <strong>timing wheel</strong>: a circular array of, say, 60 one-second slots, each holding a list of timers due in that second, with a pointer that advances once per second. Inserting is O(1) — put it in slot <code>(due_second mod 60)</code> — and firing is "take everything in the current slot". Timers further than 60 s away either go in a coarser second wheel (minutes) or stay in the store until a later look-ahead loads them. Varghese and Lauck's 1987 paper introduced hashed and hierarchical timing wheels for exactly this problem — many timers, mostly cancelled or far away — and they are used in operating-system kernels and network libraries for timeouts.</p>
+<p>A run created for "in 5 seconds" must not wait for the next look-ahead, so the API also sends it straight to the owning dispatcher, which inserts it into the in-memory wheel. The store remains the source of truth: if the dispatcher crashes, its successor reloads from the store and loses nothing.</p>
+
+<h4>7 · Deep dive: one dispatcher per partition</h4>
+<p>If two dispatchers both believe they own partition 17, both will create and publish its runs. Ownership therefore comes from a <strong>lease</strong> in the coordination service: dispatcher D1 holds "partition 17, epoch 42, expires 14:07:30" and renews it every few seconds. If D1 dies, the lease expires and D2 acquires it with epoch 43, reloads partition 17's look-ahead from the store, and continues. Takeover time is roughly the lease duration plus reload time — a few seconds to tens of seconds.</p>
+<p>The danger is the same one as for workers: D1 might be paused, not dead, and resume believing it still owns partition 17. Two defences, layered. The run row's primary key (job_id, scheduled_at) means both dispatchers can try to create the 14:07 run but only one row exists; the loser's insert fails and it does nothing more for that run. And writes from a dispatcher carry its epoch, and the store rejects writes with an epoch lower than the partition's current one — a fencing token for dispatchers. Google's cron states the requirement bluntly: "as soon as it loses its leadership for any reason, it must immediately stop interacting with the datacenter scheduler", because otherwise "the old and new leaders might perform conflicting actions".</p>
+
+<h4>8 · Deep dive: worker leases, heartbeats and at-least-once</h4>
+<p>When a worker claims a run, it writes, atomically: <code>state = running, worker = W7, lease_until = now + 30 s, fence = fence + 1</code>. The lab does this as a single SQL <code>UPDATE … RETURNING</code> that picks the oldest due run that is either pending or whose lease has expired — atomic, so two workers can't claim the same run in the same instant. The worker then heartbeats every 10 s, extending <code>lease_until</code>; three missed heartbeats and the lease lapses. The reaper, or the next claim query, treats an expired lease as "worker presumed dead" and the run becomes claimable again, with attempt + 1.</p>
+<p>That is <strong>at-least-once execution</strong>: a run is never silently lost, because any run without a live lease gets retried. The cost is the unavoidable ambiguity. If worker W7 crashed after charging the customer but before calling <code>complete</code>, the retry charges again — unless the job is idempotent.</p>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Timeline: worker A claims with fence 7 and pauses past its lease; worker B claims with fence 8 and completes; A wakes and its write with fence 7 is rejected">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="60" y1="210" x2="620" y2="210" style="fill:none;stroke:var(--line-2)"/>
+    <text x="60" y="230" style="fill:var(--muted)">t=0</text>
+    <text x="230" y="230" style="fill:var(--muted)">t=30 s lease ends</text>
+    <text x="520" y="230" style="fill:var(--muted)">t=55 s</text>
+    <text x="10" y="64" style="fill:var(--ink);font-weight:600">A</text>
+    <rect x="60" y="50" width="40" height="20" style="fill:var(--s1);opacity:0.6"/>
+    <text x="80" y="44" text-anchor="middle" style="fill:var(--ink-2)">claim, fence 7</text>
+    <rect x="100" y="50" width="440" height="20" style="fill:var(--crit);opacity:0.18"/>
+    <text x="320" y="64" text-anchor="middle" style="fill:var(--crit)">GC pause — no heartbeats</text>
+    <rect x="540" y="50" width="20" height="20" style="fill:var(--s1);opacity:0.6"/>
+    <text x="560" y="94" text-anchor="end" style="fill:var(--crit)">write(fence 7) → REJECTED</text>
+    <text x="10" y="144" style="fill:var(--ink);font-weight:600">B</text>
+    <rect x="240" y="130" width="40" height="20" style="fill:var(--s2);opacity:0.6"/>
+    <text x="260" y="124" text-anchor="middle" style="fill:var(--ink-2)">claim, fence 8</text>
+    <rect x="280" y="130" width="100" height="20" style="fill:var(--s2);opacity:0.3"/>
+    <text x="330" y="144" text-anchor="middle" style="fill:var(--ink)">run job</text>
+    <rect x="380" y="130" width="20" height="20" style="fill:var(--good)"/>
+    <text x="390" y="174" text-anchor="middle" style="fill:var(--good)">write(fence 8) → ok; store remembers 8</text>
+    <line x1="230" y1="40" x2="230" y2="210" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+  </g>
+</svg>
+<figcaption>Why a lease alone isn't mutual exclusion: A's lease expired during a pause, B legitimately took over, and A woke up still believing it owned the run. The fencing token makes the store, not the workers, decide: it accepts fence 8 and rejects the late fence 7.</figcaption>
+</figure>
+
+<h4>9 · Deep dive: fencing tokens and idempotent jobs</h4>
+<p>Martin Kleppmann's well-known essay on distributed locking describes the failure precisely: a client acquires a lease, pauses (garbage collection, a stalled VM, page faults, a network delay) for longer than the lease, another client acquires it, and the first resumes and writes, "believing that it still holds the lock". No choice of lease length prevents this, because pauses can be arbitrarily long. The fix moves the check to the resource being protected: every lease grant comes with a <strong>fencing token</strong> that strictly increases, every write carries it, and the storage rejects a write whose token is lower than the highest it has already accepted. In the lab, the stale worker's completion with fence 7 is rejected after the new worker completed with fence 8: 24 stale completions rejected, 0 duplicate side effects.</p>
+<p>Fencing needs the downstream system to check tokens, which you control only for your own databases. For external systems — a payment API, an email provider — the alternative is <strong>idempotency by run ID</strong>: pass <code>(job_id, scheduled_at)</code> as the idempotency key on the payment call, or upsert results keyed by run ID. In the lab's third mode, an idempotent sink ignores the second application of the same run: also 0 duplicates. Google's cron chapter states the same requirement for the launch itself: either all operations on external systems that may need to be continued after a leader change must be idempotent, or their state must be lookupable, and its recommended trick is to "construct job names ahead of time" including the scheduled launch time, so a new leader can simply look up which named jobs already exist and launch only the missing ones.</p>
+<p>Some jobs are naturally idempotent (rebuild a report from scratch, delete expired sessions). Some are not (send a newsletter, charge a card). For the second kind, the scheduler can only reduce the probability of a double run (heartbeats, sensible lease lengths, fencing); the job must remove the consequence.</p>
+
+<h4>10 · Deep dive: retries, misfires, overlaps and time zones</h4>
+<p><strong>Retries.</strong> A failed run (error, timeout) is retried with exponential backoff — 10 s, 20 s, 40 s… with jitter — up to <code>max_attempts</code>, then marked dead and copied to a dead-letter queue with its error history, and the job's owner is alerted. Distinguish failure kinds: a 400-type error from the target (bad payload) won't succeed on retry; a timeout or 503 might.</p>
+<p><strong>Misfires.</strong> If the scheduler or the worker pool was down at the scheduled time, the run is late. Each job has a <strong>starting deadline</strong>: within it, run late; beyond it, skip and record a missed run. For recurring jobs that missed several times, the policy decides between running once to catch up, running every missed time in order, or skipping all. Kubernetes CronJob is a concrete reference: it skips a run that misses its <code>startingDeadlineSeconds</code>, and if a CronJob has missed more than 100 schedules it refuses to start and logs "too many missed start times", forcing an operator decision rather than launching a flood.</p>
+<p><strong>Overlaps.</strong> If the 01:00 run is still going at 02:00: <em>allow</em> both (fine for independent work), <em>forbid</em> the new one (skip it), or <em>replace</em> the old one (cancel and start fresh). Implement forbid with a per-job "running" marker checked when creating the run.</p>
+<p><strong>Time zones and daylight saving.</strong> Store each recurring job's IANA time-zone name (the standard names from the Internet Assigned Numbers Authority's time-zone database) (such as <code>Australia/Sydney</code>), compute the next run in local time, then convert to UTC for storage. Daylight-saving transitions create two edge cases. In the spring, local clocks jump from 02:00 to 03:00, so a job at 02:30 has no 02:30 that day — choose a rule (usually run at the first valid time after) and document it. In the autumn, 01:00–02:00 happens twice, so a job at 01:30 could run twice — record the last run in UTC and run only the first occurrence. Jobs that must run at fixed intervals regardless of local time ("every 6 hours") should be scheduled in UTC.</p>
+
+<h4>11 · Deep dive: spreading the midnight herd</h4>
+<p>People write <code>0 0 * * *</code> because midnight is the obvious default, not because the job needs it. The estimate showed what that does: 300,000 runs in one minute instead of 83 per second. Google's cron chapter describes the same problem — "what if 30 different teams decide to run a daily cron job like this, in the same datacenter?" — and its solution: an extension to the crontab format where a question mark means "any value is acceptable", and the system chooses one "by hashing the cron job configuration over the given time range", so different jobs land at different but stable times. The lab hashes 30 job names into minutes of the hour: instead of 30 launches in minute 0, the busiest minute has 3. Two other levers complement it: per-tenant and per-target rate limits on dispatch, and run queues that absorb a spike so workers drain it at a steady rate.</p>
+
+<h4>12 · A worked trace: one run, end to end</h4>
+<p>Follow job <code>inbox-summary-u42</code>, scheduled <code>0 8 * * 1-5</code> in <code>Australia/Sydney</code>. On Thursday 1 October 2026 at 07:57:30 Sydney time (21:57:30 UTC on Wednesday; Sydney is UTC+10 until daylight saving starts on 4 October), dispatcher D3, which holds the lease for partition 117 with epoch 12, runs its look-ahead and loads the next three minutes of due entries for its partitions, including this job's 08:00 run. At 08:00:00 the timing wheel fires. D3 inserts the run row (<code>inbox-summary-u42</code>, 2026-09-30T22:00:00Z) with state <code>pending</code>, carrying epoch 12 — had another dispatcher already inserted it, the primary key would reject the insert and D3 would stop here. In the same transaction it computes the next run, Friday 08:00 Sydney, and stores it as the job's <code>next_run_at</code>. It publishes the run to the normal-priority queue for tenant t_17.</p>
+<p>At 08:00:01 worker W7 claims it: <code>state = running, lease_until = 08:00:31, fence = 1</code>. It calls the agent endpoint with the run ID as idempotency key. At 08:00:11 and 08:00:21 it heartbeats, extending the lease each time. Suppose the worker's host loses power at 08:00:25. No heartbeat arrives; at 08:00:51 the lease is 20 s expired, the reaper sees it and returns the run to the queue with attempt 2. Worker W12 claims it at 08:00:52 with fence 2, calls the agent endpoint with the <em>same</em> run ID — the agent service sees it already started this run and either resumes or returns the existing result — and completes with fence 2 at 08:01:40. The run is recorded as succeeded on attempt 2, start delay 1 s, total latency 100 s. If W7 had not died but merely paused and later tried to complete with fence 1, the store would answer <code>STALE</code>.</p>
+<p>Every step in that trace is either a conditional write keyed by the run's identity or a lease with a fence. That is the pattern to reproduce on the whiteboard: it's what makes each step safe to repeat.</p>
+
+<h4>13 · Failure modes and trade-offs</h4>
+<p><strong>Dispatcher crash:</strong> its partitions' leases expire; others take over within seconds and reload from the store; runs due in the gap start late but within their deadlines. <strong>Worker crash:</strong> leases expire, runs retry. <strong>Coordination service unavailable:</strong> existing lease holders keep their partitions until expiry, then must stop; dispatch pauses, misfire policies apply afterwards — this is why the coordination service needs its own high availability. <strong>Job store slow:</strong> heartbeats fail, leases expire on healthy workers, duplicates rise; keep heartbeats cheap and on a separate path from the job's own work. <strong>A runaway job type</strong> that fails constantly and retries: per-job retry caps and dead letters stop it consuming the fleet. <strong>Clock skew</strong> between machines: lease expiry compares times from different clocks; use the store's clock for lease decisions, or make leases long relative to expected skew.</p>
+<p><strong>The trade-offs to state in the close:</strong> at-least-once execution plus idempotent jobs instead of an impossible exactly-once; short leases for fast recovery against more false takeovers; skip versus catch-up per job; minute precision and spreading for efficiency against "exactly at 00:00"; and a central coordination dependency in exchange for clean partition ownership.</p>
+</section>
+
+<section data-field="deep">
+<h4>Recording a launch before doing it</h4>
+<p>Google's design teaches the most important ordering rule in this system. Its cron leader announces "about to launch run X at scheduled time T" to a quorum of replicas through Paxos, and only after that write succeeds does it launch; afterwards it records "launch finished" the same way. Followers track the set of <em>open launches</em> — started but not finished. If the leader dies, the new leader resolves each open launch: look it up by its precomputed name in the datacenter scheduler, or re-issue it idempotently. Had the leader launched first and recorded second, a crash between the two would leave no trace, and the new leader would launch again. The same rule applies to our dispatchers and workers: write the intent (the run row, the claim with its fence) durably before the side effect, and make the side effect findable or idempotent by the identity in that record.</p>
+
+<h4>Skipping versus double-running is a per-job policy, but have a default</h4>
+<p>The SRE chapter states Google's default: "we favor skipping launches rather than risking double launches, as much as the infrastructure allows", because "recovering from a skipped launch is more tenable than recovering from a double launch". A skipped garbage-collection run fixes itself next time; a double payroll run needs a finance team. But a skipped monthly payroll is also bad, which is why owners "can (and should!)" monitor their jobs' effects. In our design, the default for non-idempotent jobs is at-most-once-ish behaviour (no automatic retry after an ambiguous crash; alert instead), and for idempotent jobs it's at-least-once with retries. Expose this as a job setting with a sensible default rather than one global answer.</p>
+
+<h4>Lease length, heartbeat interval and false takeovers</h4>
+<p>A short lease recovers quickly from real crashes but takes over from live-but-slow workers more often; a long lease does the opposite. Choose the heartbeat interval so several heartbeats fit in a lease (e.g. 10 s heartbeats, 30 s lease) and one lost packet or slow write doesn't cause a takeover. Then watch the false-takeover rate: runs where the original worker later tried to complete with a stale fence. If it rises, something is pausing workers (GC, CPU throttling in containers) or delaying heartbeats (an overloaded store). For long-running jobs, heartbeats should also report progress, so the scheduler can distinguish "alive and progressing" from "alive but stuck" and kill truly stuck runs.</p>
+
+<h4>Long, expensive runs need checkpoints, not restarts</h4>
+<p>A 6-hour data export or a fine-tuning run that is retried from scratch after a failure at hour 5 wastes 5 hours. Long jobs should checkpoint progress keyed by run ID, and a retry should resume from the last checkpoint. That changes idempotency from "do nothing if done" to "continue from where it stopped", and makes the fencing token even more important: two workers resuming the same checkpoint would corrupt it. GPU workloads add gang scheduling (all the accelerators a run needs, at once, or none) and preemption by higher-priority work, which a general-purpose scheduler usually delegates to a cluster manager (Kubernetes with a batch scheduler, Slurm) while still owning "when" and "how many times".</p>
+
+<h4>Fairness and isolation between tenants</h4>
+<p>A shared scheduler is a multi-tenant system. One tenant creating 5 million runs for 09:00 would otherwise fill every queue and delay everyone else. Give each tenant its own queue (or a virtual queue in a shared one), and have workers pull with weighted fair queuing: in each round, each tenant with pending runs gets a number of slots proportional to its weight. Cap per-tenant concurrency so one tenant's slow target doesn't absorb all workers, and rate-limit dispatch to each target endpoint so the scheduler doesn't become a denial-of-service tool against its own users' services. Dropbox's ATF builds similar isolation by giving each task type its own queues and executor pools.</p>
+
+<h4>Observability: alert on absence</h4>
+<p>The most dangerous scheduler failure produces no error: the run simply never happens. Every job needs a "last successful run" timestamp and an alert when it exceeds the expected interval plus slack — the "dead man's switch" pattern. Scheduler-level metrics should compare <em>scheduled</em> against <em>started</em> per minute (the gap is misfires), measure start delay percentiles (scheduled time to claim), and track false takeovers, retries per job type, dead-letter growth and queue age per tenant. In the existing drill below, neither the slow billing run nor the midnight burst would have tripped an error alert; both would show up in these.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: Google's distributed cron</h4>
+<p>Chapter 24 of Google's <em>Site Reliability Engineering</em> book describes how Google turned cron into a datacenter service. It starts from the single-machine case — crond, where "the only state that needs to persist across crond restarts … is the crontab configuration itself" and launches are fire-and-forget — and from the observation that cron jobs differ wildly: some, like garbage collection, are idempotent and can run twice; others, like "a process that sends out an email newsletter", must not; a five-minutely garbage-collection job may skip a launch, a monthly payroll job may not.</p>
+<p>The design keeps the small amount of cron state inside the service itself rather than in a general distributed filesystem, because "small writes on a distributed filesystem are very expensive" and because a foundational service "should have very few dependencies". Multiple replicas run the Paxos consensus protocol; "as long as the majority of group members are available", the service keeps working. A single leader — the same replica that leads the Paxos group — is "the only replica that can modify the shared state, as well as the only replica that can launch cron jobs". If it dies, health checking notices "within seconds", and a new leader takes over "well within a generally tolerable one-minute failover time".</p>
+<p>Each launch is identified by job and scheduled start time, "otherwise, ambiguity in cron job launch tracking may occur", especially for jobs that run every minute. The leader synchronously informs a quorum of the start and end of every launch, and "the actual cron job launch does not proceed until it receives confirmation that the Paxos quorum has received the launch notification". Followers track open launches, and after failover "all open launches (i.e., partial failures) must be concluded" — using idempotent operations or by looking up the state of jobs whose names were constructed ahead of time and include the scheduled launch time.</p>
+<p>Storage is pragmatic: Paxos logs and snapshots on the local disks of the three replicas, with snapshots also backed up to a distributed filesystem; losing all three machines means restoring the last snapshot and losing only the logs since. And the thundering herd is handled with the '?' crontab extension that hashes each job's configuration to choose a time. The chapter notes that even after that change, cron-driven load remained spiky — a reminder that spreading helps but doesn't replace capacity planning.</p>
+<p>A second public design worth comparing is Dropbox's Async Task Framework, which reported serving 9,000 async tasks per second for 28 engineering teams, with explicit guarantees of at-least-once execution and "no concurrent task execution", implemented with a heartbeat-and-status controller that re-enqueues tasks whose heartbeats stop.</p>
+
+<h4>What goes wrong, and what to watch</h4>
+<p><strong>Silent misses</strong> after a deploy or failover — watch scheduled-versus-started per minute and per-job last-success age. <strong>Double runs</strong> from false takeovers — watch stale-fence rejections; a rise means pauses or a slow store. <strong>Midnight and top-of-hour spikes</strong> — watch start-delay percentiles by minute of the hour. <strong>Retry storms</strong> when a popular target goes down — every job calling it fails and retries; per-target circuit breakers and capped retries contain them. <strong>Time-zone bugs</strong> twice a year — test schedules across DST transitions for the zones you serve. <strong>Unbounded history tables</strong> — partition run history by day and drop old partitions.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> see at-least-once execution emerge from leases, and compare three ways of handling the resulting double runs: no protection, fencing tokens checked by the store, and an idempotent sink. Then spread a midnight herd with hashed minutes. Python 3.12, standard library only (SQLite 3.35+ for <code>RETURNING</code>; Python 3.12 bundles a newer SQLite), about a second.</p>
+<pre>"""Job leases with expiry, at-least-once execution and fencing tokens, on SQLite.
+Workers crash or pause; leases expire; jobs are re-run; fencing rejects the
+stale worker's result. Python 3.12 stdlib only (sqlite3 with RETURNING)."""
+import random, sqlite3, zlib
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE jobs (id INTEGER PRIMARY KEY, run_at INT, state TEXT DEFAULT 'queued',
+                   lease_until INT DEFAULT 0, fence INT DEFAULT 0, attempts INT DEFAULT 0);
+CREATE TABLE effects (job_id INT, fence INT);          -- the job's side effect
+""")
+db.executemany("INSERT INTO jobs (id, run_at) VALUES (?, ?)", [(i, i // 10) for i in range(1000)])
+LEASE, WORK = 30, 10                                   # seconds
+
+def claim(now):                                        # one atomic statement
+    return db.execute("""
+        UPDATE jobs SET state='running', lease_until=?, fence=fence+1, attempts=attempts+1
+        WHERE id = (SELECT id FROM jobs WHERE run_at &lt;= ? AND
+                    (state='queued' OR (state='running' AND lease_until &lt; ?))
+                    ORDER BY run_at, id LIMIT 1)
+        RETURNING id, fence""", (now + LEASE, now, now)).fetchone()
+
+def complete(job_id, fence, mode):
+    if mode == "fencing":                              # storage accepts only the current token
+        if db.execute("UPDATE jobs SET state='done' WHERE id=? AND fence=? AND state='running'",
+                      (job_id, fence)).rowcount != 1:
+            return "rejected stale token"
+    else:
+        db.execute("UPDATE jobs SET state='done' WHERE id=?", (job_id,))
+    if mode == "idempotent sink" and db.execute(
+            "SELECT 1 FROM effects WHERE job_id=?", (job_id,)).fetchone():
+        return "skipped: already applied"
+    db.execute("INSERT INTO effects VALUES (?, ?)", (job_id, fence))
+    return "applied"
+
+def simulate(mode, seed=5):
+    rng, workers, outcomes = random.Random(seed), [None] * 20, {}
+    db.execute("UPDATE jobs SET state='queued', lease_until=0, fence=0, attempts=0")
+    db.execute("DELETE FROM effects")
+    for now in range(700):
+        for w in range(len(workers)):
+            job = workers[w]
+            if job and now &gt;= job[2]:                  # finished (or woke from a pause)
+                r = complete(job[0], job[1], mode)
+                outcomes[r] = outcomes.get(r, 0) + 1
+                workers[w] = job = None
+            if job is None and (c := claim(now)):
+                fate = rng.random()
+                if fate &lt; 0.03:   workers[w] = None    # crashes: lease will expire
+                elif fate &lt; 0.05: workers[w] = (*c, now + WORK + 45)   # long GC pause
+                else:             workers[w] = (*c, now + WORK)
+    done = db.execute("SELECT COUNT(*) FROM jobs WHERE state='done'").fetchone()[0]
+    retried = db.execute("SELECT COUNT(*) FROM jobs WHERE attempts &gt; 1").fetchone()[0]
+    dup = db.execute("SELECT COUNT(*) FROM (SELECT job_id FROM effects GROUP BY job_id "
+                     "HAVING COUNT(*) &gt; 1)").fetchone()[0]
+    return done, retried, dup, outcomes
+
+for mode in ("no protection", "fencing", "idempotent sink"):
+    done, retried, dup, outcomes = simulate(mode)
+    print(f"{mode:15}: done {done}/1000, run &gt;1 time {retried}, "
+          f"duplicate side effects {dup}, completions {outcomes}")
+
+# Spreading '0 0 * * *' with a hashed minute (Google's '?' extension).
+jobs = [f"team-{i}-daily-report" for i in range(30)]
+minutes = sorted(zlib.crc32(j.encode()) % 60 for j in jobs)
+print("all at 00:00 -&gt;", len(jobs), "launches in one minute; hashed -&gt; busiest minute has",
+      max(minutes.count(m) for m in set(minutes)), "launch(es)")</pre>
+<p><strong>Run it:</strong> save as <code>sched_lab.py</code> and run <code>python sched_lab.py</code>.</p>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li>All 1,000 jobs finish in every mode, even though 3% of claims crash and 2% pause for 55 s against a 30 s lease: expired leases make runs claimable again. That is at-least-once — 52 jobs ran more than once.</li>
+<li><strong>No protection:</strong> 22 jobs applied their side effect twice — every long pause whose job was re-run elsewhere.</li>
+<li><strong>Fencing:</strong> the store accepts completion only with the current fence number, so 24 stale completions are rejected and no side effect is duplicated.</li>
+<li><strong>Idempotent sink:</strong> the effect is keyed by job ID; the second application is skipped. Also 0 duplicates, without needing the store to know about leases.</li>
+<li>Thirty "daily at midnight" jobs hashed over the hour put at most 3 launches in any minute instead of 30 in one.</li>
+</ol>
+<p><strong>Try next:</strong> shorten the lease to 12 s (barely longer than the 10 s work) and watch false takeovers rise even without pauses once you add a little random work time; then add heartbeats that extend the lease every 5 s while working and see them fall again.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+    <p>A scheduler runs an hourly billing job with a 10-minute lease, renewed by heartbeat every 2 minutes. The job normally takes 6 minutes. One night the database is slow and the job takes 25 minutes. Separately, at 00:00 there are 48,000 jobs due simultaneously against a worker pool that can start 2,000 jobs/s.</p>
+    <p>(a) What happens to the slow billing job? (b) What happens at 00:00? (c) What do you change?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) The slow billing job.</strong> With heartbeat renewal working, nothing goes wrong — the worker renews every 2 minutes against a 10-minute lease, so the lease never expires and the job completes at 25 minutes. Heartbeating is what makes a short lease safe for a variable-duration job.</p>
+    <p>But consider what happens if the same database slowness that made the job slow also blocks the heartbeat, because heartbeats are written to the same database. The worker is alive and working, yet cannot renew. At 10 minutes the lease expires, another worker claims the job, and <strong>two workers are now billing the same customers concurrently</strong> — the exact failure the lease existed to prevent, caused by the lease mechanism itself.</p>
+    <p>The insight: <em>a lease detects unreachability, not death.</em> A partitioned or stalled worker is indistinguishable from a dead one. The defences are (i) make the job idempotent so a double run is harmless — use the run ID <code>(job_id, scheduled_time)</code> plus customer as a unique key on each charge; (ii) carry a fencing token on every side-effecting write and have the database reject writes from an older token (a "re-read the lease, then write" check is weaker, because the lease can be lost between the check and the write); and (iii) put the heartbeat on an independent path from the job's own database work so they don't fail together.</p>
+    <p><strong>(b) At 00:00.</strong> 48,000 jobs due at once against 2,000 starts/s means the last job starts <strong>24 seconds late</strong>. For most batch work that is irrelevant. The queue absorbs it and drains; nothing breaks.</p>
+    <p>The real risks are downstream: 48,000 jobs starting within 24 seconds all hitting the same database is a self-inflicted thundering herd, and any job with a tight deadline is now behind up to 48,000 others. Also note: if the lease is taken at <em>enqueue</em> time rather than <em>start</em> time, jobs waiting 24 seconds have already used 4% of a 10-minute lease before doing any work.</p>
+    <p><strong>(c) The changes, in order:</strong></p>
+    <ul>
+    <li><strong>Run IDs and idempotent jobs.</strong> This is the one that actually prevents double-billing, whatever the lease does. Every other fix reduces probability; this one removes consequence.</li>
+    <li><strong>Fencing tokens on side effects.</strong> Cheap, and it turns a double run into a clean rejection.</li>
+    <li><strong>Priority queues.</strong> Latency-sensitive jobs must not queue behind batch rollups — the same head-of-line problem as in the notification design.</li>
+    <li><strong>Spread the schedules.</strong> Most jobs don't need exactly <code>00:00</code>; hash them across the hour. This removes the burst at its source and protects the databases they query.</li>
+    <li><strong>Alert on absence.</strong> If billing hasn't succeeded in 2 hours, page someone. Neither failure above would have produced an error alert — the slow job eventually succeeded and the 00:00 jobs all ran. The double billing would have been discovered by customers.</li>
+    </ul>
+    <p><strong>The transferable lesson:</strong> distributed leases give you failover, not mutual exclusion. Anything that treats a lease as a guarantee of uniqueness — rather than as a heuristic backed by fencing and idempotency — will eventually run twice. Design the job so that is survivable, and the lease becomes an optimisation rather than a correctness dependency.</p></details>
+
+<b>Estimate it</b>
+    <p>Users can schedule an AI agent to run "every weekday at 08:00 local time". 2 million users have done so, spread over time zones roughly in proportion to population, but 40% are in one time zone. Each agent run takes 90 seconds on average and calls an LLM. How many runs are in flight at 08:00 in the big time zone, and what would you change?</p>
+    <details><summary>Answer</summary>
+    <p>40% of 2 million = 800,000 runs due at 08:00 in one zone. If all start within the first minute, that's 800,000 ÷ 60 ≈ 13,300 starts/s, and by Little's law about 13,300 × 90 ≈ <strong>1.2 million runs in flight</strong> at the peak, each holding an LLM request — far more than any sensible fleet or model quota. Spread over 08:00–08:15 (users rarely need the exact minute; offer "around 8"), starts fall to 800,000 ÷ 900 ≈ 890/s and in-flight runs to about 890 × 90 ≈ <strong>80,000</strong>. Better still, precompute: start runs from 07:30 so results are ready by 08:00 and delivered then, which turns the burst into a 30-minute ramp of about 440 starts/s and 40,000 in flight. Add per-tenant and global concurrency caps tied to the LLM rate limit, and queue the rest.</p></details>
+</section>

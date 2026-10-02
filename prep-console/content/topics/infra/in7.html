@@ -1,0 +1,384 @@
+<!-- topic source for infra/in7; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "in7",
+  "t": "Design an object storage service (S3, GFS)",
+  "tag": "Storage",
+  "sum": "Storing hundreds of petabytes of immutable blobs cheaply and durably: a bucket/key API with multipart upload, metadata separated from data, chunk placement across failure domains, replication versus erasure coding worked out by hand (3x versus RS(10,4) at 1.4x), repair traffic and durability nines, scrubbing, hot and warm tiers, strong read-after-write consistency, and Facebook's f4 cutting its replication factor from 3.6 to 2.1.",
+  "prereq": [
+    ["sc8", "Blob/object stores hold large immutable files cheaply; databases hold structured, queryable records."],
+    ["sc6", "Replication keeps copies on several machines so data survives failures."],
+    ["sc7", "Partitioning splits keys across machines; range partitioning keeps neighbours together and can split hot ranges."],
+    ["in2", "A distributed key-value store with consistent hashing, quorums and repair; the metadata service here is one."],
+    ["in6", "Delta encoding and compression exploit regular data; tiering by age follows the access pattern."],
+    ["sc1", "Back-of-envelope estimation with bytes, rates and failure counts."]
+  ],
+  "myths": [
+    ["Eleven nines of durability means three copies.", "Durability comes from how many independent failures a piece of data survives and how fast lost pieces are rebuilt. Erasure coding such as RS(10,4) survives any 4 lost fragments at 1.4x overhead, which can beat 3x replication's tolerance of 2 lost copies at 3x overhead. What breaks the nines in practice is correlated failure — a rack, a power event, a bad disk batch, a software bug — not independent disk deaths."],
+    ["Erasure coding is strictly better because it uses less space.", "It costs elsewhere. Rebuilding one lost fragment of RS(10,4) reads 10 fragments instead of 1 copy, so repair traffic is about 10 times higher; a read during a failure must reconstruct from many disks; small objects split into 14 pieces become tiny I/Os; and every write fans out to 14 disks. That's why hot and small data is often replicated and only warm, large data is erasure-coded."],
+    ["An object store is a file system you access over HTTP.", "There are no directories, no in-place updates, no appends and no partial writes: an object is written whole and replaced whole, keys are flat strings and 'folders' are just shared key prefixes. Those restrictions are what let it scale to trillions of objects."],
+    ["Object stores are eventually consistent, so you can't read your own writes.", "That was true of Amazon S3 for years, but since December 2020 S3 provides strong read-after-write consistency for PUTs and DELETEs of objects, including overwrites. Listing consistency, cross-region replication and caches in front of the store can still be stale."],
+    ["Deleting an object frees the space immediately.", "Data is usually packed into large immutable volumes or stripes. A delete removes the metadata entry (or, as in f4, destroys the object's encryption key), and space is reclaimed later by compaction or garbage collection that rewrites volumes."],
+    ["Metadata is the easy part; the bytes are the hard part.", "At 100 billion objects the metadata — key, size, checksum, location, version, ACL — is tens of terabytes in a strongly consistent, partitioned index that must handle every request, including LIST over prefixes. GFS's single master and S3's per-prefix request limits both come from metadata scaling."]
+  ],
+  "recap": [
+    "An object store keeps immutable blobs addressed by bucket and key, with a small API: PUT, GET (including byte ranges), DELETE, LIST by prefix, and multipart upload for large objects.",
+    "Metadata (key, size, checksum, version, location) lives in a partitioned, replicated, strongly consistent index; the bytes live on storage nodes in large chunks or volumes.",
+    "Chunks are placed across failure domains — disks, hosts, racks, zones — so one failure never takes out more than one piece of a stripe.",
+    "Replication with factor 3 tolerates 2 losses at 3x storage; Reed-Solomon RS(10,4) splits data into 10 fragments plus 4 parity and tolerates any 4 losses at 1.4x storage.",
+    "Erasure coding pays with repair traffic (rebuilding one fragment reads 10), degraded-read latency and write fan-out, so hot and small objects are often replicated and warm large objects erasure-coded.",
+    "Durability depends on failure rates, the number of losses tolerated and repair speed; independent-failure maths gives astronomically small loss probabilities, so correlated failures and bugs are what really threaten the nines.",
+    "Background processes scrub data with checksums, repair lost fragments, garbage-collect deleted data and move objects between hot, warm and cold tiers.",
+    "S3 documents 99.999999999% designed durability, strong read-after-write consistency, and at least 3,500 writes and 5,500 reads per second per partitioned prefix.",
+    "GFS showed the single-master design: metadata in one machine's memory, 64 MB chunks replicated three times, and clients reading data directly from chunk servers.",
+    "Facebook's f4 moved warm photos and videos from triple-replicated Haystack (3.6x with RAID-6) to RS(10,4) cells, reaching 2.8x with two copies and 2.1x with cross-region XOR, saving over 53 PB."
+  ],
+  "glossary": [
+    ["Bucket", "A named container of objects with its own settings such as region, versioning and access policy."],
+    ["Chunk (or block)", "A large fixed-size unit of stored data, for example 64 MB in GFS or 1 GB in f4, that is replicated or erasure-coded as a whole."],
+    ["Durability", "The probability that stored data is not lost over a period, often quoted as a number of nines per year."],
+    ["Effective replication factor", "Raw bytes stored divided by logical bytes, including all copies, parity and RAID overhead."],
+    ["Erasure coding", "Adding computed parity fragments to data fragments so the original can be rebuilt from any sufficient subset."],
+    ["Failure domain", "A set of components that can fail together, such as a disk, host, rack, power circuit or availability zone."],
+    ["Fragment (shard)", "One of the pieces of an erasure-coded stripe, either data or parity."],
+    ["Garbage collection (storage)", "Reclaiming space from deleted or overwritten objects by rewriting the volumes that hold them."],
+    ["LRC", "Local Reconstruction Code: an erasure code with extra local parities so a single lost fragment is rebuilt from a small group rather than all data fragments."],
+    ["Metadata service", "The index that maps bucket and key to object properties and the locations of its chunks."],
+    ["Multipart upload", "Uploading a large object as independently uploaded parts that are then committed as one object."],
+    ["Object", "An immutable blob of bytes plus metadata, addressed by bucket and key."],
+    ["Placement", "Choosing which storage nodes hold each chunk or fragment, respecting failure domains and balancing load and capacity."],
+    ["Read-after-write consistency", "After a successful write, every subsequent read returns that write (or a later one)."],
+    ["Reed-Solomon code", "An erasure code RS(n, k) that turns n data fragments into n + k fragments, any n of which reconstruct the data."],
+    ["Repair (rebuild)", "Recreating lost replicas or fragments from surviving ones to restore full redundancy."],
+    ["Scrubbing", "Periodically reading stored data and verifying checksums to find silent corruption before it is needed."],
+    ["Stripe", "A group of data fragments and the parity fragments computed from them."],
+    ["Tiering", "Moving objects between storage classes (hot, warm, cold) by age or access to trade cost against latency."],
+    ["Versioning", "Keeping previous versions of an object when it is overwritten or deleted."],
+    ["XOR parity", "A parity fragment computed as the bitwise XOR of data fragments; it can rebuild any one lost fragment."],
+    ["AFR", "Annualised failure rate: the fraction of devices expected to fail in a year."]
+  ],
+  "qa": [
+    ["E", "How is an object store different from a file system?", "Objects are written and replaced whole, never modified in place or appended to; keys are flat strings, and directories are an illusion of shared prefixes; access is over HTTP with a small API. Dropping in-place updates and hierarchical directories is what lets it scale to trillions of objects across many machines.", "Follow-up: How would you 'rename a folder' with a million objects? — Copy and delete each object; there's no rename, which is why prefixes should be chosen carefully."],
+    ["E", "Why separate metadata from data?", "They have opposite shapes: metadata is small, read on every request, needs strong consistency and ranges for LIST; data is huge, written once and read in big sequential chunks. Separating them lets each be stored and scaled the right way, and lets clients fetch bytes directly from storage nodes.", "Follow-up: What was GFS's metadata design? — A single master holding all metadata in memory, with an operation log and checkpoints, and clients talking to chunk servers for data."],
+    ["E", "What does RS(10,4) mean?", "Reed-Solomon with 10 data fragments and 4 parity fragments per stripe: 14 fragments stored, any 10 of which rebuild the data. It tolerates any 4 lost fragments at 14 ÷ 10 = 1.4x storage, versus 3x for three replicas tolerating 2 losses.", "Follow-up: What does a degraded read cost? — Reading 10 surviving fragments and decoding, instead of reading one fragment."],
+    ["M", "Compare 3x replication and RS(10,4) for 60 PB of data.", "Replication needs 180 PB raw; RS(10,4) needs 84 PB, saving 96 PB of disks, power and racks. Replication tolerates 2 failures, RS 4. But RS repair reads 10 fragments per lost fragment, so rebuilding a 20 TB disk reads about 200 TB, and degraded reads and small-object writes are slower; that's why tiering puts hot and small data on replication.", "Follow-up: Which failures still threaten both? — Correlated ones: if placement puts two fragments in one rack, a rack failure counts twice."],
+    ["M", "How do you upload a 200 GB object reliably?", "Multipart upload: start an upload, send parts (S3 allows 5 MiB to 5 GiB each, up to 10,000 parts) in parallel, retry only failed parts, then commit with the list of parts and their checksums. The object appears atomically at commit; abandoned uploads are cleaned up by a lifecycle rule.", "Follow-up: What's the maximum object size that implies? — 10,000 × 5 GiB, about 48.8 TiB, which is S3's documented maximum."],
+    ["M", "How do you place fragments so a rack failure doesn't lose data?", "Spread each stripe's fragments over distinct failure domains: with 14 fragments over at least 14 racks, a rack loss costs at most one fragment per stripe. f4 cells use 14 racks of 15 hosts for exactly this. Also balance across disks so rebuild load spreads.", "Follow-up: And zone failures? — Either keep fragments across 3 zones (fewer per zone than parity count) or add a cross-zone layer such as f4's XOR of buddy volumes in a third region."],
+    ["M", "How does the store detect silent corruption?", "Store a checksum per chunk or fragment at write time, verify it on every read, and run background scrubbing that reads all data on a schedule and repairs fragments whose checksums fail. Clients can also send a checksum with the upload so corruption in transit is caught.", "Follow-up: Why scrub if reads already verify? — Cold data is rarely read; without scrubbing, two silent corruptions could accumulate in one stripe before anyone notices."],
+    ["M", "What partitions the metadata, and why does S3 talk about request rates per prefix?", "Metadata is range-partitioned by bucket and key so LIST by prefix is a range scan; partitions split automatically when they get hot. S3 documents at least 3,500 writes and 5,500 reads per second per partitioned prefix, so very high request rates are spread over several prefixes.", "Follow-up: Why not hash-partition keys? — Hashing balances load but turns every prefix LIST into a scatter-gather over all partitions."],
+    ["H", "Estimate how often disks fail in a 140 PB raw fleet and the repair traffic with RS(10,4).", "With 20 TB disks, 140 PB is 7,000 disks; at 2% AFR that's 140 failures a year, one every 2.6 days. Rebuilding a full 20 TB disk under RS(10,4) reads 10 × 20 = 200 TB, so about 77 TB per day on average across the cluster, roughly 0.9 GB/s continuously — fine spread across thousands of nodes, but it must be rate-limited and spread to avoid hurting reads.", "Follow-up: How do LRCs help? — With local parity groups of 6, a single lost fragment is rebuilt from about 6 fragments instead of 12, halving repair reads."],
+    ["H", "How would you implement strong read-after-write consistency?", "Make the metadata write the commit point: data fragments are written durably first, then the metadata record (with a new version) is committed in a strongly consistent, replicated index, and GETs always resolve the current version through that index. Caches in front of the metadata must be invalidated or versioned so they can't serve the previous entry.", "Follow-up: What remains eventually consistent? — Typically cross-region replication, some listing caches, and anything served from a CDN."],
+    ["H", "Small objects (4 KB thumbnails) are 70% of objects but 1% of bytes. How do you store them?", "Don't erasure-code or store each as its own file: pack many small objects into large append-only volumes (Haystack-style), keep an in-memory index from object ID to volume and offset, and replicate or erasure-code the volume as a whole. That keeps one disk seek per read and makes metadata per object tiny.", "Follow-up: How do deletes work then? — Mark deleted in the index or journal, and compact volumes in the background when enough of a volume is dead."],
+    ["H", "You're storing training datasets and model checkpoints (each checkpoint 500 GB, written every hour, read rarely, sometimes urgently after a crash). Design the storage policy.", "Write checkpoints with parallel multipart upload so a 500 GB write finishes in minutes, keep the most recent few in a hot replicated tier for fast restore, move older ones to erasure-coded warm storage and delete or archive beyond a retention window. Training data shards are read sequentially at high throughput by many GPUs, so keep them in large objects, cache locally, and spread across prefixes to avoid per-prefix limits.", "Follow-up: A restore needs 500 GB in under 5 minutes. — That's about 1.7 GB/s; use ranged GETs in parallel across many connections and nodes."]
+  ],
+  "refs": [
+    ["paper", "f4: Facebook's Warm BLOB Storage System (OSDI 2014)", "Muralidhar et al. — hot versus warm content, RS(10,4) cells across 14 racks, geo XOR, and the 3.6x → 2.8x → 2.1x numbers in this lesson.", "https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-muralidhar.pdf"],
+    ["paper", "The Google File System (SOSP 2003)", "Ghemawat, Gobioff and Leung — single master with in-memory metadata, 64 MB chunks, three replicas and chunk leases.", "https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf"],
+    ["paper", "Erasure Coding in Windows Azure Storage (USENIX ATC 2012)", "Huang et al. — Local Reconstruction Codes: 1.33x overhead with cheaper single-fragment rebuilds.", "https://www.usenix.org/system/files/conference/atc12/atc12-final181_0.pdf"],
+    ["docs", "Amazon S3 multipart upload limits", "Part sizes, part counts and the maximum object size.", "https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html"],
+    ["docs", "Amazon S3 performance guidelines", "Request rates per partitioned prefix and how to parallelise.", "https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html"],
+    ["docs", "Data protection in Amazon S3", "The 99.999999999% durability design target and how S3 verifies integrity.", "https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html"],
+    ["post", "Backblaze Vaults: zettabyte-scale cloud storage architecture", "A concrete 17 data + 3 parity layout across 20 storage pods.", "https://www.backblaze.com/blog/vault-cloud-storage-architecture/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Every product eventually accumulates bytes that aren't rows. A photo app stores billions of images in several sizes. A video service stores every upload and every transcoded rendition. A machine-learning team stores training datasets measured in petabytes and model checkpoints of hundreds of gigabytes each, written every hour. Logs, backups and database snapshots pile up behind every service. None of this fits in a database — it is too big, too binary and never queried by its contents — and a single file server runs out of disks, bandwidth and luck quickly.</p>
+<p>The first instinct is a big network file system. It fails at scale for reasons that are worth understanding. Directory trees with millions of entries become bottlenecks; in-place updates and appends require locking and consistency machinery across machines; and a file system wants to be one coherent namespace, which is hard to spread over thousands of servers. The second instinct, "keep three copies of everything", works but triples the hardware bill — and at hundreds of petabytes, a factor of three is the difference between one data centre and three.</p>
+<p>Object storage — Amazon S3, Google Cloud Storage, Azure Blob Storage, and internal systems like Facebook's Haystack and f4 — takes a deliberately narrower deal: objects are written whole, never modified, addressed by a flat key, and accessed over HTTP. That narrowness lets the system spread data over enormous fleets of cheap disks, protect it with erasure codes that cost a fraction of triple replication, and still promise that a stored object survives with probabilities quoted in "nines".</p>
+<p>This lesson designs an object store in interview order: requirements, estimates, API and data model, architecture, then deep dives into metadata, placement, replication versus erasure coding with the arithmetic done by hand, durability and repair, consistency, and tiering hot and warm data. It closes with Facebook's f4 paper, which documents exactly how much erasure coding saved on a real photo and video store, and a lab that computes the trade-offs and rebuilds a lost block from parity.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a coat check and a warehouse</h4>
+<p>Picture a huge coat check. You hand over a bag; the attendant gives you a ticket with a number. Later you hand back the ticket and get the bag. You can't open the bag on the shelf and swap one item — to change it you take it back and check in a new one. You don't care where in the building it's stored. That is an object store: <code>PUT</code> a blob under a key, <code>GET</code> it back by key, <code>DELETE</code> it, and nothing else touches the inside of an object.</p>
+<p>Behind the counter there are two very different operations. The <strong>ticket ledger</strong> records, for every ticket, what was checked, when, how big, and exactly which shelves it's on. It is small per entry but consulted for every single request, and it must never be wrong. The <strong>warehouse</strong> holds the bags themselves: enormous, cheap, rarely visited for most items. A large bag might be split across several shelves, and for safety the warehouse keeps either spare copies or something cleverer — enough "recovery information" on other shelves to reconstruct any bag even if a few shelves burn down.</p>
+<p>That split is the core of the architecture: a <strong>metadata service</strong> (the ledger) and <strong>storage nodes</strong> (the warehouse). Where the analogy breaks: a real object store has billions of tickets and thousands of shelves spread across buildings and cities, shelves fail every day, and "recovery information" turns out to be a precise mathematical construction — erasure coding — that can protect data at a fraction of the cost of copies.</p>
+
+<h4>Three ways to protect bytes</h4>
+<p><strong>Replication</strong> keeps N full copies on different machines. Three copies survive any two losses, and reading needs only one copy. It costs 3× the space. <strong>Parity</strong> stores, alongside k data blocks, one block that is the XOR of all of them; lose any one block and XOR the rest to get it back. It costs only (k + 1)/k, but tolerates one loss. <strong>Erasure coding</strong> generalises parity: Reed-Solomon RS(n, k) computes k parity fragments from n data fragments such that <em>any</em> n of the n + k fragments rebuild the data. RS(10,4) stores 14 fragments for every 10 of data — 1.4× overhead — and survives any 4 losses.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Comparison of three-way replication storing three full copies and RS(10,4) erasure coding storing ten data and four parity fragments on fourteen racks">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">3× replication: 1 GB object → 3 GB stored, survives 2 losses</text>
+    <rect x="20" y="34" width="150" height="34" rx="4" style="fill:var(--s1);opacity:0.5"/>
+    <text x="95" y="56" text-anchor="middle" style="fill:var(--ink)">copy 1 (rack A)</text>
+    <rect x="185" y="34" width="150" height="34" rx="4" style="fill:var(--s1);opacity:0.5"/>
+    <text x="260" y="56" text-anchor="middle" style="fill:var(--ink)">copy 2 (rack B)</text>
+    <rect x="350" y="34" width="150" height="34" rx="4" style="fill:var(--s1);opacity:0.5"/>
+    <text x="425" y="56" text-anchor="middle" style="fill:var(--ink)">copy 3 (rack C)</text>
+    <text x="510" y="56" style="fill:var(--muted)">read: any 1</text>
+    <text x="20" y="108" style="fill:var(--ink);font-weight:600">RS(10,4): 1 GB → 10 × 100 MB data + 4 × 100 MB parity = 1.4 GB, survives any 4 losses</text>
+    <g>
+      <rect x="20" y="120" width="38" height="34" rx="3" style="fill:var(--s2);opacity:0.5"/><text x="39" y="142" text-anchor="middle" style="fill:var(--ink)">D1</text>
+      <rect x="62" y="120" width="38" height="34" rx="3" style="fill:var(--s2);opacity:0.5"/><text x="81" y="142" text-anchor="middle" style="fill:var(--ink)">D2</text>
+      <rect x="104" y="120" width="38" height="34" rx="3" style="fill:var(--s2);opacity:0.5"/><text x="123" y="142" text-anchor="middle" style="fill:var(--ink)">D3</text>
+      <rect x="146" y="120" width="38" height="34" rx="3" style="fill:var(--crit);opacity:0.35"/><text x="165" y="142" text-anchor="middle" style="fill:var(--ink)">D4 ✗</text>
+      <rect x="188" y="120" width="38" height="34" rx="3" style="fill:var(--s2);opacity:0.5"/><text x="207" y="142" text-anchor="middle" style="fill:var(--ink)">D5</text>
+      <rect x="230" y="120" width="38" height="34" rx="3" style="fill:var(--s2);opacity:0.5"/><text x="249" y="142" text-anchor="middle" style="fill:var(--ink)">D6</text>
+      <rect x="272" y="120" width="38" height="34" rx="3" style="fill:var(--crit);opacity:0.35"/><text x="291" y="142" text-anchor="middle" style="fill:var(--ink)">D7 ✗</text>
+      <rect x="314" y="120" width="38" height="34" rx="3" style="fill:var(--s2);opacity:0.5"/><text x="333" y="142" text-anchor="middle" style="fill:var(--ink)">D8</text>
+      <rect x="356" y="120" width="38" height="34" rx="3" style="fill:var(--s2);opacity:0.5"/><text x="375" y="142" text-anchor="middle" style="fill:var(--ink)">D9</text>
+      <rect x="398" y="120" width="38" height="34" rx="3" style="fill:var(--s2);opacity:0.5"/><text x="417" y="142" text-anchor="middle" style="fill:var(--ink)">D10</text>
+      <rect x="450" y="120" width="38" height="34" rx="3" style="fill:var(--s3);opacity:0.5"/><text x="469" y="142" text-anchor="middle" style="fill:var(--ink)">P1</text>
+      <rect x="492" y="120" width="38" height="34" rx="3" style="fill:var(--crit);opacity:0.35"/><text x="511" y="142" text-anchor="middle" style="fill:var(--ink)">P2 ✗</text>
+      <rect x="534" y="120" width="38" height="34" rx="3" style="fill:var(--s3);opacity:0.5"/><text x="553" y="142" text-anchor="middle" style="fill:var(--ink)">P3</text>
+      <rect x="576" y="120" width="38" height="34" rx="3" style="fill:var(--s3);opacity:0.5"/><text x="595" y="142" text-anchor="middle" style="fill:var(--ink)">P4</text>
+    </g>
+    <text x="20" y="178" style="fill:var(--ink-2)">Each fragment on a different rack (f4 cells use 14 racks). Three fragments lost above:</text>
+    <text x="20" y="196" style="fill:var(--good)">any 10 of the remaining 11 rebuild D4 and D7 — still one more loss to spare.</text>
+    <text x="20" y="222" style="fill:var(--muted)">Normal read: just the data fragment holding the bytes. Degraded read or rebuild: read 10 fragments.</text>
+  </g>
+</svg>
+<figcaption>Replication versus RS(10,4) for the same 1 GB of data: erasure coding stores less than half as much and tolerates twice as many losses, but rebuilding or reading around a lost fragment touches ten fragments instead of one copy.</figcaption>
+</figure>
+<p>One more distinction before the deep dives: an object store's promise is quoted as <strong>durability</strong> — the probability a stored object survives a year — separately from <strong>availability</strong>, the probability you can read it right now. A store can be briefly unavailable (a metadata partition is failing over) without losing anything, and the design budgets for the two differently: durability is protected by redundancy and repair, availability by replicated front ends and metadata.</p>
+<p>The whole interview turns on that figure: which data deserves which protection, and what the cheaper option costs elsewhere. A reader who stops here should know that object storage is a small immutable API over a metadata index and a huge, failure-tolerant pool of fragments.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–18</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">18–26</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">26–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> Buckets with names, regions and policies. <code>PUT</code> an object (bytes plus user metadata) under a key; <code>GET</code> it, including byte ranges; <code>HEAD</code> for metadata; <code>DELETE</code>; <code>LIST</code> keys by prefix with pagination. Multipart upload for large objects. Optional versioning, lifecycle rules (move to a colder class after 30 days, delete after a year), and pre-signed URLs that grant temporary access.</p>
+<p><strong>Non-functional.</strong> <strong>Durability first</strong> — a stored object must essentially never be lost; S3 states a design target of 99.999999999% (eleven nines) durability over a year for its standard classes. Availability around 99.9–99.99%. Scale to hundreds of petabytes and hundreds of billions of objects. High aggregate throughput, with single-object reads limited mostly by the network. Cost per gigabyte as low as possible, because storage is a recurring bill. Strong read-after-write consistency for PUT and DELETE.</p>
+<p><strong>Clarifying questions.</strong> "What's the object size distribution?" (Small objects dominate counts; large ones dominate bytes — and they need different treatment.) "Read pattern by age?" (If reads fall off with age, tiering pays.) "Single region or cross-region durability?" "Is it an internal blob store or a multi-tenant public service?" (Public means per-tenant isolation, billing and abuse protection.)</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Scenario: an internal object store for an AI company: <strong>100 PB of logical data</strong>, <strong>100 billion objects</strong> (so an average of 1 MB, but a skewed mix: billions of small files, plus huge dataset shards and checkpoints), <strong>100,000 GETs/s and 20,000 PUTs/s</strong> at peak.</p>
+<p><strong>Raw capacity.</strong> 3× replication: 300 PB raw. RS(10,4): 100 × 1.4 = <strong>140 PB raw</strong>. Difference: 160 PB of disks. With 20 TB drives, that's 15,000 disks versus 7,000 — 8,000 drives, plus their servers, racks, power and cooling. This is why erasure coding exists.</p>
+<p><strong>Disk failures.</strong> 7,000 disks at a 2% annualised failure rate (AFR) = 140 failures a year, about <strong>one every 2.6 days</strong>. Failure is routine operations, not an emergency.</p>
+<p><strong>Repair traffic.</strong> A failed 20 TB disk under RS(10,4) holds fragments of many stripes; rebuilding each lost fragment reads 10 surviving fragments, so the rebuild reads 10 × 20 TB = <strong>200 TB</strong> (and writes 20 TB). Spread over 140 failures a year: 140 × 200 TB ÷ 365 days ≈ 77 TB a day, about 0.9 GB/s continuously. Spread across thousands of servers that is modest, but it must be rate-limited so it doesn't starve client reads. Under replication the same rebuild reads only 20 TB.</p>
+<p><strong>Metadata.</strong> 100 billion objects × ~500 bytes (key averaging 100 bytes, size, checksum, version, timestamps, ACL (access-control list) reference, list of fragment locations) = <strong>50 TB</strong>, replicated 3 times = 150 TB in a partitioned, strongly consistent store. If each metadata partition handles ~10,000 operations a second, peak load of 120,000 requests/s plus LISTs needs a few dozen partitions at minimum — in practice thousands, split by key range and load.</p>
+<p><strong>Bandwidth.</strong> 100,000 GETs/s × 1 MB = 100 GB/s of reads (800 Gbit/s) across the fleet; 20,000 PUTs/s × 1 MB × 1.4 = 28 GB/s of writes to disks including parity. At, say, 200 storage servers holding 35 disks each, that is 500 MB/s of reads per server — so the network, not the disks, and the distribution of hot objects decide per-server load.</p>
+
+<h4>3 · API</h4>
+<pre>PUT    /{bucket}/{key}            body=bytes, headers: Content-MD5 / checksum, user metadata
+GET    /{bucket}/{key}            optional Range: bytes=0-1048575   -&gt; bytes, ETag, version
+HEAD   /{bucket}/{key}            -&gt; size, checksum, metadata
+DELETE /{bucket}/{key}
+GET    /{bucket}?list-type=2&amp;prefix=datasets/2026/&amp;continuation-token=...
+
+POST   /{bucket}/{key}?uploads                     -&gt; upload_id
+PUT    /{bucket}/{key}?partNumber=7&amp;uploadId=...   -&gt; part ETag
+POST   /{bucket}/{key}?uploadId=...                -&gt; commit list of (part, ETag)</pre>
+<p>Multipart upload makes large objects practical. In S3, parts are 5 MiB to 5 GiB, there can be up to 10,000 of them, and the maximum object size is 48.8 TiB (exactly 10,000 × 5 GiB). Parts upload in parallel and failed parts are retried individually; the object becomes visible atomically when the commit succeeds. Ranged GETs are the read-side counterpart: a client fetches a large object as many parallel ranges.</p>
+
+<h4>4 · Data model</h4>
+<p><strong>Metadata record</strong>, keyed by (bucket, key, version): size, checksum (and ETag), content type, user metadata, creation time, storage class, encryption key reference, and the object's <strong>layout</strong> — which stripe or volume IDs hold it, at which offsets. Range-partitioned by (bucket, key), so a LIST for a prefix is a range scan within one or a few partitions.</p>
+<p><strong>Data layout.</strong> Objects aren't stored as individual files. Large objects are cut into chunks (GFS used 64 MB; f4 uses 1 GB blocks) and each chunk is replicated or erasure-coded. Small objects are packed into large append-only <strong>volumes</strong> — Facebook's Haystack packs many photos into volumes of about 100 GB — so a 4 KB object costs one index entry and one seek, not a file and a separate stripe. Volumes are written while "unlocked", then sealed ("locked") and from then on read-only, which makes them easy to erasure-code, replicate and move.</p>
+<p><strong>Placement map.</strong> For each volume or stripe: the nodes and disks holding each fragment. The placement service maintains it and enforces failure-domain rules.</p>
+
+<h4>5 · High-level architecture</h4>
+<p><strong>Front-end (API) servers</strong> are stateless: they authenticate, authorise, rate-limit per tenant and per prefix, and orchestrate each request. The <strong>metadata service</strong> is a partitioned, replicated key-value store with strong consistency (each partition is a small consensus group — in2's design with a leader per partition, like DynamoDB). The <strong>placement service</strong> picks storage nodes for new data. <strong>Storage nodes</strong> hold fragments on local disks, verify checksums on read and expose simple "write fragment / read fragment range" operations. Background services — <strong>repair</strong>, <strong>scrubbing</strong>, <strong>garbage collection</strong>, <strong>tiering and re-encoding</strong> — run continuously.</p>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Object store architecture: clients reach stateless front ends; front ends consult metadata and placement services and read and write fragments on storage nodes across racks; background services repair, scrub and tier">
+  <defs><marker id="in7-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="110" width="80" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="50" y="136" text-anchor="middle" style="fill:var(--ink)">Clients</text>
+    <rect x="115" y="100" width="105" height="64" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="167" y="122" text-anchor="middle" style="fill:var(--ink)">Front ends</text>
+    <text x="167" y="139" text-anchor="middle" style="fill:var(--muted)">auth, limits,</text>
+    <text x="167" y="154" text-anchor="middle" style="fill:var(--muted)">encode / decode</text>
+    <rect x="250" y="20" width="150" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="325" y="42" text-anchor="middle" style="fill:var(--ink)">Metadata service</text>
+    <text x="325" y="60" text-anchor="middle" style="fill:var(--muted)">range-partitioned, consensus</text>
+    <rect x="420" y="20" width="110" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="475" y="42" text-anchor="middle" style="fill:var(--ink)">Placement</text>
+    <text x="475" y="60" text-anchor="middle" style="fill:var(--muted)">failure domains</text>
+    <rect x="250" y="110" width="380" height="80" rx="6" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="440" y="128" text-anchor="middle" style="fill:var(--muted)">storage nodes, one fragment per rack</text>
+    <rect x="262" y="138" width="40" height="40" style="fill:var(--s2);opacity:0.5"/><text x="282" y="162" text-anchor="middle" style="fill:var(--ink)">R1</text>
+    <rect x="310" y="138" width="40" height="40" style="fill:var(--s2);opacity:0.5"/><text x="330" y="162" text-anchor="middle" style="fill:var(--ink)">R2</text>
+    <rect x="358" y="138" width="40" height="40" style="fill:var(--s2);opacity:0.5"/><text x="378" y="162" text-anchor="middle" style="fill:var(--ink)">R3</text>
+    <text x="440" y="162" text-anchor="middle" style="fill:var(--muted)">…</text>
+    <rect x="482" y="138" width="40" height="40" style="fill:var(--s3);opacity:0.5"/><text x="502" y="162" text-anchor="middle" style="fill:var(--ink)">R13</text>
+    <rect x="530" y="138" width="40" height="40" style="fill:var(--s3);opacity:0.5"/><text x="550" y="162" text-anchor="middle" style="fill:var(--ink)">R14</text>
+    <rect x="250" y="215" width="380" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="440" y="242" text-anchor="middle" style="fill:var(--ink)">Background: repair · scrub · garbage collection · re-encode / tier</text>
+    <line x1="90" y1="132" x2="113" y2="132" marker-end="url(#in7-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="210" y1="100" x2="262" y2="76" marker-end="url(#in7-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="220" y1="108" x2="430" y2="76" marker-end="url(#in7-arrow)" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <line x1="220" y1="140" x2="258" y2="150" marker-end="url(#in7-arrow)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+    <line x1="440" y1="213" x2="440" y2="192" marker-end="url(#in7-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+  </g>
+</svg>
+<figcaption>The bytes flow between front ends and storage nodes; the metadata service only records where they are. Placement keeps each stripe's 14 fragments on 14 different racks, and background services keep redundancy, integrity and tiering in shape.</figcaption>
+</figure>
+<p><strong>A PUT of a 64 MB object</strong>: the front end asks placement for a stripe of 14 nodes on 14 distinct racks; splits the object into 10 data fragments of 6.4 MB; computes 4 parity fragments; writes all 14 in parallel along with checksums; waits for enough acknowledgements to meet its durability rule (for example, all 14, or at least 12 with the rest repaired soon); then commits the metadata record — the moment the object becomes visible. If the client sent a checksum, it is verified before commit. Small objects instead append to an open, replicated volume and get an index entry.</p>
+<p><strong>A GET</strong>: the front end reads the metadata record, then reads only the data fragments covering the requested range — for a 1 MB range inside fragment D3, one read from one node. If that node is down, it performs a <strong>degraded read</strong>: fetch the same range from any 10 surviving fragments and decode. Data never passes through the metadata service; GFS made the same choice, with clients asking the master for chunk locations and then reading directly from chunk servers.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="PUT sequence: front end gets placement, writes 14 fragments in parallel, then commits metadata, which is the moment the object becomes visible">
+  <defs><marker id="in7-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="60" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Client</text>
+    <text x="210" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Front end</text>
+    <text x="370" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Placement</text>
+    <text x="470" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">14 nodes</text>
+    <text x="580" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Metadata</text>
+    <line x1="60" y1="28" x2="60" y2="240" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="210" y1="28" x2="210" y2="240" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="370" y1="28" x2="370" y2="240" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="470" y1="28" x2="470" y2="240" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="580" y1="28" x2="580" y2="240" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="60" y1="40" x2="208" y2="50" marker-end="url(#in7-arrow2)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+    <text x="134" y="38" text-anchor="middle" style="fill:var(--ink-2)">PUT + checksum</text>
+    <line x1="210" y1="64" x2="368" y2="72" marker-end="url(#in7-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="368" y1="84" x2="212" y2="92" marker-end="url(#in7-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="290" y="64" text-anchor="middle" style="fill:var(--ink-2)">14 racks</text>
+    <text x="216" y="114" style="fill:var(--muted)">split into 10, encode 4 parity</text>
+    <line x1="210" y1="126" x2="468" y2="138" marker-end="url(#in7-arrow2)" style="fill:none;stroke:var(--ink-2);stroke-width:2"/>
+    <text x="340" y="124" text-anchor="middle" style="fill:var(--ink-2)">write 14 fragments in parallel</text>
+    <line x1="468" y1="150" x2="212" y2="160" marker-end="url(#in7-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="340" y="170" text-anchor="middle" style="fill:var(--ink-2)">durable acks</text>
+    <line x1="210" y1="182" x2="578" y2="192" marker-end="url(#in7-arrow2)" style="fill:none;stroke:var(--good);stroke-width:1.5"/>
+    <text x="400" y="182" text-anchor="middle" style="fill:var(--good)">commit record v7 (visible now)</text>
+    <line x1="208" y1="214" x2="62" y2="226" marker-end="url(#in7-arrow2)" style="fill:none;stroke:var(--good);stroke-width:1.5"/>
+    <text x="134" y="210" text-anchor="middle" style="fill:var(--ink-2)">200 OK</text>
+  </g>
+</svg>
+<figcaption>The PUT's critical path: bytes are made durable everywhere first, and only then is the metadata committed. That commit is the instant the object exists; a crash before it leaves only orphaned fragments for garbage collection, never a visible half-object.</figcaption>
+</figure>
+<p><strong>A worked trace with numbers.</strong> A client in the same region uploads a 64 MB object over a 10 Gbit/s path: 64 MB × 8 ÷ 10 Gbit/s ≈ 51 ms of transfer at full speed. The front end encodes 4 parity fragments (Reed-Solomon runs at several GB/s per core, so roughly 10–20 ms for 64 MB) and writes 14 fragments of 6.4 MB to 14 nodes in parallel; each node writes 6.4 MB in tens of milliseconds, and the slowest of the 14 sets the pace. The metadata commit is a consensus write of a few hundred bytes: a few milliseconds. Total: on the order of 100–200 ms, dominated by the transfer and the slowest fragment write. That is why per-object PUT latency matters less than aggregate throughput, and why clients upload big objects as many parallel parts.</p>
+
+<h4>6 · Deep dive: replication versus erasure coding, by hand</h4>
+<p>Take 60 PB of data and the two schemes.</p>
+<table><thead><tr><th></th><th>3× replication</th><th>RS(10,4)</th></tr></thead><tbody>
+<tr><td>Raw storage</td><td>180 PB</td><td>84 PB</td></tr>
+<tr><td>Losses tolerated per object</td><td>2</td><td>4</td></tr>
+<tr><td>Normal read</td><td>1 copy</td><td>the data fragment(s) holding the range</td></tr>
+<tr><td>Read with one node down</td><td>another copy</td><td>10 fragments + decode</td></tr>
+<tr><td>Rebuild one lost 20 TB disk</td><td>read 20 TB</td><td>read 200 TB</td></tr>
+<tr><td>Write fan-out</td><td>3 writes</td><td>14 writes + encoding CPU</td></tr>
+</tbody></table>
+<p>RS(10,4) is better on space <em>and</em> on losses tolerated. What it gives up is everything that involves reconstructing: repair reads 10× the data, degraded reads touch 10 disks (so tail latency suffers during failures), and small writes are expensive. Choosing parameters is a balance. More data fragments lower overhead — RS(17,3), Backblaze's 17-data, 3-parity layout across 20 storage pods, costs only 20/17 ≈ 1.18× — but tolerate fewer losses and make each repair read 17 fragments. More parity fragments raise durability and cost space.</p>
+<p><strong>Local Reconstruction Codes</strong> attack the repair cost. Microsoft's Azure Storage paper describes LRC(12,2,2): 12 data fragments in two groups of 6, one local parity per group, and 2 global parities — 16 fragments, 1.33× overhead. A single lost data fragment, by far the most common failure, is rebuilt from the 5 other fragments in its group plus the local parity — 6 reads instead of 12 — "half the number required" by the equivalent Reed-Solomon code, while the global parities still protect against multiple failures.</p>
+<p><strong>How Reed-Solomon works, briefly.</strong> Treat each byte position across the 10 data fragments as 10 numbers. Reed-Solomon fits a polynomial through them and evaluates it at 4 more points to produce the parity bytes, using arithmetic in a finite field of 256 elements so every value stays a byte. Any 10 known points determine the polynomial, so any 10 fragments recover the rest. In practice it is implemented as a matrix multiply with a carefully chosen matrix, which modern CPUs do at gigabytes per second per core with vector instructions. You don't need to derive it in an interview; you need to say "any n of n + k" and know the costs above. The lab shows the k = 1 case — plain XOR parity — rebuilding a lost block.</p>
+
+<h4>7 · Deep dive: durability nines, repair and correlated failures</h4>
+<p>Durability is a race between failures and repair. Data is lost only if more fragments of the same stripe fail than the code tolerates, before repair restores them. With independent failures, the probability of losing a given stripe in one repair window is the chance that more than k of its n + k fragments fail inside that window.</p>
+<p>Work it for 3× replication with a 2% AFR and a 6-hour repair window: the chance one disk fails in 6 hours is about 0.02 × 6 ÷ 8,766 ≈ 1.4 × 10<sup>−5</sup>; all three copies failing in the same window is (1.4 × 10<sup>−5</sup>)<sup>3</sup> ≈ <strong>2.6 × 10<sup>−15</sup></strong>. For RS(10,4) with a slower 24-hour repair (rebuilds read more), p ≈ 5.5 × 10<sup>−5</sup>, and losing 5 of 14 is about C(14,5) × p<sup>5</sup> = 2,002 × 5.2 × 10<sup>−22</sup> ≈ <strong>1.0 × 10<sup>−18</sup></strong>. The lab computes these and RS(6,3) and RS(17,3) too. These numbers say two things. First, tolerating more losses beats a faster repair by orders of magnitude. Second, they are so small that independent disk failure is not what actually loses data.</p>
+<p>What does lose data is <strong>correlation</strong>: a rack power failure takes out every fragment on that rack at once; a bad batch of drives fails together; a firmware bug corrupts writes on every disk of one model; a software bug in the repair system deletes the wrong fragments; an operator decommissions the wrong hosts. The defences are structural. <strong>Place fragments across independent failure domains</strong> — f4 cells use 14 racks of 15 hosts, so the 14 fragments of a stripe can each sit on a different rack and a rack failure costs at most one fragment per stripe. <strong>Mix hardware batches and models</strong> within stripes. <strong>Make repair fast and prioritised</strong>: stripes missing 3 fragments are repaired before stripes missing 1. <strong>Rate-limit destructive operations</strong> — deletes and decommissions — and keep a recycle bin. And <strong>scrub</strong>: read every fragment periodically and verify checksums, because a silently corrupted fragment is a loss you haven't counted yet.</p>
+
+<h4>8 · Deep dive: metadata, listing and consistency</h4>
+<p>GFS (2003) showed the simplest design: one master holds all metadata in memory — the namespace, file-to-chunk mapping and chunk locations — logs every mutation to an operation log replicated on other machines, and checkpoints it. Clients ask the master where a chunk is and then talk to chunk servers directly, so the master is never in the data path. One master is simple and strongly consistent, but its memory and request rate cap the number of files, which is exactly the limit later systems removed by partitioning metadata.</p>
+<p>A modern object store partitions metadata by key range. LIST with a prefix is a range scan in one partition or a few adjacent ones; a partition that gets too big or too busy splits. This is why Amazon documents throughput "per partitioned prefix": at least 3,500 PUT/COPY/POST/DELETE and 5,500 GET/HEAD requests per second per prefix, with no limit on the number of prefixes, so a workload needing 50,000 reads/s should spread keys over at least 10 prefixes. A common anti-pattern is keys that start with a timestamp (<code>2026-10-02T10:15:…/…</code>), which sends every new write to the same partition; hashing or reversing part of the key spreads them.</p>
+<p><strong>Consistency.</strong> The clean way to get strong read-after-write consistency is to make the metadata commit the single moment an object becomes visible: write all fragments durably first, then commit the metadata record with a new version in a strongly consistent store; GETs always resolve the current version through it. Overwrites write new fragments and switch the pointer; the old fragments become garbage. Amazon S3 originally offered only eventual consistency for overwrites and listings, and since December 2020 provides strong read-after-write consistency for PUT and DELETE in all regions — which required making its metadata caches consistent, not changing how bytes are stored. What typically stays eventually consistent: cross-region replication, CDN caches in front of the store, and some secondary listings or inventories.</p>
+
+<h4>9 · Deep dive: hot, warm and cold tiers</h4>
+<p>Access frequency falls steeply with age. Facebook measured it across nine kinds of user-facing content: for all nine, content less than a day old received more than 100 times the request rate of one-year-old content; for eight, the rate dropped by an order of magnitude in less than a week. That makes tiering the most powerful cost lever. New, hot data goes to a tier optimised for throughput and low latency — replicated, possibly on faster disks or SSDs, with caches and CDNs in front. As data cools, a background process <strong>re-encodes</strong> it into an erasure-coded warm tier, and eventually into a cold or archival tier (dense disks or tape) with retrieval measured in minutes or hours. Lifecycle rules let users express this ("move to infrequent access after 30 days, archive after 180, delete after 3 years"), and automatic tiering moves objects by observed access.</p>
+<p>Small objects need special handling in every tier. Erasure-coding a 4 KB object into 14 fragments of about 300 bytes would make every read a scatter of tiny I/Os. Packing small objects into large volumes and coding the volume avoids it: one read of 4 KB from one fragment in the normal case.</p>
+
+<h4>10 · Failure modes and trade-offs</h4>
+<p><strong>Disk failure</strong> (every couple of days): repair reconstructs its fragments onto other disks; reads of affected stripes are degraded meanwhile. <strong>Host or rack failure</strong>: many fragments at once, but at most one per stripe if placement is right; repair prioritises the most-damaged stripes. <strong>Zone or region failure</strong>: needs data spread across zones or a cross-region layer — f4 pairs volumes in two regions and stores their XOR in a third, so any one region can be lost. <strong>Metadata partition unavailable</strong>: objects in that key range can't be read or written even though the bytes are safe — metadata availability is object availability. <strong>Hot object</strong>: one viral file at 50,000 GETs/s overloads the few nodes holding its fragments; a cache or CDN in front, or temporary extra replicas, absorbs it. <strong>Bugs</strong>: a faulty garbage collector or repair process can destroy data faster than any disk; stage rollouts, rate-limit deletions, and keep deleted data recoverable for a window.</p>
+<p><strong>The trade-offs to state in the close:</strong> erasure coding's space savings against repair traffic and degraded reads; immutability's simplicity against no in-place updates; strong metadata consistency against a heavier metadata tier; and tiering's savings against slower access to old data.</p>
+</section>
+
+<section data-field="deep">
+<h4>Encryption keys as the delete mechanism</h4>
+<p>Deleting a 4 KB photo from the middle of a sealed, erasure-coded 100 GB volume is expensive: you'd have to rewrite the volume and recompute parity. f4 avoids that entirely. Every object is encrypted with its own key, stored in a separate database; deleting the key makes the bytes unreadable — "logically deletes it" — and the space is reclaimed whenever the volume is eventually rewritten. This crypto-shredding approach also makes deletion verifiable for privacy laws: once the key is gone, every copy, replica and backup of the ciphertext is useless. The trade-off is that the key store becomes a critical, highly available dependency on every read.</p>
+
+<h4>Repair is a scheduling problem</h4>
+<p>At 140 disk failures a year, repair never stops. The scheduler should prioritise by risk: a stripe with three lost fragments (one more and it's at the edge) before a thousand stripes with one. It should spread reads over many source disks and writes over many destinations so no single node becomes a bottleneck, and throttle against client traffic. It must also distinguish a disk that is <em>gone</em> from one that is temporarily unreachable — a host rebooting for 10 minutes shouldn't trigger 20 TB of reconstruction. Systems wait a grace period before declaring fragments lost, accepting slightly higher risk during the wait in exchange for avoiding vast unnecessary repair traffic.</p>
+
+<h4>Write paths for erasure-coded data</h4>
+<p>Encoding needs a full stripe, so small writes are awkward. Common patterns: write new data replicated (fast, simple), then re-encode sealed volumes in the background (Haystack to f4, or "replicate then transition" storage classes); or buffer incoming objects into stripes in memory on the front end and write the stripe when full. Either way, durability of the in-flight data must match the promise made when the PUT is acknowledged — acknowledging a PUT held only in one server's memory is not acceptable.</p>
+
+<h4>Integrity end to end</h4>
+<p>Corruption can happen in client memory, on the network, in a server's RAM, in a disk's firmware or on the platter. Checksums must cover every hop: the client sends a checksum with the upload, the front end verifies it before committing, each fragment is stored with its own checksum, every read verifies, and scrubbing re-verifies cold data. Amazon has published work on lightweight formal methods used to validate ShardStore, the storage-node software in S3 — a sign that at this scale, testing alone isn't considered enough for the code that touches the bytes.</p>
+
+<h4>Choosing n and k</h4>
+<p>Three forces set the parameters. <strong>Overhead</strong> is (n + k)/n, so larger n is cheaper. <strong>Durability</strong> grows with k and falls as n + k grows (more pieces means more chances for several failures in the same stripe). <strong>Repair and degraded-read cost</strong> grows with n, because rebuilding reads n fragments. The failure-domain count caps n + k: you need at least n + k independent racks, or k must be large enough to cover fragments that share a domain. Typical production points sit between RS(6,3) at 1.5× and RS(17,3) at about 1.18×, with RS(10,4) a common middle. Larger stripes also mean a minimum object or volume size before encoding is efficient, which again pushes small objects into packed volumes.</p>
+
+<h4>Versioning, retention and protection from your own mistakes</h4>
+<p>Most data loss in object stores is caused not by disks but by people and programs: a script deletes the wrong prefix, a lifecycle rule expires live data, ransomware overwrites objects with encrypted junk. Versioning keeps prior versions when objects are overwritten or deleted (a delete adds a "delete marker" instead of removing data), so mistakes can be undone. Retention locks ("write once, read many") prevent deletion or overwrite until a date, even by administrators, which is how regulated data and backups are protected. Both cost storage — every version is billed — so they pair with lifecycle rules that expire old versions after a window. Mentioning these in an interview shows you know where real data loss comes from.</p>
+
+<h4>Serving ML workloads</h4>
+<p>Training jobs read datasets as large sequential shards at very high aggregate throughput — hundreds of GPUs each pulling hundreds of megabytes per second — and write checkpoints of hundreds of gigabytes in bursts. Object stores handle this well if access is shaped for them: large objects (hundreds of MB to a few GB per shard) rather than millions of tiny files, many parallel ranged GETs per client, keys spread across prefixes, and a local or regional cache tier between the store and the GPUs. Checkpoint writes use parallel multipart uploads; the newest checkpoints stay in a hot tier for fast restart, older ones move to cheaper storage.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: f4, Facebook's warm BLOB storage (OSDI 2014)</h4>
+<p>Facebook stores photos, videos and other "BLOBs" (binary large objects) that are "created once, read many times, never modified". Its original store, Haystack, packs BLOBs into volumes of about 100 GB and keeps each volume as three physical replicas — two in a primary data centre on different racks, one in another data centre — with RAID-6 (a disk-array layout inside each host that survives two disk failures) adding a further 1.2× overhead. The paper does the multiplication: an effective replication factor of 3 × 1.2 = <strong>3.6</strong>. That is the right design for hot content, optimised for input/output operations per second, but most content isn't hot.</p>
+<p>The paper's measurements make the case for a warm tier: for all nine content types studied, content less than a day old received more than 100 times the request rate of one-year-old content, and an age of about a month was a safe dividing line between hot and warm for all but two types (profile photos stayed in Haystack). Warm content was large and growing — in the oldest interval studied, more than 80% of objects.</p>
+<p>f4 stores sealed volumes in <strong>cells</strong> — at the time, 14 racks of 15 hosts with thirty 4 TB drives per host — and encodes each volume's data file with <strong>Reed-Solomon(10,4)</strong> in 1 GB blocks, laid out so the 14 blocks of a stripe sit on different racks. The cell tolerates disk, host and rack failures at 1.4× overhead. Small index files stay triple-replicated because coding them isn't worth it. Keeping a full copy of a cell in a second data centre gives 2 × 1.4 = <strong>2.8</strong>. The final design pairs each volume with a "buddy" volume in a different region and stores their XOR in a third region: each of the two volumes costs 1.4× in its own cell, and the XOR volume, also coded at 1.4×, is shared by the pair, so the factor is (1.4 × 2 + 1.4) ÷ 2 = <strong>2.1</strong> — while still surviving the loss of any one region. Reads during failures go through "backoff nodes" that reconstruct missing data from companion and parity blocks; reads after a region loss fetch the XOR block and the buddy block and XOR them together.</p>
+<p>At publication f4 stored "over 65PB of logical data" and saved "over 53PB of storage". Deletes use the encryption-key approach above. The design embodies this lesson's trade-offs: replicate hot data where request rates demand it; erasure-code warm data where bytes dominate; place fragments across racks to defeat correlated failure; and add cross-region protection with the cheapest code that meets the goal — XOR, because tolerating one region loss only requires one parity.</p>
+
+<h4>What goes wrong, and what to watch</h4>
+<p><strong>Repair backlog</strong> — the number of stripes missing one, two, three fragments, and the time to drain each class; a growing tail at "three missing" is the most important durability alarm. <strong>Scrub coverage</strong> — the age of the oldest unverified fragment. <strong>Degraded-read rate and latency</strong> — rising during failures and rebuilds. <strong>Hot prefixes and hot objects</strong> — throttling (HTTP 503 Slow Down in S3's case) from per-prefix limits. <strong>Metadata partition load and splits.</strong> <strong>Garbage backlog</strong> — space held by deleted objects not yet compacted. <strong>Capacity runway</strong> per tier, because buying and racking disks takes months. And for every destructive background process, a rate and an audit trail.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> compare 3× replication with Reed-Solomon schemes on storage overhead, data read to rebuild, and a rough probability of losing a stripe in one repair window; then rebuild a lost block from XOR parity. Python 3.12, standard library only, instant.</p>
+<pre>"""Replication vs erasure coding: storage overhead, repair traffic and a
+rough durability estimate, plus a working XOR parity rebuild.
+Python 3.12 stdlib only."""
+import math, os
+
+def p_loss(n, tolerate, afr, repair_hours):
+    """P(more than `tolerate` of the n pieces fail within one repair window),
+    assuming independent failures; ignores correlated failures (racks, bad batches)."""
+    p = 1 - (1 - afr) ** (repair_hours / 8766)          # one piece fails in the window
+    return sum(math.comb(n, i) * p**i * (1 - p)**(n - i) for i in range(tolerate + 1, n + 1))
+
+AFR = 0.02                                               # 2% annual failure rate per disk
+schemes = [  # name, pieces, failures tolerated, overhead, hours to repair one piece
+    ("3x replication",  3, 2, 3.0,  6),
+    ("RS(6,3)",         9, 3, 1.5, 12),
+    ("RS(10,4)",       14, 4, 1.4, 24),
+    ("RS(17,3)",       20, 3, 20/17, 24),
+]
+print(f"{'scheme':15} {'overhead':&gt;8} {'read to rebuild 1 GB':&gt;21} {'P(loss) per window':&gt;19}")
+for name, n, tol, ovh, hours in schemes:
+    data_pieces = n - tol if name != "3x replication" else 1
+    print(f"{name:15} {ovh:7.2f}x {data_pieces:18d} GB {p_loss(n, tol, AFR, hours):19.2e}")
+
+# Storing 10 PB of logical data:
+for name, n, tol, ovh, _ in schemes:
+    print(f"10 PB logical with {name:14} -&gt; {10 * ovh:5.1f} PB raw")
+
+# A working (k=1) parity code: XOR of the data blocks rebuilds any ONE lost block.
+blocks = [os.urandom(1024) for _ in range(4)]            # 4 data blocks of 1 KB
+parity = bytes(a ^ b ^ c ^ d for a, b, c, d in zip(*blocks))
+lost = 2
+survivors = [b for i, b in enumerate(blocks) if i != lost] + [parity]
+rebuilt = bytes(x ^ y ^ z ^ w for x, y, z, w in zip(*survivors))
+print("\nXOR parity rebuilt lost block correctly:", rebuilt == blocks[lost],
+      "| had to read", len(survivors), "blocks to rebuild 1")</pre>
+<p><strong>Run it:</strong> save as <code>ec_lab.py</code> and run <code>python ec_lab.py</code>.</p>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li>Overhead: 3.0× for replication, 1.5× for RS(6,3), 1.4× for RS(10,4), 1.18× for RS(17,3). For 10 PB of data that is 30, 15, 14 and 11.8 PB raw.</li>
+<li>Rebuild reads: 1 GB for replication versus 6, 10 and 17 GB for the codes — the hidden cost of erasure coding.</li>
+<li>Loss probability per repair window (independent failures, 2% AFR): about 2.6 × 10<sup>−15</sup> for replication with a 6-hour repair, 1.0 × 10<sup>−18</sup> for RS(10,4) even with a 24-hour repair, and 4.5 × 10<sup>−14</sup> for RS(17,3), which tolerates only 3 losses across 20 pieces. Tolerating more losses matters more than repairing faster.</li>
+<li>The XOR parity rebuilds the lost block exactly — after reading all 4 surviving blocks. That's k = 1 erasure coding, and the same reason f4 can use XOR across regions.</li>
+</ol>
+<p><strong>Try next:</strong> set <code>AFR</code> to 0.08 to model a bad batch of drives, and double the repair hours for the codes to model throttled repair; then think about what correlated failure (two fragments on one rack) does to the binomial assumption.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+    <p>You store 60 PB across 20 TB disks. Annual disk failure rate is 2%. Compare 3× replication against 6+3 erasure coding. Repair bandwidth is limited to 10 Gbps per chunk server, and a chunk server holds 20 disks.</p>
+    <p>(a) Raw capacity and disk count for each? (b) Failure rate and repair traffic for each? (c) Which do you choose, and for what?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Capacity.</strong> 3× replication: 60 PB × 3 = <strong>180 PB raw</strong> = 9,000 disks. Erasure coding 6+3: overhead is (6+3)/6 = 1.5×, so 60 PB × 1.5 = <strong>90 PB raw</strong> = 4,500 disks. Erasure coding saves <strong>4,500 disks</strong> — half the fleet, and with it half the racks, power and cooling. At any realistic cost this is the dominant line item.</p>
+    <p><strong>(b) Failures and repair traffic.</strong></p>
+    <p><em>Replication:</em> 9,000 disks × 2% = 180 failures/year ≈ <strong>one every 2 days</strong>. Repairing a 20 TB disk means copying 20 TB from surviving replicas — read 20 TB, write 20 TB. Spread over many source servers, this is modest.</p>
+    <p><em>Erasure coding:</em> 4,500 disks × 2% = 90 failures/year ≈ <strong>one every 4 days</strong> — half as many, because there are half as many disks. But each repair is far more expensive: reconstructing each lost fragment reads <strong>6 fragments for every 1 rebuilt</strong>, so recovering a 20 TB disk reads <strong>120 TB</strong> across the network and decodes all of it.</p>
+    <p>Per event that is 6× the traffic at half the frequency, so <em>average</em> repair bandwidth is about 3× higher. The bigger problem is the peak: 120 TB at 10 Gbps per server, even pulling from 20 sources in parallel, is 120 TB ÷ (20 × 1.25 GB/s) = 4,800 s ≈ <strong>80 minutes</strong> of sustained full-rate network on 20 servers. During that window those servers are degraded for normal traffic, and the durability maths assumed a repair window — if repair is slow, the probability of further failures during it rises, and the nines you quoted are wrong.</p>
+    <p><strong>(c) The choice — and it is not one or the other.</strong></p>
+    <ul>
+    <li><strong>Erasure-code the cold, large majority.</strong> Most bytes in any object store are old, rarely read and large. They suit erasure coding: the storage saving is enormous, the read amplification rarely materialises because nobody reads them, and repair can be throttled because latency doesn't matter.</li>
+    <li><strong>Replicate the hot and the small.</strong> A frequently read object should be readable from one disk even during failures, not reconstructed from six — and small objects fragment badly: a 4 KB object split nine ways is nine ~450-byte I/Os. Pack small objects into volumes first.</li>
+    <li><strong>Transition by age or access.</strong> Write new objects replicated and re-encode them once they've been cold for, say, 30 days. That's what storage classes are, and it's what Facebook did moving content from Haystack to f4.</li>
+    </ul>
+    <p><strong>The number that decides it:</strong> if 90% of bytes are cold, erasure-coding just those saves 0.9 × 60 PB × (3 − 1.5) = <strong>81 PB of raw capacity</strong> — almost the whole benefit — while leaving the 10% hot working set on cheap-to-read replication. <em>The right answer to a storage trade-off is almost always a tiering policy rather than a single scheme,</em> and saying which fraction of the benefit each tier delivers is what makes it a design rather than a preference.</p></details>
+
+<b>Estimate it</b>
+    <p>A training cluster of 512 GPUs reads a 400 TB dataset once per epoch, and an epoch takes 10 hours. Each GPU host (8 GPUs) has a 100 Gbit/s network card. Data is stored as 1 GB shards. What aggregate read throughput does the store need, how many GETs per second, and is anything likely to throttle?</p>
+    <details><summary>Answer</summary>
+    <p>400 TB ÷ 36,000 s ≈ <strong>11.1 GB/s</strong> aggregate. 512 GPUs ÷ 8 = 64 hosts, so about 174 MB/s per host — under 2% of a 100 Gbit/s (12.5 GB/s) card, so the network is fine. 400 TB ÷ 1 GB = 400,000 shards per epoch; ÷ 36,000 s ≈ <strong>11 shard reads per second</strong> if each is one GET — trivial. Even fetching each shard as 64 ranged GETs of 16 MB for parallelism, that's ~710 GETs/s, well under one prefix's 5,500/s. Nothing throttles at the store; the likely bottleneck is per-host decode and preprocessing. The design would change if the dataset were 400 million 1 MB files: 11,100 GETs/s, which must be spread over several prefixes — another argument for packing small samples into large shards.</p></details>
+</section>

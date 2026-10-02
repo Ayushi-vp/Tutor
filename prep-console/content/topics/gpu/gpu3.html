@@ -1,0 +1,490 @@
+<!-- topic source for gpu/gpu3; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "gpu3",
+  "t": "Transformer FLOPs and memory arithmetic",
+  "tag": "Performance model",
+  "sum": "Count a transformer's parameters from its config, derive 2N FLOPs per token forward and 6N to train, the attention term, 16 bytes per parameter for Adam, KV cache and activation memory — and use them to size real training and fine-tuning runs.",
+  "prereq": [
+    [
+      "lm3",
+      "A transformer block is attention (query, key, value and output projections) followed by an MLP, each wrapped in a normalisation and a residual connection, stacked L times between an embedding and an output layer."
+    ],
+    [
+      "gpu2",
+      "A matmul of an m × k by a k × n matrix costs 2·m·k·n FLOPs; time is bounded by FLOPs ÷ peak or bytes ÷ bandwidth, whichever is larger."
+    ],
+    [
+      "dl5",
+      "Adam keeps two running averages per parameter — the first moment (mean of gradients) and second moment (mean of squared gradients) — and uses them to scale each update."
+    ]
+  ],
+  "myths": [
+    [
+      "Model size in parameters tells you how much GPU memory training needs.",
+      "Parameters are only the start. With mixed-precision Adam, each parameter carries about 16 bytes of weights, gradients, master copy and optimiser state, so a 7B model needs about 112 GB before a single activation is stored — and activations, which grow with batch size and sequence length, can be larger still. Inference is different again: 2 bytes per parameter plus the KV cache."
+    ],
+    [
+      "The attention matmuls are where most of the FLOPs go.",
+      "For typical context lengths, the dense projections and MLP dominate: attention's score and weighted-sum computations add about 4·L·T·d FLOPs per token against 24·L·d² for the weights, a ratio of T/6d. For an 8B model (d = 4,096) that is 8% at 2,000 tokens of context. It only dominates at long context — above roughly 6d tokens, about 25,000 for d = 4,096."
+    ],
+    [
+      "A mixture-of-experts model with 671B parameters costs as much to run as a 671B dense model.",
+      "FLOPs per token depend only on the parameters each token actually uses. DeepSeek-V3 activates 37B of its 671B parameters per token, so it costs roughly 2 × 37B FLOPs per token forward — like a 37B dense model. Memory is what scales with the total: all 671B parameters must be stored somewhere, which is why MoE models are spread across many GPUs."
+    ],
+    [
+      "The backward pass costs the same as the forward pass.",
+      "It costs about twice as much. Each linear layer's forward pass is one matmul; its backward pass needs two of the same size — one to compute the gradient with respect to the input (to keep backpropagating) and one for the gradient with respect to the weights (to update them). That is where 6N FLOPs per token for training comes from: 2N forward plus 4N backward."
+    ],
+    [
+      "If the weights fit on the GPU, fine-tuning will fit too.",
+      "Full fine-tuning with Adam needs roughly eight times the BF16 weight size before activations: a 13B model is 26 GB of weights but about 208 GB of training state. Parameter-efficient methods such as LoRA freeze the base weights, so only the small adapter matrices carry gradients and optimiser state, which is why a 13B model can be LoRA-tuned on one 80 GB GPU but not fully fine-tuned."
+    ]
+  ],
+  "recap": [
+    "A transformer block holds about 12·d² parameters — 4d² in the attention projections (less with grouped-query attention) and 8d² in the MLP — so a model has about 12·L·d² plus the embedding and output matrices.",
+    "Each weight takes part in one multiply-add per token, so a forward pass costs about 2N FLOPs per token for a model with N parameters, plus an attention term of about 4·L·T·d that matters only at long context.",
+    "Backward costs twice forward because each layer needs gradients with respect to both its input and its weights, so training costs about 6N FLOPs per token and C ≈ 6·N·D in total for D tokens.",
+    "Training time is C ÷ (number of GPUs × peak FLOP/s × MFU); at 35-45% MFU, Llama 3 405B's 3.8 × 10^25 FLOPs took about 31 million H100-hours.",
+    "Mixed-precision Adam needs about 16 bytes per parameter: 2 for BF16 weights, 2 for gradients, 4 for an FP32 master copy and 8 for two FP32 moments.",
+    "Activations are the inputs saved for the backward pass; with FlashAttention they take about 34·s·b·h bytes per layer and grow with batch and sequence length, which is why checkpointing exists.",
+    "Inference needs 2 bytes per parameter in BF16 plus the KV cache, 2 × layers × KV heads × head dimension × bytes per element for every token of every sequence.",
+    "For mixture-of-experts models, FLOPs follow the active parameters and memory follows the total parameters."
+  ],
+  "glossary": [
+    [
+      "Activation checkpointing",
+      "Saving only some activations during the forward pass and recomputing the rest during the backward pass, trading about a third more compute for much less memory (gpu9)."
+    ],
+    [
+      "Activations",
+      "The intermediate tensors produced during the forward pass; many are saved because the backward pass needs them to compute gradients."
+    ],
+    [
+      "Active parameters",
+      "In a mixture-of-experts model, the parameters actually used for a given token: the shared layers plus the few experts the token is routed to."
+    ],
+    [
+      "Chinchilla scaling",
+      "The finding (Hoffmann et al., 2022) that compute-optimal training uses about 20 training tokens per parameter."
+    ],
+    [
+      "Embedding matrix",
+      "The vocabulary × d table that turns token ids into vectors; the output (unembedding) matrix maps vectors back to vocabulary scores. They may be tied (shared) or separate."
+    ],
+    [
+      "FFN / MLP width",
+      "The inner dimension of the MLP (feed-forward network), often written d_ff: 4d in the original transformer, about 2.7-3.5d in SwiGLU models such as Llama."
+    ],
+    [
+      "GPU-hour",
+      "One GPU used for one hour; the standard unit for training cost."
+    ],
+    [
+      "GQA (grouped-query attention)",
+      "An attention variant in which several query heads share each key/value head, shrinking the K and V projections and the KV cache."
+    ],
+    [
+      "HFU (hardware FLOPs utilisation)",
+      "Like MFU but counting all FLOPs the hardware executes, including recomputation; always at least as high as MFU."
+    ],
+    [
+      "KV cache",
+      "The stored keys and values of all previous tokens of a sequence, kept during generation so they are not recomputed."
+    ],
+    [
+      "LoRA",
+      "Low-rank adaptation: fine-tuning by training small low-rank matrices added to frozen weights, so only a tiny fraction of parameters need gradients and optimiser state (lm11)."
+    ],
+    [
+      "Master weights",
+      "An FP32 copy of the weights kept by the optimiser in mixed-precision training so that small updates are not lost to 16-bit rounding."
+    ],
+    [
+      "MFU (model FLOPs utilisation)",
+      "Model FLOPs required per second (6N × tokens/s in training) divided by the hardware's peak FLOP/s."
+    ],
+    [
+      "Mixed precision",
+      "Doing most arithmetic in a 16-bit (or 8-bit) format while keeping sensitive values such as master weights and optimiser state in FP32 (gpu4)."
+    ],
+    [
+      "Mixture of experts (MoE)",
+      "A model whose MLP is replaced by many expert MLPs, with a router sending each token to only a few of them (lm17)."
+    ],
+    [
+      "Optimiser state",
+      "Per-parameter values an optimiser keeps between steps; for Adam, the first and second moments."
+    ],
+    [
+      "SwiGLU",
+      "A gated MLP used in Llama and most modern LLMs, with three weight matrices (gate, up, down) instead of two."
+    ],
+    [
+      "Tokens per parameter",
+      "Training tokens divided by parameter count; about 20 is compute-optimal, while modern small models are trained far beyond it (Llama 3 8B: about 1,900)."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Roughly how many parameters does a transformer with L layers and hidden size d have?",
+      "About 12·L·d², plus the embedding and output matrices (vocabulary × d each). Each block has 4d² in the attention projections (Q, K, V, output) and 8d² in the MLP (two d × 4d matrices, or three d × about 2.7d in SwiGLU). Llama 2 7B: 12 × 32 × 4,096² ≈ 6.4B, plus 0.26B of embeddings ≈ 6.7B.",
+      "Follow-up: How does GQA change it? — K and V shrink to d × (KV heads × head dim); Llama 3 70B's K and V are 8,192 × 1,024 instead of 8,192 × 8,192, saving about 12% of the attention parameters."
+    ],
+    [
+      "E",
+      "Why does a forward pass cost about 2N FLOPs per token?",
+      "Almost all parameters are weights in matrix multiplications, and each weight is used exactly once per token: multiplied by an input value and added to an output sum. That is one multiply and one add — 2 FLOPs — per parameter per token. Attention's score computation adds a context-dependent term on top, and embedding lookups cost no FLOPs."
+    ],
+    [
+      "E",
+      "Why does training cost about 6N FLOPs per token?",
+      "A forward pass costs about 2N. The backward pass computes, for each linear layer, the gradient with respect to its input (to pass back to the previous layer) and the gradient with respect to its weights (to update them); each is a matmul the same size as the forward one, so backward costs about 4N. Total 6N, so training compute is about 6·N·D for D tokens."
+    ],
+    [
+      "M",
+      "Where do the 16 bytes per parameter for mixed-precision Adam come from?",
+      "BF16 weights (2 bytes) used in the forward and backward passes, BF16 gradients (2), an FP32 master copy of the weights (4) so small updates are not rounded away, and Adam's first and second moments in FP32 (4 + 4). Activations, temporary buffers and fragmentation come on top.",
+      "Follow-up: How can you reduce it? — Shard it across GPUs (ZeRO/FSDP, gpu9), use 8-bit optimiser states, or freeze most weights (LoRA) so they need no gradients or optimiser state."
+    ],
+    [
+      "M",
+      "Estimate how long it takes to train a 70B model on 15 trillion tokens with 8,192 H100s.",
+      "C = 6 × 70 × 10^9 × 15 × 10^12 ≈ 6.3 × 10^24 FLOPs. At 40% MFU each H100 delivers about 0.4 × 989 × 10^12 ≈ 4 × 10^14 FLOP/s, so the cluster does 3.2 × 10^18 FLOP/s and the run takes about 2 × 10^6 s — about 22 days, or 4.4 million GPU-hours. Meta reported 7.0 million H100-hours for Llama 3.1 70B, which is what you'd expect once lower MFU, restarts, long-context training and experiments are included.",
+      "Follow-up: What's the largest uncertainty? — MFU: a change from 40% to 30% adds a third to the time, and failures and restarts at scale add more."
+    ],
+    [
+      "M",
+      "How big is the KV cache for Llama 3 70B at 8,000 tokens, and how does GQA help?",
+      "Per token it is 2 (K and V) × 80 layers × 8 KV heads × 128 head dim × 2 bytes ≈ 0.33 MB, so 8,000 tokens is about 2.6 GB per sequence. Without GQA — 64 KV heads, one per query head — it would be eight times larger, 21 GB per sequence, which would allow only a handful of concurrent sequences per GPU.",
+      "Follow-up: And with an FP8 KV cache? — Half: about 1.3 GB per sequence, doubling the number of sequences that fit and halving KV read time per decode step."
+    ],
+    [
+      "M",
+      "Will a 13B model fine-tune on one 80 GB GPU?",
+      "Full fine-tuning with mixed-precision Adam needs about 16 × 13B = 208 GB of weights, gradients and optimiser state, so no. With LoRA, the base weights are frozen in BF16 (26 GB) and only the small adapters have gradients and Adam state (well under 1 GB), leaving room for activations with checkpointing — yes. QLoRA stores the frozen base in 4 bits (about 7 GB), making it fit even on 24-48 GB cards."
+    ],
+    [
+      "M",
+      "What are activations, why must they be stored, and how big are they?",
+      "Activations are intermediate outputs of the forward pass. The backward pass needs the input of each matmul to compute the weight gradient, and the inputs of non-linear functions to differentiate them, so they are saved until used. Korthikanti et al. estimate s·b·h·(34 + 5·a·s/h) bytes per layer in 16-bit; with FlashAttention the second term disappears, leaving about 34·s·b·h. For a 7B model (h = 4,096, 32 layers) at 4,096 tokens that is about 18 GB per sequence.",
+      "Follow-up: What reduces it? — Activation checkpointing (recompute instead of store), sequence parallelism to shard it across GPUs, and smaller micro-batches."
+    ],
+    [
+      "H",
+      "How do FLOPs and memory differ for a mixture-of-experts model? Use DeepSeek-V3 as an example.",
+      "FLOPs per token scale with active parameters, memory with total parameters. DeepSeek-V3 has 671B parameters but activates 37B per token, so training on 14.8T tokens costs about 6 × 37 × 10^9 × 14.8 × 10^12 ≈ 3.3 × 10^24 FLOPs — about a tenth of Llama 3 405B's — and DeepSeek reported 2.788 million H800 GPU-hours. But all 671B parameters must be held in memory across the cluster, and routing tokens to experts on other GPUs needs all-to-all communication, so MoE is compute-cheap but memory- and network-heavy.",
+      "Follow-up: What does that mean for serving? — You need many GPUs just to hold the experts, and you need large batches so each expert sees enough tokens per step to be efficient; hence expert parallelism across a large NVLink domain."
+    ],
+    [
+      "H",
+      "When does the attention term become significant in the FLOPs count, and what does that mean for long-context training?",
+      "Per token, the dense weights cost 24·L·d² FLOPs forward and attention costs about 4·L·T·d for a context of T (half with causal masking done efficiently). The ratio is T/6d, so attention reaches the weight cost when T ≈ 6d — about 25,000 tokens for d = 4,096 and 49,000 for d = 8,192. At 128K context attention dominates, so long-context stages cost several times more per token than the 6N rule predicts; they are usually run as a short final phase for that reason.",
+      "Follow-up: Does FlashAttention reduce these FLOPs? — No, it reduces memory traffic and activation memory; the FLOPs are the same (slightly more with recomputation)."
+    ],
+    [
+      "H",
+      "Your 8B training job runs out of memory at sequence length 8,192 even though weights and optimiser state are sharded. What's likely using the memory, and how would you check?",
+      "The usual suspects are activations and the logits. Activations at about 34·s·h bytes per layer per sequence are 34 × 8,192 × 4,096 × 32 ≈ 36 GB per sequence without checkpointing. The output logits are s × vocabulary values: 8,192 × 128,256 in FP32 is 4.2 GB per sequence, with a gradient of the same size. Check with torch.cuda.memory_summary or a memory snapshot at the peak, then apply activation checkpointing, a smaller micro-batch, and a fused or chunked cross-entropy kernel that never materialises the full logits.",
+      "Follow-up: Why is the vocabulary such a problem now? — Vocabularies grew from 32K (Llama 2) to 128K+ (Llama 3), quadrupling the logits tensor while hidden sizes stayed similar."
+    ],
+    [
+      "H",
+      "Why do MFU and HFU differ, and which would you report?",
+      "MFU counts only the FLOPs the model mathematically requires, 6N per token plus attention; HFU counts everything the GPU executes, including forward passes repeated during activation checkpointing (roughly an extra 2N per token with full recomputation). HFU can therefore look better while training is not any faster. MFU is the honest comparison across implementations and is what PaLM introduced and most papers report; HFU is useful internally to see how busy the hardware is."
+    ]
+  ],
+  "refs": [
+    [
+      "post",
+      "Transformer Math 101",
+      "EleutherAI — the 6ND rule, memory per parameter and activation estimates in one place.",
+      "https://blog.eleuther.ai/transformer-math/"
+    ],
+    [
+      "paper",
+      "Reducing Activation Recomputation in Large Transformer Models",
+      "Korthikanti et al. (2022) — derives per-layer activation memory term by term, plus selective recomputation.",
+      "https://arxiv.org/abs/2205.05198"
+    ],
+    [
+      "paper",
+      "Scaling Laws for Neural Language Models",
+      "Kaplan et al. (2020) — the parameter and FLOPs-per-token accounting, including the attention term.",
+      "https://arxiv.org/abs/2001.08361"
+    ],
+    [
+      "paper",
+      "Training Compute-Optimal Large Language Models (Chinchilla)",
+      "Hoffmann et al. (2022) — about 20 tokens per parameter for compute-optimal training.",
+      "https://arxiv.org/abs/2203.15556"
+    ],
+    [
+      "paper",
+      "The Llama 3 Herd of Models",
+      "Architecture tables, the 3.8 × 10^25 FLOPs budget for 405B, and MFU at 16K GPUs.",
+      "https://arxiv.org/abs/2407.21783"
+    ],
+    [
+      "paper",
+      "DeepSeek-V3 Technical Report",
+      "671B-total / 37B-active MoE trained on 14.8T tokens in 2.788M H800 GPU-hours with FP8.",
+      "https://arxiv.org/abs/2412.19437"
+    ],
+    [
+      "paper",
+      "PaLM: Scaling Language Modeling with Pathways",
+      "Chowdhery et al. (2022) — defines model FLOPs utilisation (MFU) and its difference from HFU.",
+      "https://arxiv.org/abs/2204.02311"
+    ],
+    [
+      "book",
+      "How to Scale Your Model: All the Transformer Math",
+      "Google DeepMind's chapter on parameter, FLOPs and memory counting for transformers.",
+      "https://jax-ml.github.io/scaling-book/transformers/"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A startup has a budget of $200,000 and wants to pre-train its own 3-billion-parameter model. Another team wants to fine-tune a 13B model on a single rented 80 GB GPU. A third is told that a long-context version of their model "will cost about the same to train, it's the same size". All three questions can be answered in five minutes with a pencil — or wasted in five days of launching jobs, watching them run out of memory, and extrapolating from partial runs. The first team can afford roughly 10<sup>22</sup> FLOPs; the second will fail with full fine-tuning and succeed with LoRA; the third is wrong, because at 128,000 tokens of context the attention computations cost more than the rest of the model put together.</p>
+<p>Senior ML engineers do this arithmetic constantly, and interviewers test it directly: "How many GPU-hours to train a 7B model on 2 trillion tokens?", "Why 16 bytes per parameter?", "How big is the KV cache for this model?". The answers come from a small set of rules — each derived from what a transformer actually computes — that fit on an index card: <em>12·L·d² parameters, 2N FLOPs per token forward, 6N to train, 16 bytes per parameter for Adam, 34·s·b·h bytes of activations per layer</em>.</p>
+<p>The rules are only useful if you know where they come from, because that is what tells you when they break: grouped-query attention changes the parameter count, SwiGLU changes the MLP, long contexts add an attention term, mixture-of-experts models split FLOPs from memory, and large vocabularies make the logits a memory problem of their own. This lesson derives each rule from the structure of the model, checks it against real published configurations — Llama 2 and 3, and DeepSeek-V3 — and then uses it for the jobs you will actually face: sizing a training run in GPU-hours and dollars, deciding whether a fine-tune fits on a GPU, estimating inference memory, and diagnosing where an out-of-memory error came from.</p>
+</section>
+
+<section data-field="primer">
+<h4>Three ledgers</h4>
+<p>Think of sizing a model like a builder estimating a house. There is a <em>bill of materials</em> — how many bricks, beams and panes of glass. There is <em>labour</em> — how many hours of work it takes to put them together. And there is <em>site space</em> — how much room you need for materials and scaffolding while you build. For a transformer these are:</p>
+<ul>
+<li><strong>Parameters</strong> (N): the numbers in its weight matrices. They decide the size of the model file and the minimum memory to hold it.</li>
+<li><strong>FLOPs</strong>: the arithmetic needed to process tokens, which, divided by the GPU's delivered FLOP/s, gives time.</li>
+<li><strong>Bytes of memory</strong>: weights plus everything else that must live on the GPU at once — gradients and optimiser state during training, saved activations, and the KV cache during generation.</li>
+</ul>
+<p>The analogy's limit: in a building the scaffolding comes down once the house is done, while in training the "scaffolding" — optimiser state and activations — is several times bigger than the house itself and stays up for the whole run.</p>
+<h4>A first estimate in one minute</h4>
+<p>Before any derivation, see how far three multiplications get you. Someone asks: "Can we pre-train a 1-billion-parameter model on 100 billion tokens this week on one 8-GPU H100 server?" Parameters: N = 10<sup>9</sup>. Labour: training costs about 6 FLOPs per parameter per token, so 6 × 10<sup>9</sup> × 10<sup>11</sup> = 6 × 10<sup>20</sup> FLOPs. Eight H100s at a realistic 40% of their 989 TFLOP/s peak deliver about 3.2 × 10<sup>15</sup> FLOP/s, so the run takes 1.9 × 10<sup>5</sup> seconds — a little over two days. Site space: 16 bytes per parameter is 16 GB of training state, which fits easily in one GPU's 80 GB, leaving room for activations. Answer: yes, comfortably, with time left for a second attempt. The same three numbers for a 70B model on 15 trillion tokens give about 60 years on that server, which is why such models are trained on tens of thousands of GPUs.</p>
+<p>That is the whole method: count parameters, multiply by tokens and a constant to get FLOPs, divide by delivered FLOP/s to get time, and multiply parameters by bytes per parameter to get memory. The rest of the lesson explains where each constant comes from and when it changes.</p>
+<h4>The index card</h4>
+<p>Here are the rules this lesson derives, for a model with N parameters, L layers and hidden size d:</p>
+<pre>parameters           N ≈ 12 · L · d²  (+ embedding and output matrices)
+forward FLOPs/token  ≈ 2N   (+ ≈ 4·L·T·d for attention over T tokens of context)
+training FLOPs/token ≈ 6N   → total training compute C ≈ 6 · N · D tokens
+training memory      ≈ 16 bytes × N  (+ activations)
+inference memory     ≈ 2 bytes × N (BF16)  + KV cache</pre>
+<p>Where do they come from? Almost every parameter sits in a weight matrix, and the forward pass multiplies each token's vector by each weight matrix. Each weight is therefore used once per token, in one multiply and one add: 2 FLOPs per parameter per token. Training adds a backward pass that does two matrix multiplications for every one in the forward pass. And training memory is dominated by the optimiser's bookkeeping — for Adam, three extra numbers per parameter, two of them in full 32-bit precision.</p>
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Parameter breakdown of one Llama 3 8B block: query and output projections of 16.8 million each, key and value projections of 4.2 million each, and three MLP matrices of 58.7 million each, for 218 million per block; 32 blocks plus embedding and output matrices give 8.03 billion">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">One Llama 3 8B block (d = 4,096, 32 query heads, 8 KV heads, d_ff = 14,336)</text>
+    <text x="20" y="48" style="fill:var(--ink-2)">attention</text>
+    <rect x="110" y="36" width="58" height="22" style="fill:var(--s1);opacity:0.55"/><text x="139" y="51" text-anchor="middle" style="fill:var(--ink);font-size:11px">W_Q</text>
+    <rect x="170" y="36" width="15" height="22" style="fill:var(--s1);opacity:0.35"/>
+    <rect x="187" y="36" width="15" height="22" style="fill:var(--s1);opacity:0.35"/>
+    <rect x="204" y="36" width="58" height="22" style="fill:var(--s1);opacity:0.55"/><text x="233" y="51" text-anchor="middle" style="fill:var(--ink);font-size:11px">W_O</text>
+    <text x="272" y="51" style="fill:var(--ink-2);font-size:11px">16.8M + 4.2M (K) + 4.2M (V) + 16.8M = 41.9M</text>
+    <text x="20" y="90" style="fill:var(--ink-2)">MLP</text>
+    <rect x="110" y="78" width="203" height="22" style="fill:var(--s2);opacity:0.55"/><text x="211" y="93" text-anchor="middle" style="fill:var(--ink);font-size:11px">gate 58.7M</text>
+    <rect x="315" y="78" width="203" height="22" style="fill:var(--s2);opacity:0.45"/><text x="416" y="93" text-anchor="middle" style="fill:var(--ink);font-size:11px">up 58.7M</text>
+    <rect x="110" y="104" width="203" height="22" style="fill:var(--s2);opacity:0.35"/><text x="211" y="119" text-anchor="middle" style="fill:var(--ink);font-size:11px">down 58.7M</text>
+    <text x="322" y="119" style="fill:var(--ink-2);font-size:11px">= 176.2M (81% of the block)</text>
+    <text x="20" y="150" style="fill:var(--ink-2)">norms</text>
+    <text x="110" y="150" style="fill:var(--ink-2);font-size:11px">2 × 4,096 = 8K (negligible)</text>
+    <line x1="20" y1="165" x2="620" y2="165" style="stroke:var(--line-2);fill:none"/>
+    <text x="20" y="188" style="fill:var(--ink)">per block ≈ 218M  ×  32 blocks  =  6.98B</text>
+    <text x="20" y="212" style="fill:var(--ink)">+ embedding 128,256 × 4,096 = 0.53B   + output matrix 0.53B</text>
+    <text x="20" y="240" style="fill:var(--accent);font-weight:600">total ≈ 8.03B parameters</text>
+    <text x="20" y="270" style="fill:var(--muted);font-size:11px">Box widths are proportional to parameter count. With plain multi-head attention K and V would each be 16.8M;</text>
+    <text x="20" y="286" style="fill:var(--muted);font-size:11px">grouped-query attention (8 KV heads for 32 query heads) shrinks them 4×.</text>
+  </g>
+</svg>
+<figcaption>Most parameters live in the MLP, and a 128K-token vocabulary makes the embedding and output matrices an eighth of an 8B model. Counting from the config like this is how you check any published parameter count.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<h4>1. Counting parameters from a config</h4>
+<p>A decoder-only transformer has three kinds of weights. Walk through them with a model config in hand — the <code>config.json</code> on a model's Hugging Face page lists every number you need.</p>
+<p><strong>Attention projections.</strong> Each block turns its input (width d) into queries, keys and values, and projects the attention output back to width d. With classic multi-head attention, W<sub>Q</sub>, W<sub>K</sub>, W<sub>V</sub> and W<sub>O</sub> are each d × d: 4d² parameters. With <strong>grouped-query attention</strong> (GQA), several query heads share one key/value head, so W<sub>K</sub> and W<sub>V</sub> are d × (KV heads × head dimension) instead. Llama 3 8B has d = 4,096, 32 query heads of dimension 128 and 8 KV heads, so W<sub>K</sub> and W<sub>V</sub> are 4,096 × 1,024 each (4.2M) while W<sub>Q</sub> and W<sub>O</sub> are 16.8M each: 41.9M in all.</p>
+<p><strong>The MLP</strong> (feed-forward network). The original transformer used two matrices, d × 4d and 4d × d: 8d². Modern LLMs use <strong>SwiGLU</strong>, a gated MLP with three matrices — gate and up (d × d<sub>ff</sub>) and down (d<sub>ff</sub> × d) — with d<sub>ff</sub> reduced to keep the total similar. Llama 3 8B: 3 × 4,096 × 14,336 = 176.2M, about 10.5d², a bit more than the classic 8d².</p>
+<p><strong>Everything else in the block</strong> — normalisation scales and any biases — is a few vectors of length d: thousands of parameters against hundreds of millions. Ignore them.</p>
+<p><strong>Embeddings.</strong> The input embedding is a vocabulary × d table, and the output layer (the "unembedding" or LM head) is another d × vocabulary matrix, unless the two are tied (shared). For Llama 3's vocabulary of 128,256 tokens, each is 525M parameters.</p>
+<p>Put it together: 32 blocks × 218.1M = 6.98B, plus 2 × 0.53B = 8.03B — exactly the published "8B". The same procedure for Llama 3 70B (80 layers, d = 8,192, 64 query heads, 8 KV heads, d<sub>ff</sub> = 28,672) gives 80 × 856M + 2 × 1.05B ≈ 70.6B. For quick estimates, <strong>N ≈ 12·L·d²</strong> is the classic shortcut: Llama 2 7B (32 layers, d = 4,096, plain multi-head attention, d<sub>ff</sub> = 11,008) gives 12 × 32 × 4,096<sup>2</sup> ≈ 6.4B, plus 0.26B of embeddings (vocabulary 32,000) ≈ 6.7B.</p>
+
+<h4>2. Forward FLOPs: 2N per token, and where it comes from</h4>
+<p>From gpu2, multiplying a [T, k] matrix by a [k, n] weight matrix costs 2·T·k·n FLOPs. The weight matrix has k·n parameters. So the cost per token (per row) is <strong>2 FLOPs per parameter</strong> — each weight is multiplied by one input value and the product added into one output. Since nearly all parameters are in weight matrices that every token passes through, a forward pass costs <strong>about 2N FLOPs per token</strong>. For Llama 3 8B that is about 16 GFLOPs per token; processing a 1,000-token prompt costs about 16 TFLOPs, which an H100 at a realistic 60% of its 989 TFLOP/s does in about 27 ms.</p>
+<p>Two refinements. The <strong>input embedding</strong> is a table lookup, not a matmul, so it costs no FLOPs — strictly, the 2N rule should use N minus the input embedding. And <strong>attention itself</strong> — computing scores between the current token and every previous token, and the weighted sum of their values — has no parameters but does cost FLOPs. Per layer, for a token attending over T positions with total attention width d: the scores are T dot products of length d (2·T·d FLOPs) and the weighted sum of T value vectors is another 2·T·d. So attention adds about <strong>4·L·T·d FLOPs per token</strong>, and about half that on average in causal (left-to-right) models if the kernel skips masked positions.</p>
+<p>Compare it with the weights: 2N ≈ 24·L·d², so attention/weights ≈ 4·L·T·d / 24·L·d² = <strong>T / 6d</strong>. For Llama 3 8B (d = 4,096):</p>
+<table><thead><tr><th>Context T</th><th>Attention as % of weight FLOPs (full)</th></tr></thead><tbody>
+<tr><td>2,048</td><td>8%</td></tr>
+<tr><td>8,192</td><td>33%</td></tr>
+<tr><td>32,768</td><td>133%</td></tr>
+<tr><td>131,072</td><td>533%</td></tr>
+</tbody></table>
+<p>At the context lengths most pre-training uses (4K-8K), the 2N rule is within tens of percent. At 128K, attention costs five times the rest of the model per token. This is why long-context capability is usually added in a short final phase of training rather than from the start: Llama 3 405B, for example, was trained mostly at 8K and extended to 128K at the end.</p>
+
+<h4>3. Backward FLOPs: why training is 6N</h4>
+<p>Training needs gradients, and the backward pass costs twice the forward. The reason is visible in a single linear layer, Y = X·W, with X of shape [T, k] and W of shape [k, n]:</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="One linear layer needs one matmul forward, Y equals X times W, and two matmuls backward: the input gradient equals the output gradient times W transposed, and the weight gradient equals X transposed times the output gradient; each costs 2 T k n FLOPs">
+  <defs><marker id="gpu3-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">Forward: 1 matmul</text>
+    <rect x="20" y="34" width="290" height="40" rx="5" style="fill:var(--s1);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="165" y="59" text-anchor="middle" style="font-family:var(--mono);fill:var(--ink)">Y = X · W        2·T·k·n</text>
+    <text x="340" y="22" style="fill:var(--ink);font-weight:600">Backward: 2 matmuls</text>
+    <rect x="340" y="34" width="280" height="40" rx="5" style="fill:var(--s2);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="480" y="59" text-anchor="middle" style="font-family:var(--mono);fill:var(--ink)">dX = dY · Wᵀ     2·T·k·n</text>
+    <rect x="340" y="84" width="280" height="40" rx="5" style="fill:var(--s2);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="480" y="109" text-anchor="middle" style="font-family:var(--mono);fill:var(--ink)">dW = Xᵀ · dY     2·T·k·n</text>
+    <line x1="310" y1="54" x2="338" y2="54" marker-end="url(#gpu3-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="20" y="150" style="fill:var(--ink-2)">dX flows back to the previous layer so backpropagation can continue.</text>
+    <text x="20" y="172" style="fill:var(--ink-2)">dW is what the optimiser uses to update W. It needs X — the saved activation.</text>
+    <text x="20" y="205" style="fill:var(--accent);font-weight:600">per token: 2 FLOPs/param forward + 4 backward = 6 FLOPs/param  →  C ≈ 6·N·D</text>
+  </g>
+</svg>
+<figcaption>The backward pass does two matmuls of the forward's size for every linear layer. The second one, dW = Xᵀ·dY, is also the reason activations must be saved: it needs the layer's input X from the forward pass.</figcaption>
+</figure>
+<p>The forward is one matmul. The backward must produce two things: the gradient with respect to the input, dX = dY·W<sup>T</sup>, which is passed to the previous layer so backpropagation can continue; and the gradient with respect to the weights, dW = X<sup>T</sup>·dY, which the optimiser uses. Each is a matmul with the same dimensions as the forward, so backward costs 4 FLOPs per parameter per token. Total: <strong>6N FLOPs per token</strong>, and for a whole run on D tokens:</p>
+<pre>C ≈ 6 · N · D</pre>
+<p>(The attention term triples the same way: about 12·L·T·d per token in training.) The first layer is a small exception — nobody needs dX for the input embeddings — but at 80 layers that rounding error doesn't matter.</p>
+
+<h4>4. From FLOPs to time, GPU-hours and money</h4>
+<p>Delivered FLOP/s is peak × MFU (model FLOPs utilisation — the fraction of peak the job achieves on the FLOPs the model needs). So:</p>
+<pre>time = C / (number of GPUs × peak FLOP/s × MFU)
+GPU-hours = C / (peak FLOP/s × MFU × 3,600)</pre>
+<p><strong>Worked example: Llama 3 405B.</strong> Meta trained it on 15.6 trillion tokens. C = 6 × 405 × 10<sup>9</sup> × 15.6 × 10<sup>12</sup> ≈ 3.8 × 10<sup>25</sup> FLOPs — exactly the budget the Llama 3 paper reports. Meta measured 380-430 TFLOP/s per GPU (38-43% of the H100's 989 dense BF16 peak). At 400 TFLOP/s: 3.8 × 10<sup>25</sup> / (4 × 10<sup>14</sup> × 3,600) ≈ 26 million GPU-hours; on 16,384 GPUs, 1,610 hours or about 67 days of pure computation. The Llama 3.1 model card reports 30.84 million H100-hours for the 405B model. The gap of about 15-20% is what you should expect: restarts after the hardware failures described in gpu1, the long-context stage where attention adds FLOPs beyond 6N, and post-training.</p>
+<p><strong>Worked example: a small budget.</strong> The startup with $200,000, renting H100s at, say, $2.50 per hour, gets 80,000 GPU-hours. At 40% MFU each GPU-hour delivers 0.4 × 989 × 10<sup>12</sup> × 3,600 ≈ 1.4 × 10<sup>18</sup> FLOPs, so the budget buys about 1.1 × 10<sup>23</sup> FLOPs. For a 3B model that is D = C / 6N ≈ 6 trillion tokens — plenty. (Real budgets must also cover experiments, failed runs, evaluation and storage, often doubling the cost.)</p>
+<p><strong>How many tokens?</strong> The Chinchilla paper (lm7) found compute-optimal training uses about 20 tokens per parameter — 140B tokens for a 7B model. Modern open models deliberately "over-train" small models far beyond that, because a smaller model is cheaper to serve for its whole life: Llama 3 8B saw about 15 trillion tokens, around 1,900 per parameter. The 6ND rule doesn't care why you chose D; it just prices it.</p>
+
+<h4>5. Training memory: 16 bytes per parameter</h4>
+<p>Standard <strong>mixed-precision training</strong> (gpu4 explains the formats) does the forward and backward matmuls in BF16 for speed, but keeps a 32-bit copy of what must not lose precision. With the Adam optimiser, each parameter carries:</p>
+<table><thead><tr><th>Item</th><th>Format</th><th>Bytes</th><th>Why it's there</th></tr></thead><tbody>
+<tr><td>Weights</td><td>BF16</td><td>2</td><td>Used in forward and backward matmuls.</td></tr>
+<tr><td>Gradients</td><td>BF16 (sometimes FP32)</td><td>2</td><td>Produced by backward, consumed by the optimiser.</td></tr>
+<tr><td>Master weights</td><td>FP32</td><td>4</td><td>Updates are often ~10<sup>-4</sup> of the weight's size; in BF16, with only about 3 significant decimal digits, they would round to nothing.</td></tr>
+<tr><td>Adam first moment</td><td>FP32</td><td>4</td><td>Running mean of gradients.</td></tr>
+<tr><td>Adam second moment</td><td>FP32</td><td>4</td><td>Running mean of squared gradients.</td></tr>
+<tr><td><strong>Total</strong></td><td></td><td><strong>16</strong></td><td>Before activations and buffers.</td></tr>
+</tbody></table>
+<p>So a 7B model needs about 112 GB just for this "model state" — more than an 80 GB H100 holds — and a 70B model about 1.1 TB. That is why training anything beyond a few billion parameters needs the state sharded across GPUs with ZeRO or FSDP (fully sharded data parallel — each GPU keeps only a slice of the state; gpu9), which divides the 16 bytes by the number of GPUs sharing it. If gradients are kept in FP32, it is 18 bytes; 8-bit optimiser states cut it to about 10.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Memory for training a 7B model with mixed-precision Adam: weights 14 GB, gradients 14 GB, master weights 28 GB, Adam moments 56 GB, then activations of about 18 GB per 4,096-token sequence without checkpointing, against an 80 GB H100 line">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Training a 7B model, one GPU, no sharding (GB)</text>
+    <rect x="20" y="40" width="56" height="44" style="fill:var(--s1);opacity:0.6"/>
+    <rect x="76" y="40" width="56" height="44" style="fill:var(--s2);opacity:0.6"/>
+    <rect x="132" y="40" width="112" height="44" style="fill:var(--s3);opacity:0.6"/>
+    <rect x="244" y="40" width="224" height="44" style="fill:var(--s4);opacity:0.6"/>
+    <rect x="468" y="40" width="72" height="44" style="fill:var(--s5);opacity:0.6"/>
+    <g style="fill:var(--ink);font-size:11px">
+      <text x="48" y="66" text-anchor="middle">wts 14</text>
+      <text x="104" y="66" text-anchor="middle">grads 14</text>
+      <text x="188" y="66" text-anchor="middle">master 28</text>
+      <text x="356" y="66" text-anchor="middle">Adam moments 56</text>
+      <text x="504" y="66" text-anchor="middle">act. ~18</text>
+    </g>
+    <line x1="340" y1="30" x2="340" y2="100" style="stroke:var(--crit);stroke-width:2;fill:none"/>
+    <text x="340" y="116" text-anchor="middle" style="fill:var(--crit);font-size:11px">80 GB H100</text>
+    <text x="20" y="140" style="fill:var(--ink-2)">model state = 16 bytes × 7B = 112 GB; activations for one 4,096-token sequence ≈ 18 GB more.</text>
+    <text x="20" y="162" style="fill:var(--ink-2)">Inference of the same model needs only the first box (14 GB) plus the KV cache.</text>
+    <text x="20" y="194" style="fill:var(--muted);font-size:11px">1 GB drawn as 4 px. Sharding (ZeRO/FSDP) divides the first four boxes by the number of GPUs;</text>
+    <text x="20" y="210" style="fill:var(--muted);font-size:11px">checkpointing shrinks the last one.</text>
+  </g>
+</svg>
+<figcaption>The weights are the smallest part of training memory. The optimiser state alone is four times their size, which is why the first thing large-scale training does is shard it.</figcaption>
+</figure>
+
+<h4>6. Activation memory</h4>
+<p><strong>Activations</strong> are the intermediate tensors of the forward pass. As the backward diagram showed, computing dW = X<sup>T</sup>·dY needs each layer's input X, and differentiating non-linear functions (softmax, GELU, normalisation) needs their inputs too, so the framework saves them until the backward pass reaches that layer. Unlike model state, activations scale with the work in flight: batch size, sequence length and hidden size.</p>
+<p>Korthikanti et al. (NVIDIA, 2022) counted every saved tensor in a standard transformer layer and arrived at, in 16-bit precision:</p>
+<pre>activation bytes per layer ≈ s · b · h · (34 + 5 · a · s / h)</pre>
+<p>where s is sequence length, b micro-batch size (sequences per GPU per step), h hidden size and a the number of attention heads. The 34·s·b·h part is the many s × h tensors a layer saves — inputs to each projection, the MLP's wide intermediate, normalisation inputs, dropout masks. The 5·a·s²·b part is the attention score matrix (a heads × s × s) and its softmax, which grows with the <em>square</em> of the sequence length. FlashAttention (gpu7) never materialises that matrix — it recomputes the pieces it needs during the backward pass — so with it, activations are about <strong>34·s·b·h bytes per layer</strong>.</p>
+<p>Worked example: a 7B model (h = 4,096, 32 layers) at s = 4,096, b = 1: 34 × 4,096 × 4,096 ≈ 570 MB per layer, 18 GB per sequence. Without FlashAttention, the attention term adds 5 × 32 heads × 4,096<sup>2</sup> ≈ 2.7 GB per layer — 86 GB per sequence. Activations, not weights, are what limit batch size and sequence length in training, and <strong>activation checkpointing</strong> (gpu9) cuts them by storing only each layer's input and recomputing the rest during the backward pass, at the cost of roughly one extra forward pass (about 33% more compute).</p>
+
+<h4>7. Inference memory and the KV cache</h4>
+<p>Inference needs no gradients or optimiser state: <strong>2 bytes per parameter</strong> in BF16 (1 in FP8, about 0.5 in 4-bit formats) plus the <strong>KV cache</strong> (lm5) — the keys and values of every token of every active sequence, kept so they are not recomputed at each generation step. Its size per token is:</p>
+<pre>KV bytes per token = 2 (K and V) × layers × KV heads × head dimension × bytes per element</pre>
+<p>Llama 3 8B: 2 × 32 × 8 × 128 × 2 = 131 KB per token. Llama 3 70B: 2 × 80 × 8 × 128 × 2 = 328 KB per token, so a 32,000-token conversation holds 10.5 GB of cache — and a server with 64 such conversations needs 670 GB for cache alone, more than four times the 140 GB of weights. Without GQA (64 KV heads instead of 8) it would be eight times larger. This is why GQA, KV quantisation and paged KV management (lm13) matter so much in serving, and why gpu10 treats KV bytes as a first-class part of decode time.</p>
+
+<h4>8. Putting the rules to work: will it fit?</h4>
+<p><strong>Full fine-tuning a 13B model on one 80 GB GPU:</strong> 16 × 13B = 208 GB of model state. No.</p>
+<p><strong>LoRA on the same model:</strong> the base weights are frozen, stored in BF16 (26 GB), with no gradients or optimiser state. LoRA adds pairs of small matrices — for rank 16 on the attention and MLP projections, a few tens of millions of parameters — each with the full 16 bytes: under 1 GB. Activations with checkpointing fit in the remaining ~50 GB. Yes. <strong>QLoRA</strong> stores the frozen base in 4 bits (about 7 GB), so it fits even on 24 GB consumer cards (lm11).</p>
+<p><strong>Serving Llama 3 70B in BF16:</strong> 141 GB of weights needs at least two 80 GB H100s — in practice four or eight, to leave room for KV cache — or one 141 GB H200 with almost nothing left for cache. In FP8 (70 GB) it fits on one H100 with about 10 GB of cache, enough for a few long conversations.</p>
+</section>
+
+<section data-field="deep">
+<h4>Mixture-of-experts: FLOPs follow active parameters, memory follows total</h4>
+<p>In a <strong>mixture-of-experts</strong> (MoE) model (lm17), each MLP is replaced by many expert MLPs and a small router that sends each token to a few of them. The FLOPs rule becomes 2 × <em>active</em> parameters per token — the shared attention and embedding weights plus the experts actually used. DeepSeek-V3 has 671B parameters but activates 37B per token; training on 14.8 trillion tokens costs about 6 × 37 × 10<sup>9</sup> × 14.8 × 10<sup>12</sup> ≈ 3.3 × 10<sup>24</sup> FLOPs, roughly a tenth of Llama 3 405B's budget. DeepSeek reported 2.788 million H800 GPU-hours for the full training (the H800 is the export version of the H100, with the same compute but reduced NVLink bandwidth) (about $5.6 million at an assumed $2 per GPU-hour, a figure that excludes research, ablations and staff). Working backwards, that is about 330 TFLOP/s per GPU of model FLOPs — plausible for a system that did most of its matmuls in FP8. But memory follows the total: 671B parameters are 671 GB in FP8, and training state is several times that, so the model must be spread over hundreds of GPUs, and tokens must be sent to whichever GPU holds their chosen expert through all-to-all communication (gpu8). MoE trades FLOPs for memory and network bandwidth.</p>
+<h4>MFU versus HFU, precisely</h4>
+<p>PaLM (2022) introduced <strong>MFU</strong> as the model's required FLOPs per second — 6N plus the attention term, times tokens per second — over peak. <strong>HFU</strong> (hardware FLOPs utilisation) counts what the hardware actually executes, including recomputation. With full activation checkpointing, each layer's forward runs twice, so the hardware does about 8N FLOPs per token instead of 6N and HFU is a third higher than MFU for the same speed. Reporting HFU flatters a system that recomputes a lot; reporting MFU rewards systems that avoid recomputation by being smart about memory. When comparing papers, check which one is quoted and whether the attention term was included — at long context, leaving it out understates MFU.</p>
+<h4>The logits are a memory problem of their own</h4>
+<p>The output layer produces a score for every vocabulary token at every position: s × V values. With Llama 3's V = 128,256 and s = 8,192, that is 1.05 billion values per sequence — 4.2 GB in FP32, where the loss is usually computed for numerical safety, plus a gradient of the same size. This single tensor can exceed all of a small model's per-layer activations combined, and it grew fourfold when vocabularies went from 32K to 128K. The fix is a fused or chunked cross-entropy kernel that computes the output matmul, the softmax and the loss piece by piece without ever storing the full logits (implemented, for example, in the open-source Liger Kernel library and in several training frameworks).</p>
+<h4>Where the 34 comes from and when it changes</h4>
+<p>The 34·s·b·h estimate assumes a classic block with a 4h MLP, dropout, and 16-bit activations. SwiGLU's three matrices and wider intermediate change the constant (roughly into the high 30s-40s, depending on d<sub>ff</sub>), models without dropout drop its 1-byte masks, and tensor or sequence parallelism divide parts of it by the parallel degree — Korthikanti et al.'s whole point was that with sequence parallelism and <em>selective</em> recomputation (recomputing only the cheap, memory-hungry attention parts), activation memory falls to a small fraction with only a few percent extra compute. Treat 34 as an order-of-magnitude constant and measure the real number with the framework's memory profiler.</p>
+<h4>The attention term under different attention variants</h4>
+<p>GQA reduces KV-cache memory and the K and V projection FLOPs, but not the score and weighted-sum FLOPs, which depend on the number of <em>query</em> heads. Sliding-window attention caps T at the window size for those layers, turning the quadratic term linear. DeepSeek's multi-head latent attention (MLA) stores a compressed latent vector per token instead of full keys and values — DeepSeek reported a 93% smaller KV cache than its previous dense model — at the cost of extra projection FLOPs. Every one of these is a trade between FLOPs, memory and bandwidth that the three ledgers make visible.</p>
+<h4>Rules for inference FLOPs</h4>
+<p>Prefill costs 2N FLOPs per prompt token plus attention, and is compute-bound, so time to first token ≈ 2·N·prompt tokens ÷ (peak × efficiency). Each decode step costs 2N FLOPs per sequence but is memory-bound, so its time is set by bytes (weights + KV cache) ÷ bandwidth (gpu2, gpu10). A long reasoning trace of 10,000 generated tokens costs 20N × 10<sup>3</sup> FLOPs — cheap in FLOPs, expensive in time, because it is 10,000 memory-bound steps.</p>
+</section>
+
+<section data-field="prod">
+<h4>Planning a real training run</h4>
+<p>Before a large run, teams produce a sizing sheet from exactly these rules: parameter count from the config, tokens from the data plan, C = 6ND plus the attention term for each context-length phase, an MFU assumption from a small-scale benchmark on the target cluster, and the resulting GPU-hours. They then add explicit overheads: typically 10-30% for failures and restarts (from checkpoint intervals and failure rates like the one-interruption-every-three-hours that Meta saw at 16K GPUs), time for evaluation, and a separate budget for ablations. The Llama 3.1 70B model card's 7.0 million GPU-hours against a bare 6ND estimate of about 4.4 million at 40% MFU shows the size of that multiplier in a real, well-run project.</p>
+<p>Memory planning follows the same pattern: model state per GPU after sharding (16N ÷ shard group size), activations per micro-batch from the 34·s·b·h estimate or a measured profile, logits, communication buffers, and a margin of 10-20% for fragmentation in PyTorch's caching allocator. The micro-batch size and checkpointing policy are then chosen to fill memory without overflowing it.</p>
+<h4>Out-of-memory errors: a diagnosis order</h4>
+<p>"CUDA out of memory" is the most common training failure. The arithmetic tells you where to look first:</p>
+<ol>
+<li><strong>At model load or first optimiser step:</strong> model state. 16 bytes × N too large for the shard group — shard more (FSDP full sharding), use LoRA, or use 8-bit optimiser states.</li>
+<li><strong>During the forward pass, scaling with sequence length:</strong> activations or attention scores. Check that FlashAttention (in PyTorch, via <code>scaled_dot_product_attention</code>, SDPA) is actually used (a silent fallback to the eager implementation brings back the s² term), enable checkpointing, reduce micro-batch.</li>
+<li><strong>At the loss:</strong> logits. A 128K vocabulary at long sequence lengths — use a chunked or fused cross-entropy.</li>
+<li><strong>Intermittently, with "reserved but unallocated" memory high:</strong> fragmentation from varying sequence lengths. PyTorch's <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> setting often helps.</li>
+</ol>
+<p><code>torch.cuda.memory_summary()</code> and PyTorch's memory snapshot tool (<code>torch.cuda.memory._record_memory_history</code>, viewed at pytorch.org/memory_viz) show exactly which tensors occupy memory at the peak; gpu11 walks through them.</p>
+<h4>Serving capacity planning</h4>
+<p>For inference, the same arithmetic sets how many GPUs a model needs and how many concurrent users each can hold. A worked case: Llama 3 70B in FP8 on one 141 GB H200 leaves about 65 GB after weights and runtime overhead. At 164 KB per token for an FP8 KV cache, that is about 400,000 tokens of cache — for example 100 concurrent conversations of 4,000 tokens, or 12 of 32,000. Serving frameworks such as vLLM compute exactly this at start-up (reporting the number of KV "blocks" available) and admit requests accordingly; if context lengths in production are longer than planned, concurrency falls and queues grow, which shows up as rising time to first token (gpu10).</p>
+<h4>A real accounting: DeepSeek-V3's headline cost</h4>
+<p>DeepSeek-V3's report states 2.788 million H800 GPU-hours for pre-training, context extension and post-training — about $5.6 million at $2 per GPU-hour — and the number drew wide attention as evidence that frontier-class models had become cheap. The three ledgers explain both why the number is plausible (37B active parameters, FP8 matmuls and heavy engineering for communication overlap make the FLOPs cheap) and what it leaves out, as the report itself notes: the cost of prior research, ablation runs and data, and the capital cost of owning a cluster of about 2,048 GPUs. When you estimate costs in an interview, separate the final run's compute from the programme's total cost in the same way.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> build a model sizer from a config and check it against published numbers. Pure Python 3.12; no GPU needed (this machine has none).</p>
+<pre>def params(L, d, heads, kv_heads, ffn, vocab, tied=False):
+    dh = d // heads
+    attn = 2 * d * d + 2 * d * kv_heads * dh          # Wq, Wo, Wk, Wv
+    mlp = 3 * d * ffn                                  # SwiGLU: gate, up, down
+    emb = vocab * d * (1 if tied else 2)               # input + output matrices
+    return L * (attn + mlp) + emb
+
+CONFIGS = {  # L, d, heads, kv_heads, ffn, vocab
+    "Llama-3-8B":  (32, 4096, 32, 8, 14336, 128256),
+    "Llama-3-70B": (80, 8192, 64, 8, 28672, 128256),
+}
+for name, cfg in CONFIGS.items():
+    L, d, heads, kv, ffn, vocab = cfg
+    N = params(*cfg)
+    kv_per_tok = 2 * L * kv * (d // heads) * 2          # K and V, BF16
+    act_per_tok = 34 * d * L                           # bytes, FlashAttention
+    print(f"{name}: {N / 1e9:.2f}B params | train state {16 * N / 1e9:.0f} GB | "
+          f"KV {kv_per_tok / 1e6:.2f} MB/token | activations {act_per_tok / 1e6:.1f} MB/token")
+
+N, D = 70e9, 15e12                                    # C = 6ND
+gpus, peak, mfu = 8192, 989e12, 0.40
+C = 6 * N * D
+seconds = C / (gpus * peak * mfu)
+print(f"70B on 15T tokens: C = {C:.2e} -&gt; {seconds / 86400:.0f} days, "
+      f"{gpus * seconds / 3600 / 1e6:.2f}M GPU-hours")</pre>
+<p><strong>What to look for.</strong> The sizer should print 8.03B and 70.55B parameters — matching the published sizes, which confirms the counting rules. Training state is 128 GB and 1,129 GB: neither fits on one GPU. The KV cache is 0.13 and 0.33 MB per token. The 70B run comes out at about 22 days and 4.4 million GPU-hours; compare with the 7.0 million Meta reported and list what the difference covers.</p>
+<p><strong>Try:</strong> set <code>kv_heads</code> equal to <code>heads</code> to see what the KV cache would be without GQA, and add Llama 2 7B (32, 4096, 32, 32, 11008, 32000) to check the 6.7B figure.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>Train a 7B model on 2 trillion tokens using 1,024 H100s at 40% MFU. (a) Total compute? (b) Wall-clock time and GPU-hours? (c) Memory per GPU for weights, gradients and optimiser state if fully sharded, and what actually limits memory?</p>
+<details><summary>Answer</summary>
+<p>(a) C = 6 × 7 × 10<sup>9</sup> × 2 × 10<sup>12</sup> = <strong>8.4 × 10<sup>22</sup> FLOPs</strong> (plus about 8% for attention at a 2K context, or 33% at 8K).</p>
+<p>(b) Cluster throughput = 1,024 × 989 × 10<sup>12</sup> × 0.4 ≈ 4.05 × 10<sup>17</sup> FLOP/s. Time = 8.4 × 10<sup>22</sup> / 4.05 × 10<sup>17</sup> ≈ 2.07 × 10<sup>5</sup> s ≈ <strong>58 hours, about 2.4 days</strong> — roughly 59,000 GPU-hours, or about $150,000 at $2.50 per GPU-hour before overheads.</p>
+<p>(c) 16 bytes × 7 × 10<sup>9</sup> = 112 GB in total; sharded over 1,024 GPUs that is about <strong>0.11 GB per GPU</strong> — negligible. At this scale activations (about 18 GB per 4,096-token sequence without checkpointing), logits and communication buffers dominate, so the real constraints are micro-batch size, sequence length and checkpointing policy. In practice you would shard the model state over a smaller group (for example the 8 GPUs of a node, 14 GB each) and use plain data parallelism across groups, because sharding over all 1,024 GPUs makes every step's parameter gathering cross the slower inter-node network (gpu9).</p>
+</details>
+</section>

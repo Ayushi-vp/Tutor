@@ -1,0 +1,464 @@
+<!-- topic source for gpu/gpu9; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "gpu9",
+  "t": "Training memory: ZeRO, FSDP and activation checkpointing",
+  "tag": "Distributed",
+  "sum": "Where training memory goes, how ZeRO's three stages and PyTorch FSDP shard the 16 bytes per parameter across GPUs and what that costs in communication, how activation checkpointing and selective recomputation trade compute for memory, and how to choose a layout that fits and still runs fast.",
+  "prereq": [
+    [
+      "gpu3",
+      "Mixed-precision Adam needs about 16 bytes per parameter (2 weights, 2 gradients, 4 FP32 master weights, 8 for two FP32 moments), and activations take about 34·s·b·h bytes per layer with FlashAttention."
+    ],
+    [
+      "gpu8",
+      "All-reduce equals reduce-scatter followed by all-gather; a ring all-reduce sends about 2× the data per GPU; NVLink is roughly nine times faster than the network per GPU on H100 systems."
+    ],
+    [
+      "dl9",
+      "Data parallelism replicates the model and splits the batch; tensor and pipeline parallelism split the model itself."
+    ]
+  ],
+  "myths": [
+    [
+      "ZeRO/FSDP is a different kind of parallelism from data parallelism.",
+      "It is data parallelism: every GPU still processes its own slice of the batch through the whole model and computes the same update. What changes is that model state is stored in shards rather than replicated, and each layer's parameters are gathered just before use. The mathematics of the training step is identical to plain data parallelism."
+    ],
+    [
+      "Sharding is free — it just divides memory by the number of GPUs.",
+      "ZeRO-1 and ZeRO-2 cost the same communication as data parallelism, but ZeRO-3/FSDP moves about 1.5 times as much, and it does so every layer, twice in each step. With too few tokens per GPU, or when the shard group spans a slow network, those all-gathers can't be hidden and throughput falls. Sharding more widely saves memory but costs bandwidth."
+    ],
+    [
+      "Activation checkpointing makes training much slower.",
+      "Full per-layer checkpointing re-runs the forward pass once, adding about a third to the compute of a step (forward is about one-third of forward plus backward). Selective recomputation, which recomputes only the cheap but memory-hungry parts, costs a few percent. And the memory it frees often allows larger micro-batches that raise efficiency, so the net cost can be small or even negative."
+    ],
+    [
+      "If the model state fits on the GPU, training will fit.",
+      "Activations, the logits, temporary buffers for communication and allocator fragmentation all come on top of model state, and activations grow with micro-batch size and sequence length. A 13B model sharded over 8 GPUs has 26 GB of state per GPU, but at 4,096 tokens its activations add another 28 GB without checkpointing — and long-context runs can need far more."
+    ],
+    [
+      "Offloading optimiser state to CPU memory is a free way to train bigger models.",
+      "It lets a model fit, but PCIe moves about 64 GB/s each way against 3.35 TB/s for HBM, and the CPU performs the optimiser step far more slowly than a GPU. Offloading is valuable for fitting a big fine-tune on few GPUs; for large-scale pre-training, where throughput is everything, sharding across more GPUs is almost always faster."
+    ]
+  ],
+  "recap": [
+    "Training memory is model state (16 bytes per parameter with mixed-precision Adam), activations that grow with batch and sequence length, logits, communication buffers and fragmentation.",
+    "Plain data parallelism stores all model state on every GPU, which is redundant and impossible for models beyond a few billion parameters.",
+    "ZeRO-1 shards the 12 bytes of optimiser state, ZeRO-2 also shards gradients, and ZeRO-3 also shards parameters, cutting model state per GPU to about 16Ψ/N — 1.9 GB instead of 120 GB for a 7.5B model on 64 GPUs.",
+    "ZeRO-1 and -2 communicate the same as data parallelism (reduce-scatter plus all-gather); ZeRO-3/FSDP all-gathers each layer's parameters in forward and again in backward, about 1.5 times the traffic.",
+    "FSDP overlaps each layer's all-gather with the previous layer's compute; its communication hides only if there are enough tokens per GPU per step, roughly thousands over NVLink and tens of thousands over the network.",
+    "Hybrid sharding keeps the shard group inside fast links and replicates across groups; tensor, pipeline and context parallelism are added when sharding alone runs out of memory or efficiency.",
+    "Activation checkpointing stores only each block's input and recomputes the rest in the backward pass, costing about one extra forward pass; selective recomputation cuts activation memory about 5× for a few percent of compute.",
+    "Offloading to CPU memory or NVMe fits larger models on fewer GPUs at a large throughput cost, because PCIe is about 50 times slower than HBM.",
+    "Choosing a layout means computing memory per GPU and communication per step, then confirming with memory snapshots and profiles."
+  ],
+  "glossary": [
+    [
+      "Activation checkpointing (gradient checkpointing)",
+      "Storing only selected activations in the forward pass and recomputing the others during the backward pass, trading compute for memory."
+    ],
+    [
+      "Activation offloading",
+      "Moving saved activations to CPU memory during the forward pass and bringing them back for the backward pass."
+    ],
+    [
+      "Caching allocator",
+      "PyTorch's GPU memory allocator, which keeps freed blocks for reuse instead of returning them to the driver; 'reserved' memory includes these cached blocks."
+    ],
+    [
+      "Distributed checkpoint",
+      "A training checkpoint written as shards, each rank saving its own part, and able to be reloaded on a different number of GPUs."
+    ],
+    [
+      "Fragmentation",
+      "Free GPU memory split into pieces too small for the next allocation, so an allocation fails even though the total free memory is enough."
+    ],
+    [
+      "FSDP (Fully Sharded Data Parallel)",
+      "PyTorch's implementation of ZeRO-3-style sharding; FSDP2 (fully_shard) shards each parameter as a DTensor."
+    ],
+    [
+      "Gradient accumulation",
+      "Summing gradients over several micro-batches before one optimiser step, giving a large effective batch with small per-step memory."
+    ],
+    [
+      "HSDP (hybrid sharded data parallel)",
+      "Sharding model state within a group of GPUs (usually a node) and replicating it across groups, so per-layer gathers stay on fast links."
+    ],
+    [
+      "Meta-device initialisation",
+      "Creating a model's structure without allocating its tensors, then materialising only each rank's shard, so no process ever holds the full model."
+    ],
+    [
+      "Micro-batch",
+      "The batch processed by one GPU in one forward and backward pass; several micro-batches may be accumulated per optimiser step."
+    ],
+    [
+      "Model state",
+      "Parameters, gradients and optimiser state: everything whose size scales with the parameter count rather than with the batch."
+    ],
+    [
+      "Prefetch",
+      "Starting the all-gather of the next layer's parameters while the current layer computes, so communication overlaps with compute."
+    ],
+    [
+      "Reshard after forward",
+      "Freeing a layer's gathered parameters after its forward pass (and gathering them again for backward); turning it off trades memory for less communication."
+    ],
+    [
+      "Selective recomputation",
+      "Recomputing only the parts of a layer that use much memory but little compute (such as attention internals), rather than the whole layer."
+    ],
+    [
+      "Sequence parallelism",
+      "Splitting the activations of normalisation and dropout along the sequence dimension across tensor-parallel GPUs, removing their replication."
+    ],
+    [
+      "ZeRO",
+      "Zero Redundancy Optimizer (DeepSpeed): stages 1, 2 and 3 shard optimiser state, gradients and parameters across data-parallel GPUs."
+    ],
+    [
+      "ZeRO-Offload / ZeRO-Infinity",
+      "DeepSpeed extensions that keep optimiser state (and, for Infinity, parameters) in CPU memory or on NVMe drives."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What do ZeRO stages 1, 2 and 3 shard?",
+      "Stage 1 shards the optimiser state — the FP32 master weights and Adam moments, 12 of the 16 bytes per parameter — across the data-parallel GPUs. Stage 2 also shards the gradients. Stage 3 also shards the parameters themselves, gathering each layer's parameters just in time for its forward and backward passes and freeing them afterwards. PyTorch FSDP implements the stage-3 idea."
+    ],
+    [
+      "E",
+      "How much memory does each ZeRO stage need per GPU?",
+      "For Ψ parameters on N GPUs with mixed-precision Adam: data parallel 16Ψ; ZeRO-1 4Ψ + 12Ψ/N; ZeRO-2 2Ψ + 14Ψ/N; ZeRO-3 16Ψ/N. The ZeRO paper's example, 7.5B parameters on 64 GPUs: 120 GB, 31.4 GB, 16.6 GB and 1.9 GB. Activations and buffers come on top."
+    ],
+    [
+      "E",
+      "What is activation checkpointing?",
+      "Instead of saving every intermediate tensor of the forward pass for the backward pass, save only some — typically each transformer block's input — and recompute the block's forward pass when the backward pass reaches it. Memory for activations drops from all intermediates of all layers to one input per layer plus one layer's full activations, at the cost of running the forward pass roughly twice."
+    ],
+    [
+      "M",
+      "Why do ZeRO-1 and ZeRO-2 cost no more communication than plain data parallelism?",
+      "Data parallelism's all-reduce is internally a reduce-scatter followed by an all-gather. ZeRO-2 reduce-scatters the gradients so each GPU gets the summed slice it owns, updates its slice of the master weights and optimiser state, and then all-gathers the updated BF16 parameters so every GPU has the full model for the next step. That is the same reduce-scatter plus all-gather, just with the optimiser step in between, so the traffic — about 2× the parameter bytes per GPU — is unchanged."
+    ],
+    [
+      "M",
+      "What does ZeRO-3 / FSDP cost compared with plain data parallelism, and how is it hidden?",
+      "About 1.5× the communication volume: parameters are all-gathered before each layer's forward pass and again before its backward pass (because they were freed in between), and gradients are reduce-scattered. FSDP hides it by prefetching the next layer's all-gather while the current layer computes, and reduce-scattering gradients as they are produced. With enough compute per GPU the extra traffic is largely hidden; with small per-GPU batches or a shard group across a slow network it becomes exposed.",
+      "Follow-up: How can you reduce it? — Don't reshard after forward (keep gathered parameters until backward, a ZeRO-2-like trade of memory for traffic), use hybrid sharding within nodes, or communicate in lower precision."
+    ],
+    [
+      "M",
+      "How does activation checkpointing trade compute for memory, and what does selective recomputation change?",
+      "Full per-block checkpointing stores only block inputs (about 2·s·b·h bytes per layer in BF16 instead of about 34·s·b·h) and re-runs each block's forward during backward: about 33% more compute for a roughly 17-fold cut in activation memory. Selective recomputation (Korthikanti et al.) recomputes only the parts that use a lot of memory but little compute, mainly attention internals, and together with sequence parallelism cut activation memory about 5× while reducing recomputation overhead by over 90% — 54.2% MFU on a 530B model versus 42.1% with full recomputation.",
+      "Follow-up: What is the √n result? — Chen et al. showed that checkpointing every √n layers of an n-layer network gives O(√n) activation memory for about one extra forward pass."
+    ],
+    [
+      "M",
+      "What is hybrid sharding and when would you use it?",
+      "Hybrid sharded data parallelism shards model state within a group of GPUs — usually the 8 GPUs of a node, connected by NVLink — and replicates it across groups. The per-layer all-gathers and reduce-scatters then stay on NVLink, and only one gradient all-reduce per step crosses the network. It works when the model state fits in the group: a 7B model's 112 GB over 8 GPUs is 14 GB each; a 70B model's 1.1 TB would be 141 GB each, too much, so the group must be larger or tensor parallelism added."
+    ],
+    [
+      "M",
+      "Your FSDP job runs out of memory. How do you work out why?",
+      "First, compute the expected budget: model state 16Ψ/N, activations for the micro-batch and sequence length, logits, and the largest layer's gathered parameters. Then take a memory snapshot at the peak with torch.cuda.memory._record_memory_history and inspect which tensors occupy memory and where they were allocated. Typical findings: activations without checkpointing, full logits at a large vocabulary, attention falling back to a non-flash kernel, too-coarse FSDP wrapping (a huge unit gathered at once), or fragmentation shown by reserved memory far above allocated.",
+      "Follow-up: Fragmentation fix? — PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True lets the allocator grow segments instead of leaving unusable gaps."
+    ],
+    [
+      "H",
+      "When does FSDP's communication stop hiding behind compute? Derive a rule of thumb.",
+      "Per layer with P_l parameters, FSDP moves about 3 × 2P_l bytes per GPU per step in BF16 (two all-gathers and a reduce-scatter), while each GPU computes 6·P_l·T FLOPs for T tokens per GPU per step. The ratio is T FLOPs per byte — the communication intensity equals tokens per GPU. To hide communication it must exceed delivered FLOP/s divided by link bandwidth: for an H100 at 50% MFU, about 500 TFLOP/s ÷ 450 GB/s ≈ 1,100 tokens per GPU over NVLink, but 500 TFLOP/s ÷ 50 GB/s = 10,000 over a 400 Gb/s network. Below that, FSDP is communication-bound unless the shard group stays on NVLink.",
+      "Follow-up: What if the global batch caps tokens per GPU? — Add tensor or pipeline parallelism so fewer data-parallel ranks share the batch, or use hybrid sharding so the network carries only one all-reduce per step."
+    ],
+    [
+      "H",
+      "When would you add tensor or pipeline parallelism on top of FSDP?",
+      "When FSDP alone runs out of memory or efficiency: a single layer's parameters or activations too large for one GPU even with checkpointing; too few tokens per GPU to hide FSDP's per-layer gathers, which happens when a fixed global batch is spread over thousands of GPUs; or a desire to keep the global batch from growing too large for good convergence. Tensor parallelism goes inside the NVLink domain; pipeline parallelism across nodes; context parallelism for very long sequences. Llama 3 405B combined tensor parallelism of 8 within nodes, pipeline parallelism of 16, context parallelism for long sequences, and FSDP-style data parallelism.",
+      "Follow-up: What does TorchTitan report? — Stacking FSDP2, tensor, pipeline parallelism and optimisations such as Float8 gave 65% speed-up on Llama 3.1 8B at 128 GPUs, and further 12.6% (70B, 256 GPUs, 2D) and 30% (405B, 512 GPUs, 3D) over their baselines."
+    ],
+    [
+      "H",
+      "How do you checkpoint and restore a sharded training job at scale?",
+      "Each rank writes its own shard in parallel — PyTorch's torch.distributed.checkpoint, DeepSpeed's sharded checkpoints — instead of gathering the full state onto one rank, which would itself run out of memory and serialise the I/O. The checkpoint stores metadata describing how tensors were sharded so it can be reloaded with a different number of GPUs (resharding). Saves are made asynchronous by copying shards to CPU memory and writing in the background, so training pauses only briefly; at thousands of GPUs, with failures every few hours, checkpoint interval and restart time directly set the fraction of time lost."
+    ],
+    [
+      "H",
+      "Compare CPU offloading with sharding across more GPUs for fitting a large model.",
+      "Offloading keeps optimiser state (ZeRO-Offload) or also parameters (ZeRO-Infinity) in CPU memory or NVMe and moves them over PCIe as needed, and can run the Adam step on the CPU. It lets a single node or even a single GPU fine-tune a model whose state is many times its HBM — ZeRO-Offload trained 13B-parameter models on one V100. But PCIe gives about 64 GB/s each way against 3.35 TB/s of HBM, and CPU optimiser steps are slow, so throughput falls sharply. Sharding over more GPUs keeps everything on HBM and fast links; when GPUs are available, it is almost always faster per dollar of time."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models",
+      "Rajbhandari et al. (2019) — the three stages and their memory and communication analysis.",
+      "https://arxiv.org/abs/1910.02054"
+    ],
+    [
+      "paper",
+      "PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel",
+      "Zhao et al. (2023) — design of FSDP, prefetching, rate limiting and hybrid sharding.",
+      "https://arxiv.org/abs/2304.11277"
+    ],
+    [
+      "paper",
+      "Reducing Activation Recomputation in Large Transformer Models",
+      "Korthikanti et al. (2022) — sequence parallelism and selective recomputation; 5× less activation memory.",
+      "https://arxiv.org/abs/2205.05198"
+    ],
+    [
+      "paper",
+      "Training Deep Nets with Sublinear Memory Cost",
+      "Chen et al. (2016) — gradient checkpointing and the √n memory result.",
+      "https://arxiv.org/abs/1604.06174"
+    ],
+    [
+      "paper",
+      "TorchTitan: One-stop PyTorch native solution for production ready LLM pre-training",
+      "Liang et al. (2024) — composing FSDP2, TP, PP and Float8 for Llama 3.1 up to 405B, with measured speed-ups.",
+      "https://arxiv.org/abs/2410.06511"
+    ],
+    [
+      "docs",
+      "PyTorch: Understanding CUDA memory usage",
+      "Recording memory snapshots and reading them to find what fills GPU memory.",
+      "https://docs.pytorch.org/docs/stable/torch_cuda_memory.html"
+    ],
+    [
+      "docs",
+      "DeepSpeed ZeRO tutorial",
+      "Configuring ZeRO stages and offload in practice.",
+      "https://www.deepspeed.ai/tutorials/zero/"
+    ],
+    [
+      "book",
+      "The Ultra-Scale Playbook",
+      "Hugging Face — memory breakdowns and the decision process for combining parallelism strategies.",
+      "https://huggingface.co/spaces/nanotron/ultrascale-playbook"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>An engineer wants to fully fine-tune a 13-billion-parameter model on a server with eight 80 GB H100s — 640 GB of GPU memory in total, five times the 26 GB the weights occupy. The job crashes at the first optimiser step with "CUDA out of memory". The reason is gpu3's arithmetic: mixed-precision training with Adam keeps about 16 bytes per parameter — weights, gradients, a 32-bit master copy and two 32-bit optimiser moments — so the model state is 208 GB. Plain data parallelism, the default way to use several GPUs, gives <em>every</em> GPU a complete copy of all 208 GB. Eight GPUs hold eight identical copies of the optimiser state, and none of them can hold one.</p>
+<p>At frontier scale the problem is starker. Llama 3 405B's model state is about 6.5 TB; no single GPU or server comes close. Yet the total memory of the cluster is enormous. The insight behind <strong>ZeRO</strong> (Zero Redundancy Optimizer, from Microsoft's DeepSpeed team in 2019) is that the redundancy is unnecessary: each GPU only needs its own slice of the optimiser state to do its part of the update, and it only needs a layer's full parameters for the brief moment that layer is computing. Store everything in shards, gather what is needed just in time, and the 208 GB becomes 26 GB per GPU on eight GPUs. PyTorch's <strong>FSDP</strong> (Fully Sharded Data Parallel) is the same idea built into PyTorch, and it is now the default way to train models from a few billion parameters upwards.</p>
+<p>Model state is only half the story. The forward pass also saves activations for the backward pass, and they grow with sequence length and batch size: 28 GB per 4,096-token sequence for that 13B model. <strong>Activation checkpointing</strong> trades compute for this memory by recomputing activations instead of storing them.</p>
+<p>This lesson builds these techniques up step by step: what fills GPU memory during training, how ZeRO's three stages remove redundancy and what each costs in communication, how FSDP runs a layer (gather, compute, free, prefetch), hybrid sharding, checkpointing and selective recomputation, and offloading. We finish with how to choose a layout — including a rule of thumb for when FSDP's communication stops hiding behind compute — and with how memory problems are debugged in practice.</p>
+</section>
+
+<section data-field="primer">
+<h4>Eight students and one very expensive textbook</h4>
+<p>A class of eight students must each work through every chapter of an enormous textbook, and each must also keep detailed notes on the book. Buying every student a full copy, and having each keep notes on every chapter, is the plain data-parallel approach: simple, but eight times the paper. The ZeRO approach: each student owns one-eighth of the book and keeps the notes only for their own chapters. When the class reaches chapter 5, its owner photocopies it for everyone; they all work through it; then they throw the copies away and move on. At the end, each student updates the notes for their own chapters using what everyone learned. Everyone still reads every chapter; nobody stores more than their share. The cost is the photocopying — which is why it must happen while everyone is still busy with the previous chapter.</p>
+<p>Where the analogy breaks: in training, "reading the chapter" is a layer's forward and backward pass, the photocopying is an all-gather over NVLink or the network, and the whole class moves through the book once forwards and once backwards every step.</p>
+<h4>What gets sharded, stage by stage</h4>
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="Memory per GPU for a 7.5 billion parameter model on 64 GPUs: plain data parallelism 120 GB, ZeRO-1 31.4 GB, ZeRO-2 16.6 GB, ZeRO-3 1.9 GB, broken down into parameters, gradients and optimiser state">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="18" style="fill:var(--ink);font-weight:600">7.5B parameters, 64 GPUs, mixed-precision Adam — GB per GPU</text>
+    <text x="20" y="54" style="fill:var(--ink)">Data parallel</text>
+    <rect x="140" y="40" width="30" height="22" style="fill:var(--s1);opacity:0.6"/><rect x="170" y="40" width="30" height="22" style="fill:var(--s2);opacity:0.6"/><rect x="200" y="40" width="180" height="22" style="fill:var(--s3);opacity:0.6"/>
+    <text x="388" y="55" style="fill:var(--ink)">120 GB</text>
+    <text x="20" y="104" style="fill:var(--ink)">ZeRO-1</text>
+    <rect x="140" y="90" width="30" height="22" style="fill:var(--s1);opacity:0.6"/><rect x="170" y="90" width="30" height="22" style="fill:var(--s2);opacity:0.6"/><rect x="200" y="90" width="3" height="22" style="fill:var(--s3);opacity:0.6"/>
+    <text x="212" y="105" style="fill:var(--ink)">31.4 GB  (optimiser state sharded)</text>
+    <text x="20" y="154" style="fill:var(--ink)">ZeRO-2</text>
+    <rect x="140" y="140" width="30" height="22" style="fill:var(--s1);opacity:0.6"/><rect x="170" y="140" width="3" height="22" style="fill:var(--s2);opacity:0.6"/><rect x="173" y="140" width="3" height="22" style="fill:var(--s3);opacity:0.6"/>
+    <text x="186" y="155" style="fill:var(--ink)">16.6 GB  (+ gradients sharded)</text>
+    <text x="20" y="204" style="fill:var(--ink)">ZeRO-3 / FSDP</text>
+    <rect x="140" y="190" width="3" height="22" style="fill:var(--s1);opacity:0.6"/>
+    <text x="152" y="205" style="fill:var(--ink)">1.9 GB  (+ parameters sharded; gathered per layer when needed)</text>
+    <g style="font-size:11px">
+      <rect x="140" y="236" width="14" height="14" style="fill:var(--s1);opacity:0.6"/><text x="160" y="248" style="fill:var(--ink-2)">BF16 parameters (2Ψ)</text>
+      <rect x="310" y="236" width="14" height="14" style="fill:var(--s2);opacity:0.6"/><text x="330" y="248" style="fill:var(--ink-2)">BF16 gradients (2Ψ)</text>
+      <rect x="460" y="236" width="14" height="14" style="fill:var(--s3);opacity:0.6"/><text x="480" y="248" style="fill:var(--ink-2)">FP32 master + Adam (12Ψ)</text>
+    </g>
+    <text x="20" y="272" style="fill:var(--muted);font-size:11px">1 GB drawn as 1.5 px. Numbers from the ZeRO paper; activations and buffers are extra in every case.</text>
+  </g>
+</svg>
+<figcaption>Most of the memory is optimiser state, so stage 1 alone removes three-quarters of it; stage 3 divides everything by the number of GPUs. The price of stage 3 is gathering each layer's parameters every time it is used.</figcaption>
+</figure>
+<p>The three stages remove redundancy in order of size. <strong>ZeRO-1</strong> shards the optimiser state — the FP32 master weights and Adam moments, 12 of the 16 bytes — so each GPU keeps only the slice it will update. <strong>ZeRO-2</strong> also shards the gradients, because each GPU only needs the summed gradients for its own slice. <strong>ZeRO-3</strong> also shards the BF16 parameters, gathering each layer's parameters from all GPUs just before the layer runs and freeing them afterwards. With N GPUs, stage 3 brings model state from 16 bytes per parameter down to about 16/N. <strong>Activation checkpointing</strong> attacks the other half of memory: instead of saving every intermediate result of the forward pass, it saves a few and recomputes the rest when the backward pass needs them, trading roughly one extra forward pass for a large cut in activation memory.</p>
+<h4>A first calculation</h4>
+<p>Put numbers on the 13B example from the introduction. Plain data parallelism: 208 GB of model state on each of the eight GPUs — no chance. ZeRO-1 shards the 156 GB of optimiser state (12 bytes per parameter) eight ways, leaving 26 GB of BF16 weights, 26 GB of gradients and 19.5 GB of optimiser state per GPU: 71.5 GB before any activations — still too much. ZeRO-2 also shards gradients: 26 + 3.25 + 19.5 ≈ 49 GB. ZeRO-3 shards everything: 26 GB. Then add activations — 28.5 GB for one 4,096-token sequence, or about 2.4 GB with checkpointing — and the job fits comfortably with ZeRO-3 plus checkpointing. Every number in that paragraph comes from multiplying parameter counts by bytes, which is why memory planning is done on paper before any job is launched.</p>
+</section>
+
+<section data-field="body">
+<h4>1. What fills GPU memory during training</h4>
+<p>From gpu3, a training step needs, per GPU:</p>
+<ul>
+<li><strong>Model state</strong>, proportional to parameters Ψ: BF16 parameters (2Ψ bytes), BF16 gradients (2Ψ), FP32 master weights (4Ψ) and two FP32 Adam moments (8Ψ) — 16Ψ in total.</li>
+<li><strong>Activations</strong>, proportional to tokens: roughly 34·s·b·h bytes per layer with FlashAttention, for sequence length s, micro-batch b and hidden size h.</li>
+<li><strong>Logits</strong> at the output: s × b × vocabulary values, often in FP32, plus their gradient.</li>
+<li><strong>Temporary buffers</strong>: communication buffers, workspace for matmul and attention kernels, gathered parameters in FSDP.</li>
+<li><strong>Fragmentation</strong>: memory the caching allocator has reserved but can't use for the next request because it is split into pieces too small.</li>
+</ul>
+<p>The techniques in this lesson address the first two, which are the large ones. Model state is independent of batch size and sequence length; activations are independent of how many GPUs share the model. That is why the fixes are different: sharding for model state, recomputation (and splitting sequences) for activations.</p>
+
+<h4>2. The redundancy in data parallelism</h4>
+<p>In plain data parallelism (DP), each of N GPUs holds the full model, processes its own micro-batch, and after the backward pass all-reduces the gradients so every GPU has the same summed gradient; then each GPU runs the same optimiser step on the same numbers and gets the same new weights. N GPUs perform N identical optimiser steps on N identical copies of 16Ψ bytes. Only the forward and backward passes, which process different data, genuinely need to happen on every GPU. Everything else is redundant — that is the observation ZeRO turns into savings.</p>
+
+<h4>3. ZeRO-1 and ZeRO-2: shard the update</h4>
+<p>Divide the parameters into N equal slices; GPU i "owns" slice i. With <strong>ZeRO-1</strong>, GPU i keeps the FP32 master weights and Adam moments only for slice i (12Ψ/N bytes), but still keeps full BF16 parameters and gradients. A step goes:</p>
+<ol>
+<li>Forward and backward on the local micro-batch with the full BF16 parameters, producing full local gradients.</li>
+<li><strong>Reduce-scatter</strong> the gradients: GPU i receives the sum over all GPUs of slice i's gradients.</li>
+<li>GPU i runs Adam on slice i only, updating its FP32 master weights and moments.</li>
+<li><strong>All-gather</strong> the updated BF16 parameters so every GPU again has the full model.</li>
+</ol>
+<p>Reduce-scatter plus all-gather is exactly what an all-reduce does internally (gpu8), so ZeRO-1 moves the same bytes as plain DP while cutting memory to 4Ψ + 12Ψ/N. <strong>ZeRO-2</strong> notices that after step 2 each GPU only needs slice i of the gradients, so gradients for other slices can be freed as soon as they have been reduce-scattered — in practice bucket by bucket during the backward pass. Memory falls to 2Ψ + 14Ψ/N, still with the same communication. For the ZeRO paper's example of 7.5B parameters on 64 GPUs: 120 GB for DP, 31.4 GB for ZeRO-1, 16.6 GB for ZeRO-2.</p>
+
+<h4>4. ZeRO-3 and FSDP: shard the parameters too</h4>
+<p><strong>ZeRO-3</strong> also shards the BF16 parameters: GPU i permanently holds only slice i of every parameter tensor. Model state per GPU becomes 16Ψ/N — 1.9 GB in the example. But a layer can't run with a slice of its weights, so the full parameters of each layer are assembled just in time:</p>
+<ol>
+<li><strong>Forward, layer by layer:</strong> all-gather layer ℓ's parameters from all GPUs; run its forward pass; free the gathered parameters (keeping only the local shard).</li>
+<li><strong>Backward, layer by layer in reverse:</strong> all-gather layer ℓ's parameters again; compute its gradients; <strong>reduce-scatter</strong> the gradients so each GPU keeps the summed gradient for its own slice; free the gathered parameters and full gradients.</li>
+<li><strong>Optimiser step:</strong> each GPU updates its own slice, with no further communication — the parameters are already in sharded form for the next step.</li>
+</ol>
+<p>Communication per step: two all-gathers of all parameters plus one reduce-scatter of all gradients, about 3 × 2Ψ bytes per GPU in BF16, compared with about 2 × 2Ψ for DP's all-reduce — <strong>1.5 times the traffic</strong>. And it happens layer by layer, on the critical path of every layer, unless it is overlapped.</p>
+<p>PyTorch's <strong>FSDP</strong> implements this. You wrap the model in units — typically one per transformer block — and each unit's parameters are flattened and sharded. The newer <strong>FSDP2</strong> API (<code>fully_shard</code>) shards each parameter individually as a DTensor (a distributed tensor that knows how it is split across GPUs), which composes more cleanly with tensor parallelism, FP8 and checkpointing:</p>
+<pre>from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+for block in model.layers:                 # one FSDP unit per transformer block
+    fully_shard(block, mp_policy=mp)
+fully_shard(model, mp_policy=mp)           # the rest: embeddings, final norm, head
+optim = torch.optim.AdamW(model.parameters(), lr=3e-4)   # states are sharded too</pre>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="FSDP forward timeline: a communication stream all-gathers layer 2's parameters while the compute stream runs layer 1; each layer's gathered parameters are freed after use, so only about two layers are ever materialised">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">FSDP forward pass with prefetch (time →)</text>
+    <text x="20" y="58" style="fill:var(--ink-2)">comm stream</text>
+    <g style="fill:var(--s2);opacity:0.55;stroke:var(--line-2)">
+      <rect x="120" y="44" width="80" height="22"/><rect x="200" y="44" width="80" height="22"/><rect x="300" y="44" width="80" height="22"/><rect x="400" y="44" width="80" height="22"/>
+    </g>
+    <g style="fill:var(--ink);font-size:11px"><text x="160" y="59" text-anchor="middle">gather L1</text><text x="240" y="59" text-anchor="middle">gather L2</text><text x="340" y="59" text-anchor="middle">gather L3</text><text x="440" y="59" text-anchor="middle">gather L4</text></g>
+    <text x="20" y="108" style="fill:var(--ink-2)">compute stream</text>
+    <g style="fill:var(--s1);opacity:0.55;stroke:var(--line-2)">
+      <rect x="200" y="94" width="100" height="22"/><rect x="300" y="94" width="100" height="22"/><rect x="400" y="94" width="100" height="22"/><rect x="500" y="94" width="100" height="22"/>
+    </g>
+    <g style="fill:var(--ink);font-size:11px"><text x="250" y="109" text-anchor="middle">forward L1</text><text x="350" y="109" text-anchor="middle">forward L2</text><text x="450" y="109" text-anchor="middle">forward L3</text><text x="550" y="109" text-anchor="middle">forward L4</text></g>
+    <rect x="120" y="94" width="80" height="22" style="fill:var(--crit);opacity:0.3"/>
+    <text x="160" y="109" text-anchor="middle" style="fill:var(--ink);font-size:11px">exposed</text>
+    <text x="20" y="150" style="fill:var(--ink-2)">memory held</text>
+    <text x="120" y="150" style="fill:var(--ink);font-size:11px">own shards of all layers  +  gathered params of ≤ 2 layers (current + prefetched)  +  saved activations</text>
+    <text x="20" y="184" style="fill:var(--ink-2);font-size:11px">Backward runs in reverse: gather L4 again → compute gradients → reduce-scatter them → free; prefetch L3 meanwhile.</text>
+    <text x="20" y="206" style="fill:var(--ink-2);font-size:11px">Only the first gather is exposed if each gather is shorter than the previous layer's compute.</text>
+    <text x="20" y="232" style="fill:var(--muted);font-size:11px">If gathers are slower than compute (few tokens per GPU, slow links), gaps open on the compute stream every layer.</text>
+  </g>
+</svg>
+<figcaption>FSDP turns one big memory problem into a steady stream of small gathers. It runs at full speed only if each layer's gather finishes while the previous layer is still computing — a condition set by tokens per GPU and link bandwidth.</figcaption>
+</figure>
+<p><strong>Prefetching</strong> is what makes this fast: while layer ℓ computes, FSDP issues the all-gather for layer ℓ+1 on a separate communication stream, so its parameters are ready when needed. In the backward pass it prefetches layer ℓ−1 while computing layer ℓ and overlaps reduce-scatters too. Only about two layers' full parameters are ever materialised at once. The option to <strong>not reshard after forward</strong> keeps each layer's gathered parameters until its backward pass, skipping the second all-gather — back to ZeRO-2's communication at the cost of holding full parameters (useful when memory allows, and for pipeline stages that run several micro-batches).</p>
+<p><strong>Wrapping granularity</strong> matters. One unit per transformer block is the norm. A single unit around the whole model would gather everything at once, defeating the purpose; units that are too small mean many tiny collectives with high latency. Embeddings and the output layer are often their own units because at a 128K vocabulary they are the largest single tensors.</p>
+
+<h4>5. Hybrid sharding: keep the gathers on fast links</h4>
+<p>If the shard group spans the whole cluster, every layer's all-gather crosses the network. <strong>Hybrid sharded data parallelism</strong> (HSDP) shards within a group — usually the 8 GPUs of a node, on NVLink — and replicates across groups, with one gradient all-reduce across groups per step. The per-layer traffic stays on NVLink; the network carries the same once-per-step gradient reduction as plain DP.</p>
+<p>The group must be large enough to hold the model state. A worked example for a 70B model, 16 × 70 × 10<sup>9</sup> = 1.12 TB of state: sharded over 8 GPUs it is 140 GB per GPU — doesn't fit on 80 GB. Over 32 GPUs (four nodes) it is 35 GB, which fits with room for activations, but now the shard group spans the network. The usual answer for models of this size is to add <strong>tensor parallelism</strong> inside the node (each GPU holds 1/8 of each layer), and shard the remaining state across nodes with FSDP: with TP = 8 and FSDP over 16 nodes, each GPU holds 1.12 TB / 128 ≈ 8.8 GB of state. This is the 2D layout TorchTitan uses for Llama 3.1 70B, and adding pipeline parallelism gives the 3D layout used for 405B.</p>
+
+<h4>6. Activation memory and checkpointing</h4>
+<p>Activations are saved in the forward pass because the backward pass needs them: the weight gradient of a linear layer is Xᵀ·dY, which needs the layer's input X, and differentiating normalisation, activation functions and attention needs their inputs (gpu3). They are proportional to tokens per GPU and to the number of layers, and independent of data-parallel sharding: FSDP does nothing for them.</p>
+<p><strong>Activation checkpointing</strong> (also called gradient checkpointing) keeps only each transformer block's input during the forward pass and discards everything else inside the block. When the backward pass reaches a block, it re-runs that block's forward pass from the saved input to regenerate its activations, then does the block's backward pass and discards them again.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Activation checkpointing: during forward only each block's input is kept; during backward each block is recomputed from its saved input just before its gradients are computed, so only one block's full activations exist at a time">
+  <defs><marker id="gpu9-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Forward: keep only block inputs</text>
+    <g style="fill:var(--surface-2);stroke:var(--line-2)"><rect x="60" y="32" width="100" height="30" rx="4"/><rect x="200" y="32" width="100" height="30" rx="4"/><rect x="340" y="32" width="100" height="30" rx="4"/><rect x="480" y="32" width="100" height="30" rx="4"/></g>
+    <g style="fill:var(--ink);font-size:11px"><text x="110" y="51" text-anchor="middle">block 1</text><text x="250" y="51" text-anchor="middle">block 2</text><text x="390" y="51" text-anchor="middle">block 3</text><text x="530" y="51" text-anchor="middle">block 4</text></g>
+    <g style="fill:var(--accent)"><circle cx="60" cy="76" r="5"/><circle cx="200" cy="76" r="5"/><circle cx="340" cy="76" r="5"/><circle cx="480" cy="76" r="5"/></g>
+    <text x="20" y="96" style="fill:var(--ink-2);font-size:11px">dots: saved inputs (2·s·b·h bytes each in BF16); everything inside the blocks is discarded</text>
+    <text x="20" y="130" style="fill:var(--ink);font-weight:600">Backward: recompute one block, then differentiate it</text>
+    <rect x="480" y="142" width="100" height="30" rx="4" style="fill:var(--s2);opacity:0.4;stroke:var(--line-2)"/>
+    <text x="530" y="161" text-anchor="middle" style="fill:var(--ink);font-size:11px">re-run forward 4</text>
+    <rect x="340" y="142" width="100" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="390" y="161" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">then block 3 …</text>
+    <line x1="478" y1="157" x2="442" y2="157" marker-end="url(#gpu9-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="20" y="196" style="fill:var(--ink-2);font-size:11px">Peak activation memory: all saved inputs + one block's full activations (34·s·b·h), instead of all blocks' full activations.</text>
+    <text x="20" y="216" style="fill:var(--ink-2);font-size:11px">Extra compute: one more forward pass ≈ +33% of a training step (forward ≈ 1/3 of forward + backward).</text>
+  </g>
+</svg>
+<figcaption>Checkpointing replaces "store everything from every block" with "store one tensor per block, and rebuild one block at a time". Memory now grows with the number of block inputs rather than with all their internals.</figcaption>
+</figure>
+<p>The numbers: per layer, stored activations fall from about 34·s·b·h bytes to the block input, 2·s·b·h bytes in BF16 — about 17 times less — plus one block's full activations during its recomputation. For the 13B model (h = 5,120, 40 layers) at s = 4,096, b = 1: 28.5 GB without checkpointing; with it, 40 × 42 MB ≈ 1.7 GB of saved inputs plus 0.7 GB for the block being recomputed, about 2.4 GB. The cost is one more forward pass: forward is roughly a third of forward plus backward (2N versus 4N FLOPs per token), so the step does about 33% more compute. Chen et al.'s 2016 paper showed the general version: checkpointing every √n layers of an n-layer network brings activation memory to O(√n) for the same one-extra-forward cost.</p>
+<p><strong>Selective recomputation</strong> is more economical. Not all activations cost the same to recompute: the attention core (scores, softmax, dropout) takes a lot of memory but few FLOPs, while the big matmuls are the reverse. Korthikanti et al. at NVIDIA recompute only the cheap, memory-hungry parts and, combined with <strong>sequence parallelism</strong> (splitting the activations of normalisation and dropout along the sequence across tensor-parallel GPUs, which tensor parallelism alone leaves replicated), cut activation memory about five-fold while reducing the recomputation overhead by over 90%. Training a 530B-parameter model on 2,240 A100s, that raised MFU from 42.1% with full recomputation to 54.2%. With FlashAttention, which already recomputes attention internally, the same principle continues: recompute cheap element-wise operations (norms, activations) and keep the matmul inputs.</p>
+
+<h4>7. Offloading: using CPU memory and NVMe</h4>
+<p>A server's CPU memory is often 1-2 TB — more than all its GPUs combined — and NVMe drives hold tens of terabytes. <strong>ZeRO-Offload</strong> keeps the optimiser state in CPU memory and runs the Adam step on the CPU; gradients go down over PCIe and updated parameters come back up. <strong>ZeRO-Infinity</strong> also offloads parameters and can use NVMe. <strong>Activation offloading</strong> moves saved activations to CPU memory during the forward pass and back for the backward pass. The constraint is bandwidth: PCIe Gen5 moves about 64 GB/s each way, against 3.35 TB/s of HBM, and a CPU Adam step over billions of parameters takes seconds. Offloading shines when GPUs are scarce — ZeRO-Offload's paper trained 13B-parameter models on a single V100 — and for fine-tuning big models on one node; for large-scale pre-training, sharding over more GPUs is almost always the faster use of money.</p>
+
+<h4>8. A worked plan: fine-tuning a 13B model on one node</h4>
+<p>Eight 80 GB H100s, full fine-tuning with AdamW, sequence length 4,096, micro-batch 1 per GPU, BF16 with FlashAttention (the lab computes these):</p>
+<ul>
+<li><strong>Plain DP:</strong> 16 × 13B = 208 GB per GPU. Impossible.</li>
+<li><strong>ZeRO-2:</strong> 2Ψ + 14Ψ/8 = 26 + 22.8 = 48.8 GB per GPU of state, plus 28.5 GB of activations without checkpointing: 77 GB — too close to 80 GB once buffers and fragmentation are added.</li>
+<li><strong>FSDP (ZeRO-3) over the 8 GPUs:</strong> 26 GB of state per GPU. Plus 28.5 GB of activations: about 55 GB — fits. With checkpointing: about 28 GB, leaving room to raise the micro-batch to 4, which improves matmul efficiency and more than pays for the recomputation.</li>
+<li><strong>Communication:</strong> about 3 × 26 GB = 78 GB sent per GPU per step, all over NVLink at 450 GB/s — about 0.2 s. Compute per GPU per step at micro-batch 4: 6 × 13 × 10<sup>9</sup> × 16,384 tokens ≈ 1.3 × 10<sup>15</sup> FLOPs, about 2.6 s at 50% of peak (plus a third with checkpointing). Communication hides comfortably.</li>
+</ul>
+<p>The same arithmetic, scaled up, produces the layouts of published runs. Meta's Llama 3 405B used tensor parallelism of 8 within each server, pipeline parallelism of 16, context parallelism for long sequences, and FSDP-style sharded data parallelism across the rest; TorchTitan, PyTorch's reference trainer, reports that composing FSDP2 with tensor and pipeline parallelism and Float8 training gave speed-ups of 65% for Llama 3.1 8B on 128 GPUs, and a further 12.6% (70B, 256 GPUs, 2D) and 30% (405B, 512 GPUs, 3D) over their baselines on H100s.</p>
+</section>
+
+<section data-field="deep">
+<h4>When FSDP's communication hides: tokens per GPU</h4>
+<p>For a layer with P parameters, FSDP moves about 3 × 2P bytes per GPU per step (two all-gathers and a reduce-scatter in BF16), while each GPU computes 6·P·T FLOPs for its T tokens per step. The ratio — FLOPs per communicated byte — is simply <strong>T, the tokens per GPU per step</strong>. To hide communication, that ratio must exceed the delivered FLOP rate divided by the link's bandwidth (the communication roofline of gpu2 and gpu8). For an H100 running at 50% of peak, about 500 TFLOP/s: over NVLink at 450 GB/s, T must exceed about 1,100 tokens; over a 400 Gb/s network at 50 GB/s, about 10,000 tokens. A 4,096-token micro-batch per GPU hides easily within a node and not across nodes — which is the quantitative reason for hybrid sharding, and for adding tensor or pipeline parallelism when a fixed global batch spread over thousands of GPUs leaves each with too few tokens.</p>
+<h4>Composing sharding with other parallelisms</h4>
+<p>Real large-scale layouts are products of dimensions: TP × CP × PP × DP GPUs. Each GPU holds 1/TP of each layer's weights (tensor parallelism), 1/PP of the layers (pipeline), and within its data-parallel group a 1/DP shard of the remaining state (FSDP). Communication sits on the matching links: TP all-reduces on NVLink every layer, CP exchanges of keys and values within the node or rack, PP point-to-point sends across nodes, and FSDP gathers across the DP group once per layer per step. FSDP2's per-parameter DTensor sharding exists precisely so a tensor can be sharded along one dimension for TP and along another for FSDP at the same time. Choosing the degrees is a search: TP no larger than the NVLink domain, PP as small as memory allows (bubbles cost throughput), DP as large as the global batch permits.</p>
+<h4>Checkpointing and recomputation, optimally</h4>
+<p>Which activations to keep is an optimisation problem: minimise recomputation FLOPs subject to a memory budget. Frameworks offer points on the curve — full per-block checkpointing, selective recomputation of attention or MLP internals, checkpointing every k-th block, or offloading some saved tensors to CPU memory. PyTorch's compiler can make the choice automatically: its min-cut partitioner decides which forward values to save and which to recompute in the backward graph, favouring recomputation of cheap element-wise operations, and a memory-budget setting lets you trade further towards memory. The best configuration depends on sequence length (longer sequences make activations dominate), model width (wider models make matmul recomputation more expensive) and whether memory saved can buy a larger micro-batch.</p>
+<h4>Reducing the 16 bytes themselves</h4>
+<p>Sharding divides model state; other techniques shrink it. 8-bit optimiser states (bitsandbytes' 8-bit Adam) store the moments in 8 bits with block-wise scales, cutting 8 bytes to about 2; Adafactor stores factored second-moment estimates, one row vector and one column vector per matrix, instead of a full matrix; keeping master weights out entirely is possible with stochastic rounding (gpu4). ZeRO++ reduced communication rather than memory, with quantised all-gathers of weights and hierarchical partitioning that keeps a secondary copy of parameters within each node. Each of these trades some risk to convergence or accuracy for memory or bandwidth, and needs validation against the standard recipe.</p>
+<h4>Pipeline parallelism and memory</h4>
+<p>Pipeline parallelism divides the layers among stages, so each GPU holds only its stage's model state — the most direct way to cut memory for very deep models — but it has an activation cost that surprises people. To keep all stages busy, a schedule such as 1F1B (one forward, one backward) has several micro-batches in flight at once, and the first stage must hold the saved activations of up to as many micro-batches as there are stages until their backward passes arrive. So pipeline stages near the start need more activation memory than those near the end, and deeper pipelines need more micro-batches in flight. Checkpointing is commonly combined with pipelining for exactly this reason, and interleaved schedules trade more communication for smaller bubbles and more even memory.</p>
+<h4>The allocator and fragmentation</h4>
+<p>FSDP allocates and frees each layer's gathered parameters and gradients every step, in patterns that fragment memory: a request for a 500 MB buffer can fail with several gigabytes free in scattered pieces. PyTorch's caching allocator reports "allocated" (in use by tensors) and "reserved" (held from the driver, including cached free blocks); a large gap in an out-of-memory message is the fragmentation signature. Setting <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> lets the allocator grow segments in place instead of carving new fixed blocks, which removes most of it. FSDP also rate-limits how far ahead it prefetches, because unbounded prefetching would materialise many layers at once and defeat the sharding.</p>
+</section>
+
+<section data-field="prod">
+<h4>Planning memory before launch</h4>
+<p>Experienced teams don't discover memory limits by trial and error on a 1,000-GPU allocation. They compute a budget per GPU — model state after sharding, activations for the planned micro-batch and sequence length with the chosen recomputation policy, logits, communication buffers, and a 10-20% margin — then validate on a small number of GPUs with the same per-GPU shapes, since per-GPU memory depends on the shard size, not the total GPU count, once the layout is fixed. The lab's planner is the minimal version of this.</p>
+<h4>Debugging out-of-memory errors</h4>
+<p>When a job runs out of memory, the fastest path is a <strong>memory snapshot</strong>: <code>torch.cuda.memory._record_memory_history()</code> before the step, <code>torch.cuda.memory._dump_snapshot("snap.pickle")</code> after, and the viewer at pytorch.org/memory_viz shows every live allocation over time with the Python stack that made it. Typical culprits, in rough order of frequency: activations without checkpointing at a new, longer sequence length; the full logits tensor at a large vocabulary; an attention call silently falling back to a non-flash kernel (quadratic memory, gpu7); an FSDP unit that is too large (for example the whole model accidentally wrapped as one); gathered parameters kept alive by a stray reference; and fragmentation, visible as reserved memory far above allocated.</p>
+<h4>Initialisation and checkpoint I/O</h4>
+<p>Two practical traps come from forgetting that no single process should ever hold the full model. <strong>Initialisation:</strong> if every rank builds the full model on the CPU and then shards it, a node with eight ranks needs eight copies of the model in host memory — 1.1 TB for a 70B model in FP16 — and the host runs out of memory before training starts. The fix is to create the model on PyTorch's "meta" device (structure without storage) and materialise only each rank's shard, or to load weights shard by shard from a distributed checkpoint. <strong>Checkpoints:</strong> gathering the full state onto rank 0 to save it is slow and can itself run out of memory. Distributed checkpointing (<code>torch.distributed.checkpoint</code>, DeepSpeed's sharded format) has every rank write its shard in parallel, with metadata that allows reloading onto a different number of GPUs. At scale, saves are made asynchronous — copy shards to host memory, keep training, write in the background — because with failures every few hours (gpu1, gpu8), checkpoint frequency directly sets how much work each failure costs.</p>
+<h4>Fine-tuning versus pre-training</h4>
+<p>Most teams meet these tools in fine-tuning rather than pre-training, and the trade-offs differ. Fine-tuning runs are short, GPUs are few, and memory is the binding constraint, so ZeRO-3 with checkpointing, CPU offload of optimiser state, or parameter-efficient methods (LoRA, lm11) that avoid most of the 16 bytes are all reasonable. Pre-training runs for weeks on thousands of GPUs, so throughput dominates, and layouts are tuned to keep communication hidden even at the cost of more memory.</p>
+<h4>Performance symptoms of a memory layout</h4>
+<p><strong>Throughput drops when you scale out at a fixed global batch.</strong> Tokens per GPU fell below the level where FSDP's gathers hide; add hybrid sharding, TP or PP, or increase the batch if convergence allows. <strong>Throughput is fine but MFU is low with checkpointing on.</strong> The 33% recomputation is being counted as waste — check HFU versus MFU (gpu3) and consider selective recomputation, or use the freed memory for a larger micro-batch. <strong>Periodic slow steps.</strong> Synchronous checkpoint writes, or allocator defragmentation (cudaMalloc/cudaFree calls visible in the profile) — expandable segments and asynchronous checkpointing fix both.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> build the memory planner teams use before launching a job, check it against the ZeRO paper's numbers, and size a 13B fine-tune on one node. Pure Python 3.12; no GPU needed.</p>
+<pre>def model_state(psi, n, stage):              # bytes per GPU, mixed-precision Adam
+    return {0: 16 * psi,
+            1: 4 * psi + 12 * psi / n,
+            2: 2 * psi + 14 * psi / n,
+            3: 16 * psi / n}[stage]
+
+def activations(s, b, h, layers, ckpt):       # BF16, FlashAttention (gpu3)
+    full = 34 * s * b * h                     # per layer, everything saved
+    return full * layers if not ckpt else 2 * s * b * h * layers + full
+
+print("ZeRO paper: 7.5B parameters on 64 GPUs")
+for st in range(4):
+    print(f"  stage {st}: {model_state(7.5e9, 64, st) / 1e9:6.1f} GB")
+
+psi, n, s, b, h, L = 13e9, 8, 4096, 1, 5120, 40
+for ckpt in (False, True):
+    ms, act = model_state(psi, n, 3), activations(s, b, h, L, ckpt)
+    print(f"13B FSDP/8, checkpointing={ckpt}: state {ms / 1e9:.1f} + "
+          f"activations {act / 1e9:.1f} = {(ms + act) / 1e9:.1f} GB of 80")
+print(f"bytes sent per GPU per step: DP ~{4 * psi / 1e9:.0f} GB, FSDP ~{6 * psi / 1e9:.0f} GB")</pre>
+<p><strong>What to look for.</strong> The four stages print 120, 31.4, 16.6 and 1.9 GB — matching the ZeRO paper, which confirms the formulas. The 13B fine-tune needs about 54.5 GB per GPU without checkpointing and 28.4 GB with it. FSDP sends about 78 GB per GPU per step against 52 GB for plain DP: the 1.5× cost.</p>
+<p><strong>Try:</strong> set <code>b = 4</code> with checkpointing on and see whether it still fits; set <code>s = 32768</code> and see activations dominate; then compute tokens per GPU (s × b) and compare with the ~1,100 (NVLink) and ~10,000 (network) thresholds from the deep section.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>Full fine-tuning of a 13B model (40 layers, hidden size 5,120) on one node of 8 × 80 GB GPUs, sequence length 4,096, micro-batch 1 per GPU, BF16 with FlashAttention. (a) Can plain data parallelism work? (b) Memory per GPU for model state with FSDP? (c) Activation memory per GPU without and with per-layer checkpointing (use about 34·s·h bytes per layer without, 2·s·h with)? (d) Now the same model must be trained on 64 GPUs across 8 nodes with a global batch of 64 sequences. How would you lay it out?</p>
+<details><summary>Answer</summary>
+<p>(a) 16 × 13 × 10<sup>9</sup> = <strong>208 GB</strong> of model state per GPU — impossible on 80 GB.</p>
+<p>(b) Sharded over 8: 208 / 8 = <strong>26 GB</strong> per GPU, plus a transient copy of about two layers' gathered parameters (about 0.6 GB each in BF16 — small).</p>
+<p>(c) Without checkpointing: 34 × 4,096 × 5,120 ≈ 713 MB per layer × 40 = <strong>28.5 GB</strong>. With per-layer checkpointing: 2 × 4,096 × 5,120 ≈ 42 MB per layer × 40 ≈ 1.7 GB, plus one layer's full activations (0.7 GB) during recomputation ≈ <strong>2.4 GB</strong>. Total without checkpointing ≈ 26 + 28.5 + buffers ≈ 60 GB — fits, but with the logits (4,096 × vocabulary in FP32) and fragmentation it is tight; with checkpointing ≈ 30 GB, leaving room for a micro-batch of 4.</p>
+<p>(d) One sequence per GPU is 4,096 tokens per GPU per step — enough to hide FSDP over NVLink (threshold about 1,100) but not over the network (about 10,000). So use <strong>hybrid sharding</strong>: shard the 208 GB within each node (26 GB per GPU, as above), replicate across the 8 nodes, and all-reduce gradients across nodes once per step: each GPU owns a 26 GB / 8 = 3.25 GB slice of the BF16 gradients and all-reduces it with its counterparts in the other 7 nodes, sending 2 × 7/8 × 3.25 ≈ 5.7 GB — about 115 ms at 50 GB/s, largely overlapped with the backward pass. Full sharding across all 64 GPUs would save memory (3.3 GB of state per GPU) that isn't needed, at the price of every layer's gathers crossing the slow network.</p>
+</details>
+</section>

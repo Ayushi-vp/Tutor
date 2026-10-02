@@ -1,0 +1,460 @@
+<!-- topic source for gpu/gpu6; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "gpu6",
+  "t": "Kernel fusion, Triton and torch.compile",
+  "tag": "Kernels",
+  "sum": "Why chains of small operations are slow, how fusion removes their memory traffic and launch overhead, how torch.compile captures and fuses a model (Dynamo, AOTAutograd, Inductor), what Triton lets you write in Python, CUDA graphs — and the graph breaks, recompiles and compile times to watch for.",
+  "prereq": [
+    [
+      "gpu2",
+      "Element-wise operations have arithmetic intensity around 1 FLOP/byte, so their time is set by bytes moved to and from HBM; a sequence of kernels costs the sum of their times."
+    ],
+    [
+      "gpu5",
+      "A kernel is launched from the CPU over a grid of thread blocks; each launch costs a few microseconds, and fast kernels keep data in registers and shared memory instead of HBM."
+    ]
+  ],
+  "myths": [
+    [
+      "torch.compile makes every model faster.",
+      "It speeds up models whose time goes to many memory-bound operations and CPU overhead; a model dominated by a few large matmuls, already running cuBLAS at 70% of peak, gains little. It also adds compile time on start-up and after every recompilation, and graph breaks can leave most of the model running eagerly. PyTorch's own benchmark of 163 models found an average 43% training speed-up on an A100, with a wide spread — always measure your own model."
+    ],
+    [
+      "Fusion reduces the number of FLOPs.",
+      "Fusion does the same arithmetic; what it removes is traffic. Intermediate results stay in registers instead of being written to HBM and read back, and several kernel launches become one. That is why fusion helps memory-bound chains dramatically and compute-bound matmuls hardly at all."
+    ],
+    [
+      "Triton is a slower, easier CUDA.",
+      "Triton works at a different level: you describe what a program does to whole blocks of data, and the compiler decides how threads, shared memory, coalescing, tensor-core instructions and software pipelining implement it. For fused element-wise, reduction and many matmul-shaped kernels it reaches performance comparable to hand-written CUDA; CUDA is still needed for the finest control over warp specialisation, data layouts and the newest hardware features."
+    ],
+    [
+      "If the compiled model gives slightly different numbers from eager mode, the compiler has a bug.",
+      "Fusion changes the order and precision of intermediate computations — for example, keeping an intermediate in FP32 registers instead of rounding it to BF16 in memory, or summing in a different order. Floating-point results then differ in the last bits. Compare compiled and eager outputs with tolerances; investigate only differences that exceed what the format's precision explains."
+    ],
+    [
+      "CUDA graphs are a general speed-up you can turn on anywhere.",
+      "They remove per-launch CPU overhead, which matters only when kernels are short — small batches and decoding. They require the same shapes and memory addresses on every replay, so varying inputs must be padded to captured sizes, and each captured graph holds its own memory. For large training steps where kernels run for milliseconds, they save almost nothing."
+    ]
+  ],
+  "recap": [
+    "In eager PyTorch every operation is a separate kernel that reads its inputs from HBM and writes its output back, so a chain of element-wise operations pays memory traffic and launch overhead once per operation.",
+    "Fusion combines a chain into one kernel that reads inputs once, keeps intermediates in registers and writes once, cutting memory-bound time roughly by the number of passes it removes.",
+    "Fusable patterns include element-wise chains, reductions with their neighbours (norms, softmax), and epilogues fused into matmuls (bias, activation, residual); FlashAttention is fusion across a whole attention block.",
+    "torch.compile captures Python code into a graph with TorchDynamo, derives the backward graph with AOTAutograd, and TorchInductor fuses the graph and generates Triton kernels on GPUs.",
+    "Graph breaks — code Dynamo cannot trace, such as .item(), printing or data-dependent control flow — split the graph and limit fusion; recompilations happen when guards on shapes or types fail.",
+    "Triton kernels are written per program over blocks of data; the compiler handles thread mapping, coalescing, shared memory, tensor-core instructions and pipelining.",
+    "CUDA graphs record a sequence of launches and replay it with one call, removing CPU launch overhead for small, short kernels, at the cost of static shapes and addresses.",
+    "In practice: start with torch.compile, use existing fused kernels for known hot spots, write Triton for a specific unfused memory-bound pattern, and reserve CUDA for the last margin."
+  ],
+  "glossary": [
+    [
+      "AOTAutograd",
+      "The torch.compile stage that traces the forward and backward passes together ahead of time, so the backward graph can be optimised and fused too."
+    ],
+    [
+      "Autotuning",
+      "Running several candidate kernel configurations (block sizes, warps, pipeline stages) and keeping the fastest for the given shapes and GPU."
+    ],
+    [
+      "CUDA graph",
+      "A recorded sequence of GPU operations that can be replayed with one launch, removing per-kernel CPU overhead; requires fixed shapes and memory addresses."
+    ],
+    [
+      "Decomposition",
+      "Rewriting a complex PyTorch operation into simpler primitive operations so the compiler can fuse and optimise them uniformly."
+    ],
+    [
+      "Eager mode",
+      "PyTorch's default execution: each operation runs immediately as its own kernel when Python reaches it."
+    ],
+    [
+      "Epilogue fusion",
+      "Applying element-wise work (bias, activation, scaling, residual add) to a matmul's output tile inside the matmul kernel, before it is written to memory."
+    ],
+    [
+      "FX graph",
+      "PyTorch's intermediate representation of a program as a graph of operations, which Dynamo produces and later stages transform."
+    ],
+    [
+      "Graph break",
+      "A point where TorchDynamo cannot capture code into the graph, so compilation splits there and the code in between runs in ordinary Python."
+    ],
+    [
+      "Guard",
+      "A check that torch.compile records with compiled code (tensor shapes, dtypes, Python values); if a guard fails on a later call, the code is recompiled."
+    ],
+    [
+      "Kernel fusion",
+      "Combining several operations into one kernel so intermediate results never travel to HBM."
+    ],
+    [
+      "Program (Triton)",
+      "One instance of a Triton kernel, identified by tl.program_id, processing a block of data; roughly the counterpart of a CUDA thread block."
+    ],
+    [
+      "Recompilation",
+      "Compiling a function again because a guard failed, for example on a new input shape; frequent recompiles cost time and eventually fall back to eager."
+    ],
+    [
+      "TorchDynamo",
+      "The torch.compile front end that intercepts Python bytecode as it runs and extracts PyTorch operations into an FX graph."
+    ],
+    [
+      "TorchInductor",
+      "torch.compile's default back end: it schedules and fuses the graph and generates Triton kernels for GPUs (C++ for CPUs)."
+    ],
+    [
+      "Triton",
+      "A Python-embedded language and compiler for GPU kernels written at the level of blocks of data, originally from OpenAI."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why does kernel fusion speed up element-wise operations?",
+      "Element-wise operations are memory-bound: each unfused kernel reads its input from HBM and writes its output back while doing trivial arithmetic. Fusing a chain into one kernel reads the input once, keeps intermediates in registers and writes once, cutting memory traffic roughly by the number of fused operations and replacing several launches with one. Five operations on a 4,096 × 4,096 BF16 tensor take about 125 µs unfused and about 25 µs fused on an H100."
+    ],
+    [
+      "E",
+      "What does torch.compile do, in one paragraph?",
+      "It captures the PyTorch operations your Python code performs into a graph (TorchDynamo, by intercepting bytecode as it runs), traces the matching backward pass (AOTAutograd), and hands the graph to a back end — by default TorchInductor — which fuses operations and generates optimised kernels, written in Triton on GPUs, while calling cuBLAS or tuned templates for matmuls. You get fused kernels without changing the model code, at the cost of compile time."
+    ],
+    [
+      "E",
+      "What is Triton, and how does it differ from CUDA?",
+      "Triton is a Python-embedded language and compiler for GPU kernels. In CUDA you write code for one thread and manage shared memory, coalescing and synchronisation yourself; in Triton you write code for a program that operates on whole blocks of data — load a block, compute on it, store it — and the compiler maps that onto threads, handles shared memory and coalescing, and chooses tensor-core instructions. It is also what TorchInductor generates."
+    ],
+    [
+      "M",
+      "What is a graph break in torch.compile and why does it matter?",
+      "A point where TorchDynamo cannot capture the Python code into the graph — calling .item() or .tolist(), printing a tensor, data-dependent Python control flow, unsupported libraries — so it ends the current graph, runs that code in eager Python, and starts a new graph afterwards. Each break prevents fusion across the boundary, adds overhead, and in the worst case leaves most of the model uncompiled. Find them with TORCH_LOGS=graph_breaks or torch._dynamo.explain, and use fullgraph=True to make any break an error.",
+      "Follow-up: How would you fix a break caused by a data-dependent if statement? — Replace it with tensor operations such as torch.where, move the check outside the compiled region, or use torch.cond for genuine control flow."
+    ],
+    [
+      "M",
+      "What causes recompilation in torch.compile and how do you control it?",
+      "Compiled code is stored with guards — assumptions about input shapes, dtypes, devices and some Python values. When a call violates a guard, for example a new sequence length, Dynamo recompiles. By default it first specialises on exact shapes, then on a second distinct shape tries to compile a dynamic-shape version. Too many recompiles (a limit of 8 per function by default) make it fall back to eager. Control it by marking dimensions dynamic, padding or bucketing inputs to a few sizes, and checking TORCH_LOGS=recompiles."
+    ],
+    [
+      "M",
+      "What do CUDA graphs solve, and what constraint do they impose?",
+      "They record a sequence of kernel launches once and replay it with a single launch, eliminating per-kernel CPU launch overhead, which dominates when kernels are short — small batches and LLM decoding. They require static shapes and memory addresses, so inputs are copied into fixed buffers and servers capture graphs for a set of batch sizes and pad each batch to the nearest one. In gpt-fast, torch.compile's reduce-overhead mode (CUDA graphs plus fusion) took Llama-7B decoding from 25.5 to 107 tokens per second.",
+      "Follow-up: Why does vLLM capture 'piecewise' graphs? — Attention kernels with variable-length sequences aren't always graph-safe, so vLLM captures everything between attention calls as graphs and runs attention outside them (or fully, with graph-compatible attention backends)."
+    ],
+    [
+      "M",
+      "Walk through what a fused RMSNorm kernel saves compared with the eager version.",
+      "Eager RMSNorm is typically x.pow(2), .mean(-1), + eps and rsqrt, x * r, * weight: around five kernels and seven full passes over the activation (reads and writes of intermediates). A fused kernel has each program load one row, compute the sum of squares in registers, compute the reciprocal root, scale and multiply by the weight, and write once: two passes and one launch. For an 8,192 × 4,096 BF16 activation on an H100 that is roughly 165 µs versus 45 µs per norm.",
+      "Follow-up: Can it fuse further? — Yes: the residual add before it and even the quantisation of its output for an FP8 matmul after it can be folded into the same kernel."
+    ],
+    [
+      "M",
+      "Which operations can be fused easily, and which can't?",
+      "Easy: element-wise chains (each output depends on the same input position), a reduction with the element-wise work before and after it along the same axis (normalisation, softmax, loss), and element-wise epilogues on a matmul's output tile (bias, activation, residual, scaling). Hard: operations that need the whole result of the previous one before starting, such as two consecutive matmuls, or a reduction over one axis followed by work along another. FlashAttention shows that even 'hard' cases can be fused with algorithmic changes, here an online softmax."
+    ],
+    [
+      "H",
+      "When would you write a Triton kernel instead of relying on torch.compile?",
+      "When profiling shows a memory-bound hot spot the compiler doesn't handle well — a custom attention mask or normalisation, a fused loss over a large vocabulary that should never materialise the logits, a quantised matmul in an unsupported format, or an operation with irregular indexing — and a hand-written block-level kernel can keep data on-chip. Triton gets most of CUDA's performance with far less effort and runs on both NVIDIA and AMD GPUs. CUDA or CUTLASS is for the last margin or hardware-specific features.",
+      "Follow-up: Give a real example. — Liger Kernel's fused linear cross-entropy computes the output projection, softmax and loss chunk by chunk in Triton; LinkedIn reports about 20% higher throughput and 60% lower memory for Llama 3 8B training with its kernels."
+    ],
+    [
+      "H",
+      "How does TorchInductor decide what to fuse and how to generate the kernel?",
+      "After decomposing operations into a small set of primitives, Inductor represents each as a loop nest over its output with a body describing how each element is computed. Its scheduler merges nodes whose loops iterate over compatible index spaces and where fusion avoids writing an intermediate, including reductions with their neighbours; it avoids fusions that would recompute expensive work or exceed register limits. Each fused group becomes a Triton kernel with block sizes chosen by heuristics or autotuning; matmuls go to cuBLAS or autotuned Triton templates, which can carry fused epilogues. It also plans memory so buffers are reused.",
+      "Follow-up: How do you see what it generated? — TORCH_LOGS=output_code prints the generated Triton, and tlparse turns compile logs into a browsable report of graphs, breaks and kernels."
+    ],
+    [
+      "H",
+      "A team adds torch.compile to their serving stack and p99 latency gets worse. What could be happening?",
+      "Likely recompilation or compile work on the request path: new sequence lengths or batch sizes trigger guards and each recompile takes seconds, hitting unlucky requests; once past the recompile limit, those shapes run eagerly. Other causes: CUDA graphs captured only for some batch sizes, so others pad to much larger sizes; graph breaks leaving hot parts eager with extra overhead; or memory taken by many captured graphs reducing KV-cache space and concurrency. Fixes: warm up every expected shape before serving, bucket and pad shapes, mark dynamic dimensions, cache compiled artefacts, and watch recompile logs.",
+      "Follow-up: How do production servers avoid this? — They compile and capture during start-up for a fixed list of batch sizes and token budgets, and route every request to one of them."
+    ],
+    [
+      "H",
+      "Estimate how much fusion can speed up a transformer layer, and explain why the answer depends on batch size.",
+      "Split the layer into matmuls (compute-bound, unaffected by fusion) and element-wise work (norms, residual adds, RoPE, SwiGLU; memory-bound). For a Llama-3-8B-sized layer with 8,192 tokens on an H100, the matmuls take about 5.2 ms at 70% of peak, and eager element-wise work about 1.1 ms, which fusion cuts to about 0.4 ms — about 1.13× overall, excluding attention. With fewer tokens per step the matmuls shrink proportionally but per-kernel launch overhead doesn't, so the element-wise share and CPU overhead grow, and fusion plus CUDA graphs can give several-fold speed-ups — as in small-batch decoding."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "Introduction to torch.compile",
+      "The official tutorial: usage, modes, graph breaks and debugging.",
+      "https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html"
+    ],
+    [
+      "docs",
+      "Triton tutorials",
+      "Vector add, fused softmax, matmul and FlashAttention written in Triton, step by step with benchmarks.",
+      "https://triton-lang.org/main/getting-started/tutorials/index.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.x overview",
+      "The design of TorchDynamo, AOTAutograd, PrimTorch and TorchInductor, and the 163-model benchmark.",
+      "https://docs.pytorch.org/get-started/pytorch-2.0/"
+    ],
+    [
+      "docs",
+      "Dealing with Recompilations",
+      "PyTorch's guide to guards, dynamic shapes, recompile limits and how to diagnose recompiles.",
+      "https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html"
+    ],
+    [
+      "paper",
+      "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations",
+      "Tillet, Kung and Cox (2019) — the design of Triton's block-level programming model.",
+      "https://www.eecs.harvard.edu/~htk/publication/2019-mapl-tillet-kung-cox.pdf"
+    ],
+    [
+      "docs",
+      "vLLM: torch.compile integration",
+      "How a production inference server combines torch.compile with piecewise CUDA graphs.",
+      "https://docs.vllm.ai/en/latest/design/torch_compile/"
+    ],
+    [
+      "code",
+      "Liger Kernel",
+      "Production Triton kernels for LLM training — fused RMSNorm, RoPE, SwiGLU and linear cross-entropy.",
+      "https://github.com/linkedin/Liger-Kernel"
+    ],
+    [
+      "post",
+      "Getting Started with CUDA Graphs",
+      "NVIDIA — capturing and replaying kernel sequences to remove launch overhead.",
+      "https://developer.nvidia.com/blog/cuda-graphs/"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A research team writes a new transformer variant in PyTorch. Every line is simple — a normalisation, a rotation of the query and key vectors, a gated activation, a few residual additions — and the model trains correctly. It also trains at half the speed of a well-known model of the same size. The profiler explains why: each training step launches about 2,000 GPU kernels, most of them lasting a few microseconds. The large matrix multiplications are fast, but between them the GPU reads a tensor from memory, does one addition, writes it back, reads it again, multiplies it, writes it back, and repeats. For long stretches it also sits idle, waiting for Python to decide which kernel to launch next.</p>
+<p>They could rewrite every block as a hand-written CUDA kernel. Instead, they add one line — <code>model = torch.compile(model)</code> — and training becomes about 40% faster. That number is not unusual: when the PyTorch team released PyTorch 2.0, they benchmarked 163 open-source models and found <code>torch.compile</code> worked on 93% of them and trained 43% faster on average on an A100 (51% with mixed precision). Where does that speed come from, when the arithmetic hasn't changed at all?</p>
+<p>The answer is <strong>kernel fusion</strong>: combining chains of operations into single kernels so intermediate results never make the round trip to HBM. It is the practical consequence of gpu2's roofline — memory-bound operations are limited by bytes, so the way to speed them up is to stop moving the bytes. This lesson explains fusion from first principles, then the three tools that deliver it: <strong>torch.compile</strong>, which captures a model's operations and generates fused kernels automatically; <strong>Triton</strong>, a Python-embedded language in which you can write your own fused kernels at the level of blocks rather than threads; and <strong>CUDA graphs</strong>, which remove the CPU's launch overhead. We will also cover how they fail — graph breaks, recompilation storms, compile time, numerical differences — because in production those failures matter as much as the speed-ups.</p>
+</section>
+
+<section data-field="primer">
+<h4>The kitchen that puts everything away</h4>
+<p>Imagine a cook preparing a sauce in five steps: chop, fry, add stock, reduce, season. A strangely strict kitchen requires that after every step the cook puts the pan back in the walk-in fridge down the corridor, and fetches it again for the next step. The cooking takes a minute per step; the walking takes five. A sensible cook keeps the pan on the stove for all five steps and only puts the finished sauce away. Same recipe, same cooking, a fraction of the time.</p>
+<p>Eager PyTorch is the strict kitchen. Each operation is a separate kernel; each kernel reads its inputs from HBM (the walk-in fridge) and writes its output back, because the next operation is a different kernel that can only find its input there. For a matrix multiplication, the walk is negligible compared with the cooking. For an element-wise operation — add, multiply, GELU — the cooking is a few FLOPs per element and the walk is everything. A <strong>fused</strong> kernel is the sensible cook: it reads the input once, does all the operations on values held in registers, and writes the final result once.</p>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Unfused: three kernels, each reading from and writing to HBM, six trips in total. Fused: one kernel reads x once, keeps intermediates in registers, writes y once">
+  <defs><marker id="gpu6-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="18" style="fill:var(--ink);font-weight:600">Eager: y = gelu(x * w + b)  → 3 kernels</text>
+    <rect x="20" y="95" width="600" height="26" rx="4" style="fill:var(--accent);opacity:0.25;stroke:var(--line-2)"/>
+    <text x="320" y="112" text-anchor="middle" style="fill:var(--ink)">HBM</text>
+    <g style="fill:var(--surface-2);stroke:var(--line-2)">
+      <rect x="60" y="30" width="120" height="30" rx="4"/><rect x="260" y="30" width="120" height="30" rx="4"/><rect x="460" y="30" width="120" height="30" rx="4"/>
+    </g>
+    <g style="fill:var(--ink);font-size:11px">
+      <text x="120" y="50" text-anchor="middle">kernel 1: x * w</text><text x="320" y="50" text-anchor="middle">kernel 2: + b</text><text x="520" y="50" text-anchor="middle">kernel 3: gelu</text>
+    </g>
+    <g style="stroke:var(--crit);stroke-width:1.5;fill:none">
+      <line x1="90" y1="93" x2="90" y2="62" marker-end="url(#gpu6-arrow)"/><line x1="150" y1="62" x2="150" y2="93" marker-end="url(#gpu6-arrow)"/>
+      <line x1="290" y1="93" x2="290" y2="62" marker-end="url(#gpu6-arrow)"/><line x1="350" y1="62" x2="350" y2="93" marker-end="url(#gpu6-arrow)"/>
+      <line x1="490" y1="93" x2="490" y2="62" marker-end="url(#gpu6-arrow)"/><line x1="550" y1="62" x2="550" y2="93" marker-end="url(#gpu6-arrow)"/>
+    </g>
+    <text x="320" y="138" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">6 trips over the full tensor + 3 launches</text>
+    <text x="20" y="168" style="fill:var(--ink);font-weight:600">Fused: 1 kernel</text>
+    <rect x="200" y="178" width="240" height="30" rx="4" style="fill:var(--good);opacity:0.35;stroke:var(--line-2)"/>
+    <text x="320" y="197" text-anchor="middle" style="fill:var(--ink);font-size:11px">load x → x*w+b → gelu (registers) → store y</text>
+    <rect x="20" y="226" width="600" height="26" rx="4" style="fill:var(--accent);opacity:0.25;stroke:var(--line-2)"/>
+    <text x="320" y="243" text-anchor="middle" style="fill:var(--ink)">HBM</text>
+    <g style="stroke:var(--good);stroke-width:1.5;fill:none">
+      <line x1="240" y1="224" x2="240" y2="210" marker-end="url(#gpu6-arrow)"/><line x1="400" y1="210" x2="400" y2="224" marker-end="url(#gpu6-arrow)"/>
+    </g>
+  </g>
+</svg>
+<figcaption>Each unfused kernel must write its result to HBM because the next kernel can only find it there. Fusion keeps intermediates in registers, so the memory traffic falls from six passes to two and three launches become one.</figcaption>
+</figure>
+<h4>Why not fuse everything into one kernel?</h4>
+<p>If fusion is so good, why not write each layer — or the whole model — as a single kernel? Three reasons. First, different operations want different shapes of parallelism: a matmul wants to tile its output across all SMs, while a row-wise normalisation wants one program per row; one kernel has to choose one launch shape. Second, some operations need the complete result of the previous one before they can start, and blocks of a single kernel cannot wait for each other (gpu5). Third, hand-writing a fused kernel for every model variant is expensive, fragile and hard to maintain. So in practice fusion happens in the places it pays most — chains of memory-bound operations, reductions with their neighbours, matmul epilogues — and is automated wherever possible. (At the extreme, researchers have built "megakernels" that run an entire small model's decode step as one persistent kernel; they are fast and very specialised.)</p>
+<h4>Three tools, three problems</h4>
+<p><strong>torch.compile</strong> addresses the traffic automatically: it watches your model's Python code run, builds a graph of the PyTorch operations, decides which ones to fuse, and generates new kernels for the fused groups. <strong>Triton</strong> is the language those generated kernels are written in, and one you can use yourself when the compiler doesn't produce what you need: you write in Python, describing operations on whole blocks of data, and the Triton compiler handles the thread-level details you met in gpu5. <strong>CUDA graphs</strong> address a different cost — the CPU time to launch each kernel — by recording a sequence of launches once and replaying it with one call.</p>
+<p>A quick number to anchor it: five element-wise operations applied in sequence to a 4,096 × 4,096 BF16 tensor (33.5 MB) on an H100 move 335 MB unfused — about 100 µs at 3.35 TB/s, plus five launches — and 67 MB fused, about 20 µs plus one launch. Roughly 125 µs versus 25 µs, from the same arithmetic.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Anatomy of an eager operation</h4>
+<p>When Python executes <code>y = torch.relu(x * w + b) * scale</code> on GPU tensors, PyTorch does the following for each of the four operations: the Python interpreter calls into PyTorch's C++ dispatcher; the dispatcher checks types, devices and autograd, allocates an output tensor from the caching allocator, records what the backward pass will need, and selects a kernel; the CUDA runtime enqueues the launch. That host-side path costs a few microseconds per operation. The GPU then runs the kernel: read the inputs from HBM, compute, write the output to HBM.</p>
+<p>For the expression above on an 8,192 × 4,096 BF16 tensor (67 MB): four kernels, each reading one or two tensors and writing one — roughly 8 full passes, 540 MB, about 160 µs at 3.35 TB/s, plus four launches. Fused: read <code>x</code> once (the vectors <code>w</code> and <code>b</code> are small, or broadcast), write <code>y</code> once — 134 MB, about 40 µs. In training, the backward pass has its own chain of element-wise kernels, and autograd saves intermediate tensors for it, so unfused code also uses more memory.</p>
+<p>Two kinds of waste are mixed together here, and the tools attack them separately. <strong>Memory traffic</strong> (the extra passes over HBM) is removed by fusion. <strong>Launch and dispatch overhead</strong> (the microseconds of CPU work per operation) is removed by fusion (fewer operations) and by CUDA graphs (no per-kernel CPU work at all). Which dominates depends on tensor size: for large tensors, traffic; for small ones — a decode step with batch size 1 — overhead.</p>
+
+<h4>2. What can be fused</h4>
+<p>Fusion works when one kernel can compute its output piece by piece without waiting for results from elsewhere in the tensor. Four patterns cover most ML code:</p>
+<ul>
+<li><strong>Element-wise chains</strong> ("vertical" fusion): each output element depends only on the input element at the same position — add, multiply, activation functions, dropout, casts. Any chain of these fuses trivially.</li>
+<li><strong>Reductions with their neighbours:</strong> RMSNorm, LayerNorm, softmax and cross-entropy each reduce along a row (a sum or a max) and then apply element-wise work using the result. One program per row can load the row, reduce it in registers or shared memory, and apply the rest — one read, one write.</li>
+<li><strong>Matmul epilogues and prologues:</strong> a matmul produces its output tile by tile; bias addition, an activation, a residual addition, scaling or quantisation can be applied to each tile in registers before it is written (<strong>epilogue fusion</strong>). Similarly, a cheap transformation of the input (dequantising int4 weights, applying a norm's scale) can happen as tiles are loaded (prologue).</li>
+<li><strong>Horizontal fusion:</strong> several independent small operations — for example, the same optimiser update applied to hundreds of parameter tensors — launched as one kernel. PyTorch's "foreach" and "fused" AdamW implementations do this.</li>
+</ul>
+<p>What doesn't fuse easily is work whose next step needs the <em>whole</em> result of the previous one: two consecutive matmuls (the second needs complete rows of the first's output), or a reduction along one axis followed by work along another. These sometimes yield to algorithmic cleverness — FlashAttention (gpu7) fuses the two matmuls and the softmax of attention by restructuring the softmax so it can be computed incrementally — but a general-purpose compiler won't find such rewrites by itself.</p>
+
+<h4>3. How torch.compile works</h4>
+<p><code>torch.compile</code> is a pipeline of three components, each solving one problem.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="torch.compile pipeline: Python code goes to TorchDynamo, which produces an FX graph plus guards, or a graph break back to Python; AOTAutograd produces joint forward and backward graphs with decompositions; TorchInductor fuses and generates Triton kernels and calls cuBLAS for matmuls; optionally CUDA graphs wrap the result">
+  <defs><marker id="gpu6-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="40" width="100" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="60" y="64" text-anchor="middle" style="fill:var(--ink)">your Python</text><text x="60" y="80" text-anchor="middle" style="fill:var(--ink)">model code</text>
+    <rect x="140" y="40" width="130" height="56" rx="6" style="fill:var(--s1);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="205" y="62" text-anchor="middle" style="fill:var(--ink);font-weight:600">TorchDynamo</text><text x="205" y="80" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">bytecode → FX graph</text>
+    <rect x="300" y="40" width="130" height="56" rx="6" style="fill:var(--s2);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="365" y="62" text-anchor="middle" style="fill:var(--ink);font-weight:600">AOTAutograd</text><text x="365" y="80" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">fwd + bwd graphs</text>
+    <rect x="460" y="40" width="170" height="56" rx="6" style="fill:var(--s3);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="545" y="62" text-anchor="middle" style="fill:var(--ink);font-weight:600">TorchInductor</text><text x="545" y="80" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">fuse → Triton kernels</text>
+    <g style="stroke:var(--ink-2);stroke-width:1.5;fill:none">
+      <line x1="110" y1="68" x2="138" y2="68" marker-end="url(#gpu6-arrow2)"/><line x1="270" y1="68" x2="298" y2="68" marker-end="url(#gpu6-arrow2)"/><line x1="430" y1="68" x2="458" y2="68" marker-end="url(#gpu6-arrow2)"/>
+    </g>
+    <path d="M 205 98 Q 205 140 110 140 L 60 140 L 60 100" marker-end="url(#gpu6-arrow2)" style="stroke:var(--crit);stroke-width:1.5;stroke-dasharray:5 4;fill:none"/>
+    <text x="140" y="158" style="fill:var(--crit);font-size:11px">graph break: unsupported code runs in Python</text>
+    <text x="205" y="120" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">+ guards (shapes, dtypes)</text>
+    <text x="365" y="120" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">decompose to primitives</text>
+    <text x="545" y="120" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">matmuls → cuBLAS / templates</text>
+    <rect x="460" y="170" width="170" height="40" rx="6" style="fill:var(--good);opacity:0.25;stroke:var(--line-2)"/>
+    <text x="545" y="194" text-anchor="middle" style="fill:var(--ink);font-size:11px">optional: CUDA graphs</text>
+    <line x1="545" y1="98" x2="545" y2="168" marker-end="url(#gpu6-arrow2)" style="stroke:var(--ink-2);stroke-width:1.5;fill:none"/>
+    <text x="20" y="222" style="fill:var(--muted);font-size:11px">If a later call fails a guard (e.g. a new input shape), Dynamo recompiles that function.</text>
+  </g>
+</svg>
+<figcaption>Dynamo decides what can be compiled and under which assumptions (guards); AOTAutograd makes the backward pass part of the graph; Inductor decides what to fuse and writes the kernels. Graph breaks and guard failures are where the pipeline hands control back to Python or starts over.</figcaption>
+</figure>
+<p><strong>TorchDynamo</strong> — capture. Python code is compiled to bytecode before it runs. Dynamo hooks into CPython's frame evaluation (a documented interpreter extension point) and, when a compiled function is called, symbolically runs its bytecode: PyTorch operations become nodes in an <strong>FX graph</strong> (PyTorch's graph representation), while ordinary Python — loops over layers, attribute lookups, arithmetic on constants — is executed away, so the graph contains only tensor work. Alongside the graph it records <strong>guards</strong>: the assumptions it relied on, such as "x has shape [8, 4,096] and dtype bfloat16" or "self.training is True". On later calls the guards are checked first; if they pass, the compiled code runs directly. When Dynamo meets something it can't trace — a call into an unsupported library, <code>.item()</code> turning a tensor into a Python number that then controls an <code>if</code>, printing a tensor — it inserts a <strong>graph break</strong>: it compiles the graph so far, runs the problematic code in normal Python, and starts a new graph after it.</p>
+<p><strong>AOTAutograd</strong> — the backward pass. In eager mode, autograd builds the backward computation as the forward runs. AOTAutograd instead traces the forward and backward together ahead of time, producing a joint graph that can be optimised as a whole — for example, choosing which intermediate tensors to save for the backward pass and which to recompute cheaply (recomputing an element-wise result can be faster than saving and re-reading it). It also <strong>decomposes</strong> PyTorch's roughly 2,000 operators into a much smaller set of primitive ones (about 250 in the PrimTorch set), so the back end only needs to handle those.</p>
+<p><strong>TorchInductor</strong> — code generation. Inductor lowers each primitive to a loop-level description ("for each output element i, compute …") and its scheduler fuses nodes whose loops line up, so that intermediates live in registers. Each fused group becomes a <strong>Triton</strong> kernel on GPUs (C++/OpenMP on CPUs). Matmuls and convolutions usually go to cuBLAS/cuDNN, or, in <code>max-autotune</code> mode, to Triton matmul templates that are benchmarked against cuBLAS and can carry fused epilogues.</p>
+
+<h4>4. Using torch.compile, and what goes wrong</h4>
+<pre>model = torch.compile(model)                              # default: fusion, moderate compile time
+model = torch.compile(model, mode="reduce-overhead")      # + CUDA graphs: small batches, inference
+model = torch.compile(model, mode="max-autotune")         # + kernel autotuning: long compile, best speed
+model = torch.compile(model, fullgraph=True)              # make any graph break an error</pre>
+<p>The first call to a compiled function is slow — tens of seconds to minutes for a large model — because it traces and generates kernels. Subsequent calls with matching guards run the compiled code. Three problems account for most disappointing results.</p>
+<p><strong>Graph breaks.</strong> Common causes: <code>.item()</code>, <code>.tolist()</code> or <code>print</code> on tensors; data-dependent Python control flow (<code>if x.sum() &gt; 0:</code>); calls into NumPy or other libraries on tensor data; some custom autograd functions or C extensions. Each break limits fusion across it and adds overhead; a break inside a transformer block, repeated 32 times, can erase most of the gain. Find them with <code>TORCH_LOGS="graph_breaks"</code> or <code>torch._dynamo.explain(model)(inputs)</code>. Fix by moving logging and checks outside the compiled region, replacing Python conditionals with tensor operations (<code>torch.where</code>), or using <code>torch.cond</code> for true control flow.</p>
+<p><strong>Recompilation.</strong> Every guard failure triggers a recompile. The usual trigger is shape: with variable sequence lengths, each new length fails the shape guard. PyTorch first specialises on the exact shape; on seeing a second value it recompiles a dynamic-shape version that treats the dimension as a symbol. After a limit (8 recompiles per function by default) it gives up and runs that function eagerly. <code>TORCH_LOGS="recompiles"</code> shows each recompile and the failing guard. The remedies are marking dimensions dynamic up front (<code>torch._dynamo.mark_dynamic</code> or <code>dynamic=True</code>), and padding or bucketing inputs to a few fixed sizes.</p>
+<p><strong>Compile time.</strong> Minutes of compilation matter for iteration speed and for server start-up. Inductor caches compiled kernels on disk (reused across runs with the same code and shapes), and "regional compilation" — compiling one transformer block and reusing it for all identical layers — cuts compile time for deep models.</p>
+
+<h4>5. CUDA graphs: removing launch overhead</h4>
+<p>Even perfectly fused code launches dozens of kernels per layer, and each launch costs CPU time. When kernels are long (training with large batches), the CPU runs ahead and the GPU never waits. When kernels are short — a decode step for one sequence, where each kernel lasts a few microseconds — the GPU finishes each kernel before the CPU has launched the next, and it sits idle. That is the overhead-bound regime from gpu1.</p>
+<figure>
+<svg viewBox="0 0 640 200" width="100%" role="img" aria-label="Timelines: eager launches leave the GPU idle between short kernels while the CPU launches each one; with a CUDA graph the CPU launches once and kernels run back to back">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Eager: one CPU launch per kernel</text>
+    <text x="20" y="46" style="fill:var(--ink-2)">CPU</text>
+    <g style="fill:var(--s1);opacity:0.55"><rect x="70" y="34" width="60" height="16"/><rect x="140" y="34" width="60" height="16"/><rect x="210" y="34" width="60" height="16"/><rect x="280" y="34" width="60" height="16"/><rect x="350" y="34" width="60" height="16"/></g>
+    <text x="20" y="72" style="fill:var(--ink-2)">GPU</text>
+    <g style="fill:var(--good);opacity:0.6"><rect x="130" y="60" width="18" height="16"/><rect x="200" y="60" width="18" height="16"/><rect x="270" y="60" width="18" height="16"/><rect x="340" y="60" width="18" height="16"/><rect x="410" y="60" width="18" height="16"/></g>
+    <text x="440" y="72" style="fill:var(--crit);font-size:11px">GPU mostly idle, waiting</text>
+    <text x="20" y="116" style="fill:var(--ink);font-weight:600">CUDA graph: one launch replays all kernels</text>
+    <text x="20" y="142" style="fill:var(--ink-2)">CPU</text>
+    <rect x="70" y="130" width="60" height="16" style="fill:var(--s1);opacity:0.55"/>
+    <text x="20" y="168" style="fill:var(--ink-2)">GPU</text>
+    <g style="fill:var(--good);opacity:0.6"><rect x="130" y="156" width="18" height="16"/><rect x="150" y="156" width="18" height="16"/><rect x="170" y="156" width="18" height="16"/><rect x="190" y="156" width="18" height="16"/><rect x="210" y="156" width="18" height="16"/></g>
+    <text x="240" y="168" style="fill:var(--ink-2);font-size:11px">kernels back to back — same work, done ~4× sooner</text>
+    <text x="20" y="194" style="fill:var(--muted);font-size:11px">Blue: CPU launch work. Green: GPU kernel execution. Time runs left to right.</text>
+  </g>
+</svg>
+<figcaption>When kernels are shorter than the CPU's launch cost, the GPU spends most of its time waiting. A CUDA graph moves the launching work to capture time, so replay costs one launch for the whole sequence.</figcaption>
+</figure>
+<p>A <strong>CUDA graph</strong> is created by <em>capturing</em> a stream: you run the sequence once in capture mode, CUDA records every kernel and its arguments instead of (or as well as) executing them, and afterwards you <em>replay</em> the whole recording with one call. Because the recording contains fixed kernel arguments — including memory addresses — replays must use the same shapes and the same buffers: inputs are copied into static tensors before each replay, and outputs appear in static tensors. PyTorch exposes this as <code>torch.cuda.CUDAGraph</code> and applies it automatically in <code>mode="reduce-overhead"</code>.</p>
+<p>The effect on overhead-bound workloads is large. In the gpt-fast case study from gpu2, compiling Llama-7B's decode step with CUDA graphs and a static KV cache took it from 25.5 to 107 tokens per second on an A100 — the whole gain came from removing CPU overhead and fusing kernels, after which the model was bandwidth-bound. Inference servers use CUDA graphs universally for decoding: vLLM captures graphs for a list of batch sizes at start-up and pads each decode batch up to the nearest captured size; because attention over variable-length sequences isn't always graph-safe, it captures "piecewise" graphs covering everything between attention calls, or full graphs when the attention back end supports it.</p>
+
+<h4>6. Triton: writing fused kernels in Python</h4>
+<p>When the compiler doesn't fuse what you need, you write a kernel. Triton, created by Philippe Tillet and developed at OpenAI, lets you do that in Python with a different mental model from CUDA. In CUDA (gpu5) you write the code for one thread and arrange threads, shared memory and synchronisation yourself. In Triton you write the code for one <strong>program</strong> — an instance of the kernel identified by <code>tl.program_id</code> — that operates on whole <em>blocks</em> of data: load a block of values into what behaves like a small array, compute on it with NumPy-like operations, store it. The compiler decides how many threads implement each program, lays out memory accesses for coalescing, uses shared memory where it helps, and — for <code>tl.dot</code> — emits tensor-core instructions.</p>
+<p>A fused row-wise softmax shows the style, including a reduction:</p>
+<pre>import triton, triton.language as tl
+
+@triton.jit
+def softmax_kernel(x_ptr, y_ptr, n_cols, stride, BLOCK: tl.constexpr):
+    row = tl.program_id(0)                        # one program per row
+    cols = tl.arange(0, BLOCK)                    # BLOCK ≥ n_cols, a power of two
+    mask = cols &lt; n_cols                          # ragged edge of the row
+    x = tl.load(x_ptr + row * stride + cols, mask=mask, other=-float("inf"))
+    x = x - tl.max(x, axis=0)                     # reduction in registers
+    num = tl.exp(x.to(tl.float32))
+    y = num / tl.sum(num, axis=0)                 # second reduction, same row
+    tl.store(y_ptr + row * stride + cols, y, mask=mask)   # one read, one write
+
+# launch: one program per row
+# softmax_kernel[(n_rows,)](x, y, n_cols, x.stride(0), BLOCK=triton.next_power_of_2(n_cols))</pre>
+<p>The eager equivalent — max, subtract, exp, sum, divide — is several kernels and several passes over the tensor; this is one pass in, one pass out. Triton's official tutorial benchmarks this exact kernel against PyTorch's eager softmax and shows it running close to the memory-bandwidth limit. Performance knobs are exposed as parameters rather than code: block sizes, <code>num_warps</code> (how many warps implement each program) and <code>num_stages</code> (how deep the compiler pipelines asynchronous loads in loops), and the <code>@triton.autotune</code> decorator benchmarks a list of configurations per input shape and caches the winner.</p>
+<p>Triton's reach is the reason it matters: it is what TorchInductor generates, it runs on NVIDIA and AMD GPUs, and many production kernels — FlashAttention implementations, fused MoE layers, quantised matmuls in serving systems, and training kernels such as those in LinkedIn's Liger Kernel library — are written in it.</p>
+
+<h4>7. A worked example: one transformer layer</h4>
+<p>How much does fusion buy in a real layer? Take a Llama-3-8B-sized layer (d = 4,096, MLP width 14,336, 8 KV heads) processing 8,192 tokens in BF16 on an H100, and look at its non-matmul, non-attention work. Typical eager implementations do: two RMSNorms (each about five kernels and seven passes over the activation), two residual additions, rotary position embedding on queries and keys (slices, negations, concatenation, multiplies and an add — around six kernels, ten passes), and the SwiGLU product silu(gate) × up. Counting bytes at 3.35 TB/s plus 5 µs per launch (the lab does this):</p>
+<table><thead><tr><th>Operation</th><th>Eager</th><th>Fused</th></tr></thead><tbody>
+<tr><td>2 × RMSNorm</td><td>330 µs, 10 kernels</td><td>90 µs, 2 kernels</td></tr>
+<tr><td>2 × residual add</td><td>130 µs, 2 kernels</td><td>40 µs, folded into the norms</td></tr>
+<tr><td>RoPE on q and k</td><td>280 µs, 6 kernels</td><td>55 µs, 1 kernel</td></tr>
+<tr><td>SwiGLU</td><td>360 µs, 2 kernels</td><td>215 µs, 1 kernel</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>≈ 1.1 ms</strong></td><td><strong>≈ 0.4 ms</strong></td></tr>
+</tbody></table>
+<p>The layer's matmuls take about 5.2 ms at 70% of peak, so fusion improves this layer by about 13% — useful, not dramatic, because at 8,192 tokens the layer is dominated by compute-bound matmuls. Now shrink the batch to a decode step of a few sequences: the matmuls become memory-bound and short, the element-wise kernels become tiny, and launch overhead dominates — which is where fusion plus CUDA graphs gives several-fold gains, as gpt-fast showed. Published results fall between these poles: PyTorch 2.0's 43% average across 163 models (21% in FP32, 51% with mixed precision, where matmuls are faster and the memory-bound share is larger); and Liger Kernel's fused Triton kernels for RMSNorm, RoPE, SwiGLU and cross-entropy, which LinkedIn reports raise Llama 3 8B training throughput by about 20% and cut memory by about 60% on 8 A100s — the memory saving coming mostly from never materialising the full logits tensor (gpu3).</p>
+</section>
+
+<section data-field="deep">
+<h4>How Inductor chooses fusions</h4>
+<p>After decomposition, every operation is a node with a loop nest over its output and a body saying how each element is computed from inputs. Inductor's scheduler then greedily merges nodes that can share a loop — same iteration space, or a reduction and the element-wise work around it along the same axis — scoring candidate fusions by the memory traffic they save, and refusing ones that would recompute expensive work many times or combine incompatible loop structures. Reductions get special treatment: a row reduction followed by a broadcast back over the row (normalisation, softmax) becomes one "persistent" kernel if the row fits in a block, or a looped kernel if it doesn't. Inductor also plans memory, reusing buffers whose lifetimes don't overlap, and chooses what autograd saves: sometimes recomputing a cheap element-wise result in the backward pass is faster than writing and re-reading it, and its min-cut-based partitioner makes that choice automatically.</p>
+<h4>Inside the Triton compiler</h4>
+<p>A Triton function is parsed into Triton IR, a representation of block-level operations. The compiler then assigns each block a <em>layout</em> — how its elements are distributed across threads and registers — choosing layouts that make loads coalesced and that match the operand formats tensor-core instructions expect, inserting conversions (through shared memory) where layouts must change. Loops that load tiles are software-pipelined to <code>num_stages</code> depth, issuing asynchronous copies (<code>cp.async</code> or TMA) several iterations ahead. The result is lowered to LLVM IR and then to PTX, NVIDIA's intermediate assembly, or to AMD's equivalent. This is why the same Python source can be competitive on different GPU generations — and also why brand-new hardware features (Blackwell's tensor memory, for example) need compiler support before Triton code benefits from them.</p>
+<h4>Guards, dynamic shapes and symbolic reasoning</h4>
+<p>Dynamic-shape compilation replaces concrete sizes with symbols and reasons about them: if the code reshapes [B, S, 4096] to [B·S, 4096], the compiler tracks B·S symbolically and records guards such as "S &gt; 1" or "S is divisible by 8" when the generated code depends on them. Specialising on exact sizes produces the best kernels but recompiles for every new size; fully dynamic kernels avoid recompiles but can't exploit known sizes (for example, choosing a block size that exactly divides a dimension). Practical systems take the middle path: dynamic batch and sequence dimensions, static hidden sizes, and padding to multiples of 8, 16 or 64 so the dynamic kernels still meet tensor-core alignment.</p>
+<h4>Ahead-of-time compilation for deployment</h4>
+<p>Just-in-time compilation is awkward for servers: start-up time, compile-time memory spikes, and the risk of a recompile under load. <code>torch.export</code> captures a whole model into a single graph with explicitly declared dynamic dimensions (graph breaks are errors), and AOTInductor compiles that into a shared library that can be loaded without Python. Similar deployment paths exist outside PyTorch — TensorRT and TensorRT-LLM build optimised engines ahead of time for fixed ranges of shapes. The trade-off is flexibility: every shape and code path must be known at build time.</p>
+<h4>Megakernels: the far end of fusion</h4>
+<p>Even with CUDA graphs, a decode step is a sequence of separate kernels, and between two kernels the GPU drains: the last blocks of one kernel finish while most SMs sit idle, and the next kernel's loads only start after it launches. Hazy Research's 2025 "Look Ma, No Bubbles" work removed those gaps for Llama 3.2 1B by fusing the entire forward pass into one persistent "megakernel": each SM runs an interpreter that pulls small tasks (a slice of a matmul, a piece of attention) from a schedule, with fine-grained counters in global memory standing in for kernel boundaries, and loads for the next task starting while the current one computes. On an H100 they reported using about 78% of memory bandwidth and beating vLLM and SGLang by over 1.5× in batch-1 latency. The approach shows how much time the gaps between kernels cost in latency-critical decoding — and, because the kernel is specific to one model and GPU, why it remains a specialist technique rather than a default.</p>
+<h4>Fusion and numerics</h4>
+<p>Fused kernels often keep intermediates in FP32 registers where eager code rounded them to BF16 in memory, and they may sum in a different order. Results therefore differ slightly — usually for the better in accuracy, but enough to break exact-equality tests and occasionally to change which token wins at temperature 0 (gpu4). When a compiled model diverges meaningfully from eager, PyTorch's accuracy minifier (<code>TORCHDYNAMO_REPRO_AFTER="aot"</code> with an accuracy check level) shrinks the model to the smallest graph that reproduces the difference, which isolates whether a specific fusion or a real bug is responsible.</p>
+</section>
+
+<section data-field="prod">
+<h4>Rolling out torch.compile safely</h4>
+<p>Teams adopting <code>torch.compile</code> in training typically compile the model (or each repeated block), run a few hundred steps side by side with eager to compare loss curves, profile to confirm the speed-up comes from where expected, and check the logs for graph breaks and recompiles. For long training runs, compile time is negligible; the concern is correctness and stability across a months-long job, including after checkpoint restarts (compiled caches may need to be rebuilt, adding minutes to each restart unless cached on shared storage).</p>
+<p>In serving, the concerns are latency and memory. A first request that triggers a compile can take seconds or minutes, so servers compile and capture everything at start-up for a fixed list of batch sizes and token budgets and never compile on the request path. Recompilation storms — variable prompt lengths each failing a shape guard — show up as sporadic multi-second latency spikes at p99 and as "recompile limit reached" warnings, after which affected functions silently run eagerly and slower. CUDA graphs cost memory: each captured size keeps its own static buffers, which competes with KV-cache space, so servers limit how many sizes they capture.</p>
+<h4>Symptoms and what they mean</h4>
+<p><strong>Compiled model is no faster.</strong> Either the model is dominated by large matmuls (check with the profiler: if 80% of GPU time is GEMMs at good efficiency, there is little for fusion to do), or graph breaks left the hot path eager (check <code>graph_breaks</code> logs), or the step is bound by data loading or communication.</p>
+<p><strong>Speed-up disappears after some steps.</strong> Recompiles hit the limit and fell back to eager — typically from varying shapes or from a Python value (a step counter, a flag) that the code reads inside the compiled region and Dynamo guards on.</p>
+<p><strong>Out of memory only when compiled.</strong> CUDA graph pools, autotuning benchmarks at compile time, or different saved-activation choices. Compare memory snapshots between modes; <code>mode="default"</code> avoids CUDA-graph pools.</p>
+<p><strong>Results differ from eager.</strong> Expect last-bit differences; use tolerances. Investigate larger differences with the accuracy minifier, and check for code with side effects inside the compiled region (in-place updates of Python state), which compiled code may not reproduce.</p>
+<h4>Observability for compiled models</h4>
+<p>Treat compilation as part of the system you monitor. Log compile time per run and per restart, the number of graphs and graph breaks, and recompile counts (PyTorch keeps counters in <code>torch._dynamo.utils.counters</code>, and <code>tlparse</code> turns structured compile logs into a browsable report of every graph, guard and generated kernel). Alert when recompiles appear after warm-up in a server, since they mean some input shape escaped the buckets. Keep the generated kernels (<code>TORCH_LOGS="output_code"</code>) for the hot path, so a regression after a PyTorch upgrade can be traced to a specific changed kernel.</p>
+<h4>When to write the kernel yourself</h4>
+<p>The decision rule from gpu5 applies: profile, compute each hot kernel's roofline bound, and write Triton only where a specific memory-bound pattern is both large and unfused. Good candidates are losses over large vocabularies (never materialise the logits), fused normalisation with quantisation for an FP8 matmul, custom attention masks or positional schemes, MoE routing and permutation, and dequantise-and-multiply for unusual weight formats. Keep the eager version as the reference implementation and test the kernel against it across shapes, dtypes and edge cases, just as with CUDA.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> estimate what fusion saves in one transformer layer by counting passes over memory and kernel launches. This machine has no NVIDIA GPU, so this is the calculation rather than a benchmark; it runs on plain Python 3.12.</p>
+<pre>T, d, dff = 8192, 4096, 14336          # tokens, hidden size, MLP width (Llama-3-8B)
+BW, LAUNCH_US = 3.35e12, 5             # H100 HBM bytes/s, per-kernel overhead
+
+# (name, elements per pass, eager kernels, eager passes, fused kernels, fused passes)
+OPS = [
+    ("2x RMSNorm",       2 * T * d,      10, 7, 2, 2),
+    ("2x residual add",  2 * T * d,       2, 3, 0, 1),   # folded into the next norm
+    ("RoPE on q and k",  T * (d + 1024),  6, 10, 1, 2),
+    ("SwiGLU silu(g)*u", T * dff,         2, 5, 1, 3),
+]
+tot_e = tot_f = 0.0
+for name, n, ke, pe, kf, pf in OPS:
+    te = n * 2 * pe / BW * 1e6 + ke * LAUNCH_US        # BF16 = 2 bytes
+    tf = n * 2 * pf / BW * 1e6 + kf * LAUNCH_US
+    tot_e, tot_f = tot_e + te, tot_f + tf
+    print(f"{name:18s} eager {te:6.0f} us ({ke:2d} kernels)  fused {tf:5.0f} us")
+mm = 2 * T * (2 * d * d + 2 * d * 1024 + 3 * d * dff) / (989e12 * 0.7) * 1e6
+print(f"element-wise {tot_e:.0f} -&gt; {tot_f:.0f} us; matmuls {mm:.0f} us; "
+      f"layer {(mm + tot_e) / (mm + tot_f):.2f}x faster")</pre>
+<p><strong>What to look for.</strong> Element-wise work drops from about 1,100 µs to about 400 µs, but the layer only improves about 1.13× because the matmuls (about 5,160 µs) dominate at 8,192 tokens. Now set <code>T = 64</code>: the passes shrink 128-fold but the launch costs don't, so the eager column is mostly launch overhead and the fused/eager ratio grows — the small-batch regime where fusion and CUDA graphs give their biggest wins. Try setting <code>LAUNCH_US = 0</code> to see how much of the gain at small T was overhead rather than bytes.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A block applies five element-wise operations in sequence to a 4,096 × 4,096 BF16 tensor on an H100 (3.35 TB/s). Estimate the time unfused (five kernels) and fused (one kernel), including about 5 µs of launch overhead per kernel. Then redo it for a 1 × 4,096 tensor, as in single-sequence decoding. What does each case tell you about which tool to reach for?</p>
+<details><summary>Answer</summary>
+<p><strong>Large tensor.</strong> Size: 4,096<sup>2</sup> × 2 bytes ≈ 33.5 MB. Unfused, each kernel reads and writes it: 67 MB × 5 = 335 MB → about <strong>100 µs</strong> of traffic, plus 5 × 5 µs = 25 µs of launches → about <strong>125 µs</strong>. Fused: one read and one write, 67 MB → about 20 µs + 5 µs → about <strong>25 µs</strong>. About 5× faster, and the intermediate tensors never need to exist, saving memory too. Here fusion (torch.compile or a Triton kernel) is the tool; CUDA graphs would save only the 20 µs of extra launches.</p>
+<p><strong>Tiny tensor.</strong> Size: 4,096 × 2 bytes = 8 KB. Traffic is a few nanoseconds per pass — irrelevant. Unfused: 5 launches ≈ <strong>25 µs</strong>, fused: one launch ≈ <strong>5 µs</strong>, and with a CUDA graph covering the whole decode step, the per-kernel CPU cost almost disappears. Here the problem is entirely overhead: fusion helps by reducing the number of launches, and CUDA graphs help most. This is why decode-heavy inference uses <code>mode="reduce-overhead"</code> or equivalent graph capture, while training with large batches mostly benefits from fusion itself.</p>
+</details>
+</section>

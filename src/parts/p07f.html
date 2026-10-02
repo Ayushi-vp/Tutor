@@ -1,0 +1,443 @@
+
+/* ============================================================
+   DATA — infrastructure building blocks. The primitives the product
+   designs assume exist. Same field shape as CLASSICS.
+   ============================================================ */
+const INFRA = [
+
+{ id:"in1", t:"Design a distributed message queue (Kafka)", tag:"Messaging", sum:"The append-only log: partitions, offsets, consumer groups and what 'exactly once' really means.",
+  primer:`<h4>Start here — the idea that makes Kafka different</h4>
+  <p>A traditional queue (RabbitMQ, SQS) works like a to-do list: a consumer takes a message, and the message is <em>removed</em>. One message, one consumer, then it is gone.</p>
+  <p>Kafka does something else. It is an <strong>append-only log</strong> — a file you can only add to the end of. Messages are never removed when read. Each consumer keeps a <strong>bookmark</strong> (an offset) saying how far it has got. Ten different consumers can read the same log at their own pace, and a consumer can rewind its bookmark to reprocess last week's data.</p>
+  ${flow([{t:"Producer",d:"appends to the end"},{t:"Partition",d:"ordered, immutable log"},{t:"Consumer A",d:"offset 4,812"},{t:"Consumer B",d:"offset 91 (rewound)"}])}
+  <p>That one change — <em>the broker stores, the consumer tracks</em> — is why Kafka scales: the broker does almost no bookkeeping per consumer, so adding consumers is nearly free.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Topic</strong> — a named stream, like <code>orders</code> or <code>clicks</code>.</li>
+  <li><strong>Partition</strong> — a topic is split into partitions, each an independent ordered log on one broker. <strong>Ordering is guaranteed within a partition and nowhere else.</strong> This single sentence answers half the follow-up questions.</li>
+  <li><strong>Offset</strong> — a message's position in its partition. Monotonic, never reused, and it is the consumer's bookmark.</li>
+  <li><strong>Consumer group</strong> — several consumers cooperating. Each partition is assigned to exactly one consumer in the group, so parallelism is capped by partition count. Different groups read independently.</li>
+  <li><strong>Replication factor</strong> — how many brokers hold a copy of each partition. One is the leader and takes all reads and writes; the others follow.</li>
+  <li><strong>ISR (in-sync replicas)</strong> — the replicas currently caught up with the leader. Durability is defined against this set, not against all replicas.</li>
+  <li><strong>Retention</strong> — how long messages stay. Time-based (7 days), size-based, or compacted (keep only the latest value per key).</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>Kafka is <strong>a distributed, replicated, partitioned commit log</strong> — not really a queue at all. Once you see it as "a database's write-ahead log, exposed as a product", the design decisions become obvious: sequential writes are fast, immutability makes replication easy, and letting consumers track their own position is what removes the broker's per-consumer state.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["Storage model","12–24"],["Replication","24–34"],["Consumers","34–46"],["Failure","46–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> producers publish to topics; consumers read at their own pace; messages survive broker failure; ordering guarantees; horizontal scale; replay.</li>
+  <li><strong>Out of scope:</strong> stream processing (that is Flink or Kafka Streams on top), schema registry, connectors. Name them and set them aside.</li>
+  <li><strong>Non-functional:</strong> millions of messages/s; sub-10 ms produce latency; no acknowledged message is ever lost; a broker failure costs seconds, not data.</li>
+  <li><strong>The question to ask:</strong> "what ordering do you need?" Global ordering across a topic means one partition, which means no parallelism at all — so the honest answer is almost always per-key ordering, and that choice drives the entire partitioning scheme.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>1M messages/s at 1 KB each = <strong>1 GB/s ingest</strong>. With replication factor 3 that is 3 GB/s of disk writes and 2 GB/s of cross-broker network.</li>
+  <li>Retention 7 days: 1 GB/s × 604,800 s = <strong>~600 TB</strong> per replica set, ~1.8 PB with replication. Large, but it is sequential on cheap spinning or NVMe disks, not random access.</li>
+  <li>Partitions: a single partition sustains perhaps 10–50 MB/s. At 1 GB/s you need at least <strong>~50 partitions</strong> for throughput, and more for consumer parallelism — say 200. Note the constraint to state: <em>consumer parallelism cannot exceed partition count</em>, so partition count is a capacity decision you make early and cannot easily reduce.</li>
+  <li>Brokers: at ~200 MB/s of useful write throughput each, 3 GB/s needs <strong>15–20 brokers</strong> plus headroom.</li></ul>
+
+  <h4>3 · The storage model — 12–24 min</h4>
+  <p>This is where the performance comes from, so spend time on it.</p>
+  <p>Each partition is a directory of <strong>segment files</strong>. Writes append to the active segment; when it reaches a size or age limit it is closed and a new one starts. Closed segments are immutable, which makes them trivially safe to replicate, cache, delete or archive.</p>
+  <p><strong>Why this is fast</strong> — three reasons, and naming all three is the point:</p>
+  <ul>
+  <li><strong>Sequential I/O.</strong> Appending to a file is the fastest thing a disk does. A spinning disk doing sequential writes outperforms random writes by orders of magnitude, and this is why Kafka can be disk-backed without being slow.</li>
+  <li><strong>The page cache does the caching.</strong> Kafka does not maintain its own in-process cache. It writes to the OS page cache and lets the kernel flush. Recent messages — which is what consumers want — are served from memory without Kafka managing a byte of it.</li>
+  <li><strong>Zero-copy.</strong> Sending a segment to a consumer uses <code>sendfile</code>, which moves bytes from page cache to socket inside the kernel, never copying into application memory. This is only possible because <em>Kafka does not transform the message</em> — it stores and returns the producer's exact bytes.</li>
+  </ul>
+  <p>An index file per segment maps offset → byte position, so "start reading at offset 4,812" is a binary search over a small index plus a seek, not a scan.</p>
+
+  <h4>4 · Replication and durability — 24–34 min</h4>
+  <p>Each partition has one <strong>leader</strong> and N−1 followers. All reads and writes go to the leader; followers continuously fetch from it, exactly as a consumer would. Followers that are caught up form the <strong>ISR</strong>.</p>
+  <p>The producer chooses its durability with <code>acks</code>:</p>
+  <table><thead><tr><th>acks</th><th>Waits for</th><th>Loses data when</th></tr></thead><tbody>
+  <tr><td><code>0</code></td><td>nothing</td><td>anything goes wrong at all</td></tr>
+  <tr><td><code>1</code></td><td>leader's local write</td><td>leader dies before a follower replicates</td></tr>
+  <tr><td><code>all</code></td><td>every ISR member</td><td>all ISR members die together</td></tr>
+  </tbody></table>
+  <p><strong>The subtlety worth volunteering:</strong> <code>acks=all</code> alone is not enough. If the ISR has shrunk to just the leader, "all" means "one", and you are back to <code>acks=1</code> without noticing. You must also set a minimum in-sync replica count so the broker <em>rejects</em> writes when it cannot meet the durability you asked for. Failing loudly beats silently degrading — this pairing is the single most commonly missed detail in this design.</p>
+  <p>Consumers only ever see messages up to the <strong>high water mark</strong> — the highest offset replicated to all ISR members — so a consumer can never read a message that might be lost in a leader failover.</p>
+
+  <h4>5 · Consumers and delivery semantics — 34–46 min</h4>
+  <p><strong>Group assignment.</strong> A coordinator assigns partitions to group members. When a member joins or dies, a <em>rebalance</em> redistributes them. Naive rebalancing stops all consumption briefly ("stop the world"), so real systems use incremental cooperative rebalancing that only moves the partitions that must move.</p>
+  <p><strong>The three delivery semantics</strong>, and the mechanism behind each:</p>
+  <ul>
+  <li><strong>At-most-once:</strong> commit the offset before processing. A crash loses the message. Rarely what you want.</li>
+  <li><strong>At-least-once:</strong> process, then commit the offset. A crash after processing but before committing means reprocessing. <em>This is the default and the right default.</em></li>
+  <li><strong>Exactly-once:</strong> achievable only within Kafka, via idempotent producers (sequence numbers per producer per partition, so the broker drops duplicates) plus transactions that atomically commit both the output messages and the consumed offsets. The moment your consumer writes to an external database, Kafka's transaction cannot cover it — you are back to at-least-once plus idempotent writes on your side.</li>
+  </ul>
+  <p>Say that last point explicitly. "Exactly-once" in Kafka means <em>exactly-once within a Kafka-to-Kafka pipeline</em>, and candidates who claim it end-to-end have misunderstood the guarantee.</p>
+
+  <h4>6 · Failure and operations — 46–56 min</h4>
+  <ul><li><strong>Broker dies:</strong> the controller elects a new leader from the ISR for every partition that broker led. Producers and consumers discover the new leader via metadata refresh. Unavailability is seconds.</li>
+  <li><strong>Unclean leader election:</strong> if the whole ISR is gone, you choose between staying unavailable, or promoting an out-of-date replica and <em>losing acknowledged messages</em>. This is CAP made concrete — name it as a configuration decision with a business owner.</li>
+  <li><strong>Consumer lag</strong> is the metric that matters: how far behind the log end each group is. Rising lag means consumers cannot keep up, and it is your earliest warning of a downstream problem.</li>
+  <li><strong>Hot partitions:</strong> a bad partition key (say, one tenant id dominating) sends most traffic to one broker. Monitor per-partition rate, and use a composite key or random suffix when a key is genuinely too hot — accepting that you lose ordering for that key.</li>
+  <li><strong>Poison messages:</strong> a message that always fails blocks its partition forever under at-least-once. You need a retry topic and a dead-letter topic, with a bounded attempt count. Kafka does not give you this — you build it.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the two ideas that define it: the broker stores an immutable ordered log and does no per-consumer bookkeeping, and ordering is a per-partition guarantee that you buy with reduced parallelism. Then name the trade-off you accepted — at-least-once with idempotent consumers, because true end-to-end exactly-once across systems does not exist.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Partition count is close to irreversible, and that is the planning trap.</strong> You can add partitions, but adding them changes <code>hash(key) % partitions</code>, so existing keys move to different partitions and their ordering guarantee breaks across the boundary. You cannot reduce partitions at all. So over-provision modestly at creation — but not wildly, because every partition costs file handles, memory, and leader-election time on the controller. Being able to say <em>why</em> it is hard rather than just "pick a good number" is the senior version.</li>
+  <li><strong>Know when Kafka is the wrong answer,</strong> because interviewers increasingly probe this. If you need per-message acknowledgement, arbitrary redelivery delays, priority queues, or per-message TTL, a traditional broker (RabbitMQ) or a managed queue (SQS) fits better and costs far less to operate. Kafka earns its complexity when you need long retention, replay, many independent consumers of the same stream, or ordered high throughput. Volunteering the anti-case is more convincing than advocating.</li>
+  <li><strong>Log compaction is a different retention model</strong> and it is what makes Kafka usable as a changelog. Instead of deleting by age, keep only the most recent message per key. The topic then becomes a snapshot of current state that a new consumer can replay from the beginning to rebuild a complete view — which is how you bootstrap a cache or a materialised view. Deletion is a tombstone: a message with a null value. This is the mechanism behind event sourcing on Kafka, and most candidates have never heard of it.</li>
+  <li><strong>Consumer lag has two very different causes</strong> and the fix differs. If lag is spread across all partitions, consumers are genuinely too slow — scale out, up to the partition count ceiling. If lag is concentrated on a few partitions, you have a key-skew problem and adding consumers will not help at all, because those partitions are each already owned by exactly one consumer. Diagnosing which before acting is the difference between fixing it and doubling your cluster for nothing.</li>
+  <li><strong>The controller and metadata layer is the part people forget.</strong> Something must track which broker leads which partition and drive elections. Kafka used ZooKeeper for this and moved to a self-hosted Raft quorum (KRaft) precisely because an external coordination dependency was an operational burden and a scaling limit on partition count. If asked to design this yourself, that metadata service <em>is</em> the coordination-service design — say so and reuse it rather than inventing a second mechanism.</li>
+  <li><strong>Tiered storage changes the economics.</strong> Keeping 600 TB on broker-local disks means your cluster size is driven by retention rather than throughput. Offloading closed segments to object storage and fetching them on demand decouples the two, so brokers hold only the hot tail. The trade-off is that replaying old data becomes slower and hits an external service — fine for backfills, not for a lagging real-time consumer.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A topic has 12 partitions and a consumer group of 4 consumers. Throughput is 60,000 messages/s. Each consumer processes 6,000 messages/s per thread. Messages are keyed by <code>customer_id</code>, and one enterprise customer generates 35% of all traffic.</p>
+    <p>(a) Can this group keep up? (b) You add 8 more consumers. What happens? (c) What is actually wrong, and what do you do?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a)</strong> Total group capacity is 4 × 6,000 = <strong>24,000 messages/s</strong> against 60,000 arriving. Lag grows by 36,000 messages/s — the group falls behind immediately and unboundedly.</p>
+    <p><strong>(b) Adding 8 consumers (total 12).</strong> Partitions are assigned one-per-consumer within a group, so 12 consumers each own exactly 1 partition. Nominal capacity is now 12 × 6,000 = <strong>72,000/s</strong>, which looks sufficient. Going beyond 12 would be pointless: a 13th consumer gets <em>zero</em> partitions and sits idle, because partition count is the hard ceiling on group parallelism.</p>
+    <p>But the group still does not keep up, and this is the real question.</p>
+    <p><strong>(c) The skew.</strong> The enterprise customer is 35% of 60,000 = <strong>21,000 messages/s</strong>, and because partitioning is <code>hash(customer_id) % 12</code>, every one of those messages lands on <em>one</em> partition. That partition's consumer must process 21,000/s against a capacity of 6,000/s, so it falls behind at 15,000 messages/s while the other eleven consumers are at roughly 30% utilisation and idle much of the time.</p>
+    <p>Adding consumers cannot help. The partition is already owned by exactly one consumer, and that is a guarantee, not a tunable — it is what preserves per-key ordering.</p>
+    <p><strong>The options, and the trade-off each carries:</strong></p>
+    <ul>
+    <li><strong>Change the key to a composite</strong> such as <code>customer_id + hash(order_id) % 8</code>, spreading the hot customer across 8 partitions. Throughput problem solved — but <em>you have given up ordering within that customer</em>. Acceptable if the consumer's work is order-independent (say, independent enrichment); unacceptable if it is applying a sequence of state changes to one account.</li>
+    <li><strong>Give the large customer their own topic</strong> with its own partition count and consumer group. Ordering is preserved, noisy-neighbour isolation is better, and it is operationally honest for a genuinely outsized tenant. The cost is per-tenant topology to manage.</li>
+    <li><strong>Make the consumer faster</strong> — batch downstream writes, parallelise within the partition while preserving order by sub-key, or move work off the hot path. Often the cheapest real fix, and it changes nothing about the topology.</li>
+    <li><strong>More partitions overall</strong> does not fix it. 100 partitions still hash that one customer id to exactly one of them.</li>
+    </ul>
+    <p><strong>The lesson to state:</strong> in a partitioned log, consumer parallelism is bounded by partition count, and per-partition throughput is bounded by key distribution. A capacity plan based on totals will look fine and fail in production, because the constraint is the hottest key, not the average. This is the same skew failure as the celebrity in a feed and the viral link in a shortener — worth naming the recurrence.</p></details>`,
+
+  refs:[
+    ["docs","Kafka design documentation","The official explanation of segments, page cache, zero-copy and the replication model. Unusually well written for reference docs.","https://kafka.apache.org/documentation/#design"],
+    ["post","Is it okay to store data in Apache Kafka?","Jay Kreps on treating the log as a system of record rather than a transport - the argument for why a log is the right primitive, from the person who made it.","https://www.confluent.io/blog/okay-store-data-apache-kafka/"],
+    ["post","Exactly-once semantics are possible: here's how Kafka does it","Confluent — idempotent producers and transactions, including an honest account of where the guarantee stops.","https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/"],
+    ["post","Kafka deep dive for system design interviews","Hello Interview — framed specifically for the interview, with the questions interviewers actually push on.","https://www.hellointerview.com/learn/system-design/deep-dives/kafka"],
+    ["docs","Kafka replication and ISR","The min.insync.replicas pairing described above, and what unclean leader election actually costs you.","https://kafka.apache.org/documentation/#replication"],
+    ["docs","Log compaction","The changelog retention model that turns a topic into a replayable snapshot of current state.","https://kafka.apache.org/documentation/#compaction"]
+  ]},
+
+{ id:"in2", t:"Design a distributed key-value store (DynamoDB, Cassandra)", tag:"Storage", sum:"Consistent hashing, quorums, and the CAP trade-off made concrete.",
+  primer:`<h4>Start here — the two questions that define the design</h4>
+  <p>You have more data than one machine can hold. So you must answer two questions, and everything else follows:</p>
+  <ol>
+  <li><strong>Which machine holds this key?</strong> That is <em>partitioning</em>.</li>
+  <li><strong>What happens when that machine is down or disagrees with its copies?</strong> That is <em>replication and consistency</em>.</li>
+  </ol>
+  <h4>Why the obvious partitioning fails</h4>
+  <p><code>hash(key) % N</code> where N is the number of servers is simple and catastrophic: add one server and N changes, so <em>almost every key</em> maps somewhere new and the entire dataset must move. You need a scheme where adding a server moves only 1/N of the keys.</p>
+  <p><strong>Consistent hashing</strong> does this. Imagine a circle of hash values. Each server is placed at several points on the circle (its "virtual nodes"). A key hashes to a point and belongs to the next server clockwise. Add a server and it takes over only the arcs immediately before its own positions — everything else is untouched.</p>
+  ${flow([{t:"hash(key)",d:"a point on the ring"},{t:"walk clockwise",d:"find the owner"},{t:"next N-1 nodes",d:"the replicas"}])}
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Virtual nodes</strong> — each physical server occupies many points on the ring rather than one. Without this, load is uneven (some arcs are much bigger than others) and a failing server dumps all its load onto exactly one neighbour instead of spreading it.</li>
+  <li><strong>N, R, W</strong> — N replicas per key; a read waits for R of them; a write waits for W. You pick these per operation, and they decide your consistency.</li>
+  <li><strong>Quorum</strong> — if <code>R + W &gt; N</code>, any read set and any write set must overlap in at least one node, so a read is guaranteed to see the latest acknowledged write.</li>
+  <li><strong>Eventual consistency</strong> — with <code>R + W ≤ N</code> you may read stale data, but you get lower latency and stay available when nodes are down.</li>
+  <li><strong>Gossip</strong> — nodes periodically exchange membership and health information with random peers, so the cluster converges on who is alive without a central registry.</li>
+  <li><strong>LSM tree</strong> — the on-disk structure: buffer writes in memory, flush sorted files to disk, merge them in the background. Optimised for writes, which is what these systems are for.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p><strong>Every hard question here is "what do you do when nodes disagree?"</strong> They will disagree — networks partition, nodes pause, writes arrive out of order. The design is not about preventing disagreement, which is impossible, but about defining precisely when you notice it, who resolves it, and what the caller is promised in the meantime.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–11"],["Partitioning","11–24"],["Replication","24–38"],["Storage engine","38–46"],["Failure","46–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> get and put by key; horizontal scale to petabytes; survive node and rack failure; tunable consistency; predictable latency.</li>
+  <li><strong>Out of scope:</strong> joins, secondary indexes, transactions across keys, SQL. Say this deliberately — <em>the restricted API is what buys the scale</em>, and pointing that out is itself a design insight.</li>
+  <li><strong>Non-functional:</strong> p99 under 10 ms for single-key reads; always writable, ideally even during a partition; linear scale-out by adding nodes.</li>
+  <li><strong>The question to ask:</strong> "can we ever refuse a write?" If availability must be absolute, you are choosing AP and must handle conflicting versions. If correctness matters more, you choose CP and become unavailable during partitions. This is not a technical preference; it is a product decision and you should make the interviewer own it.</li></ul>
+
+  <h4>2 · Numbers — 5–11 min</h4>
+  <ul><li>100 TB of data, replication factor 3 = <strong>300 TB</strong> stored. At 2 TB usable per node that is <strong>~150 nodes</strong>.</li>
+  <li>500,000 reads/s and 100,000 writes/s. Spread over 150 nodes with RF 3, each node sees roughly 10,000 reads/s and 2,000 writes/s — comfortable for an LSM engine.</li>
+  <li>Virtual nodes: ~256 per physical node gives 150 × 256 ≈ <strong>38,400 ring positions</strong>, which is enough that the arc sizes even out and a node failure spreads across many neighbours rather than one.</li>
+  <li>Say the key sizing insight out loud: <em>you are sizing for the hot key as well as the average.</em> A single key cannot be split, so a key taking 50,000 reads/s will saturate its 3 replicas no matter how many nodes you add.</li></ul>
+
+  <h4>3 · Partitioning — 11–24 min</h4>
+  <p>Hash the key onto a 128-bit ring. Walk clockwise to find the <em>coordinator</em> node; the next N−1 distinct physical nodes are the replicas. Two refinements to state:</p>
+  <ul>
+  <li><strong>Virtual nodes</strong>, as above — and note the second benefit beyond load balance: when a node fails, its ranges are scattered across <em>many</em> peers, so recovery streaming is parallel rather than hammering one neighbour.</li>
+  <li><strong>Rack and zone awareness.</strong> The replica walk must skip nodes in a failure domain you already used, or all three copies could land in one rack and a single power failure loses the data. This is a small rule with a large consequence and it is worth a sentence.</li>
+  </ul>
+  <p><strong>Membership</strong> is maintained by gossip: each node periodically exchanges a heartbeat and version vector with a few random peers, so information about a joining or failing node propagates in <em>O(log n)</em> rounds without any central coordinator to become a bottleneck or a single point of failure.</p>
+
+  <h4>4 · Replication and consistency — 24–38 min</h4>
+  <p>This is the heart of the interview. Work the quorum arithmetic explicitly:</p>
+  <table><thead><tr><th>N</th><th>W</th><th>R</th><th>Property</th></tr></thead><tbody>
+  <tr><td>3</td><td>3</td><td>1</td><td>Fast reads, writes fail if any replica is down</td></tr>
+  <tr><td>3</td><td>1</td><td>1</td><td>Fastest, eventually consistent, stale reads possible</td></tr>
+  <tr><td>3</td><td>2</td><td>2</td><td><strong>Quorum.</strong> R+W&gt;N so reads see the latest write; tolerates one node down</td></tr>
+  </tbody></table>
+  <p><strong>Why R+W &gt; N works:</strong> a write touched W nodes, a read asks R nodes, and if R + W exceeds N the two sets must share at least one node — which has the latest value. Draw this; it takes ten seconds and it is the cleanest idea in the design.</p>
+  <p><strong>When replicas disagree</strong> you need a resolution rule:</p>
+  <ul>
+  <li><strong>Last-write-wins by timestamp.</strong> Simple, and it silently discards a concurrent write. Requires synchronised clocks, which you do not have. Cassandra's default, and a known footgun.</li>
+  <li><strong>Vector clocks.</strong> Track causality properly, so the system can distinguish "B happened after A" (take B) from "A and B are concurrent" (a genuine conflict). Then hand the conflict to the application, which is the only layer that knows what merging means. This is Dynamo's approach — the shopping cart that merges by union rather than picking a winner.</li>
+  <li><strong>CRDTs.</strong> Use data types that merge deterministically, so conflicts cannot occur. Best when your values fit one of the shapes (counters, sets, registers).</li>
+  </ul>
+  <p><strong>Anti-entropy</strong> keeps replicas converging in the background: <em>read repair</em> fixes stale replicas noticed during a read, <em>hinted handoff</em> stores writes destined for a down node on a peer and replays them when it returns, and a <em>Merkle tree</em> comparison finds divergent ranges between replicas cheaply by comparing hashes rather than data.</p>
+
+  <h4>5 · The storage engine — 38–46 min</h4>
+  <p>Per node, an <strong>LSM tree</strong>: writes append to a commit log for durability and go into an in-memory sorted structure (the memtable). When it fills, it is flushed as an immutable sorted file (SSTable). Background compaction merges SSTables, discarding superseded values and tombstones.</p>
+  <p><strong>Why this and not a B-tree:</strong> every write is sequential, so write throughput is very high. The cost is read amplification — a key may live in several SSTables, so a read must check them. Mitigate with a bloom filter per SSTable (skip files that certainly do not contain the key) and a sparse index. Being able to state the write-amplification versus read-amplification trade-off, and that compaction is where the hidden cost lives, is the mark of someone who has operated one of these.</p>
+  <p><strong>Deletes are tombstones,</strong> not removals, because a delete must be replicated and must outlive any older value on a replica that was down. Tombstones then have to survive longer than the longest possible node outage before compaction removes them — get that wrong and deleted data resurrects.</p>
+
+  <h4>6 · Failure — 46–56 min</h4>
+  <ul><li><strong>Node down:</strong> quorum still satisfiable with N=3, W=2. Writes for the down node are stored as hints elsewhere and replayed on return.</li>
+  <li><strong>Network partition:</strong> this is the CAP decision made real. An AP system lets both sides accept writes and reconciles later, which means conflicting versions. A CP system refuses writes on the minority side. Say which you chose and why, and note that in practice the choice is often <em>per operation</em> — a shopping cart is AP, a password change is CP.</li>
+  <li><strong>Node permanently lost:</strong> a replacement takes over the ring positions and streams data from the surviving replicas. With virtual nodes this pulls in parallel from many peers, so rebuild time is a fraction of what it would be otherwise.</li>
+  <li><strong>Hot key:</strong> the one problem this architecture cannot solve by scaling, since a key lives on exactly N nodes. Answer with a cache in front, or application-level key splitting with a known merge.</li>
+  <li><strong>Correctness under stress</strong> is not testable by unit tests. Say you would use fault-injection testing that partitions the network and verifies the claimed consistency model, because these bugs only appear under specific interleavings.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the three levers and their interaction: consistent hashing with virtual nodes gives you scale-out with minimal data movement; N, R and W let the caller choose consistency per operation rather than the system choosing once for everyone; and anti-entropy makes eventual consistency actually converge instead of merely hoping. Then state the price honestly — no multi-key transactions and no joins, which is exactly what makes the rest possible.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>"Quorum" does not mean linearizable, and conflating them is the classic error.</strong> R+W&gt;N guarantees a read set intersects the latest <em>completed</em> write set. It says nothing about a write that is still in flight, and it permits anomalies: a read can return a newer value than a subsequent read (no monotonicity), and a failed write may still be visible because it reached some replicas before failing. True linearizability needs consensus — Raft or Paxos per key range — which is what DynamoDB's strongly-consistent reads and Spanner actually do, at a latency cost. Knowing that quorum is <em>weaker</em> than strong consistency is a genuine dividing line between candidates.</li>
+  <li><strong>Last-write-wins is a data-loss policy, not a conflict-resolution strategy.</strong> It relies on wall-clock timestamps across machines whose clocks disagree by milliseconds or worse, so the "winner" may be the older write. Two concurrent writes are silently reduced to one with no record that the other existed. It is chosen because it is cheap and stateless, and it is correct only when losing a concurrent update is genuinely acceptable. Say that explicitly rather than presenting it as the default answer.</li>
+  <li><strong>Compaction is where operational pain lives.</strong> It is background work that competes with foreground traffic for disk and CPU, so a compaction storm shows up as a latency spike with no change in request rate. Size-tiered compaction gives cheap writes and bad read amplification and needs up to 50% free disk headroom for a merge; levelled compaction gives good reads and much higher write amplification. Choosing between them by workload — and knowing the disk-headroom requirement — is real operator knowledge.</li>
+  <li><strong>Tombstone lifetime is a correctness parameter with a trap.</strong> Tombstones must be retained longer than the maximum time a node can be down and rejoin, or a returning node will re-replicate its old value and the deleted data comes back. So the retention window couples your delete semantics to your operational practices: if a node is down for longer than the window, you must rebuild it from scratch rather than let it rejoin. This is a genuinely surprising constraint and volunteering it is strong.</li>
+  <li><strong>Secondary indexes are the feature that breaks the model.</strong> The whole design rests on knowing which node owns a key. An index on a non-key attribute either lives locally on every node (so a query must scatter-gather across all 150 nodes, with latency set by the slowest) or is a separate global table (which must be kept consistent with the base table, and you have no cross-partition transactions to do it with). This is why these systems either lack indexes or offer them with prominent caveats — recognising that the limitation is structural rather than missing effort is the point.</li>
+  <li><strong>Know when you do not need this.</strong> A single Postgres with a read replica handles tens of thousands of QPS and terabytes of data, gives you transactions, joins and secondary indexes for free, and one person can operate it. A distributed KV store costs you all of those and a team. Reach for it when a single node genuinely cannot hold the data or the write rate, or when you need multi-region availability — and be able to say where that line is.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A cluster runs N=3, W=2, R=2 across three availability zones, one replica per zone. A network partition isolates zone C from A and B for 90 seconds. Clients can reach all three zones.</p>
+    <p>(a) What happens to writes from a client talking to zone A? To zone C? (b) What happens after the partition heals? (c) The team proposes W=1, R=1 "for latency". Evaluate.</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) During the partition.</strong> A client at zone A can reach A and B, which is 2 nodes — W=2 is satisfiable, so <strong>writes succeed</strong> and reads with R=2 succeed. A client at zone C can reach only C, which is 1 node — W=2 cannot be met, so <strong>writes fail</strong> and R=2 reads fail too.</p>
+    <p>This is the CAP trade-off in concrete form: the majority side stays fully available, the minority side becomes unavailable, and the system has chosen consistency over availability for zone C's clients. Note that this is a <em>consequence of the quorum arithmetic</em>, not a separate design decision — choosing W=2 with N=3 <em>is</em> choosing to sacrifice the minority partition.</p>
+    <p><strong>(b) After healing.</strong> Zone C's replica is 90 seconds stale for every key written during the partition. Three mechanisms converge it, at different speeds:</p>
+    <ul>
+    <li><strong>Hinted handoff</strong> — writes during the partition were acknowledged by A and B, and the coordinator stored hints for C. On reconnection those hints replay, usually within seconds. This is the fast path and it handles most of it.</li>
+    <li><strong>Read repair</strong> — any read that includes C notices the version mismatch and pushes the newer value. This fixes hot keys quickly and cold keys never.</li>
+    <li><strong>Merkle tree anti-entropy</strong> — a scheduled comparison hashes ranges on each replica and streams only the differing ranges. This is the backstop that catches what hints and reads missed, and it is why hints are an optimisation rather than a correctness requirement.</li>
+    </ul>
+    <p>Crucially, <strong>no data is lost and no conflict arises</strong> here, because the minority side never accepted a conflicting write. Had W=1 been configured, both sides would have accepted writes to the same key and you would have a genuine conflict to resolve.</p>
+    <p><strong>(c) Evaluating W=1, R=1.</strong> Latency does improve — you wait for one node rather than two, removing the slowest-of-two effect, which at p99 is a substantial win. But R+W = 2, which is not greater than N = 3, so the read set and write set need not intersect, and the consequences are concrete:</p>
+    <ul>
+    <li><strong>Stale reads are routine,</strong> not exceptional. Write to node A, read immediately from node B, get the old value. A user changes a setting and sees it revert.</li>
+    <li><strong>Both sides of a partition accept writes,</strong> so you now genuinely need conflict resolution — and if that is last-write-wins on unsynchronised clocks, one of the two writes is silently discarded.</li>
+    <li><strong>An acknowledged write can be lost.</strong> W=1 means one node confirmed it; if that node dies before replicating, the write is gone despite having been acknowledged to the client.</li>
+    </ul>
+    <p><strong>The response to give:</strong> not "no", but "per operation". W=1/R=1 is right for high-volume, loss-tolerant, self-correcting data — telemetry, view counts, cache-like values. Quorum is right for anything a user would notice reverting. The strength of this design is that N, R and W are chosen <em>per request</em>, so the answer is to route the latency-sensitive tolerant traffic one way and everything else the other — and to measure how much latency the quorum path actually costs before trading away correctness for a number nobody has measured.</p></details>`,
+
+  refs:[
+    ["paper","Dynamo: Amazon's Highly Available Key-value Store","DeCandia et al., SOSP 2007 — consistent hashing, vector clocks, hinted handoff, Merkle anti-entropy. The source of nearly everything in this design.","https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"],
+    ["paper","Cassandra: A Decentralized Structured Storage System","Lakshman & Malik, 2009 — Dynamo's partitioning combined with Bigtable's storage engine, which is the shape most modern systems took.","https://www.cs.cornell.edu/projects/ladis2009/papers/lakshman-ladis2009.pdf"],
+    ["paper","Bigtable: A Distributed Storage System for Structured Data","Chang et al., OSDI 2006 — the LSM-based storage engine and the tablet model.","https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/"],
+    ["post","CAP Twelve Years Later: How the Rules Have Changed","Eric Brewer — why 'pick two' is a caricature, and how real systems vary the trade-off per operation.","https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/"],
+    ["docs","Log-structured merge-tree","The write path, compaction strategies and the read/write amplification trade-off discussed above.","https://en.wikipedia.org/wiki/Log-structured_merge-tree"],
+    ["tool","Jepsen","Kyle Kingsbury's consistency test reports. Reading one for a database you thought you understood is the fastest way to learn what these guarantees actually mean.","https://jepsen.io/"]
+  ]},
+
+{ id:"in3", t:"Design a distributed cache (Redis, Memcached at scale)", tag:"Caching", sum:"Eviction, hot keys, coherence, and the failure modes that take down the database behind it.",
+  primer:`<h4>Start here — a cache is a bet, and sometimes it loses</h4>
+  <p>A cache stores the results of expensive operations so you do not repeat them. The bet is that the same data will be asked for again soon. When the bet pays off you serve from memory in under a millisecond instead of querying a database in twenty. When it fails, you have added a network hop for nothing.</p>
+  <p>The interesting part of this design is not the happy path — it is that <strong>a cache failure is usually worse than having no cache</strong>. A system sized assuming a 95% hit rate sends 20× its expected load to the database the moment the cache goes away, and the database falls over. The cache you added for performance has become a single point of failure for availability.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Cache-aside (lazy loading)</strong> — the application checks the cache, and on a miss reads the database and populates the cache. The default. The cache never talks to the database itself.</li>
+  <li><strong>Write-through</strong> — writes go to cache and database together, so the cache is never stale. Slower writes, and you cache data nobody may read.</li>
+  <li><strong>Write-behind</strong> — write to cache, flush to database asynchronously. Fast, and you can lose data if the cache dies before flushing.</li>
+  <li><strong>TTL</strong> — an expiry per entry. The crudest and most effective staleness control.</li>
+  <li><strong>Eviction policy</strong> — what to discard when memory is full: LRU, LFU, or random. Redis uses <em>approximate</em> LRU by sampling, because exact LRU costs memory per key.</li>
+  <li><strong>Hot key</strong> — one key taking a disproportionate share of traffic. The failure mode that a distributed cache cannot solve by adding nodes, because a key lives on exactly one node.</li>
+  <li><strong>Thundering herd / stampede</strong> — many requests missing the same key simultaneously and all hitting the database.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>Treat the cache as <strong>an optimisation that must be allowed to fail</strong>. Every design decision follows from asking "what happens when this is empty, or gone, or wrong?" A system that is correct but slow without its cache is well designed. A system that is down without its cache has a distributed database it is calling a cache.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["Topology","12–24"],["Invalidation","24–34"],["Failure modes","34–48"],["Operations","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> a shared cache tier for many application servers; sub-millisecond reads; horizontal scale; survive node failure; bounded staleness.</li>
+  <li><strong>Out of scope:</strong> using it as a primary datastore, as a queue, or as a lock service — all things Redis <em>can</em> do and all separate designs. Naming them and declining is good scoping.</li>
+  <li><strong>Non-functional:</strong> p99 under 1 ms; the origin must survive a total cache loss; adding capacity must not invalidate everything.</li>
+  <li><strong>The question to ask:</strong> "how stale can this data be?" Seconds, minutes, or must-be-exact changes the answer completely — and "must be exact" usually means the thing should not be cached at all.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>1M reads/s at a 95% hit rate → 950,000 served from cache, <strong>50,000/s reaching the database</strong>. Note immediately: if the hit rate drops to 80%, database load quadruples to 200,000/s. <em>Cache hit rate is a load-bearing parameter for the tier behind it,</em> and that sentence frames the whole design.</li>
+  <li>Working set: 200M objects × 2 KB = <strong>400 GB</strong>. At 64 GB usable per node that is <strong>~8 nodes</strong> plus replicas.</li>
+  <li>Throughput per node: a single Redis instance handles roughly 100,000 simple operations/s per core. 1M/s over 8 nodes is 125,000/s each — so you are near the limit and should plan for 12–16 nodes or use pipelining and multi-get to reduce round trips.</li>
+  <li>Network: 950,000 × 2 KB = <strong>1.9 GB/s ≈ 15 Gbps</strong> out of the cache tier. Worth checking, because cache tiers frequently become network-bound before they become CPU-bound.</li></ul>
+
+  <h4>3 · Topology — 12–24 min</h4>
+  ${flow([{t:"App + local cache",d:"microseconds, per-process"},{t:"Cache tier",d:"sharded, consistent hashing"},{t:"Replicas",d:"read scale + failover"},{t:"Origin",d:"database"}])}
+  <p><strong>Two levels, and say why.</strong> A small in-process cache in front of the shared tier removes a network hop entirely for the very hottest keys — which is precisely the traffic that would otherwise create a hot shard. The cost is that each process has its own copy, so invalidation is harder and staleness is per-process. Accept short TTLs locally (seconds) and treat it as a shock absorber, not a source of truth.</p>
+  <p><strong>Sharding by consistent hashing</strong>, for exactly the reason from the key-value design: <code>hash(key) % N</code> means adding a node remaps nearly every key, so scaling up would empty the cache and instantly send full traffic to the database — turning a capacity increase into an outage. Consistent hashing with virtual nodes moves only 1/N of keys.</p>
+  <p><strong>Client-side or proxy routing?</strong> A smart client computes the shard itself and connects directly — one hop, but every client needs the topology and must handle rebalancing. A proxy centralises that at the cost of a hop and a component to run. For a large fleet, a proxy is usually worth it; say which you chose and why.</p>
+
+  <h4>4 · Invalidation and staleness — 24–34 min</h4>
+  <p>Cache invalidation is hard because it is a <em>distributed consistency problem wearing a performance costume</em>. Options, worst to best:</p>
+  <ul>
+  <li><strong>TTL only.</strong> Data is stale for up to the TTL. Crude, but it self-heals, requires no coordination, and is right far more often than people expect.</li>
+  <li><strong>Delete on write.</strong> When the database is updated, delete the cache key; the next read repopulates. <strong>Delete, do not update</strong> — updating means two writers can interleave and leave the cache holding an older value than the database, permanently. Deleting is idempotent and the repopulation reads the truth.</li>
+  <li><strong>Change-data-capture.</strong> Tail the database's replication log and invalidate from it. This catches writes that bypassed the application, and it removes the dual-write problem where the database commits but the invalidation is lost.</li>
+  </ul>
+  <p><strong>The race worth naming:</strong> reader A misses, reads the database, and is paused by the scheduler. Writer B updates the database and deletes the cache key. Reader A resumes and writes its now-stale value into the cache, where it lives until the TTL expires. Mitigate with a short TTL always present as a backstop, or with a versioned write that refuses to overwrite a newer entry. Volunteering this race unprompted is a strong signal — it is the reason "always set a TTL, even when you invalidate explicitly" is a rule.</p>
+
+  <h4>5 · The failure modes — 34–48 min</h4>
+  <p>This section is the interview. Four named failures, each with a specific fix:</p>
+  <ul>
+  <li><strong>Cache stampede.</strong> A popular key expires and thousands of concurrent requests all miss and hit the database. Fix with <em>single-flight</em>: the first miss takes a short lock and repopulates while the others wait briefly. Add <em>TTL jitter</em> so keys populated together do not all expire together, and <em>refresh-ahead</em> so hot keys are renewed asynchronously before they expire and never have a miss window at all.</li>
+  <li><strong>Hot key.</strong> One key at 100,000 requests/s saturates its single shard while the rest of the tier is idle. Adding nodes does not help — the key still hashes to one place. Fix by replicating the key under several suffixed names and picking randomly, or by relying on the local in-process cache, which absorbs exactly this pattern for free.</li>
+  <li><strong>Cache penetration.</strong> Requests for keys that do not exist anywhere miss the cache <em>and</em> the database every time, so the cache provides no protection at all — and this is an easy attack. Fix by caching the negative result (a short-TTL "does not exist" marker) and by a bloom filter in front for known-absent keys.</li>
+  <li><strong>Cache avalanche.</strong> The cache tier restarts empty, or a large fraction of keys expire at once, and the database takes full traffic. This is the one that causes outages. Fix with jittered TTLs, gradual warming rather than serving cold, and — most importantly — <em>a rate limiter or admission control in front of the database</em>, so a cold cache degrades latency instead of destroying the origin.</li>
+  </ul>
+
+  <h4>6 · Operations — 48–56 min</h4>
+  <ul><li><strong>Replication and failover:</strong> each shard has a replica. On primary failure, promote — accepting that asynchronous replication may lose the last few writes, which is fine for a cache and would not be for a database.</li>
+  <li><strong>The metrics that matter:</strong> hit rate (per key pattern, not just globally — a global 95% can hide a 40% on your most expensive query), p99 latency, evictions per second (rising evictions mean the working set no longer fits), and memory fragmentation.</li>
+  <li><strong>Sizing:</strong> the right memory is where the hit-rate curve flattens. Plot hit rate against memory and find the knee; beyond it you are paying for cold data.</li>
+  <li><strong>Deployment:</strong> never restart the whole tier at once. Rolling restarts with warm-up, and if possible a persistence snapshot so a restarted node comes back warm instead of empty.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the discipline: the cache is an optimisation that must be allowed to fail, so the origin has admission control and the system is correct without the cache; invalidation is delete-plus-TTL rather than update, because updates race; and the failure modes are named and each has a specific mitigation. Then state the thing you would instrument first — per-pattern hit rate, because the global number hides the problems.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>A cache that the system cannot run without is not a cache, it is an undeclared database.</strong> The test is simple: can you flush the entire tier during business hours and survive on degraded latency? If not, you have a durability and availability dependency you have not designed for — no persistence, no backups, asynchronous replication that loses writes, and an eviction policy that deletes data without asking. Teams discover this during an incident. Saying it out loud, and proposing admission control on the origin so the answer becomes "yes, slowly", is the most valuable thing in this design.</li>
+  <li><strong>Facebook's memcache paper is the reference for the hard parts,</strong> and two of its ideas are worth knowing by name. <em>Leases</em> solve both the stampede and the stale-set race in one mechanism: on a miss the server hands exactly one client a token permitting it to set the key, and rejects sets without a valid token — so only one client queries the database, and a slow reader cannot overwrite a newer value. <em>Gutter pools</em> handle node failure: rather than rehashing the ring (which would move keys and cause a correctness problem with in-flight invalidations), traffic for a dead node goes to a small standby pool with short TTLs, containing the blast radius.</li>
+  <li><strong>Consistent hashing is not automatically the right answer for a cache,</strong> which surprises people. When a node fails, consistent hashing reassigns its keys to neighbours, which then miss and query the database — a small extra load. But it also means a key can move to a node that holds a stale copy from a previous assignment. If your invalidation is by key deletion, a key that moves back to an old node may resurrect stale data. This is why memcache uses a fixed hash with a failover pool rather than continuous rebalancing, and knowing that the standard answer has a caveat is a strong differentiator.</li>
+  <li><strong>Serialisation cost is frequently the real bottleneck</strong> and is invisible in cache metrics. The cache reports a 0.3 ms round trip while the application spends 4 ms deserialising a large JSON blob into objects. Cache the smallest useful representation, prefer a compact binary format, and measure end to end from the application rather than trusting the cache's own latency numbers.</li>
+  <li><strong>Multi-region caching has no good answer,</strong> and an honest treatment scores well. Replicating a cache across regions means cross-region invalidation, which is slow and lossy, so you get windows where regions disagree. The usual approach is independent per-region caches with short TTLs, accepting that a write in one region is stale in another for the TTL duration — and routing users consistently to one region so a single user does not see values flip back and forth. That last detail, session stickiness to avoid <em>observable</em> inconsistency, is the part that actually protects the user experience.</li>
+  <li><strong>Know the case for no cache at all.</strong> If the database can serve the traffic, adding a cache adds a failure mode, a consistency problem, an operational burden and a class of bugs, in exchange for latency you may not need. Caching is often a symptom of a missing index or an N+1 query. Being willing to say "I would first check whether the origin query can be made fast" is a mature position that interviewers notice.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A product page service does 800,000 reads/s with a 96% cache hit rate. The database sustains 60,000 reads/s before latency degrades. Cache TTL is 300 seconds, set uniformly when an entry is created. A deploy restarts the entire cache tier at 14:00.</p>
+    <p>(a) What is normal database load? (b) What happens at 14:00? (c) Suppose instead the tier survives, but a product goes viral at 400,000 requests/s for one key. What happens, and what do you do?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a)</strong> 4% of 800,000 = <strong>32,000 reads/s</strong> to the database, about half its capacity. Comfortable, with headroom for a hit rate dropping to roughly 7.5% before the database is in trouble.</p>
+    <p><strong>(b) The restart.</strong> The cache is empty, so the hit rate is 0% and <strong>all 800,000 reads/s hit the database</strong> — 13× its capacity. It queues, latency climbs, connections exhaust, timeouts begin. Clients retry, adding more load. The database is effectively down, and because every request now misses, the cache cannot repopulate either: requests time out before returning a value to cache. <strong>The system cannot recover on its own</strong>, which is the defining property of an avalanche and why it is worse than it first looks.</p>
+    <p>Worse, even once you restore it, the uniform 300-second TTL means everything populated in the recovery minute expires together five minutes later, producing a second avalanche. The uniform TTL turned a one-off incident into a recurring one.</p>
+    <p><strong>What should have been in place, in order of importance:</strong></p>
+    <ul>
+    <li><strong>Admission control on the database.</strong> Cap concurrent origin queries at, say, 50,000/s and fail or queue the rest quickly. The result is degraded service — some requests fail fast — rather than a dead database, and critically the cache can refill from the requests that do succeed, so the system heals.</li>
+    <li><strong>Rolling restart with warm-up.</strong> Never restart the whole tier. Take one shard at a time, so at most 1/8 of traffic misses and the database sees 132,000/s... which is still over capacity, so combine with admission control.</li>
+    <li><strong>TTL jitter</strong> — 300 seconds ± 20% randomised — so expiry is spread rather than synchronised. This is a one-line change that removes an entire class of incident.</li>
+    <li><strong>Persistence or a warm standby</strong> so a restarted node comes back populated instead of empty.</li>
+    </ul>
+    <p><strong>(c) The viral key.</strong> 400,000 requests/s for one key all hash to <strong>one shard</strong>. That shard must serve 400,000/s against a per-node capacity of perhaps 125,000/s, so it saturates — and because it also holds 1/8 of all other keys, those become slow too. <em>One key has degraded 12.5% of the entire cache.</em> Adding shards does not help at all: the key still hashes to exactly one of them.</p>
+    <p>The fixes, in order of how fast you can apply them:</p>
+    <ul>
+    <li><strong>Local in-process cache</strong> with a 1–5 second TTL. Each app server caches this key itself, so the shared tier sees one request per server per TTL instead of 400,000/s. If you have 200 app servers and a 2-second TTL, that is 100 requests/s reaching the shard. This is by far the most effective fix and it needs no topology change.</li>
+    <li><strong>Key replication</strong> — store the value under <code>key:0</code> through <code>key:9</code>, and have clients read a random one. Traffic spreads across up to 10 shards. Invalidation now means deleting 10 keys, which is the cost.</li>
+    <li><strong>Promote to the CDN or edge</strong> if the content is public and cacheable. A key at 400,000/s should probably not be reaching your infrastructure at all.</li>
+    </ul>
+    <p><strong>The connecting observation:</strong> parts (b) and (c) are the same lesson from opposite directions. Sizing by aggregate hit rate and aggregate capacity hides both failures — one is about what happens when the cache is <em>absent</em>, the other about what happens when load is <em>skewed</em>. Neither appears in a spreadsheet of averages, and both are the normal way cache tiers fail.</p></details>`,
+
+  refs:[
+    ["paper","Scaling Memcache at Facebook","Nishtala et al., NSDI 2013 — leases, gutter pools, the stale-set race and regional invalidation. The single best paper on operating a cache at scale.","https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala"],
+    ["docs","Redis cluster specification","How sharding, resharding and failover actually work, including the hash-slot model and why it differs from pure consistent hashing.","https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/"],
+    ["docs","Redis key eviction","Approximate LRU and LFU, and an honest explanation of why exact LRU was rejected on memory grounds.","https://redis.io/docs/latest/develop/reference/eviction/"],
+    ["post","Redis deep dive for system design interviews","Hello Interview — what interviewers push on, including the 'is it a cache or a database' question.","https://www.hellointerview.com/learn/system-design/deep-dives/redis"],
+    ["paper","Consistent Hashing with Bounded Loads","Mirrokni et al., 2016 — the refinement that prevents any single node taking disproportionate load, which is the hot-shard problem formalised.","https://arxiv.org/abs/1608.01350"],
+    ["docs","Caching patterns","Redis' own guidance on cache-aside, write-through, TTL jitter and the single-flight pattern.","https://redis.io/docs/latest/develop/clients/patterns/"]
+  ]},
+
+{ id:"in4", t:"Design a notification service (push, email, SMS)", tag:"Delivery", sum:"Multi-channel fan-out, user preferences, deduplication and the dead-letter path.",
+  primer:`<h4>Start here — the deceptively simple requirement</h4>
+  <p>"Send the user a notification." The complexity is that <em>send</em> hides five decisions the system must make every time: <strong>should</strong> we send this (preferences, quiet hours, frequency caps), <strong>which channel</strong> (push, email, SMS, in-app), <strong>what content</strong> (templating, localisation), <strong>when</strong> (now, batched, scheduled in the user's timezone), and <strong>what if it fails</strong> (retry, fall back to another channel, give up).</p>
+  <p>Meanwhile every delivery channel is a third party you do not control, each with different rate limits, latencies, failure modes and cost.</p>
+  ${flow([{t:"Event",d:"something happened"},{t:"Rules",d:"should we? which channel?"},{t:"Render",d:"template + locale"},{t:"Dispatch",d:"per-channel workers"},{t:"Track",d:"sent, delivered, opened"}])}
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Channel</strong> — push (APNs, FCM), email, SMS, in-app, webhook. Each has its own provider, cost and guarantees. SMS costs real money per message; push is free but unreliable.</li>
+  <li><strong>Template</strong> — the message body with placeholders, versioned, per locale. Never build message strings in application code, or you cannot change copy without a deploy.</li>
+  <li><strong>Preference</strong> — the user's opt-in state per notification type per channel. Legally significant, not merely a setting.</li>
+  <li><strong>Deduplication</strong> — the same logical event may be produced twice; the user must be notified once.</li>
+  <li><strong>Dead-letter queue (DLQ)</strong> — where messages go after exhausting retries, so they are inspectable rather than silently lost.</li>
+  <li><strong>Digest</strong> — batching many notifications into one ("12 people liked your post") rather than sending twelve.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>Separate <strong>what happened</strong> from <strong>what to send</strong> from <strong>how to deliver it</strong>. Producers emit domain events and know nothing about channels. A rules layer turns events into delivery intents. Channel workers turn intents into provider API calls. Keeping those three apart is what lets you add a channel, change a policy or swap a provider without touching anything else — and mixing them is why most in-house notification systems become unmaintainable.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["Pipeline","12–26"],["Preferences","26–36"],["Delivery","36–48"],["Failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> many services trigger notifications; route by user preference to the right channels; template and localise; deliver reliably; track outcomes; respect frequency caps and quiet hours.</li>
+  <li><strong>Out of scope:</strong> the marketing campaign tool, the in-app inbox UI, analytics dashboards. Say so.</li>
+  <li><strong>Non-functional:</strong> transactional notifications (a password reset, a payment receipt) delivered within seconds and never lost; marketing can be minutes late; a provider outage must not lose messages.</li>
+  <li><strong>The question that splits the design:</strong> "transactional or marketing?" Transactional is low-volume, latency-critical and must not be deduplicated away. Marketing is high-volume, batchable, and must respect consent and frequency caps rigorously. Many teams build one system for both and it serves neither — flag that.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>100M users, average 5 notifications/day = 500M/day ≈ <strong>5,800/s average</strong>. But it is spiky: a broadcast to 50M users is 50M messages that must be produced in minutes, so design for <strong>peaks of 200,000/s</strong> with the queue absorbing the difference.</li>
+  <li>Channel mix: 60% push, 30% email, 8% in-app, 2% SMS. Note the cost asymmetry immediately — at £0.03 per SMS, 2% of 500M/day is 10M SMS = <strong>£300,000/day</strong>. SMS is 2% of volume and the overwhelming majority of the bill, which makes channel selection a financial control, not just a preference.</li>
+  <li>Storage: a delivery record per notification at ~300 bytes is 150 GB/day. Keep detailed records 30 days, aggregates for longer.</li>
+  <li>Provider limits are the real constraint: APNs and FCM have per-connection throughput limits, email providers throttle per domain reputation, SMS carriers have per-second caps. <em>Your throughput is set by provider quotas, not by your own capacity</em> — say this, it reframes the whole scaling discussion.</li></ul>
+
+  <h4>3 · The pipeline — 12–26 min</h4>
+  ${flow([{t:"Producers",d:"emit domain events"},{t:"Event queue",d:"Kafka, durable"},{t:"Rules engine",d:"preferences, caps, dedup"},{t:"Renderer",d:"template + locale"},{t:"Channel queues",d:"one per channel"},{t:"Workers",d:"call provider, retry"}])}
+  <p><strong>Producers emit events, not notifications.</strong> The orders service publishes <code>order.shipped</code>; it does not decide that this means a push notification. That decision belongs to the rules layer, so a product manager can change it without a code change in the orders service. This separation is the main architectural point of the design.</p>
+  <p><strong>A queue per channel</strong>, not one shared queue. Channels have wildly different rates, latencies and failure modes: a stuck SMS provider must not block push delivery. Separate queues give independent scaling, independent rate limiting, and independent backpressure.</p>
+
+  <h4>4 · Preferences, caps and dedup — 26–36 min</h4>
+  <p><strong>Preferences</strong> are a matrix of user × notification type × channel, plus global switches (do not disturb, unsubscribe all). Two rules to state:</p>
+  <ul>
+  <li><strong>Default carefully and record consent.</strong> Marketing must be opt-in with an auditable record of when and how; transactional notifications generally cannot be disabled (you must be able to tell someone their password changed). Getting this wrong is a legal problem, not a bug.</li>
+  <li><strong>Check preferences as late as possible</strong> — at dispatch, not at event time. A user who unsubscribes while a batch is queued must not receive the queued messages.</li>
+  </ul>
+  <p><strong>Frequency capping</strong> — no more than N notifications per user per hour or day, with priority so that a transactional message is never suppressed by a marketing cap. Implement as a per-user counter with a sliding window, which is exactly the rate-limiter design applied to a different resource.</p>
+  <p><strong>Deduplication</strong> uses an idempotency key derived from the event: <code>(user_id, event_type, entity_id)</code> within a time window. Because the event queue gives at-least-once delivery, the same event <em>will</em> be processed twice, and without this the user gets two identical messages. Store keys in a short-TTL store and check before dispatch.</p>
+  <p><strong>Digesting</strong> is the quality feature. Rather than twelve "someone liked your post" notifications, hold them in a short window and collapse into one. Implement as a per-user, per-type buffer with a flush timer — the same dual-trigger pattern as the batching queue: flush when the window closes or when the buffer is full.</p>
+
+  <h4>5 · Delivery and tracking — 36–48 min</h4>
+  <p>Each channel worker owns one provider integration and applies its own rate limit, retry policy and circuit breaker. Points to make:</p>
+  <ul>
+  <li><strong>Retries must distinguish permanent from transient.</strong> An invalid device token, an unsubscribed email or a disconnected number is permanent — retrying wastes quota and harms sender reputation. Mark the destination invalid and stop. A 429 or 503 is transient and should back off with jitter.</li>
+  <li><strong>Token lifecycle:</strong> push tokens expire and rotate constantly. Providers report invalid tokens in their response or via a feedback channel, and you must prune them. A system that keeps sending to dead tokens degrades its own delivery rates with the provider.</li>
+  <li><strong>Channel fallback</strong> — if push is not delivered within N minutes, try email. This needs a delivery <em>receipt</em>, which push does not reliably give you, so it is usually implemented as "no app-open event within the window" rather than true delivery confirmation. Be honest about that limitation.</li>
+  <li><strong>Tracking</strong> is a funnel: accepted → sent to provider → provider accepted → delivered → opened → clicked. Each stage can fail and you need per-stage metrics per channel and per template to spot a broken template or a degraded provider quickly.</li>
+  </ul>
+
+  <h4>6 · Failure — 48–56 min</h4>
+  <ul><li><strong>Provider outage:</strong> circuit-break, queue, and drain when it recovers. For transactional messages consider a secondary provider; for marketing, just wait. Never drop silently.</li>
+  <li><strong>The dead-letter queue</strong> is a first-class component with an owner and an alarm. Messages arriving there must be inspectable and replayable, and a growing DLQ is an incident, not a statistic.</li>
+  <li><strong>The broadcast spike:</strong> 50M messages produced in minutes. The queue absorbs it; workers drain at whatever rate providers allow. Crucially, <em>keep a separate high-priority path for transactional messages</em> so a marketing blast cannot delay a password reset behind 50M queued items. This is the single most important operational design decision here.</li>
+  <li><strong>The duplicate storm:</strong> a producer bug replays an event topic and 10M users get a notification twice. Dedup keys catch it if the window is long enough; a global kill switch per notification type is the emergency control you want to have built beforehand.</li>
+  <li><strong>Timezone correctness:</strong> "send at 9am local" for 100M users across every timezone means a scheduler that shards by timezone and runs continuously, not a nightly cron. Quiet hours have the same shape.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the three-layer separation — events, rules, channels — because it is what makes the system changeable; on the priority split that keeps transactional traffic out of the marketing queue; and on preference checking at dispatch time rather than event time. Then name the thing that surprises people: throughput is bounded by provider quotas, so the scaling work is mostly about queuing and rate limiting rather than raw capacity.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Transactional and marketing should arguably be two systems.</strong> They differ in every dimension that matters: latency (seconds vs hours), volume (thousands vs tens of millions), consent (implied vs explicit opt-in), suppression (never vs frequency-capped), and failure tolerance (must retry aggressively vs may drop). Running both through one pipeline means the strictest requirement applies everywhere, which makes marketing expensive, or the loosest applies, which makes transactional unreliable. At minimum, separate queues, workers and provider accounts — sender reputation is per-account, and a marketing blast that triggers spam complaints will degrade deliverability of your password resets if they share a sending domain. That last detail is concrete, commercially serious, and almost nobody mentions it.</li>
+  <li><strong>Email deliverability is a reputation system you must actively manage.</strong> SPF, DKIM and DMARC records must be correct or you land in spam. Bounce rates above a small threshold get you throttled by receiving providers. Sending to a purchased or stale list destroys a domain's reputation in days and recovery takes weeks. Practically: warm up new sending domains gradually, process bounce and complaint feedback loops automatically, and suppress hard bounces permanently. This is operational knowledge that separates someone who has run an email system from someone who has read about one.</li>
+  <li><strong>Exactly-once notification is impossible, so decide which error you prefer per type.</strong> You cannot guarantee both "never duplicate" and "never miss" across an unreliable provider boundary — a lost acknowledgement leaves you unable to tell whether it was delivered. For a password reset, prefer a duplicate over a miss. For a payment charge notification, prefer a miss over a duplicate that alarms the customer. Making this an explicit per-notification-type policy rather than a system-wide default is the senior framing.</li>
+  <li><strong>The rules engine will become a product surface, so design for it.</strong> It starts as code, then product wants A/B tests on copy, then send-time optimisation per user, then suppression rules for users in a support escalation. If the rules are compiled into the service, every change is a deploy. Make them data — versioned, auditable, with a dry-run mode that shows who <em>would</em> receive something before you send it. The dry run is the feature that prevents the incident where a bad rule notifies 100M people.</li>
+  <li><strong>Notification fatigue is a measurable product failure, not a soft concern.</strong> Track opt-out rate and app-uninstall rate per notification type. A type with a high opt-out rate is destroying a channel you cannot get back — once a user disables push, every future notification of every type is gone. That makes frequency capping and digesting <em>revenue protection</em> rather than politeness, and framing it that way is how you win the argument with a growth team.</li>
+  <li><strong>Scheduling at scale is its own problem.</strong> "Send to 100M users at 9am local time" means ~24 waves, each of several million, and "remind me in 3 days" means tens of millions of pending timers. Neither fits a naive cron or an in-memory timer. Use a partitioned, time-bucketed store — rows keyed by due-time bucket, polled by workers that claim a bucket with a lease — which is the distributed job scheduler design. Recognising it as that problem, rather than inventing a fifth mechanism, is the right instinct.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A marketing campaign fires a broadcast to 40M users at 10:00. The channel mix is 70% push, 25% email, 5% SMS. Push workers sustain 15,000/s, email 8,000/s, SMS 500/s (carrier limit). SMS costs £0.028 each. Transactional traffic runs at 2,000/s continuously through the same queues.</p>
+    <p>(a) How long does the campaign take per channel? (b) What happens to a password reset sent at 10:01? (c) What does the SMS portion cost, and what would you change?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Drain times.</strong> Push: 28M ÷ 15,000/s = <strong>~31 minutes</strong>. Email: 10M ÷ 8,000/s = <strong>~21 minutes</strong>. SMS: 2M ÷ 500/s = <strong>4,000 seconds ≈ 67 minutes</strong>... but that is only the drain rate. The real figure matters more: SMS is 5% of the campaign and takes more than twice as long as push, because the carrier limit is an external constraint you cannot scale around by adding workers.</p>
+    <p><strong>(b) The password reset at 10:01 — this is the important part.</strong> If transactional and marketing share a queue, that password reset is behind roughly 27 million queued push messages. At 15,000/s it waits <strong>~30 minutes</strong>. The user requested a reset, received nothing, requested again, received nothing, and has filed a support ticket before the first message arrives. The system is not down, no error was logged, and every metric looks healthy — throughput is at capacity and the queue is draining normally.</p>
+    <p>This is head-of-line blocking, and it is the most common real failure in notification systems. The fixes:</p>
+    <ul>
+    <li><strong>Separate priority queues per channel</strong> — a transactional push queue and a marketing push queue, with workers servicing transactional first and only draining marketing with spare capacity. A password reset then waits milliseconds regardless of what marketing is doing.</li>
+    <li><strong>Separate provider connections or accounts,</strong> so transactional throughput is not consumed by the campaign and — for email — so marketing complaint rates cannot damage the sending reputation your password resets depend on.</li>
+    <li><strong>Rate-limit the campaign</strong> to leave deliberate headroom, e.g. cap marketing at 12,000/s of the 15,000/s push capacity. The campaign takes 39 minutes instead of 31, which nobody notices, and transactional latency is protected.</li>
+    </ul>
+    <p><strong>(c) SMS cost.</strong> 2M × £0.028 = <strong>£56,000 for one campaign</strong>. Against push, which is free, and email at a fraction of a penny. SMS is 5% of the messages and essentially all of the cost.</p>
+    <p>What to change, in order:</p>
+    <ul>
+    <li><strong>Do not use SMS for marketing at all</strong> unless the user explicitly chose it and the message justifies the cost. Reserve SMS for transactional cases where reachability genuinely matters — two-factor codes, delivery arrival, fraud alerts.</li>
+    <li><strong>Channel selection by value, with fallback.</strong> Send push first; fall back to SMS only for users with no active push token <em>and</em> only for high-value notifications. That might cut SMS volume by 90%.</li>
+    <li><strong>Put a spend cap in the rules engine</strong> with a hard stop and an alert. A bug that routes 40M messages to SMS instead of push is a <strong>£1.1M</strong> incident that would complete before anyone noticed — the queue would drain for 22 hours at the carrier limit, which is your only accidental protection. Make it a deliberate control rather than a lucky one.</li>
+    </ul>
+    <p><strong>The lesson:</strong> in this design the two things that actually hurt you — head-of-line blocking of critical messages, and per-message cost on one channel — are both invisible in a throughput-oriented capacity plan. Priority separation and a spend cap are cheap to build beforehand and impossible to add during the incident.</p></details>`,
+
+  refs:[
+    ["docs","Apple Push Notification service","The delivery guarantees (best effort, no receipt), token lifecycle, payload limits and error responses your push worker must handle.","https://developer.apple.com/documentation/usernotifications"],
+    ["docs","Firebase Cloud Messaging","The Android and cross-platform counterpart, including topic messaging and the batch-send semantics.","https://firebase.google.com/docs/cloud-messaging"],
+    ["docs","Amazon SQS dead-letter queues","The DLQ pattern with redrive — worth reading for the operational contract around replay and alarming.","https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html"],
+    ["docs","DMARC, SPF and DKIM","Google's sender guidelines — the authentication and bounce-rate requirements that decide whether your email is delivered at all.","https://support.google.com/a/answer/81126"],
+    ["post","Notification system design interview walkthrough","A structured treatment of the same problem, useful for comparing how another author sequences the discussion.","https://spacecomplexity.ai/blog/notification-system-design-interview"],
+    ["docs","Twilio messaging rate limits and queueing","A real provider's documented throughput limits and queue behaviour — the constraint that actually bounds your SMS throughput.","https://www.twilio.com/docs/messaging/services"]
+  ]}
+
+];

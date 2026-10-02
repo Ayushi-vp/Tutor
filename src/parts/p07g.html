@@ -1,0 +1,453 @@
+
+/* ============================================================
+   DATA — infrastructure building blocks, part two.
+   Continues INFRA from p07f.
+   ============================================================ */
+INFRA.push(
+
+{ id:"in5", t:"Design a distributed job scheduler (cron at scale)", tag:"Scheduling", sum:"Leader election, exactly-once execution, and why a cron job on one box is a time bomb.",
+  primer:`<h4>Start here — why cron does not survive contact with a cluster</h4>
+  <p><code>cron</code> on a single machine is perfect until that machine dies, at which point your billing job silently stops running and nobody notices for a week. So you run it on three machines — and now the billing job runs three times, charging every customer triple.</p>
+  <p>That is the whole problem: <strong>you need redundancy for availability and uniqueness for correctness, and those pull in opposite directions.</strong></p>
+  ${flow([{t:"Schedule",d:"when should this run"},{t:"Trigger",d:"exactly one claims it"},{t:"Execute",d:"on a worker, with a lease"},{t:"Record",d:"succeeded / failed / retry"}])}
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Leader election</strong> — a group of nodes agrees that exactly one of them is in charge. Implemented over a consensus system (Raft, ZooKeeper, etcd) or a database row with a lease. The leader triggers jobs; the followers wait to take over.</li>
+  <li><strong>Lease</strong> — a claim with an expiry. A worker claims a job for 5 minutes; if it dies, the claim expires and another worker can take it. This is how you get automatic failover without a heartbeat protocol of your own.</li>
+  <li><strong>Idempotency</strong> — running the job twice produces the same result as once. Because exactly-once execution across failures is impossible, idempotency is what makes at-least-once safe.</li>
+  <li><strong>Backfill</strong> — running missed executions after an outage. Do you run all twelve hourly jobs you missed, or just the latest? A policy decision per job.</li>
+  <li><strong>Fan-out job</strong> — one schedule producing many tasks ("send a digest to each of 40M users"), which is a different scaling shape from one schedule producing one task.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>Separate <strong>deciding what should run</strong> from <strong>running it</strong>. The scheduler is a small, highly-available component that only writes "this job is due" records. Execution is a large, stateless worker pool that claims and runs them. Once they are separate, the scheduler can be a tiny leader-elected process while the workers scale independently — and a slow job can never delay the scheduler's clock.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–11"],["The scheduler","11–24"],["Execution","24–38"],["Semantics","38–48"],["Failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> recurring schedules (cron expressions) and one-off future tasks; guaranteed execution; retries; a job must not run concurrently with itself; visibility into what ran and what failed.</li>
+  <li><strong>Out of scope:</strong> workflow orchestration with dependencies between jobs (that is Airflow or Temporal, a different design), the job code itself. Name them.</li>
+  <li><strong>Non-functional:</strong> trigger within a few seconds of the scheduled time; no job silently skipped; survive the loss of any node; support millions of pending one-off timers.</li>
+  <li><strong>The question to ask:</strong> "what does a missed execution mean?" For a metrics rollup, skip it and run the next one. For an invoice run, you must backfill. For a reminder, running it four hours late may be worse than not at all. The answer is per-job policy, not a system-wide setting — and asking it is what turns this from a cron clone into a design.</li></ul>
+
+  <h4>2 · Numbers — 5–11 min</h4>
+  <ul><li>100,000 recurring schedules plus 50M pending one-off timers (reminders, delayed retries, "notify me in 3 days").</li>
+  <li>Trigger rate: if timers are spread evenly, 50M over a week is <strong>~83/s</strong> — trivial. But they are <em>not</em> evenly spread: everything lands on the hour, and midnight is worse. Expect <strong>peaks of 50,000/s</strong> at <code>00:00</code>. That skew is the actual capacity problem.</li>
+  <li>Scheduler state: 50M rows × ~200 bytes = 10 GB. Small. The difficulty is the query "what is due in the next second?" against 50M rows, 50,000 times a second at peak — which is an indexing problem, not a storage one.</li>
+  <li>Say it plainly: <strong>this system is small in data and hard in coordination.</strong> Spending the interview on sharding strategy is a misread.</li></ul>
+
+  <h4>3 · The scheduler — 11–24 min</h4>
+  <p>Store schedules in a table keyed by <strong>next due time, bucketed</strong>:</p>
+  <pre>jobs(job_id PK, cron_expr, payload, timezone, policy, enabled)
+due(bucket_minute, job_id, run_at, state, lease_owner, lease_expires)
+    PRIMARY KEY ((bucket_minute), run_at, job_id)</pre>
+  <p>Bucketing by minute means "what is due now?" reads a single partition rather than scanning an index over 50M rows — the query cost is constant regardless of how many timers exist. This is the key structural decision and it is worth stating as such.</p>
+  <p><strong>Who triggers?</strong> A leader-elected process wakes each second, reads the current bucket, and enqueues due jobs. Elect the leader with a lease in etcd or a database row updated with a compare-and-set — not a bespoke protocol.</p>
+  <p><strong>Why the leader is safe to be a single point:</strong> it does almost no work (read a small partition, push to a queue), so one process handles the whole system, and if it dies a follower acquires the lease within a lease period. Crucially, <em>the leader does not execute anything</em> — so a slow job cannot block the clock.</p>
+  <p><strong>Beyond one leader:</strong> if the trigger rate genuinely outgrows one process, shard the buckets by hash and elect a leader per shard. Say that you would only do this when measured, because it multiplies the coordination surface.</p>
+
+  <h4>4 · Execution — 24–38 min</h4>
+  <p>Workers pull from the queue and <strong>claim with a lease</strong>: a conditional update setting <code>lease_owner</code> and <code>lease_expires</code> only if the row is unclaimed or its lease has expired. Exactly the atomic-hold pattern from the ticket-booking design — the same shape recurs whenever contested work must be claimed once.</p>
+  <ul>
+  <li><strong>Heartbeat to extend.</strong> A long-running job renews its lease periodically. If the worker dies, the lease expires and another worker picks it up. Choose the lease duration from the job's expected runtime: too short and healthy jobs get stolen mid-run, too long and a crash leaves work stalled.</li>
+  <li><strong>Prevent overlap.</strong> "This job must not run concurrently with itself" is enforced by the lease on the job id, not on the execution — so a slow hourly job that is still running at the next hour either skips or queues, by policy.</li>
+  <li><strong>Timeouts.</strong> Every job has a maximum runtime, after which it is killed and marked failed. Without this, one wedged job holds its lease forever under heartbeat renewal.</li>
+  <li><strong>Retries</strong> with exponential backoff and jitter, a bounded attempt count, then a dead-letter state that alerts. Same policy vocabulary as the resilient-client design.</li>
+  </ul>
+  <p><strong>Fan-out jobs</strong> need care: "email 40M users" must not be one task. The scheduled job's only work is to enqueue 40M child tasks in batches, checkpointing its progress so a crash resumes rather than restarting — otherwise a failure at 90% re-sends 36M emails.</p>
+
+  <h4>5 · Execution semantics — 38–48 min</h4>
+  <p>Be precise here; it is what the interviewer is checking.</p>
+  <p><strong>Exactly-once execution is impossible.</strong> A worker can run the job, then die before recording success. The scheduler cannot distinguish "never ran" from "ran and the acknowledgement was lost", so it must either re-run (at-least-once) or risk skipping (at-most-once). There is no third option across a failure boundary.</p>
+  <p>Therefore: <strong>at-least-once delivery plus idempotent jobs</strong>. Give every execution a deterministic id — <code>(job_id, scheduled_time)</code>, not the wall clock at start — so a re-run produces the same id and the job can detect it has already done this work. That deterministic id is the mechanism; state it explicitly.</p>
+  <p><strong>Backfill policy</strong> per job: <em>skip</em> (run only the latest, correct for rollups), <em>run all</em> (correct for invoices, but beware a 12-hour outage producing a 12× burst), or <em>run one and alert</em>. Make it a field on the job, not a global behaviour.</p>
+  <p><strong>Timezones and DST</strong> are where correctness quietly breaks. "Every day at 02:30 Europe/London" happens <em>twice</em> on the autumn clock change and <em>not at all</em> on the spring one. Store the timezone with the schedule, compute the next run with a proper timezone library, and decide the DST policy deliberately. Volunteering this is a reliable signal of experience, because everyone who has run a scheduler has been bitten by it.</p>
+
+  <h4>6 · Failure — 48–56 min</h4>
+  <ul><li><strong>Leader dies:</strong> a follower acquires the lease after it expires. Jobs due during the gap are picked up on the next tick, because the bucket query is "everything due at or before now", not "due exactly now" — that detail is what makes the gap harmless.</li>
+  <li><strong>Worker dies mid-job:</strong> the lease expires, another worker claims it, and the job re-runs. Safe only because it is idempotent — which is why idempotency is a requirement on job authors, documented and tested, not a hope.</li>
+  <li><strong>The thundering midnight:</strong> 50,000 jobs due at <code>00:00</code>. The queue absorbs the burst and workers drain it; add deliberate jitter to schedules that do not need exact timing, and prioritise so that a latency-sensitive job is not behind 50,000 batch rollups.</li>
+  <li><strong>Clock skew:</strong> nodes disagree about the time, so a worker may think a lease has expired when it has not. Use the database's clock as the single source of truth for lease comparisons rather than each node's local clock.</li>
+  <li><strong>The silent failure</strong> is the one that matters most: a job that stops being scheduled at all. Alert on <em>absence</em> — "this job has not succeeded in 2× its period" — not only on explicit failures. A job that never runs produces no error to alert on.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the separation (a tiny leader-elected trigger, a large stateless executor pool), the two claim mechanisms (leader lease for triggering, job lease for execution), and the honest semantics: at-least-once with deterministic execution ids and idempotent jobs, because exactly-once does not exist. Then name the monitoring insight — alert on absence, since the worst failure produces no signal.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Know when to buy instead of build, and say so.</strong> Temporal, Airflow, or a cloud scheduler already solve leader election, leases, retries, backfill and visibility, and the interesting part of your problem is almost never the scheduling. Build your own when you need scale or latency those cannot give, or when the operational dependency is unacceptable. An answer that designs the system <em>and</em> says "I would use Temporal unless X" is stronger than one that only does the first, because it shows you know what you would be signing up to operate.</li>
+  <li><strong>The database-as-queue pattern is fine here, and knowing why is useful.</strong> People reflexively reach for Kafka, but a scheduler's workload is low-throughput, needs conditional claiming and arbitrary-time visibility, and benefits enormously from transactional updates alongside job state. A relational table with <code>SELECT ... FOR UPDATE SKIP LOCKED</code> gives you all of that in one component, at tens of thousands of claims per second — far beyond what most schedulers need. Kafka is the wrong shape because you cannot claim an arbitrary message or delay one.</li>
+  <li><strong>Lease duration is a real tuning parameter with failures at both ends,</strong> and it is worth being specific. Too short: a healthy long-running job loses its lease mid-execution and a second worker starts it concurrently — which is the overlap you were preventing, now caused by your own timeout. Too long: a crashed worker's job sits idle for the full lease before anyone retries, so a 30-minute lease means a 30-minute delay on every worker crash. The resolution is heartbeat renewal with a short base lease, so healthy jobs keep extending and dead ones are detected quickly.</li>
+  <li><strong>Schedule drift is a subtle correctness issue.</strong> If you compute the next run as "now + interval" at completion time, a job that takes 3 minutes on an hourly schedule drifts an hour later every twenty runs. Compute the next run from the <em>scheduled</em> time, not the actual time, so executions stay anchored to the intended cadence. The same applies to the execution id — anchoring on scheduled time is what makes re-runs deduplicable.</li>
+  <li><strong>The fan-out job deserves its own treatment.</strong> One schedule producing 40M tasks is a completely different problem from 100,000 schedules producing one task each: it needs checkpointed progress, rate limiting so it does not overwhelm downstream systems, partial-failure handling (what if 12,000 of 40M fail?), and a way to cancel mid-flight. Most designs cover the small-job case and fall apart on this one, so raising it unprompted is valuable — and note that a cancelled or crashed fan-out without checkpointing is the mechanism behind the "everyone got the email twice" incident.</li>
+  <li><strong>Dependencies are the line between a scheduler and an orchestrator.</strong> As soon as someone asks for "run B after A succeeds", you need a DAG, per-task state, and the ability to re-run a subtree. That is a genuinely different system and the correct response is to name it rather than bolt it on — a scheduler that grows dependency support incrementally becomes an orchestrator nobody designed.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A scheduler runs an hourly billing job with a 10-minute lease, renewed by heartbeat every 2 minutes. The job normally takes 6 minutes. One night the database is slow and the job takes 25 minutes. Separately, at 00:00 there are 48,000 jobs due simultaneously against a worker pool that can start 2,000 jobs/s.</p>
+    <p>(a) What happens to the slow billing job? (b) What happens at 00:00? (c) What do you change?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) The slow billing job.</strong> With heartbeat renewal working, nothing goes wrong — the worker renews every 2 minutes against a 10-minute lease, so the lease never expires and the job completes at 25 minutes. Heartbeating is what makes a short lease safe for a variable-duration job.</p>
+    <p>But consider what happens if the same database slowness that made the job slow also blocks the heartbeat. The worker is alive and working, yet cannot renew. At 10 minutes the lease expires, another worker claims the job, and <strong>you now have two workers billing the same customers concurrently</strong> — the exact failure the lease existed to prevent, caused by the lease mechanism itself.</p>
+    <p>This is the important insight: <em>a lease detects unreachability, not death.</em> A partitioned or stalled worker is indistinguishable from a dead one. The defences are (i) make the job idempotent so a double run is harmless — deterministic execution id <code>(job_id, scheduled_time)</code> checked before each charge; (ii) have the worker check it still holds the lease before each side-effecting batch and abort if not (a fencing check); and (iii) put the heartbeat on an independent path from the job's own database work so they do not fail together.</p>
+    <p><strong>(b) At 00:00.</strong> 48,000 jobs due at once against 2,000 starts/s means the last job starts <strong>24 seconds late</strong>. For most batch work that is irrelevant. The queue absorbs it and drains; nothing breaks.</p>
+    <p>The real risks are downstream, not in the scheduler: 48,000 jobs starting within 24 seconds all hitting the same database is a self-inflicted thundering herd, and any job with a tight SLA is now behind up to 48,000 others. Also worth noting — if the lease is claimed at <em>enqueue</em> time rather than <em>start</em> time, jobs waiting 24 seconds have already burned 4% of a 10-minute lease before doing any work.</p>
+    <p><strong>(c) The changes, in order:</strong></p>
+    <ul>
+    <li><strong>Deterministic execution ids and idempotent jobs.</strong> This is the one that actually prevents double-billing, and it protects you regardless of what the lease does. Every other fix reduces probability; this one removes consequence.</li>
+    <li><strong>Fencing check before side effects.</strong> Re-read the lease and abort if another owner holds it. Cheap, and it turns a double-run into a clean abort.</li>
+    <li><strong>Priority queues.</strong> Latency-sensitive jobs must not queue behind batch rollups — the same head-of-line problem as the notification design.</li>
+    <li><strong>Jitter the schedules.</strong> Most jobs do not need to start at exactly <code>00:00</code>; spread them over a few minutes. This removes the burst at its source and protects the databases they all query.</li>
+    <li><strong>Alert on absence.</strong> If billing has not succeeded in 2 hours, page someone. Note that neither failure above would have produced an error alert — the slow job eventually succeeded, and the 00:00 jobs all ran. The double-billing would have been discovered by customers.</li>
+    </ul>
+    <p><strong>The transferable lesson:</strong> distributed leases give you failover, not mutual exclusion. Anything that treats a lease as a guarantee of uniqueness — rather than as a heuristic backed by idempotency — will eventually run twice. Design the job so that is survivable, and the lease becomes an optimisation rather than a correctness dependency.</p></details>`,
+
+  refs:[
+    ["docs","Distributed Periodic Scheduling with Cron","Google SRE Book, ch. 24 — how Google built a distributed cron, including the exactly-once discussion and why they chose to skew toward re-running.","https://sre.google/sre-book/distributed-periodic-scheduling/"],
+    ["docs","Understanding Temporal","Durable execution: checkpointing, leases, retries and replay. The model to borrow, and often the thing to use instead of building.","https://docs.temporal.io/evaluate/understanding-temporal"],
+    ["docs","etcd: distributed locks and leader election","The concrete API for lease-based election, including the fencing-token problem discussed above.","https://etcd.io/docs/v3.5/dev-guide/interacting_v3/"],
+    ["post","How to do distributed locking","Martin Kleppmann — why leases without fencing tokens are unsafe, which is exactly the part (a) failure.","https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"],
+    ["docs","Airflow concepts: DAGs, scheduling and catchup","The backfill and catchup semantics described above, in a system where they are user-visible configuration.","https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html"],
+    ["docs","SELECT ... FOR UPDATE SKIP LOCKED","PostgreSQL's locking clause — the mechanism that makes a database table a perfectly good job queue.","https://www.postgresql.org/docs/current/sql-select.html"]
+  ]},
+
+{ id:"in6", t:"Design a metrics and monitoring system (Prometheus, Datadog)", tag:"Observability", sum:"Time-series storage, cardinality explosions, and alerting that people actually trust.",
+  primer:`<h4>Start here — why time-series data gets its own database</h4>
+  <p>Metrics look like ordinary rows: a name, some labels, a timestamp, a number. Store them in Postgres and you will be fine until you are storing a billion points a day, at which point the shape of the data matters:</p>
+  <ul>
+  <li><strong>Writes are append-only and timestamp-ordered.</strong> You never update a past measurement.</li>
+  <li><strong>Reads are range scans over one series.</strong> "CPU on host-42 for the last 6 hours" — contiguous, not random.</li>
+  <li><strong>Values compress extraordinarily well.</strong> CPU usage changes slowly, timestamps are regularly spaced. Purpose-built encoding gets a 16-byte point down to about <strong>1.4 bytes</strong>.</li>
+  <li><strong>Old data loses value fast</strong> and can be downsampled — nobody needs per-second resolution from six months ago.</li>
+  </ul>
+  <p>A general database exploits none of these. A time-series database exploits all four, which is a 10× storage difference and more in query speed.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Series</strong> — a unique combination of metric name and labels, e.g. <code>http_requests{host="a1", route="/pay", status="200"}</code>. Each series is a separate stream of timestamped values.</li>
+  <li><strong>Cardinality</strong> — the number of distinct series. <strong>This is the number that kills monitoring systems</strong>, and the whole design revolves around controlling it.</li>
+  <li><strong>Pull vs push</strong> — the collector scrapes targets on a schedule (Prometheus), or agents push to the collector (StatsD, Datadog). Pull gives you target health for free; push works behind firewalls and for short-lived jobs.</li>
+  <li><strong>Downsampling / rollup</strong> — replacing raw points with aggregates at coarser resolution as they age.</li>
+  <li><strong>Counter vs gauge vs histogram</strong> — a counter only increases (total requests), a gauge moves freely (memory in use), a histogram buckets observations so you can compute percentiles. Confusing them produces wrong dashboards.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p><strong>Cardinality is the budget, and every label you add spends it multiplicatively.</strong> Ten hosts × twenty routes × five status codes is 1,000 series — fine. Add a <code>user_id</code> label with a million users and it is a billion series, each with its own index entry and memory footprint. Most monitoring outages are a deploy that added one innocent-looking label.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–13"],["Ingestion","13–24"],["Storage","24–36"],["Query & alert","36–48"],["Failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> collect metrics from thousands of services; store with retention; query and aggregate; dashboards; alerting with notification.</li>
+  <li><strong>Out of scope:</strong> distributed tracing and log aggregation — related, differently shaped, and each deserves its own design. Name them; conflating the three pillars is a common error.</li>
+  <li><strong>Non-functional:</strong> a metric is queryable within ~30 s of being emitted; queries over 24 hours return in under a second; alerting stays up when the monitored system is down (this one matters more than it sounds).</li>
+  <li><strong>The question to ask:</strong> "what retention and what resolution?" Per-second for 30 days is a hundred times the storage of per-minute for a year. Resolution and retention together set the entire cost structure.</li></ul>
+
+  <h4>2 · Numbers — 5–13 min</h4>
+  <ul><li>5,000 hosts × 2,000 series each = <strong>10M active series</strong>. Scraped every 15 s → 10M ÷ 15 = <strong>667,000 samples/s</strong>.</li>
+  <li>Raw storage: 667,000/s × 86,400 = 57.6B samples/day. At 16 bytes each that is 920 GB/day — unaffordable. With Gorilla-style compression at ~1.4 bytes/sample it is <strong>~80 GB/day</strong>, or 2.4 TB/month. That single comparison justifies the whole storage section, so do it out loud.</li>
+  <li>Index: 10M series, each with a name and several labels, needs an inverted index from label pair to series id. This is typically <strong>the memory bottleneck</strong> — often gigabytes of RAM — and it is why cardinality, not sample volume, is the limiting resource.</li>
+  <li>Query: "p99 latency by route over 24 h" touches perhaps 500 series × 5,760 points = 2.9M points. Trivial. But "group by user_id" over a million-series metric touches billions and will time out — <em>the query cost is set by cardinality, not by time range</em>.</li></ul>
+
+  <h4>3 · Ingestion — 13–24 min</h4>
+  ${flow([{t:"Targets",d:"expose /metrics"},{t:"Scrapers",d:"sharded by target"},{t:"Ingest",d:"validate, limit cardinality"},{t:"WAL + memory",d:"recent, queryable"},{t:"Blocks",d:"compressed, on disk"}])}
+  <p><strong>Pull, with a push gateway for the exceptions.</strong> Pulling means the collector knows the target list, so a target that disappears is immediately detectable — you get "is it up?" for free, which is the single most important signal. The exceptions are short-lived batch jobs that may not exist when a scrape comes round, and anything behind a firewall; those push to a gateway that is then scraped.</p>
+  <p><strong>Shard scrapers by target</strong> using consistent hashing, so each scraper owns a slice of the fleet. Scraping is embarrassingly parallel and the work is bounded by target count, not by data volume.</p>
+  <p><strong>Enforce cardinality limits at ingestion,</strong> and say this deliberately: reject or drop series beyond a per-metric limit, and alert on it. Without a limit, one bad deploy that adds a unique label takes down monitoring for everyone — precisely when you most need it. A hard limit degrades one team's metrics instead of the whole system.</p>
+
+  <h4>4 · Storage — 24–36 min</h4>
+  <p>Two-tier, and the reasoning matters:</p>
+  <ul>
+  <li><strong>Recent data in memory</strong>, backed by a write-ahead log for crash recovery. Most queries are for the last few hours (dashboards, alerts), so serving them from memory makes the common case fast.</li>
+  <li><strong>Older data in immutable blocks on disk</strong>, each covering a time range and containing its own index. Immutability means blocks can be compacted, downsampled, replicated or shipped to object storage without coordination.</li>
+  </ul>
+  <p><strong>Compression is the load-bearing detail.</strong> Delta-of-delta encoding on timestamps: regular 15-second intervals mean the delta is constant, so the delta-of-delta is zero and costs a single bit. XOR encoding on values: consecutive floats of a slowly-changing metric differ in few bits, so XOR yields mostly zeros which run-length encode. Together this is the Gorilla scheme and it is roughly a 10× win — being able to explain <em>why</em> it works, rather than naming it, is the differentiator.</p>
+  <p><strong>Downsampling</strong> as data ages: raw for 7 days, 1-minute aggregates for 30 days, 5-minute for a year. Store min, max, sum and count per bucket rather than just the average, so you can still compute meaningful aggregates later — averaging averages is wrong when the buckets have different counts, and that is a mistake people ship.</p>
+  <p><strong>Sharding</strong> by series (hash of the label set), so a single series' history is contiguous on one node and a range query is local. Queries that aggregate across series scatter-gather, which is fine because the per-node work is small.</p>
+
+  <h4>5 · Querying and alerting — 36–48 min</h4>
+  <p>A query is: select series by label matchers (an inverted-index lookup), fetch their points over a range, then apply functions (rate, percentile, sum by label). <code>rate()</code> on counters is the one to explain — counters reset when a process restarts, so the rate function must detect the reset and handle it rather than reporting a huge negative value.</p>
+  <p><strong>Alerting</strong> evaluates rules on a schedule. Design points worth raising:</p>
+  <ul>
+  <li><strong>A "for" duration</strong> so a rule must be true continuously before firing. Without it every transient spike pages someone, and people stop trusting alerts — which is a worse outcome than not having them.</li>
+  <li><strong>Grouping and deduplication.</strong> One bad deploy triggers 400 alerts. Group by cause and send one notification with the list, or the responder cannot see the signal.</li>
+  <li><strong>Inhibition.</strong> If the datacentre is down, suppress the 300 "service unreachable" alerts it implies. Alert on the cause, not every symptom.</li>
+  <li><strong>The alerting path must not depend on the thing it monitors.</strong> If alerting runs in the cluster it watches, a cluster outage means silence — which reads identically to "everything is fine". Run it separately, and have a dead-man's-switch alert that fires if the monitoring system <em>stops</em> reporting.</li>
+  </ul>
+
+  <h4>6 · Failure — 48–56 min</h4>
+  <ul><li><strong>Cardinality explosion</strong> is the characteristic outage: a deploy adds a high-cardinality label, memory for the index balloons, the ingester OOMs, and monitoring dies during an incident. Per-metric limits, ingestion-time alerting on series growth, and a fast path to block a metric are the defences.</li>
+  <li><strong>Scrape failures</strong> produce gaps. Distinguish "target down" from "scrape failed" — they mean different things and only one is an incident.</li>
+  <li><strong>Query overload:</strong> one expensive dashboard query can starve alert evaluation. Separate the query path from the alerting path, and enforce per-query limits on series touched and duration.</li>
+  <li><strong>Retention and cost:</strong> the honest failure mode is financial. Monitoring costs grow with the system it monitors and often outpace it. Treat retention and resolution as budget decisions with an owner, reviewed rather than accreted.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on cardinality as the governing constraint, on the compression that makes the volume affordable, and on the independence of the alerting path from the monitored system. Then name the cultural point that engineers respect: an alert that fires without a required action trains people to ignore alerts, so every alert needs a runbook or it should be a dashboard instead.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Metrics, logs and traces answer different questions and should not be one system.</strong> Metrics are cheap, aggregated, and tell you <em>that</em> something is wrong. Traces are sampled, per-request, and tell you <em>where</em>. Logs are expensive, unaggregated, and tell you <em>why</em>. A design that stores everything as logs and aggregates at query time is ruinously expensive; one that stores everything as metrics loses the per-request detail you need to debug. The modern answer is metrics always-on, traces sampled with tail-based sampling that keeps the interesting ones, and logs with aggressive retention limits — and exemplars linking a metric spike to a representative trace.</li>
+  <li><strong>Averages are the wrong aggregate and percentiles do not average either.</strong> Mean latency hides everything that matters. But the subtler point is that you cannot average p99 across hosts — the p99 of the fleet is not the mean of each host's p99. Percentiles must be computed from the underlying distribution, which is why histograms store bucket counts rather than computed percentiles. Getting this right changes how you design the metric type; getting it wrong produces dashboards that are confidently incorrect during exactly the incidents you built them for.</li>
+  <li><strong>Pull versus push is really a question about knowing your target list.</strong> Pull requires service discovery — the collector must know what should exist — and that requirement is a feature, because "a target that should be there and is not" is the highest-value alert in the system. Push scales better for ephemeral workloads and works across network boundaries, but you lose the ability to distinguish "sent nothing because it is healthy and idle" from "sent nothing because it is dead". Most large systems end up with both and should be explicit about which signal each provides.</li>
+  <li><strong>Long-term storage belongs in object storage, not on ingester disks.</strong> Keeping a year of blocks on local SSD couples your cluster size to retention rather than to ingest rate. Shipping immutable compacted blocks to object storage and querying them through a gateway (the Thanos and Cortex model) decouples the two and makes retention a cost slider rather than a capacity project. The trade-off is slower historical queries, which is almost always acceptable.</li>
+  <li><strong>The alerting philosophy matters as much as the mechanism.</strong> Alert on symptoms users feel — error rate, latency, saturation — not on causes like CPU, which may be high for entirely benign reasons. Every page must be actionable and have a runbook. Measure your own alert quality: what fraction of pages resulted in action? A team with a 20% actionable rate has trained itself to ignore alerts and is less safe than a team with three good ones. Bringing this up unprompted signals that you have carried a pager.</li>
+  <li><strong>Know when not to build this.</strong> A hosted service costs money and removes an entire operational domain, and the crossover is further out than engineers like to admit. Build your own when volume makes hosted pricing untenable, when data cannot leave your network, or when you need query semantics no vendor offers. "I would use a hosted product until metrics spend exceeds the cost of two engineers" is a defensible, numerate answer.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A service exposes <code>http_requests_total{service, host, route, method, status}</code>. There are 40 services, 200 hosts each, 30 routes, 5 methods and 8 status codes. A developer adds a <code>customer_id</code> label to help debug one customer's issue. The platform has 100,000 tenants.</p>
+    <p>(a) Cardinality before and after? (b) What happens operationally? (c) What should have prevented it, and how should the developer get what they wanted?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Before.</strong> The theoretical maximum is 40 × 200 × 30 × 5 × 8 = 9,600,000, but in practice most combinations never occur — a given host belongs to one service, most routes accept one or two methods, and most requests return one of two status codes. Realistically this is on the order of <strong>100,000–300,000 active series</strong>. Comfortable.</p>
+    <p><strong>After.</strong> Adding <code>customer_id</code> multiplies by the number of customers actually appearing in each combination. Even if only 10% of customers hit any given route, this is <em>multiplicative</em>: 200,000 × 10,000 = <strong>2 billion series</strong>. At even 500 bytes of index and memory overhead per active series, that is a terabyte of RAM for the index alone.</p>
+    <p><strong>(b) What happens.</strong> Not a graceful degradation — a cascade:</p>
+    <ul>
+    <li>The ingester's in-memory index grows on every scrape as new customer ids appear. Memory climbs steadily over minutes.</li>
+    <li>It OOMs and restarts. On restart it replays the write-ahead log, re-creating the same series, and OOMs again — a <strong>crash loop that cannot self-recover</strong>, because the data causing the problem is durably in the WAL.</li>
+    <li>Ingestion stops for <em>every</em> team, not just the one that deployed. Dashboards go blank.</li>
+    <li>Alerting evaluates against missing data. Depending on rule semantics, alerts either all fire or — worse — all resolve, so the system reports that everything is fine.</li>
+    </ul>
+    <p>The critical detail: <strong>this happens during a deploy, and the monitoring you would use to diagnose it is the thing that is broken.</strong> That is why the defence has to be preventive rather than reactive.</p>
+    <p><strong>(c) What should have prevented it:</strong></p>
+    <ul>
+    <li><strong>A per-metric series limit enforced at ingestion.</strong> Cap <code>http_requests_total</code> at, say, 500,000 series and drop the excess with a loud alert. One team's metric degrades; the platform survives. This is the single most important control.</li>
+    <li><strong>Alert on series-growth rate,</strong> not just absolute count — a metric whose cardinality doubles in ten minutes is a deploy problem, and catching it at 2× rather than 10,000× is the difference between a warning and an outage.</li>
+    <li><strong>A label allow-list</strong> for high-traffic metrics, so adding a label is a deliberate, reviewed change rather than a one-line commit.</li>
+    <li><strong>Separate ingestion by tenant or team</strong> so blast radius is bounded — one team cannot OOM the shared ingester.</li>
+    </ul>
+    <p><strong>How the developer should get what they wanted.</strong> They had a legitimate need: debugging one customer. Metrics are the wrong tool, because metrics are aggregates and per-entity identifiers do not belong in them — that is the general rule to state. The right answers are: <strong>traces</strong> with <code>customer_id</code> as a span attribute (per-request, sampled, and attributes do not create series); <strong>logs</strong> with structured fields, queried ad hoc; or a <strong>deliberately scoped metric</strong> covering only the handful of customers under investigation, with a documented expiry.</p>
+    <p>The principle worth closing on: <em>the cardinality of a label must be bounded and small, and it must not grow with your user base.</em> Host, route, status and version are fine. User id, request id, email address, full URL with query string and error message are not — and that list is worth writing into a linting rule rather than a wiki page.</p></details>`,
+
+  refs:[
+    ["paper","Gorilla: A Fast, Scalable, In-Memory Time Series Database","Pelosi et al., VLDB 2015 — Facebook's delta-of-delta and XOR compression, the source of the ~1.4 bytes/sample figure.","https://www.vldb.org/pvldb/vol8/p1816-teller.pdf"],
+    ["paper","Monarch: Google's Planet-Scale In-Memory Time Series Database","Adams et al., VLDB 2020 — regionalised ingestion, the independence of the alerting path, and cardinality controls at a scale beyond Prometheus.","https://research.google/pubs/monarch-googles-planet-scale-in-memory-time-series-database/"],
+    ["docs","Prometheus storage and TSDB","How blocks, the WAL, compaction and the inverted index actually work in the reference open-source implementation.","https://prometheus.io/docs/prometheus/latest/storage/"],
+    ["docs","Monitoring Distributed Systems","Google SRE Book, ch. 6 — the four golden signals, symptom-based alerting, and why alert quality is measurable.","https://sre.google/sre-book/monitoring-distributed-systems/"],
+    ["docs","OpenTelemetry","The vendor-neutral standard for metrics, traces and logs, including exemplars linking a metric to a trace.","https://opentelemetry.io/docs/"],
+    ["docs","Thanos architecture","Object-storage-backed long-term retention and global query for Prometheus — the decoupling described in the senior layer.","https://thanos.io/tip/thanos/design.md/"]
+  ]},
+
+{ id:"in7", t:"Design an object storage service (S3, GFS)", tag:"Storage", sum:"Chunking, replication versus erasure coding, and a metadata layer that outgrows one machine.",
+  primer:`<h4>Start here — the split that defines the system</h4>
+  <p>Object storage stores arbitrary blobs by key: <code>PUT /bucket/photo.jpg</code>, <code>GET</code> it back. No partial updates, no file locking, no directory tree — an object is immutable once written and replaced wholesale. That restriction is deliberate, and it is what makes planetary scale possible.</p>
+  <p>The system splits cleanly in two, and the whole design is about keeping them separate:</p>
+  ${flow([{t:"Metadata",d:"key → chunk list, small, transactional"},{t:"Data",d:"chunks, enormous, immutable"}])}
+  <ul>
+  <li><strong>Metadata</strong> is tiny and hot: which chunks make up this object, where they live, what the permissions are. Needs consistency and low latency.</li>
+  <li><strong>Data</strong> is enormous and cold-ish: the bytes themselves, split into chunks, replicated across machines. Needs throughput and durability, not transactions.</li>
+  </ul>
+  <p>Mix them and you get a system that is neither consistent nor scalable.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Chunk / block</strong> — a fixed-size piece of an object, typically 4–64 MB. Large chunks keep metadata small; small chunks make partial reads and recovery cheaper.</li>
+  <li><strong>Replication factor</strong> — how many copies. Three copies gives 200% storage overhead and survives two failures.</li>
+  <li><strong>Erasure coding</strong> — split data into k fragments plus m parity fragments; any k of the k+m can rebuild the original. With k=6, m=3 you survive 3 failures at 50% overhead rather than 200%. The trade is CPU and network on reconstruction.</li>
+  <li><strong>Durability</strong> — the probability data survives, usually quoted as "eleven nines" (99.999999999%). This is an engineering target you compute, not a slogan.</li>
+  <li><strong>Read-after-write consistency</strong> — after a successful PUT, a GET returns the new object. Harder than it sounds in a replicated system, and S3 famously did not have it for a decade.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p><strong>Disks fail constantly and that is the normal operating condition, not an incident.</strong> With 100,000 disks and a 2% annual failure rate, you lose about five every day. The system is not designed to prevent failure; it is designed so that failure is boring — detected automatically, re-replicated in the background, and invisible to callers.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–13"],["Architecture","13–24"],["Durability","24–38"],["Metadata","38–48"],["Failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> PUT, GET, DELETE and LIST by key; objects from bytes to terabytes; extreme durability; multi-tenant with access control; versioning.</li>
+  <li><strong>Out of scope:</strong> a POSIX filesystem (no partial writes, no rename semantics, no locking — and say that these omissions are <em>why</em> it scales), search inside objects, CDN.</li>
+  <li><strong>Non-functional:</strong> eleven nines of durability; 99.99% availability; first-byte latency in the tens of milliseconds; throughput limited by the client's network, not ours.</li>
+  <li><strong>The question to ask:</strong> "what is the object size distribution?" Billions of small objects is a metadata problem; millions of large ones is a bandwidth problem. They need different designs, and most real systems are unfortunately both.</li></ul>
+
+  <h4>2 · Numbers — 5–13 min</h4>
+  <ul><li>100 PB stored, 50B objects. Average object size is 2 MB, but the distribution is bimodal — billions of thumbnails and millions of videos.</li>
+  <li><strong>Metadata:</strong> 50B objects × ~500 bytes = <strong>25 TB of metadata</strong>. This does not fit on one machine, which is the observation that drives the whole metadata section. Small objects make this worse: a billion 4 KB objects have more metadata than data.</li>
+  <li><strong>Raw capacity:</strong> at 3× replication, 100 PB needs 300 PB of disk. With erasure coding at k=6/m=3 it needs 150 PB — <strong>a saving of 150 PB</strong>, which at any plausible cost per terabyte is tens of millions of pounds. Quote that; it makes the erasure-coding discussion obviously worth having.</li>
+  <li><strong>Failure rate:</strong> 300 PB at 20 TB/disk is 15,000 disks; at 2% AFR that is 300 disk failures/year, roughly <strong>one a day</strong>. Repair must be continuous and automatic.</li>
+  <li><strong>Request rate:</strong> 500,000 GET/s, 50,000 PUT/s. Note the ratio — heavily read-biased, which argues for caching hot objects and for read-optimised placement.</li></ul>
+
+  <h4>3 · Architecture — 13–24 min</h4>
+  ${flow([{t:"API gateway",d:"auth, rate limit"},{t:"Metadata service",d:"sharded, transactional"},{t:"Placement",d:"chooses chunk servers"},{t:"Chunk servers",d:"raw disks, immutable"},{t:"Repair",d:"background re-replication"}])}
+  <p><strong>PUT:</strong> the gateway authenticates, the metadata service allocates chunk ids and asks placement for target servers, the client (or gateway) streams chunks directly to those servers, and only when all chunks are durably written does the metadata service commit the object record. <strong>Data first, metadata last</strong> — so metadata never points at chunks that do not exist. A crash mid-upload leaves orphan chunks, which a garbage collector reclaims; that is the safe direction to fail.</p>
+  <p><strong>GET:</strong> look up the chunk list, then stream chunks from the nearest healthy replica. Note the client can fetch chunks in parallel from different servers, so throughput for a large object scales with chunk count rather than being capped by one disk.</p>
+  <p><strong>Multipart upload</strong> for large objects: the client uploads parts independently, retries individual parts on failure, and issues a final "complete" that assembles the manifest. Without this, a failure at 99% of a 5 TB upload restarts from zero.</p>
+
+  <h4>4 · Durability — 24–38 min</h4>
+  <p>This is the section that distinguishes answers. Work the trade-off explicitly:</p>
+  <table><thead><tr><th></th><th>3× replication</th><th>Erasure coding (6+3)</th></tr></thead><tbody>
+  <tr><td>Storage overhead</td><td>200%</td><td>50%</td></tr>
+  <tr><td>Failures tolerated</td><td>2</td><td>3</td></tr>
+  <tr><td>Read cost (healthy)</td><td>read 1 replica</td><td>read 6 fragments</td></tr>
+  <tr><td>Repair cost</td><td>copy 1 chunk</td><td>read 6, compute, write 1</td></tr>
+  <tr><td>Best for</td><td>hot, small, latency-sensitive</td><td>cold, large, cost-sensitive</td></tr>
+  </tbody></table>
+  <p><strong>The nuance to volunteer:</strong> erasure coding is not strictly better despite the superior numbers. Repair is far more expensive — reconstructing one lost fragment requires reading six others across the network, so a disk failure generates 6× its own capacity in repair traffic. At the rate of one failure per day, that repair traffic becomes a permanent background load you must provision for. And small objects are a poor fit: splitting a 4 KB object into nine fragments produces tiny scattered I/O. So: replicate hot and small, erasure-code cold and large, and transition objects between the two as they age.</p>
+  <p><strong>Placement must respect failure domains.</strong> Replicas or fragments spread across racks and, where possible, availability zones — otherwise one power event takes all copies. This constraint is why placement is its own service rather than a hash.</p>
+  <p><strong>Detecting silent corruption:</strong> disks return wrong bytes without reporting an error (bit rot). Store a checksum per chunk, verify on every read, and run a background scrubber that reads and verifies everything on a rolling schedule. Without scrubbing you discover corruption when you need the data, which is too late.</p>
+  <p><strong>Computing durability:</strong> with 3 replicas, independent failures and a repair window of hours, the probability of losing all three before repair completes is vanishingly small — this is where "eleven nines" comes from. Then say the honest part: the calculation assumes independence, and real losses come from <em>correlated</em> failures — a bad firmware batch, a datacentre fire, or an operator deleting a bucket. Those dominate the real risk and are not in the arithmetic.</p>
+
+  <h4>5 · Metadata at scale — 38–48 min</h4>
+  <p>25 TB of metadata and high query rates mean the metadata service is itself a distributed database. Decisions:</p>
+  <ul>
+  <li><strong>Shard by bucket, then by key range</strong> within a bucket. Key-range sharding keeps <code>LIST</code> with a prefix efficient, because keys sharing a prefix are adjacent. Hash sharding would spread them and make listing a scatter-gather over every shard.</li>
+  <li><strong>The consequence:</strong> sequential keys (timestamps, monotonic ids) create a hot shard, because all new writes land at the end of the key range. The standard advice to hash-prefix your keys exists for exactly this reason — and knowing <em>why</em> that advice exists is the point.</li>
+  <li><strong>LIST is the expensive operation.</strong> It is a range scan that may cross shards, it is paginated, and it competes with point lookups. Many systems deliberately give it weaker consistency guarantees than GET.</li>
+  <li><strong>Consistency:</strong> read-after-write for a new object is achievable by committing metadata last and routing reads for a key to its owning shard. Overwrite and delete are harder because caches and replicas may hold the previous version — this is precisely why S3 offered read-after-write for new objects long before it offered it for overwrites.</li>
+  </ul>
+
+  <h4>6 · Failure — 48–56 min</h4>
+  <ul><li><strong>Disk fails:</strong> the chunk server reports missing chunks, or a scrubber detects them. Repair re-replicates from surviving copies. Throttle repair so it does not saturate the network — but not so much that you exceed the repair window your durability maths assumed.</li>
+  <li><strong>Chunk server fails:</strong> the same, at larger scale. Re-replication must pull from many sources in parallel, which means chunk placement should scatter an object's chunks widely rather than co-locating them.</li>
+  <li><strong>Metadata shard fails:</strong> this is the serious one — objects on that shard are unreachable even though their data is intact. Replicate metadata with consensus (Raft) so failover is automatic and consistent.</li>
+  <li><strong>Correlated failure</strong> is the real durability threat: a rack, a zone, a bad firmware rollout. Defend with failure-domain-aware placement and staged rollouts, and be explicit that cross-region replication is the only answer to a region loss.</li>
+  <li><strong>The human failure:</strong> accidental deletion. Versioning, soft deletes with a retention window, and object lock for compliance. More data is lost to <code>rm -rf</code> than to disk failure, and saying so is both true and memorable.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the metadata/data split, the write ordering that makes orphans rather than dangling pointers, and the replication-versus-erasure-coding decision as a per-object-class choice rather than a system-wide one. Then name the thing the durability arithmetic does not cover: correlated and human failures, which is why versioning and multi-region matter more than another nine on paper.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>The small-object problem is the one that breaks naive designs.</strong> A billion 4 KB objects hold 4 TB of data and generate 500 GB of metadata, so metadata is 12% of payload and the system is metadata-bound rather than storage-bound. Worse, each object still costs a full set of chunk placements, checksums and index entries. The standard answer is to pack many small objects into large append-only containers and keep an offset in the metadata — which is how Facebook's Haystack solved photo storage, and it turns a metadata problem back into a data problem.</li>
+  <li><strong>Immutability is what makes everything else tractable,</strong> and it is worth stating as the core design principle rather than a limitation. Because a chunk never changes, it can be cached anywhere without invalidation, replicated without coordination, checksummed once, and garbage-collected by reference counting. Every hard distributed-systems problem you avoided — cache coherence, write conflicts, distributed locking — was avoided by this one restriction. That is the trade the API makes on the user's behalf.</li>
+  <li><strong>Storage classes are a product surface over a placement policy.</strong> Hot, infrequent-access, archive and deep-archive differ in replication scheme, media, and whether data is online at all — an archive tier may keep data on tape or spun-down disks with retrieval latency measured in hours. Lifecycle rules move objects between classes automatically. The engineering consequence is that "read an object" is no longer a uniform operation, so the API needs an asynchronous restore path and the metadata needs to record which tier an object currently lives in.</li>
+  <li><strong>Strong consistency was added to S3 in 2020, and the reason it took so long is instructive.</strong> The cache and replica layers that made reads fast were exactly what made read-after-write hard: a GET could be served by a node that had not yet seen the PUT. Getting it right required the metadata layer to become authoritative for freshness without adding a round trip to every read. The general lesson — that a caching layer added for performance silently weakens your consistency model, and unwinding it later is expensive — transfers to almost every system.</li>
+  <li><strong>Multi-tenancy needs isolation you must design for explicitly.</strong> One customer's 100,000 requests/s to a single key prefix will hot-shard the metadata layer and degrade everyone on that shard. Per-tenant rate limits, request-rate-aware shard splitting, and keeping prefixes with pathological access patterns isolated are all required. Note the connection: this is the same hot-key problem as the cache and the partitioned log, and the answer is the same shape — limit at the front door and split the hot range.</li>
+  <li><strong>Know when you do not need this.</strong> Almost nobody should build object storage; S3 and its equivalents are extraordinarily cheap, durable and operationally free. The legitimate reasons are data-residency requirements, egress economics at very large scale, or building the cloud product itself. The interview is testing whether you understand the internals, so design it confidently — and say in one sentence that you would buy it, which demonstrates judgement rather than undermining your answer.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>You store 60 PB across 20 TB disks. Annual disk failure rate is 2%. Compare 3× replication against 6+3 erasure coding. Repair bandwidth is limited to 10 Gbps per chunk server, and a chunk server holds 20 disks.</p>
+    <p>(a) Raw capacity and disk count for each? (b) Daily failure rate and repair traffic for each? (c) Which do you choose, and for what?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Capacity.</strong> 3× replication: 60 PB × 3 = <strong>180 PB raw</strong> = 9,000 disks. Erasure coding 6+3: overhead is (6+3)/6 = 1.5×, so 60 PB × 1.5 = <strong>90 PB raw</strong> = 4,500 disks. Erasure coding saves <strong>4,500 disks</strong> — roughly half the fleet, and with it half the racks, power and cooling. At any realistic cost this is the dominant line item in the design.</p>
+    <p><strong>(b) Failures and repair traffic.</strong></p>
+    <p><em>Replication:</em> 9,000 disks × 2% = 180 failures/year ≈ <strong>one every 2 days</strong>. Repairing a 20 TB disk means copying 20 TB from surviving replicas — read 20 TB, write 20 TB. Spread over a few hours across many source servers, this is modest.</p>
+    <p><em>Erasure coding:</em> 4,500 disks × 2% = 90 failures/year ≈ <strong>one every 4 days</strong> — half as many, because there are half as many disks. But each repair is far more expensive: reconstructing the lost fragments requires reading <strong>6 fragments for every 1 rebuilt</strong>, so recovering a 20 TB disk reads <strong>120 TB</strong> across the network and computes parity over all of it.</p>
+    <p>Per-event that is 6× the traffic at half the frequency, so <em>average</em> repair bandwidth is about 3× higher. The bigger problem is the peak: 120 TB at 10 Gbps per server, even pulling from 20 sources in parallel, is 120 TB ÷ (20 × 1.25 GB/s) ≈ <strong>80 minutes</strong> of sustained full-rate network on 20 servers. During that window those servers are degraded for normal traffic, and your durability maths assumed a repair window — if repair is slow, the probability of a second failure during it rises, and the nines you quoted are wrong.</p>
+    <p><strong>(c) The choice — and it is not one or the other.</strong></p>
+    <ul>
+    <li><strong>Erasure-code the cold, large majority.</strong> Most bytes in any object store are old, rarely read, and large. They are perfect for erasure coding: the storage saving is enormous, the read amplification never materialises because nobody reads them, and repair can be throttled because latency does not matter.</li>
+    <li><strong>Replicate the hot and the small.</strong> A frequently-read object should be readable from one disk, not reconstructed from six — erasure coding a hot object multiplies read I/O sixfold and adds reconstruction latency to the tail. And small objects fragment badly: a 4 KB object split nine ways is nine ~450-byte I/Os, which is pathological for any storage medium.</li>
+    <li><strong>Transition by age or access.</strong> Write new objects replicated, and let a background process re-encode them to erasure coding once they have been cold for, say, 30 days. This is exactly what storage classes are, and it gets you replication's latency where it matters and erasure coding's economics where the bytes are.</li>
+    </ul>
+    <p><strong>The number that decides it:</strong> if 90% of bytes are cold, erasure-coding just those saves 0.9 × 60 PB × 1.5 overhead reduction ≈ <strong>81 PB of raw capacity</strong> — essentially the whole benefit — while leaving the 10% hot working set on fast, cheap-to-read replication. Chasing the last 10% would cost you tail latency on every hot read for a marginal saving. <em>The right answer to a storage trade-off is almost always a tiering policy rather than a single scheme,</em> and being able to say which fraction of the benefit each tier delivers is what makes it a design rather than a preference.</p></details>`,
+
+  refs:[
+    ["paper","The Google File System","Ghemawat et al., SOSP 2003 — the master/chunkserver split, 64 MB chunks, and the decision to make the metadata service a single machine and why that was acceptable.","https://research.google/pubs/the-google-file-system/"],
+    ["paper","Finding a needle in Haystack: Facebook's photo storage","Beaver et al., OSDI 2010 — the small-object metadata problem and the packing solution described in the senior layer.","https://www.usenix.org/legacy/event/osdi10/tech/full_papers/Beaver.pdf"],
+    ["docs","HDFS architecture","The open-source descendant of GFS, with replica placement policy and rack awareness spelled out concretely.","https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html"],
+    ["docs","Erasure coding","The k+m construction, the storage/durability trade-off, and why repair cost scales with k.","https://en.wikipedia.org/wiki/Erasure_code"],
+    ["docs","Amazon S3 consistency model","Read-after-write semantics, and what changed in 2020 — worth reading alongside the senior-layer point about caching weakening consistency.","https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html"],
+    ["docs","Ceph architecture","A complete open-source object store you can read the design of, including CRUSH placement, which solves the failure-domain problem generically.","https://docs.ceph.com/en/latest/architecture/"]
+  ]},
+
+{ id:"in8", t:"Design a coordination service (ZooKeeper, etcd)", tag:"Consensus", sum:"Raft, leases and fencing — the small system every other distributed system depends on.",
+  primer:`<h4>Start here — what problem consensus actually solves</h4>
+  <p>Several machines must agree on one value. Not "eventually converge" — <strong>agree</strong>, such that no two machines ever believe different things, even when messages are lost, machines crash, and the network splits. That is <em>consensus</em>, and it is the primitive underneath leader election, distributed locks, configuration and service discovery.</p>
+  <p>Almost every system you have designed assumed it. Kafka needs a controller. The job scheduler needs a leader. The object store's metadata layer needs failover. All of them are using a coordination service, explicitly or by building a worse one themselves.</p>
+  <h4>Why it is hard</h4>
+  <p>You cannot distinguish a crashed machine from a slow one, or from one you simply cannot reach. So you cannot wait for everyone — that blocks forever on any failure — and you cannot proceed with one, because two disconnected halves would each proceed differently. <strong>The resolution is a majority.</strong> Any two majorities of the same group must overlap in at least one member, so two conflicting decisions cannot both be made.</p>
+  ${flow([{t:"Propose",d:"leader appends to its log"},{t:"Replicate",d:"send to followers"},{t:"Majority acks",d:"3 of 5"},{t:"Commit",d:"apply to state machine"}])}
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Raft</strong> — the consensus algorithm designed to be understandable, having the same guarantees as Paxos. Three pieces: leader election, log replication, safety.</li>
+  <li><strong>Term</strong> — a logical clock. Each election increments it. A message from an older term is ignored, which is how stale leaders are neutralised.</li>
+  <li><strong>Quorum</strong> — a majority, so ⌈(n+1)/2⌉. With 5 nodes you need 3 and tolerate 2 failures.</li>
+  <li><strong>Replicated state machine</strong> — every node applies the same commands in the same order, so all reach identical state. The log <em>is</em> the system; the state is derived.</li>
+  <li><strong>Lease</strong> — a lock with an expiry, so a crashed holder does not block forever.</li>
+  <li><strong>Fencing token</strong> — a monotonically increasing number handed out with each lock. Resources reject operations carrying an older token, which is what makes locks safe despite pauses.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>A coordination service is <strong>a tiny, very reliable, replicated log</strong> with a small data model on top. It is deliberately <em>not</em> a database — it holds kilobytes, not terabytes, and every write costs a round trip to a majority. Its value is not capacity; it is that it never lies.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–10"],["Raft","10–28"],["The API","28–38"],["Using it safely","38–48"],["Failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> a small strongly-consistent key-value store; watches on keys; leases; leader election; service discovery and configuration.</li>
+  <li><strong>Out of scope:</strong> bulk data storage, queues, high write throughput. Say explicitly that this is a <em>coordination</em> primitive, and using it as a database is the most common misuse.</li>
+  <li><strong>Non-functional:</strong> linearizable reads and writes; tolerate a minority of failures; a few thousand writes/s is plenty; leader failover in seconds.</li>
+  <li><strong>The question to ask:</strong> "how many nodes, and across how many failure domains?" It determines the fault tolerance and — because every write waits for a majority — the write latency. Spreading five nodes across three regions gives regional fault tolerance and cross-region write latency on every write.</li></ul>
+
+  <h4>2 · Numbers — 5–10 min</h4>
+  <p>Deliberately short. This is the rare design where the numbers argue for <em>smallness</em>.</p>
+  <ul><li>Cluster size 5: tolerates 2 failures. Seven tolerates 3 but every write waits for 4 acknowledgements, so latency rises. <strong>Odd numbers only</strong> — six nodes tolerate the same 2 failures as five while being slower and more expensive.</li>
+  <li>Throughput: ~10,000 writes/s within a datacentre, far less across regions. Every write is a disk sync plus a majority round trip. <em>This is not a scalable store and is not meant to be.</em></li>
+  <li>Data: megabytes. etcd's default limit is a couple of gigabytes, and that is a ceiling you should never approach — the whole dataset is held in memory on every node and replayed on restart.</li>
+  <li>Reads can scale: serve from followers if you accept staleness, or use a lease-based read on the leader for linearizable reads without a full round trip.</li></ul>
+
+  <h4>3 · Raft — 10–28 min</h4>
+  <p>Spend the time here; it is the question.</p>
+  <p><strong>Leader election.</strong> Every node is a follower, waiting for a heartbeat. If none arrives within a randomised election timeout, it becomes a candidate, increments the term, and requests votes. A node grants one vote per term, and only to a candidate whose log is at least as up to date as its own. A candidate winning a majority becomes leader and starts heartbeating.</p>
+  <p><strong>The randomised timeout is load-bearing.</strong> If every node timed out simultaneously, they would all become candidates and split the vote, repeatedly, never electing anyone. Randomising means one node usually times out first and wins uncontested. This is a small detail with an outsized role, and naming it shows you have read the algorithm rather than a summary.</p>
+  <p><strong>Log replication.</strong> Clients send commands to the leader, which appends to its log and replicates to followers. Once a majority have written it durably, the entry is <em>committed</em> and applied to the state machine. Followers apply committed entries in the same order, so every node's state is identical.</p>
+  <p><strong>Safety — the two rules that make it correct:</strong></p>
+  <ul>
+  <li><strong>Election restriction:</strong> a node only votes for a candidate whose log is at least as complete as its own. This guarantees a new leader already has every committed entry, so committed data can never be lost.</li>
+  <li><strong>Leader append-only:</strong> a leader never overwrites its own entries; it only appends, and forces conflicting follower entries to match. Combined with terms, this means a stale leader that returns after a partition cannot corrupt anything — its term is old, so its messages are rejected.</li>
+  </ul>
+  <p><strong>Log compaction:</strong> the log grows forever, so periodically snapshot the state machine and discard entries before it. A node that has fallen far behind is sent a snapshot instead of replaying millions of entries.</p>
+
+  <h4>4 · The API — 28–38 min</h4>
+  <p>A hierarchical key-value store with a few primitives that compose into everything else:</p>
+  <pre>put(key, value, lease?)          -- linearizable write
+get(key, consistency)            -- linearizable or stale
+compare_and_swap(key, expected, new)
+watch(key_prefix)                -- stream of changes
+lease_grant(ttl) / keep_alive    -- TTL attached to keys</pre>
+  <p><strong>Leader election falls out of this:</strong> every candidate tries to create the same key with a lease, conditional on it not existing. Exactly one succeeds and is the leader; the rest watch the key and retry when it disappears. The leader keeps its lease alive with heartbeats; if it dies, the lease expires, the key vanishes, and the watchers race again.</p>
+  <p><strong>Watches</strong> are what make this useful rather than a polling target. A configuration change or a leader failure notifies every interested client immediately. Two details to get right: watches must be resumable from a revision number so a disconnected client does not miss events, and clients must handle "your watch was compacted away" by re-reading current state.</p>
+
+  <h4>5 · Using it safely — 38–48 min</h4>
+  <p>This section is where senior candidates separate themselves, because the <em>correct</em> answer is uncomfortable: <strong>a distributed lock does not give you mutual exclusion.</strong></p>
+  <p>Consider: a client acquires a lock with a 10-second lease, then its process is paused by a long garbage-collection cycle for 15 seconds. The lease expires, another client acquires the lock and starts working. The first client resumes, believing it still holds the lock, and writes. <strong>Two clients are now in the critical section</strong>, and no bug in the coordination service caused it.</p>
+  <p>The fix is a <strong>fencing token</strong>: each lock acquisition returns a monotonically increasing number. The client passes it with every write to the protected resource, and the resource <em>rejects any write carrying a token lower than the highest it has seen</em>. The paused client returns with token 33, the resource has already seen 34, and the write is refused. The protection lives in the resource, not the lock service — which is the part people miss.</p>
+  <p>Say this clearly: without fencing, a lease is a performance optimisation that usually prevents concurrency, not a safety guarantee. Anything that must never run twice needs either fencing or idempotency.</p>
+
+  <h4>6 · Failure — 48–56 min</h4>
+  <ul><li><strong>Leader fails:</strong> followers stop receiving heartbeats, one times out and is elected. Unavailability is roughly one election timeout — typically hundreds of milliseconds to a few seconds. Writes fail during it; reads from followers can continue if staleness is acceptable.</li>
+  <li><strong>Network partition:</strong> the majority side elects a leader if needed and continues. The minority side cannot achieve quorum and becomes unavailable for writes. This is a <strong>CP</strong> system by deliberate design — it chooses to stop rather than to disagree, which is exactly what you want from the component everything else trusts.</li>
+  <li><strong>Losing quorum</strong> (3 of 5 nodes gone) means total write unavailability, and there is no safe automatic recovery. Restoring from a snapshot with a forced membership change is a manual, dangerous operation that can lose committed writes. Say that; it argues for spreading nodes across failure domains.</li>
+  <li><strong>The dependency risk:</strong> every service that relies on this is down when it is down. That makes it the most critical component in the infrastructure, and it argues for keeping it boring, small and well understood rather than feature-rich.</li>
+  <li><strong>Overload:</strong> a client putting large values or watching thousands of keys can degrade the cluster for everyone. Enforce value size limits, watch limits and per-client rate limits.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the three ideas: majorities make agreement possible despite failures, the replicated log makes every node's state identical, and terms make stale leaders harmless. Then deliver the practical warning — locks need fencing tokens or idempotent consumers, because a lease detects unreachability rather than death, and the failure mode is silent.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Raft and Paxos have the same guarantees; Raft's contribution is comprehensibility.</strong> Multi-Paxos is more flexible and famously hard to specify correctly, which led to a generation of subtly broken implementations. Raft constrains the design — a strong leader, logs that never have holes, elections restricted by log completeness — specifically so that implementations are more likely to be right. Saying "I would use Raft because correct implementations are easier to verify, not because it is a better algorithm" is the accurate framing.</li>
+  <li><strong>Linearizable reads are not free, and the mechanisms are worth knowing.</strong> Naively reading from the leader is wrong: a partitioned leader that has not yet noticed its own deposition will serve stale data confidently. Three fixes — commit a no-op entry through the log before answering (correct, a full round trip), confirm leadership with a heartbeat round to a quorum (a quorum round trip, no disk write), or use a lease held for less than the election timeout so the leader can answer locally while guaranteeing no other leader exists (fast, but depends on bounded clock drift). Most systems use the lease. Naming the clock assumption is what shows depth.</li>
+  <li><strong>Cross-region deployment is usually a mistake, and knowing why is the point.</strong> Every write waits for a majority, so a cluster spread across three regions pays inter-region latency on every single write — 100+ ms, before any application work. That is fine for configuration changed hourly and disastrous for a lock acquired thousands of times a second. The usual pattern is a per-region cluster for latency-sensitive coordination, plus one global cluster for genuinely global state, and explicit acceptance that the two can disagree during a partition.</li>
+  <li><strong>Watch semantics cause real bugs.</strong> A watch is not a guaranteed stream of every change: if a client disconnects and history has been compacted, it will miss events. Clients must therefore be written to reconcile against current state on reconnect rather than assuming they can replay everything — the correct pattern is "on any watch event or reconnect, re-read the full state and act on the difference", which makes missed events harmless. Systems that treat watches as a reliable event log develop drift that is very hard to debug.</li>
+  <li><strong>The most common failure is misuse, not the algorithm.</strong> Teams store application data in etcd, watch thousands of keys, write at hundreds of hertz, or put megabyte values in it — and then the cluster becomes slow, which takes down every service depending on it. Because it is the root of the dependency graph, its degradation is maximally correlated. The discipline is to treat it as a small, protected resource with hard quotas, and to ask of every use "does this genuinely need consensus?" Most things do not: eventually-consistent configuration distribution is usually fine and infinitely cheaper.</li>
+  <li><strong>Sometimes you do not need consensus at all.</strong> If the thing you are protecting is idempotent, you do not need a lock. If you only need approximate leadership and can tolerate two leaders briefly, a database row with a timestamp is sufficient. If you need service discovery, DNS with health checks is often enough. Consensus costs latency, an operational dependency and a correlated failure domain — it should be reached for when the alternative is genuinely unsafe, and being able to say when it is not needed is the strongest form of understanding it.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A 5-node etcd cluster runs with a 1-second election timeout. A service uses it for leader election with a 10-second lease, renewed every 3 seconds. The elected leader writes to a shared database.</p>
+    <p>(a) How many node failures can the cluster survive, and what is the impact of each? (b) The leader's process pauses for 14 seconds in garbage collection. Walk through what happens. (c) How do you make this safe?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Fault tolerance.</strong> A majority of 5 is 3, so the cluster survives <strong>2 failures</strong>.</p>
+    <ul>
+    <li><em>One follower lost:</em> no impact. Writes still reach a majority of the remaining 4.</li>
+    <li><em>Two followers lost:</em> still working, but now at the edge — 3 nodes remain and all 3 must acknowledge every write. Any further failure, including a routine restart, loses quorum. Latency also rises, because every write now waits for the slowest of three rather than the median of five.</li>
+    <li><em>The leader lost:</em> no writes for roughly one election timeout while a new leader is elected — call it 1–2 seconds including detection and vote. Clients see write errors and must retry.</li>
+    <li><em>Three lost:</em> quorum is gone. Writes fail permanently, and recovery requires manual intervention that may lose committed data. Note the implication for operations: a rolling restart across 5 nodes must wait for each node to rejoin before touching the next, or you can accidentally create this state during routine maintenance.</li>
+    </ul>
+    <p><strong>(b) The 14-second GC pause.</strong> Trace it precisely:</p>
+    <ol>
+    <li><strong>t=0</strong> — the leader pauses. It last renewed at some point within the previous 3 seconds, so its lease has up to 10 seconds remaining.</li>
+    <li><strong>t≈7–10</strong> — no keep-alive arrives. The lease expires and etcd deletes the leader-election key.</li>
+    <li><strong>t≈10</strong> — watchers are notified, a second service instance acquires the key, and <strong>believes it is the leader</strong>. It begins writing to the shared database. This is correct behaviour — from etcd's view, the old leader is gone.</li>
+    <li><strong>t=14</strong> — the original process resumes. From its perspective <em>no time has passed</em>. It has no idea it was paused, still holds what it thinks is a valid lease, and continues writing to the database.</li>
+    <li><strong>t=14 onwards</strong> — <strong>two leaders are writing concurrently.</strong> Both are behaving correctly according to their own state. etcd has not malfunctioned. No error is logged anywhere.</li>
+    </ol>
+    <p>The essential insight: <em>a lease proves a node was reachable recently, not that it is dead now.</em> A paused, partitioned, or swap-thrashing process is indistinguishable from a crashed one, and it can come back.</p>
+    <p><strong>(c) Making it safe</strong> — three layers, in order of strength:</p>
+    <ul>
+    <li><strong>Fencing tokens (the real fix).</strong> Each successful acquisition returns a monotonically increasing number — etcd's revision works directly. The leader includes it with every database write, and <em>the database rejects any write with a token lower than the highest it has seen</em>. The returning old leader carries token 41, the database has seen 42, and its writes are refused. Note where the enforcement lives: <strong>in the resource, not in etcd</strong>. A lock service cannot protect a resource that does not check.</li>
+    <li><strong>Check-before-act with a shorter horizon.</strong> Before each batch of side effects, re-verify leadership and abort if lost. This narrows the window but does not close it — the process could pause between the check and the write. It is a useful mitigation, not a guarantee, and being clear about that distinction matters.</li>
+    <li><strong>Idempotent writes.</strong> If every write is keyed such that applying it twice is harmless, two leaders are inefficient rather than incorrect. Often the most practical answer, especially when you cannot modify the resource to support fencing.</li>
+    </ul>
+    <p><strong>What not to do:</strong> lengthening the lease. It reduces the probability of a spurious expiry but increases failover time proportionally, so you trade availability for a risk you have not eliminated — the pause could simply be longer. Tuning timeouts is the instinct that feels like a fix and is not one.</p>
+    <p>The generalisation worth stating: <strong>every distributed lock is unsafe unless the protected resource participates.</strong> This is the same conclusion as the job scheduler's lease and the ticket-booking hold, and recognising it as one recurring principle rather than three separate problems is exactly what the interview is looking for.</p></details>`,
+
+  refs:[
+    ["paper","In Search of an Understandable Consensus Algorithm (Raft)","Ongaro & Ousterhout, 2014 — the paper. Genuinely readable; sections 5.2 to 5.4 cover election, replication and the safety argument.","https://raft.github.io/raft.pdf"],
+    ["tool","The Raft visualisation","An interactive simulation where you can kill nodes and partition the network and watch elections happen. Fifteen minutes here beats an hour of reading.","https://raft.github.io/"],
+    ["paper","ZooKeeper: Wait-free coordination for Internet-scale systems","Hunt et al., USENIX ATC 2010 — the API design (znodes, watches, ephemeral nodes) and the recipes built on it.","https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf"],
+    ["paper","The Chubby lock service for loosely-coupled distributed systems","Burrows, OSDI 2006 — Google's service, and unusually candid about how engineers misused it. Read the lessons section.","https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/"],
+    ["post","How to do distributed locking","Martin Kleppmann — the fencing-token argument, and the clearest statement of why leases alone are not mutual exclusion.","https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"],
+    ["docs","etcd learning: API and linearizability","How linearizable reads, leases and watches are actually implemented, including the leader-lease read optimisation.","https://etcd.io/docs/v3.5/learning/api_guarantees/"]
+  ]}
+
+);

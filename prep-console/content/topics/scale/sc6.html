@@ -1,0 +1,595 @@
+<!-- topic source for scale/sc6; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "sc6",
+  "t": "Replication: leaders, followers and failover",
+  "tag": "Data",
+  "sum": "Why databases keep copies and how the copies are kept: streaming the write-ahead log from a leader to followers, synchronous versus asynchronous commits and what each can lose, the user-visible anomalies of replication lag and their fixes, failover and split brain, multi-leader conflicts, leaderless quorums, and why a replica is never a backup.",
+  "prereq": [
+    [
+      "sc4",
+      "Every change is appended to a write-ahead log (WAL) before data pages are updated; replaying the log reproduces the changes."
+    ],
+    [
+      "sc5",
+      "A commit is acknowledged once its log record is durable; transactions see snapshots of committed data."
+    ],
+    [
+      "sc1",
+      "Availability multiplies for components in series and improves with independent redundant copies; each extra nine cuts allowed downtime by ten."
+    ]
+  ],
+  "myths": [
+    [
+      "Replicas are a backup.",
+      "Replication copies every change as fast as it can, including mistakes. A DROP TABLE, a bad migration or a bug that corrupts rows reaches every replica within milliseconds. A backup is a copy from a point in time you can go back to. You need both: replicas for availability and read capacity, and backups with point-in-time recovery (restoring to any moment, such as one second before the mistake), tested by actually restoring them."
+    ],
+    [
+      "With replication, committed data can never be lost.",
+      "Only if the commit waited for a replica to confirm it. With asynchronous replication — the default in most setups — the leader acknowledges a commit as soon as it's durable locally, so if the leader dies before the change is shipped, a promoted replica simply doesn't have it. Those writes were confirmed to users and then vanished. Synchronous replication to at least one replica closes that gap, at a cost in write latency."
+    ],
+    [
+      "Adding read replicas scales a database.",
+      "Replicas multiply read capacity, but every replica must apply every write, so write capacity doesn't grow at all, and each replica adds work for the leader to ship logs. Replicas also introduce lag, which breaks read-your-writes unless you handle it. They're the right tool for read-heavy workloads; write-heavy growth needs partitioning (sc7)."
+    ],
+    [
+      "Failover is just promoting a replica when the leader dies.",
+      "The hard parts are around the promotion: deciding the leader is really dead rather than slow or partitioned, choosing the most up-to-date replica, making sure the old leader can't keep accepting writes (split brain), redirecting every client, and dealing with writes the old leader acknowledged but never shipped. Most serious replication incidents are failover incidents."
+    ],
+    [
+      "Quorum reads and writes (W + R > N) give strong consistency.",
+      "The overlap guarantees that a read contacts at least one replica that accepted the latest completed write, but not that the read returns it in every case: concurrent writes, a write that failed on some replicas but succeeded on others, sloppy quorums during partitions and clock-based conflict resolution can all return stale or inconsistent values. Quorums improve the odds; linearizability needs more (sc9)."
+    ],
+    [
+      "Multi-leader replication is the easy way to go multi-region.",
+      "It gives each region local writes, but any two leaders can accept conflicting writes to the same data at the same time, and someone has to decide the winner. Last-writer-wins silently discards data; better resolution requires merge logic or special data types. Many teams instead give each record a home region that alone accepts its writes, which keeps single-leader semantics per record."
+    ]
+  ],
+  "recap": [
+    "Replication keeps copies of data on several machines for availability, read capacity, lower latency near users and durability, and every scheme trades these against consistency and write latency.",
+    "In single-leader replication, the leader accepts all writes and streams its write-ahead log to followers, which replay it and serve reads.",
+    "Asynchronous replication acknowledges commits before followers have them, so failover can lose acknowledged writes; synchronous replication waits for at least one follower, trading write latency and availability for zero loss.",
+    "Replication lag causes visible anomalies — your own write disappearing, time going backwards across refreshes, effects seen before causes — fixed by reading from the leader after writes, waiting for a log position, or pinning users to one replica.",
+    "Failover means detecting a failed leader, promoting the most up-to-date follower, fencing the old leader and redirecting clients; mistakes cause lost writes or split brain.",
+    "Split brain is prevented by electing leaders through a consensus-backed coordinator and fencing, typically with increasing epoch or term numbers that make an old leader's writes rejectable.",
+    "Multi-leader replication allows writes in several places and therefore needs conflict resolution: last-writer-wins, merges, CRDTs, or avoiding conflicts by giving each record a home.",
+    "Leaderless replication writes to and reads from several replicas with quorums (W + R > N) and repairs divergence with read repair and anti-entropy.",
+    "Physical replication copies the log byte for byte; logical replication sends row changes, enabling selective replication, cross-version upgrades and change data capture.",
+    "Replicas are not backups: keep continuous archives for point-in-time recovery, and prove backups by restoring them."
+  ],
+  "glossary": [
+    [
+      "Anti-entropy",
+      "A background process that compares replicas (often with Merkle trees) and copies over missing or newer data so they converge."
+    ],
+    [
+      "Asynchronous replication",
+      "The leader acknowledges a commit before any follower has confirmed receiving it."
+    ],
+    [
+      "Consistent prefix reads",
+      "The guarantee that if writes happened in a certain order, anyone reading them sees them in that order."
+    ],
+    [
+      "CRDT (conflict-free replicated data type)",
+      "A data structure, such as a counter or set, designed so concurrent updates on different replicas can always be merged into the same result."
+    ],
+    [
+      "Epoch / term",
+      "A number that increases with every leader election; nodes reject requests carrying an older number, which stops a deposed leader from acting."
+    ],
+    [
+      "Failover",
+      "Switching the leader role to another replica when the current leader fails or is taken down."
+    ],
+    [
+      "Fencing",
+      "Making sure a deposed leader can no longer affect data, for example by rejecting its epoch, revoking its storage access or powering it off."
+    ],
+    [
+      "Follower (replica, standby)",
+      "A copy of the database that receives the leader's changes and applies them; it can usually serve reads."
+    ],
+    [
+      "Hinted handoff",
+      "In leaderless systems, a temporary replica stores writes meant for an unreachable node and hands them over when it returns."
+    ],
+    [
+      "Hot standby",
+      "A follower that accepts read-only queries while replaying the leader's log."
+    ],
+    [
+      "Last-writer-wins (LWW)",
+      "Resolving conflicting writes by keeping the one with the latest timestamp and discarding the others."
+    ],
+    [
+      "Leader (primary)",
+      "The replica that accepts writes and is the source of changes for the followers."
+    ],
+    [
+      "Leaderless replication",
+      "A design in which clients write to and read from several replicas directly, with no single leader, as in Dynamo-style databases."
+    ],
+    [
+      "Logical replication",
+      "Replicating row-level changes (insert this row, update that one) rather than raw log bytes."
+    ],
+    [
+      "LSN (log sequence number)",
+      "A position in the write-ahead log; comparing LSNs tells you whether a replica has applied a particular change."
+    ],
+    [
+      "Merkle tree",
+      "A tree of hashes in which each parent hashes its children, so comparing two roots shows whether any data differs and walking down finds where."
+    ],
+    [
+      "Monotonic reads",
+      "The guarantee that a user who has seen a value will never later see an older one."
+    ],
+    [
+      "Multi-leader replication",
+      "A design in which more than one replica accepts writes and they replicate to each other."
+    ],
+    [
+      "Physical replication",
+      "Replicating the exact bytes of the write-ahead log, producing an identical copy of the database files."
+    ],
+    [
+      "Point-in-time recovery (PITR)",
+      "Restoring a database to any chosen moment by replaying archived logs on top of a base backup."
+    ],
+    [
+      "Quorum",
+      "The minimum number of replicas that must acknowledge an operation; with N replicas, W write acknowledgements and R read responses, W + R > N makes reads and writes overlap."
+    ],
+    [
+      "Read repair",
+      "When a read notices replicas returning different versions, it writes the newest version back to the stale ones."
+    ],
+    [
+      "Read-your-writes consistency",
+      "The guarantee that after you write something, your subsequent reads reflect it."
+    ],
+    [
+      "Replication lag",
+      "How far a follower is behind the leader, measured in time or log bytes."
+    ],
+    [
+      "RPO / RTO",
+      "Recovery point objective (how much recent data you can afford to lose) and recovery time objective (how long recovery may take)."
+    ],
+    [
+      "Semi-synchronous replication",
+      "The leader waits for at least one follower to confirm receipt before acknowledging, while other followers stay asynchronous."
+    ],
+    [
+      "Split brain",
+      "Two nodes both acting as leader and accepting writes, so the copies diverge."
+    ],
+    [
+      "Synchronous replication",
+      "The leader waits for a follower to confirm it has a change before acknowledging the commit."
+    ],
+    [
+      "Version vector",
+      "A set of per-replica update counters attached to a value, used to tell whether one version supersedes another or whether they were written concurrently."
+    ],
+    [
+      "WAL (write-ahead log)",
+      "The append-only log of every change a database writes before updating its data pages; replicating it reproduces the database."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why do databases replicate, and what are the main approaches?",
+      "For availability (survive a machine or zone failure), read scaling (spread reads over copies), latency (copies near users) and durability (data on more than one machine). The main approaches are single-leader, where one node takes all writes and streams changes to followers; multi-leader, where several nodes take writes and exchange them; and leaderless, where clients write to several replicas directly using quorums. Single-leader is the default for relational databases because it avoids write conflicts entirely.",
+      "Follow-up: Which of those scales writes? — Only multi-leader and leaderless accept writes in more than one place, and each write still has to reach every replica, so real write scaling comes from partitioning the data (sc7), usually combined with replication."
+    ],
+    [
+      "E",
+      "Why are replicas not a substitute for backups?",
+      "Because replication copies mistakes as faithfully as good changes: a bad DELETE, a dropped table or a bug that corrupts data reaches every replica within milliseconds. A backup lets you go back to a point before the mistake. Production databases keep base backups plus continuously archived write-ahead logs, which allow point-in-time recovery, and teams regularly restore them to prove they work.",
+      "Follow-up: What's a delayed replica? — A follower deliberately kept, say, an hour behind; it gives a quick way to recover from a recent mistake, but it complements backups rather than replacing them."
+    ],
+    [
+      "E",
+      "What is the difference between synchronous and asynchronous replication?",
+      "With synchronous replication the leader waits for a follower to confirm it has the change before acknowledging the commit to the client, so a committed write survives the leader's loss, but every commit pays a network round trip and writes stall if the synchronous follower is unavailable. With asynchronous replication the leader acknowledges immediately and ships changes afterwards, so commits are fast and followers can be far away, but if the leader dies, recently acknowledged writes that weren't shipped are lost. Most production setups use one synchronous (or quorum-synchronous) follower and the rest asynchronous.",
+      "Follow-up: How much latency does synchronous replication add? — At least one round trip to the follower: well under a millisecond in the same zone, one to two milliseconds across zones, tens of milliseconds across regions, which is why synchronous replicas are usually kept in the same region."
+    ],
+    [
+      "M",
+      "How do you provide read-your-writes consistency with asynchronous replicas?",
+      "Several ways, from simplest to most precise. Route reads of data the user can modify (their own profile) to the leader. Or, for a short window after a user writes — say 10-30 seconds, tracked in their session — send all their reads to the leader. Or record the leader's log position (LSN) when the write commits and, for that user's next reads, use only a replica that has replayed past it, waiting briefly or falling back to the leader. The LSN approach keeps most reads on replicas while guaranteeing the user sees their own change.",
+      "Follow-up: What about the same user on two devices? — Session-based windows don't cover it; you'd need to store the last-write position per user server-side, or read the user's own data from the leader."
+    ],
+    [
+      "M",
+      "What is split brain and how is it prevented?",
+      "Split brain is two nodes both believing they're the leader and accepting writes, so the data diverges and must later be reconciled by hand. It happens when a leader is cut off or just slow, a failover promotes another node, and the old leader keeps going. Prevention has two parts: elect the leader through a consensus system (etcd, ZooKeeper, Consul, or Raft built into the database) so only one node can hold leadership at a time, usually as a lease that expires; and fence the old leader, by making every write carry an epoch number that storage and clients reject if it's stale, by having the old leader stop accepting writes when it loses its lease, or by forcibly cutting it off.",
+      "Follow-up: Why isn't a lease alone enough? — A leader can pause (a long garbage collection, a frozen VM) past its lease expiry and then resume, believing it's still leader; only fencing at the resource being written stops its late writes."
+    ],
+    [
+      "M",
+      "Walk through what happens during a failover and what can go wrong.",
+      "First, detection: followers or a monitor notice the leader isn't responding within a timeout. Too short and a brief hiccup triggers an unnecessary failover; too long and downtime grows. Second, election: choose the follower with the most recent data, ideally a synchronous one, and promote it. Third, fencing: ensure the old leader can't accept writes. Fourth, reconfiguration: point clients at the new leader, via DNS, a virtual IP, a proxy or service discovery. What goes wrong: acknowledged writes lost because they never reached the promoted follower; split brain if fencing fails; the old leader rejoining with writes the new leader never had; and clients caching the old address.",
+      "Follow-up: What should happen to the old leader's unreplicated writes? — They're usually discarded when it rejoins as a follower, which is why they should be captured for reconciliation and why critical systems use synchronous replication so there are none."
+    ],
+    [
+      "M",
+      "Explain quorums in leaderless replication.",
+      "Each value is stored on N replicas. A write is sent to all N and considered successful once W of them acknowledge; a read queries replicas and waits for R responses, returning the newest version among them. If W + R > N, every read set overlaps every write set in at least one replica, so the read sees the latest successful write. A common choice is N = 3, W = 2, R = 2, which tolerates one unavailable replica for both reads and writes. Divergent replicas are repaired by read repair (a read writes the newest version back to stale replicas) and by background anti-entropy.",
+      "Follow-up: What do W = 1 and R = N buy you? — Very fast, highly available writes, with reads that must contact every replica, so reads fail if any replica is down; you pick W and R per operation based on which should be cheap and available."
+    ],
+    [
+      "M",
+      "How do multi-leader systems handle write conflicts?",
+      "Two leaders can accept conflicting writes to the same record at the same time, so the system must converge on one result. Options: last-writer-wins by timestamp, which is simple but silently discards the losing write and depends on clocks; merging values with application logic, such as a union of shopping-cart items; data types designed to merge (CRDTs), such as counters where each replica tracks its own increments; recording conflicts for a user to resolve, as document editors do; or avoiding conflicts by routing all writes for a record to one home leader. The last is the most common in practice.",
+      "Follow-up: Why is last-writer-wins dangerous with physical clocks? — Clocks on different machines drift, so a write that happened later can carry an earlier timestamp and be discarded, with no error anywhere."
+    ],
+    [
+      "M",
+      "What is the difference between physical and logical replication?",
+      "Physical replication ships the write-ahead log's bytes, so the follower is an exact, byte-for-byte copy of the leader's files: simple and efficient, but the whole database is replicated and both sides must run the same major version and platform. Logical replication decodes the log into row-level changes — insert this row, update that one — and applies them on the other side, so you can replicate selected tables, replicate between different major versions (useful for zero-downtime upgrades), and feed change data capture pipelines. It's more flexible but costs more CPU, and schema changes need care.",
+      "Follow-up: Why is statement-based replication risky? — Replaying SQL statements can produce different results on the follower when they use non-deterministic functions (now(), random()) or depend on row order, so most databases prefer row-based changes."
+    ],
+    [
+      "H",
+      "Your team plans to move reads to three asynchronous replicas. What problems should you plan for?",
+      "Lag-driven anomalies: users not seeing their own writes, results going backwards between refreshes as requests hit replicas with different lag, and related data appearing out of order. Plan read routing — leader for recently written or strongly needed data, LSN-aware or session-pinned replica reads for the rest. Operational issues: lag spikes during bulk writes or when a replica runs long queries, queries on a hot standby being cancelled because replay needs to remove rows they're reading (or, with feedback enabled, bloat on the leader), connection management across more hosts, and failure handling when a replica dies. And the failover plan: which replica gets promoted, whether any is synchronous, and how many acknowledged writes you're prepared to lose.",
+      "Follow-up: How would you monitor it? — Replica lag in both bytes and seconds per replica, alerting on growth rather than a single spike, plus the rate of cancelled queries on standbys and the time since each replica last applied a change."
+    ],
+    [
+      "H",
+      "How do you get zero data loss and high availability at the same time with PostgreSQL?",
+      "Use synchronous replication to more than one candidate, so no single failure blocks writes: with synchronous_standby_names set to ANY 1 of two standbys in different zones, a commit waits for whichever standby confirms first, and writes continue if one standby is down. Run a consensus-backed manager such as Patroni, which holds the leader key in etcd or Consul with a TTL, promotes only a standby known to be synchronous, and demotes a leader that loses its key. Put clients behind a stable endpoint that follows the leader. Add asynchronous replicas for reads and continuous WAL archiving for point-in-time recovery. The cost is a cross-zone round trip on every commit, and if all synchronous candidates fail, you must choose between blocking writes or accepting potential loss.",
+      "Follow-up: What does synchronous_commit = remote_apply add over on? — It waits until the standby has applied the change, not just flushed it, so a read on that standby immediately after the commit sees the write, at the cost of more commit latency."
+    ],
+    [
+      "H",
+      "Explain the GitHub October 2018 incident. What does it teach about failover?",
+      "A 43-second network partition separated GitHub's primary US East data centre from the rest of its network. Their MySQL failover tool, Orchestrator, backed by Raft consensus, saw the East primaries as unreachable and promoted replicas in the US West data centre. When connectivity returned, the East primaries held a few seconds of writes that had never reached the West, and the West had since accepted new writes, so the two sides had diverged. Applications in the East also performed badly with every database call crossing the country. GitHub chose to preserve data integrity and 'fail forward', running degraded for about 24 hours while restoring from backups and replaying writes. Lessons: a failover that is correct in terms of consensus can still be wrong for the system — topology and latency matter; asynchronous replication makes every failover a potential data-loss event; and failover automation needs guardrails, such as not promoting across regions automatically.",
+      "Follow-up: What would you change? — Constrain automatic promotion to the same region, require a longer outage before cross-region promotion, use synchronous or semi-synchronous replication within the region, and rehearse region failover as a planned operation."
+    ],
+    [
+      "H",
+      "Design replication for a service that must survive a zone failure with no data loss and a region failure with at most a minute of loss.",
+      "Within the primary region, run the leader and two standbys in three different zones, with quorum-synchronous replication (commit waits for one of the two standbys). Losing any one zone loses no acknowledged data, and a consensus-based manager promotes the synchronous standby in seconds. For the region, stream asynchronously to a standby cluster in a second region; with typical lag well under a second, and alerting if lag exceeds, say, 30 seconds, the recovery point for a region loss is within the one-minute budget. Region failover is a deliberate, rehearsed decision because it may lose the last seconds of writes and requires moving application traffic too. Continuous WAL archiving to object storage in both regions provides point-in-time recovery for mistakes and corruption.",
+      "Follow-up: Why not make the cross-region replica synchronous too? — Every commit would wait for a cross-region round trip, tens of milliseconds, and writes would stall whenever the link to the other region degraded, trading daily latency and availability for protection against a rare event."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "High availability, load balancing and replication (PostgreSQL)",
+      "Streaming replication, hot standby, synchronous commit and failover, from the source.",
+      "https://www.postgresql.org/docs/current/high-availability.html"
+    ],
+    [
+      "book",
+      "Designing Data-Intensive Applications, chapter 5",
+      "Martin Kleppmann's chapter on replication: leaders and followers, lag anomalies, multi-leader and leaderless designs.",
+      "https://dataintensive.net/"
+    ],
+    [
+      "paper",
+      "Dynamo: Amazon's Highly Available Key-value Store",
+      "SOSP 2007 — leaderless replication, quorums, sloppy quorums, hinted handoff and anti-entropy.",
+      "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
+    ],
+    [
+      "post",
+      "October 21 post-incident analysis",
+      "GitHub — a 43-second partition, a cross-region failover and 24 hours of degraded service.",
+      "https://github.blog/news-insights/company-news/oct21-post-incident-analysis/"
+    ],
+    [
+      "post",
+      "Postmortem of database outage of January 31",
+      "GitLab — a primary deleted by mistake while repairing a replica, and backups that didn't work.",
+      "https://about.gitlab.com/blog/postmortem-of-database-outage-of-january-31/"
+    ],
+    [
+      "code",
+      "Patroni",
+      "A widely used consensus-based high-availability manager for PostgreSQL.",
+      "https://github.com/patroni/patroni"
+    ],
+    [
+      "paper",
+      "Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases",
+      "SIGMOD 2017 — replicating the log to a storage quorum of six copies across three zones.",
+      "https://www.amazon.science/publications/amazon-aurora-design-considerations-for-high-throughput-cloud-native-relational-databases"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A company runs its whole product on one PostgreSQL server. It's a big, reliable machine, and for two years nothing goes wrong. Then, at 3 a.m. on a Saturday, its disk controller fails. The database is gone until someone replaces the hardware and restores last night's backup — which takes six hours and loses everything written since midnight. Orders placed overnight, sign-ups, payments: all gone, even though customers were told they'd succeeded.</p>
+<p>A second company has the opposite problem. Its database is healthy, but it's drowning in reads: the product pages, dashboards and search results generate thirty times more reads than writes, and the single server's CPU is pinned. They'd like more machines to share the reading, but every machine needs the same, current data.</p>
+<p>A third company has users in Sydney whose every page load waits 250 milliseconds for a round trip to a database in Virginia.</p>
+<p>All three need the same thing: <strong>copies of the data on more than one machine</strong>, kept up to date. That's <strong>replication</strong>. It's how databases survive machine and datacentre failures, scale reads, and serve users far away. It sounds simple — just keep the copies in sync — but "in sync" hides the real questions. When a write happens, does it wait for the copies, making every write slower, or not, risking that a crash loses it? When a user reads from a copy that's a fraction of a second behind, what do they see? When the main copy dies, who takes over, and how do you make sure the old one doesn't keep accepting writes? Some of the worst outages in the industry — GitHub's day-long degradation in 2018, GitLab's deleted database in 2017 — happened exactly at these seams.</p>
+<p>This lesson builds replication from the ground up: how a leader ships its log to followers, what synchronous and asynchronous replication each guarantee and lose, the strange things users see when replicas lag and how to prevent them, how failover works and how it goes wrong, why split brain happens and how fencing stops it, and the two alternative designs — multi-leader and leaderless — with their conflicts and quorums. It finishes with a real-world design that survives a zone failure with no data loss.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: a head chef and line cooks with copies of the recipe book</h4>
+<p>Picture a restaurant chain's head office with the master recipe book. Only the head chef may change a recipe. Every change is written into a numbered change log: "change 1,041: reduce salt in the soup to 8 g". Branch kitchens receive the change log and apply each entry in order to their own copy of the book. Diners at any branch can read the recipes; changes always go through head office. That's <strong>single-leader replication</strong>: one <strong>leader</strong> (also called primary) accepts writes, and <strong>followers</strong> (replicas, standbys) apply its changes in order and serve reads.</p>
+<p>Now the questions become concrete. When the head chef makes a change, do they wait until at least one branch confirms it has written it down before telling anyone "done"? If they wait, changes are slower but a fire at head office can't lose a confirmed change — that's <strong>synchronous replication</strong>. If they don't, changes are quick but the last few might burn with the office — <strong>asynchronous replication</strong>. A branch a few entries behind will serve yesterday's soup — that's <strong>replication lag</strong>. If head office burns down, a branch must become the new head office — <strong>failover</strong> — and if the old head office turns out to be fine and keeps issuing changes too, you have two head chefs contradicting each other: <strong>split brain</strong>.</p>
+<p>The analogy breaks in one important way: a real branch manager can phone head office and ask "are you still there?" In a network, silence is ambiguous — a machine that doesn't answer might be dead, overloaded, or just cut off by a broken link while still running happily. Almost every hard problem in replication comes from not being able to tell those apart. Keep that in mind through every section below.</p>
+
+<h4>The big picture</h4>
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="Single-leader replication: clients write to the leader, which appends to its WAL and streams it to one synchronous follower and two asynchronous followers; reads can go to followers.">
+  <defs><marker id="sc6-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="30" y="110" width="90" height="36" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="75" y="132" text-anchor="middle" style="fill:var(--ink)">App (writes)</text>
+    <line x1="120" y1="128" x2="198" y2="128" marker-end="url(#sc6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="200" y="90" width="140" height="76" rx="6" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="270" y="114" text-anchor="middle" style="fill:var(--ink);font-weight:600">Leader</text>
+    <text x="270" y="134" text-anchor="middle" style="fill:var(--ink-2)">writes → WAL</text>
+    <text x="270" y="152" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">LSN 0/5A3F20</text>
+    <rect x="430" y="20" width="180" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="520" y="41" text-anchor="middle" style="fill:var(--ink)">Follower A (sync)</text>
+    <text x="520" y="59" text-anchor="middle" style="fill:var(--muted)">zone 2, lag ~0</text>
+    <rect x="430" y="104" width="180" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="520" y="125" text-anchor="middle" style="fill:var(--ink)">Follower B (async)</text>
+    <text x="520" y="143" text-anchor="middle" style="fill:var(--muted)">zone 3, lag 40 ms</text>
+    <rect x="430" y="188" width="180" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="520" y="209" text-anchor="middle" style="fill:var(--ink)">Follower C (async)</text>
+    <text x="520" y="227" text-anchor="middle" style="fill:var(--muted)">other region, lag 300 ms</text>
+    <line x1="340" y1="110" x2="428" y2="48" marker-end="url(#sc6-arrow)" style="fill:none;stroke:var(--good);stroke-width:1.5"/>
+    <line x1="428" y1="58" x2="345" y2="118" marker-end="url(#sc6-arrow)" style="fill:none;stroke:var(--good);stroke-dasharray:4 3"/>
+    <text x="360" y="70" style="fill:var(--good)">ack before commit</text>
+    <line x1="340" y1="128" x2="428" y2="128" marker-end="url(#sc6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="340" y1="146" x2="428" y2="210" marker-end="url(#sc6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="370" y="192" style="fill:var(--muted)">WAL stream</text>
+    <rect x="30" y="220" width="90" height="36" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="75" y="242" text-anchor="middle" style="fill:var(--ink)">App (reads)</text>
+    <line x1="120" y1="238" x2="428" y2="215" marker-end="url(#sc6-arrow)" style="fill:none;stroke:var(--s2);stroke-dasharray:5 3"/>
+  </g>
+</svg>
+<figcaption>The leader's write-ahead log is the replication stream. The synchronous follower must acknowledge before a commit is confirmed; the asynchronous ones catch up when they can, so each is a little behind — by different amounts.</figcaption>
+</figure>
+<p>Everything in this lesson is a variation on that picture: whether to wait for followers, how to read from them safely, what to do when the leader disappears, and what changes when there's more than one leader, or none at all.</p>
+<p>It helps to name the four reasons to replicate, because each design choice trades them against each other. <strong>Availability</strong>: survive the loss of a machine, a zone or a region. <strong>Read scaling</strong>: spread reads across copies. <strong>Latency</strong>: put copies near users. <strong>Durability</strong>: never lose data that was confirmed. Waiting for followers helps durability and hurts latency; spreading copies far away helps latency for readers and hurts write latency or consistency; more copies help reads and availability and cost more to keep in sync. There is no free design, only a choice about which of these matters most for which data. A payment and a page-view counter deserve different answers, and good systems make that choice per kind of data rather than once for everything.</p>
+</section>
+
+<section data-field="body">
+<h4>1. How a leader ships changes: log shipping</h4>
+<p>Recall from sc4 that every database change is first appended to the <strong>write-ahead log</strong> (WAL). The log already describes every change in order, so it's the natural thing to replicate: if a follower starts from a copy of the leader's data and replays the leader's log entries in the same order, it ends up with the same data.</p>
+<p>In PostgreSQL's <strong>streaming replication</strong>, each follower connects to the leader and says "send me the log from position X". Positions in the log are <strong>log sequence numbers</strong> (LSNs), which look like <code>0/5A3F20</code> and simply increase. The leader streams log records as they're written; the follower writes them to its own log, flushes them to disk, and replays them into its data files. The follower tracks four positions that tell you exactly how far behind it is: how much it has received (sent), written, flushed and replayed. MySQL does the same with its <strong>binary log</strong> (binlog), usually identifying positions with global transaction IDs (GTIDs).</p>
+<p>Setting up a new follower takes two steps: copy a consistent snapshot of the leader's data (a base backup, taken while the leader keeps running), then stream the log from the position the snapshot corresponds to. The same two steps are how a failed follower is rebuilt and how backups are restored — a pattern worth remembering.</p>
+<p>There are two flavours of what gets shipped. <strong>Physical replication</strong> ships the log's raw bytes, which describe changes to specific disk pages. The follower becomes a byte-for-byte copy of the leader: simple, fast and exact, but it must run the same major version and it copies everything. <strong>Logical replication</strong> decodes the log into row-level changes — "insert this row into orders", "update row 42 of accounts" — and applies them as ordinary operations on the other side. It can replicate chosen tables, work across different major versions (the standard way to upgrade with near-zero downtime) and feed other systems: change-data-capture pipelines (sc3, sc10) are built on logical decoding. A third historical flavour, <strong>statement-based</strong> replication, re-runs the original SQL statements on followers; it breaks whenever statements are non-deterministic (<code>now()</code>, <code>random()</code>, or updates that depend on row order), so modern systems prefer row-based changes.</p>
+
+<h4>2. Synchronous versus asynchronous: when is a commit "done"?</h4>
+<p>The most important replication setting is what the leader waits for before telling the client "committed". Here's a single commit traced both ways.</p>
+<p><strong>Asynchronous.</strong> The client sends <code>COMMIT</code>. The leader flushes the commit record to its own disk (about 0.1-1 ms on an SSD) and replies "committed". Separately and shortly afterwards, the log record is streamed to followers. Commit latency: just the local flush. Risk: if the leader's machine dies in the gap between acknowledging and shipping — usually milliseconds, but seconds under heavy load or with a slow network — the committed transaction exists nowhere else. A follower promoted to leader doesn't have it. The client was told it succeeded; it's gone.</p>
+<p><strong>Synchronous.</strong> The client sends <code>COMMIT</code>. The leader flushes locally <em>and</em> sends the record to a synchronous follower, and waits until the follower confirms it has flushed it too, then replies. Commit latency: local flush plus a network round trip to the follower plus its flush — under a millisecond within a zone, about one to two milliseconds across zones in the same region, and tens of milliseconds across regions. Guarantee: a committed transaction is on at least two machines, so losing the leader loses nothing that was acknowledged. Risk: availability. If the only synchronous follower goes down or becomes unreachable, the leader can't complete any commit — writes stall.</p>
+<p>The standard compromise has two parts. <strong>Semi-synchronous</strong> replication (MySQL's name; PostgreSQL achieves the same with its settings) waits for one follower and lets the rest be asynchronous. And to avoid stalling when that one follower fails, you wait for <em>any one of several</em>: PostgreSQL's <code>synchronous_standby_names = 'ANY 1 (standby_a, standby_b)'</code> makes a commit wait for whichever of two standbys confirms first, so either can fail without blocking writes. This quorum-style commit is how production systems get zero data loss and high availability together.</p>
+<p>PostgreSQL also lets you choose how far the follower must get before the commit returns, through <code>synchronous_commit</code>: <code>remote_write</code> (the follower has received it and handed it to its operating system), <code>on</code> (flushed to the follower's disk — the usual choice), or <code>remote_apply</code> (replayed, so a read on that follower immediately sees the change). It can even be set per transaction, so a payment can wait for the replica while a page-view log entry doesn't. That per-transaction choice is a good example of the theme: pick durability by the value of the data.</p>
+
+<h4>3. What users see when replicas lag</h4>
+<p>Asynchronous followers are always a little behind — usually milliseconds, but lag spikes to seconds or minutes during bulk writes, long-running queries on the follower, network trouble or when a follower is overloaded. Sending reads to followers then produces behaviour that looks like bugs. Each has a name, a cause and a standard fix.</p>
+
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="Read-your-writes violation: a user writes a new display name to the leader, then immediately reads from a follower that hasn't replayed the change and sees the old name.">
+  <defs><marker id="sc6-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="90" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">User</text>
+    <text x="320" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Leader</text>
+    <text x="540" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Follower</text>
+    <line x1="90" y1="28" x2="90" y2="270" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="320" y1="28" x2="320" y2="270" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="540" y1="28" x2="540" y2="270" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="90" y1="50" x2="318" y2="70" marker-end="url(#sc6-arrow2)" style="fill:none;stroke:var(--accent)"/>
+    <text x="200" y="50" text-anchor="middle" style="fill:var(--accent)">name = "Mei"</text>
+    <line x1="320" y1="80" x2="92" y2="100" marker-end="url(#sc6-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="200" y="104" text-anchor="middle" style="fill:var(--ink-2)">committed (LSN 900)</text>
+    <line x1="90" y1="130" x2="538" y2="150" marker-end="url(#sc6-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="330" y="132" text-anchor="middle" style="fill:var(--ink-2)">reload profile</text>
+    <line x1="540" y1="160" x2="92" y2="180" marker-end="url(#sc6-arrow2)" style="fill:none;stroke:var(--crit)"/>
+    <text x="330" y="186" text-anchor="middle" style="fill:var(--crit)">name = "May" (old!)</text>
+    <line x1="320" y1="90" x2="538" y2="220" marker-end="url(#sc6-arrow2)" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="470" y="238" text-anchor="middle" style="fill:var(--muted)">LSN 900 arrives late</text>
+    <text x="320" y="264" text-anchor="middle" style="fill:var(--muted)">Nothing is broken, the follower is just 150 ms behind</text>
+  </g>
+</svg>
+<figcaption>The write committed on the leader, but the next read went to a follower that hadn't replayed it yet. To the user it looks like the save failed.</figcaption>
+</figure>
+
+<p><strong>Read-your-writes (read-after-write) violations.</strong> A user saves a change and the next page shows the old value, as in the diagram. The user thinks the save failed and does it again, or files a bug. Fixes, from simplest to most precise:</p>
+<ul>
+<li>Always read data the user can edit — their own profile, settings, cart — from the leader. Other users' data can come from followers.</li>
+<li>After any write, route that user's reads to the leader for a short window (10-30 seconds, longer than typical lag), remembered in their session.</li>
+<li>Record the leader's LSN when the write commits (PostgreSQL's <code>pg_current_wal_lsn()</code>) and store it in the session; on the user's next read, use a follower only if it has replayed past that LSN (<code>pg_last_wal_replay_lsn()</code>), otherwise wait briefly or go to the leader. Most reads stay on followers, and the guarantee is exact.</li>
+</ul>
+<p>The session-based fixes don't cover the same user on two devices — they write on their phone and read on their laptop — which needs the last-write position stored per user on the server side.</p>
+<p><strong>Monotonic-read violations.</strong> A user refreshes and sees 3 comments, refreshes again and sees 2, then 3 again: successive requests hit followers with different lag, so time appears to go backwards. Fix: pin each user to one follower — for example, choose it by a hash of the user ID — and only switch if that follower fails.</p>
+<p><strong>Consistent-prefix violations.</strong> A reader sees an effect before its cause: an answer appears before the question it replies to. On a single follower this can't happen, because the log is applied in order; it appears when related writes live in different partitions replicated independently (sc7), so one arrives before the other. Fix: keep causally related data in the same partition, or track dependencies explicitly.</p>
+<p>These guarantees — read-your-writes, monotonic reads and consistent prefix — are weaker than full consistency but are what users actually notice, and sc9 places them in the wider family of consistency models.</p>
+<p>Lag has a less obvious cost on the follower side too. On a PostgreSQL <strong>hot standby</strong> (a follower that serves read queries), replay sometimes needs to remove row versions that a running query is still reading. Replay can either wait (letting lag grow) or cancel the query. PostgreSQL waits up to <code>max_standby_streaming_delay</code> (30 seconds by default) and then cancels the query with a "conflict with recovery" error. Setting <code>hot_standby_feedback = on</code> tells the leader which versions the standby's queries still need, avoiding cancellations — but then long queries on the standby hold back cleanup on the leader, causing bloat there (sc5). Running analytics on a production standby is therefore a real trade-off, which is why teams often dedicate a separate replica to it.</p>
+
+<h4>4. Failover, step by step</h4>
+<p>When the leader fails, a follower must take over. <strong>Failover</strong> can be manual (a human decides and runs the promotion) or automatic (a tool does it). Either way, it has four steps, and each can go wrong.</p>
+<p><strong>Step 1: detect the failure.</strong> There's no reliable way to know a machine is dead; you only know it hasn't answered. So failure detection uses timeouts: if the leader misses health checks for, say, 10-30 seconds, it's declared failed. A short timeout means faster recovery but more false alarms — a leader that paused for a long garbage collection, was briefly overloaded, or suffered a network blip gets replaced unnecessarily, and a failover itself causes disruption. A long timeout means more downtime for real failures. There's no universally right value; it depends on how costly each mistake is.</p>
+<p><strong>Step 2: choose a new leader.</strong> The best candidate is the follower with the most recent data — ideally a synchronous follower, which by definition has every acknowledged commit. Choosing requires agreement: if two monitoring processes each pick a different follower, you get two leaders. So real systems make this decision through a <strong>consensus</strong> system — etcd, ZooKeeper, Consul, or Raft built into the database — where a majority must agree (sc9 explains consensus).</p>
+<p><strong>Step 3: fence the old leader.</strong> The old leader may not be dead. It might be alive but cut off from the monitors, still accepting writes from clients that can reach it. It must be stopped from doing so — see the next section.</p>
+<p><strong>Step 4: redirect clients.</strong> Applications must now send writes to the new leader. Common mechanisms: updating a DNS name (slow if clients cache it), moving a virtual IP address to the new machine, a proxy layer such as PgBouncer or HAProxy that follows the leader, or service discovery (sc2). Client libraries that list all hosts and look for the writable one (PostgreSQL's <code>target_session_attrs=read-write</code>) also work.</p>
+<p>Typical failover times range from a few seconds with well-tuned tools to a minute or two for managed services (Amazon RDS documents one to two minutes for its classic Multi-AZ failover). During that time writes fail, so applications must retry — which brings back the need for idempotent operations (sc11).</p>
+<p>Then there's the question of the old leader's data. If replication was asynchronous, the old leader may hold committed transactions the new leader never received. When the old leader comes back, it can't simply rejoin as a follower with those extra transactions; its log has diverged. PostgreSQL's <code>pg_rewind</code> rewinds it to the point of divergence so it can follow the new leader, which discards those transactions. They were acknowledged to users. This is the concrete meaning of "asynchronous replication can lose data", and why for critical data the only real fix is synchronous replication. If you must accept the risk, capture the discarded transactions for manual reconciliation rather than silently losing them — and make sure external effects (emails, payments) can be reconciled against what the database finally holds.</p>
+
+<h4>5. Split brain and fencing</h4>
+<p><strong>Split brain</strong> is two nodes both acting as leader. It happens like this: the leader is cut off from the monitors by a network problem but is still reachable by some application servers. The monitors see a dead leader and promote a follower. Now clients on one side of the partition write to the old leader and clients on the other side write to the new one. Both accept writes, the data diverges, and there's no automatic way to merge it: an account might be debited on one side and closed on the other.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Fencing with epochs: the old leader with epoch 7 is partitioned away; a new leader is elected with epoch 8; storage and clients now reject any write carrying epoch 7.">
+  <defs><marker id="sc6-arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="30" y="40" width="150" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="105" y="62" text-anchor="middle" style="fill:var(--ink)">Old leader</text>
+    <text x="105" y="82" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">epoch 7</text>
+    <line x1="215" y1="20" x2="215" y2="240" style="fill:none;stroke:var(--crit);stroke-width:2;stroke-dasharray:6 4"/>
+    <text x="215" y="252" text-anchor="middle" style="fill:var(--crit)">network partition</text>
+    <rect x="260" y="20" width="160" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="340" y="42" text-anchor="middle" style="fill:var(--ink)">Consensus (etcd)</text>
+    <text x="340" y="62" text-anchor="middle" style="fill:var(--muted)">majority elects</text>
+    <rect x="460" y="40" width="150" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="535" y="62" text-anchor="middle" style="fill:var(--ink)">New leader</text>
+    <text x="535" y="82" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">epoch 8</text>
+    <line x1="420" y1="50" x2="458" y2="60" marker-end="url(#sc6-arrow3)" style="fill:none;stroke:var(--s3)"/>
+    <rect x="300" y="150" width="220" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="410" y="172" text-anchor="middle" style="fill:var(--ink)">Storage / clients</text>
+    <text x="410" y="192" text-anchor="middle" style="fill:var(--muted)">highest epoch seen: 8</text>
+    <line x1="535" y1="96" x2="470" y2="148" marker-end="url(#sc6-arrow3)" style="fill:none;stroke:var(--good)"/>
+    <text x="560" y="130" style="fill:var(--good)">write (8) ✓</text>
+    <line x1="105" y1="96" x2="298" y2="178" marker-end="url(#sc6-arrow3)" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/>
+    <text x="60" y="150" style="fill:var(--crit)">late write (7) ✗ rejected</text>
+  </g>
+</svg>
+<figcaption>The old leader doesn't need to know it has been replaced. As long as whatever it writes to checks the epoch, its stale writes are refused — which is the whole point of fencing.</figcaption>
+</figure>
+
+<p>Preventing split brain takes two layers.</p>
+<p><strong>Single leadership through consensus and leases.</strong> Leadership is a record in a consensus store — for example, a key in etcd that only one node can hold, with a time-to-live (a <strong>lease</strong>). The leader must renew it every few seconds. If it can't reach the consensus store (because it's partitioned from the majority), its lease expires and it must stop accepting writes — it demotes itself. Only then can another node acquire the key. This is how Patroni manages PostgreSQL, and how Orchestrator manages MySQL with its own Raft group.</p>
+<p><strong>Fencing.</strong> Leases alone aren't enough, because a node can pause — a long garbage collection, a frozen virtual machine, a stalled disk — past its lease expiry, then resume and carry on writing, unaware that time passed. Fencing makes the <em>thing being written to</em> reject the old leader. The standard technique is an <strong>epoch</strong> (or term, or fencing token): a number that increases with every election. Each write carries the leader's epoch; storage and replicas remember the highest epoch they've seen and reject anything older. A more physical form is <strong>STONITH</strong> ("shoot the other node in the head"): cut power to the old leader or revoke its access to shared storage before promoting the new one. Either way, the principle is that safety can't depend on the old leader realising it has been replaced.</p>
+
+<h4>6. Multi-leader replication</h4>
+<p>In <strong>multi-leader</strong> replication, more than one node accepts writes, and each replicates its changes to the others. The usual reason is geography: a leader in each region lets users write with local latency, and a region can keep accepting writes when it's cut off from the others. Offline-capable apps are an extreme version — each device is a "leader" that syncs later — and collaborative editing is another.</p>
+<p>The cost is <strong>write conflicts</strong>. If a user in Europe changes a document's title to "Q3 plan" at the same moment a user in the US changes it to "Q3 roadmap", both leaders accept their write, and when they exchange changes, each sees a conflict. All replicas must end up with the same value — they must <strong>converge</strong> — so there has to be a rule. The options:</p>
+<p><strong>Last-writer-wins (LWW).</strong> Attach a timestamp to each write and keep the latest. Simple and always converges, but it silently discards the other write, and it depends on clocks: machine clocks drift and jump, so a write that really happened later can carry an earlier timestamp and lose. For data where losing a concurrent update is acceptable (a "last seen" time), it's fine; for anything valuable, it's a data-loss mechanism with no error message.</p>
+<p><strong>Merge.</strong> Combine the values with application logic: for a shopping cart, take the union of items from both sides. Amazon's Dynamo paper describes exactly this, including its quirk: a deleted item can reappear if the delete conflicts with an add.</p>
+<p><strong>CRDTs.</strong> Conflict-free replicated data types are data structures designed so concurrent updates always merge to the same result, whatever order they arrive in. A grow-only counter keeps one count per replica and reports the sum; sets, maps and even text sequences (used by collaborative editors) have CRDT versions. They're elegant but only fit data that can be expressed with them.</p>
+<p><strong>Ask the user.</strong> Keep both versions and let a person choose, as version-control and document tools do.</p>
+<p><strong>Avoid conflicts.</strong> Give each record a <strong>home</strong> leader that alone accepts its writes: a user's data is written only in their home region, even though it's replicated everywhere for reads. That's single-leader replication per record, and it's what most multi-region systems actually do (sc17 covers multi-region design).</p>
+<p>Multi-leader setups have other traps: changes can arrive in different orders at different leaders, replication loops must be prevented (each change is tagged with its origin), and constraints like uniqueness can't be enforced across leaders without coordination — two regions can each accept the username "mei". That's why multi-leader is chosen deliberately for specific data, not as a default.</p>
+
+<h4>7. Leaderless replication and quorums</h4>
+<p>Amazon's Dynamo (2007) popularised a third design, used by Cassandra, ScyllaDB and Riak: no leader at all. Each piece of data is stored on <strong>N</strong> replicas, and clients (or a coordinator node acting for them) send each write to all N replicas and each read to several.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Quorum with N equals 3: a write succeeds on replicas 1 and 2 (W equals 2); a read contacts replicas 2 and 3 (R equals 2); because W plus R is greater than N, replica 2 is in both sets and returns the newest version.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="80" y="100" width="120" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--s1);stroke-width:1.5"/>
+    <text x="140" y="122" text-anchor="middle" style="fill:var(--ink)">Replica 1</text>
+    <text x="140" y="142" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">v2</text>
+    <rect x="260" y="100" width="120" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:2"/>
+    <text x="320" y="122" text-anchor="middle" style="fill:var(--ink)">Replica 2</text>
+    <text x="320" y="142" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">v2</text>
+    <rect x="440" y="100" width="120" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--s2);stroke-width:1.5"/>
+    <text x="500" y="122" text-anchor="middle" style="fill:var(--ink)">Replica 3</text>
+    <text x="500" y="142" text-anchor="middle" style="fill:var(--crit);font-family:var(--mono)">v1 (missed write)</text>
+    <path d="M60,90 L400,90 L400,166 L60,166 Z" style="fill:none;stroke:var(--s1);stroke-dasharray:5 4"/>
+    <text x="230" y="80" text-anchor="middle" style="fill:var(--s1)">write set: W = 2 acknowledged v2</text>
+    <path d="M240,176 L580,176 L580,86 L240,86" style="fill:none;stroke:var(--s2);stroke-dasharray:2 3"/>
+    <text x="410" y="196" text-anchor="middle" style="fill:var(--s2)">read set: R = 2</text>
+    <text x="320" y="226" text-anchor="middle" style="fill:var(--ink)">W + R = 4 &gt; N = 3 → the sets overlap at replica 2, so the read sees v2</text>
+    <text x="320" y="244" text-anchor="middle" style="fill:var(--muted)">and read repair then writes v2 back to replica 3</text>
+  </g>
+</svg>
+<figcaption>With N = 3, any two replicas share at least one member with any other two. The read compares versions, returns the newest, and fixes the stale replica on the way.</figcaption>
+</figure>
+
+<p>A write succeeds once <strong>W</strong> replicas acknowledge it; a read waits for <strong>R</strong> responses and returns the newest version among them (versions are compared by timestamps or version vectors). If <strong>W + R &gt; N</strong>, every set of W replicas overlaps every set of R replicas, so a read always includes at least one replica with the latest successful write. With the common N = 3, W = 2, R = 2, both reads and writes tolerate one replica being down. Tuning shifts the balance: W = 1 makes writes fast and always available but reads must use R = N to overlap; W = N makes every write reach all replicas and reads can use R = 1, but a single down replica blocks writes. Cassandra exposes this per request as consistency levels (<code>ONE</code>, <code>QUORUM</code>, <code>LOCAL_QUORUM</code>, <code>ALL</code>).</p>
+<p>Replicas that missed writes — they were down, or a message was lost — are brought back in line in two ways. <strong>Read repair</strong>: when a read sees replicas return different versions, it writes the newest back to the stale ones. <strong>Anti-entropy</strong>: a background process compares replicas, efficiently using <strong>Merkle trees</strong> (trees of hashes where comparing two roots tells you whether any data differs, and walking down finds where), and copies over differences. Dynamo also used <strong>sloppy quorums</strong> with <strong>hinted handoff</strong>: if some of a key's home replicas are unreachable, the write goes to other nodes temporarily, which hand it over when the home nodes return. That keeps writes available during failures, at the cost that a read quorum might not overlap the nodes actually holding the latest write.</p>
+<p>Quorums are often described as giving strong consistency, but they don't fully. If a write succeeds on only one replica and then fails, some reads return it and others don't; concurrent writes need conflict resolution (often last-writer-wins, with its clock problems); and sloppy quorums break the overlap. Leaderless systems are best understood as highly available with tunable, probabilistic freshness. When you need linearizability — every read seeing the latest write, as if there were one copy — you need consensus (sc9).</p>
+
+<h4>8. Backups: what replication doesn't give you</h4>
+<p>Replication protects against machines failing. It does nothing against the more common causes of data loss: a mistaken <code>DELETE</code> without a <code>WHERE</code>, a migration that drops the wrong column, an application bug that corrupts rows, ransomware, or an operator running a command on the wrong server. All of those replicate instantly. That's what backups are for.</p>
+<p>The standard approach for a relational database is a periodic <strong>base backup</strong> (a full physical copy, taken online) plus <strong>continuous archiving</strong> of every write-ahead log segment to separate storage, typically object storage in another account or region. Together they allow <strong>point-in-time recovery</strong> (PITR): restore the base backup and replay the archived log up to any moment — say, 14:31:59, one second before the bad migration. Tools like pgBackRest, WAL-G and Barman automate this for PostgreSQL; managed databases include it.</p>
+<p>Two numbers frame backup and replication design. The <strong>recovery point objective</strong> (RPO) is how much recent data you can afford to lose: zero for a synchronous replica, seconds for asynchronous replication, the archive interval for log archiving, a day for nightly dumps. The <strong>recovery time objective</strong> (RTO) is how long recovery may take: seconds for automatic failover, hours for restoring a multi-terabyte backup. Different failures hit different mechanisms, so a complete design states both numbers for machine failure, zone failure, region failure and human error. And one rule overrides everything else: <strong>a backup you haven't restored is not a backup</strong>. Automated, regular restore tests are the only proof.</p>
+
+<h4>9. A real-world walk-through: an order database that survives a zone with zero loss</h4>
+<p>An e-commerce company's order database takes 3,000 writes per second at peak and 40,000 reads per second. Requirements: losing one availability zone must lose no acknowledged orders and recover within a minute; losing the whole region may lose at most a minute of data; and a mistaken migration must be recoverable to the second. Here's the design and the reasoning.</p>
+<p><strong>Topology.</strong> PostgreSQL with a leader in zone A and two standbys in zones B and C, managed by Patroni with a three-node etcd cluster spread across the same three zones. Patroni holds the leader key in etcd with a 30-second TTL; the leader renews it every 10 seconds and demotes itself if it can't.</p>
+<p><strong>Commit durability.</strong> <code>synchronous_standby_names = 'ANY 1 (standby_b, standby_c)'</code> with <code>synchronous_commit = on</code>. Each commit waits for whichever standby flushes it first. Cross-zone round trips in the region are about a millisecond, so commit latency rises from roughly 1 ms to 2-3 ms — acceptable for orders. If one standby fails, commits continue using the other. If both fail, commits block: the team deliberately chose to stop taking orders rather than take orders it might lose, and alerts fire long before that point.</p>
+<p><strong>Failover.</strong> If zone A fails, the leader stops renewing its key. After the TTL expires, Patroni on a standby that is known to be synchronous acquires the key and promotes itself; the old leader, if it's actually alive but isolated, has already demoted itself because it couldn't reach an etcd majority. Clients connect through a proxy layer that routes writes to whichever node holds the leader key. End-to-end, writes are unavailable for roughly 30-45 seconds, inside the one-minute objective. Because the promoted standby was synchronous, it has every acknowledged order — zero loss.</p>
+<p><strong>Reads.</strong> The 40,000 reads per second go mostly to two additional asynchronous replicas (plus the standbys), behind a read endpoint. Order history for the user who just placed an order is read with an LSN check: the checkout service stores the commit LSN in the session, and the order-history service uses a replica only if it has replayed past it, otherwise the leader. Analytics queries go to a separate replica with <code>hot_standby_feedback</code> off and a generous standby delay, so they neither bloat the leader nor block replay on the serving replicas.</p>
+<p><strong>Region loss.</strong> A standby cluster in a second region follows the leader asynchronously; normal lag is under a second, and an alert fires if it exceeds 30 seconds. Region failover is a deliberate, rehearsed human decision, because it may lose the last second or so of orders and because the application tier must move too. That meets the one-minute RPO for a region.</p>
+<p><strong>Human error.</strong> pgBackRest takes a nightly base backup and archives every WAL segment to object storage in the second region, under a separate account so a compromised production account can't delete them. A weekly automated job restores the latest backup to a scratch server, replays the logs to a random point and runs consistency checks — the proof that the backups work.</p>
+<p><strong>What it costs.</strong> Five database servers and three etcd nodes instead of one server, a few milliseconds on every commit, and a team that rehearses failover quarterly. Stated against the requirements — zone: zero loss, under a minute; region: under a minute of loss; mistakes: to the second — every piece has a job, which is the shape of a strong interview answer.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why "is the leader dead?" is fundamentally hard</h4>
+<p>In an asynchronous network — where messages can be delayed arbitrarily and processes can pause — no algorithm can perfectly distinguish a crashed node from a slow one. This isn't a tooling gap; it's a theorem-level property of distributed systems (related to the FLP impossibility result — Fischer, Lynch and Paterson's 1985 proof that no algorithm can guarantee consensus in a fully asynchronous system if even one process may crash). Practical systems cope by using timeouts and accepting that they'll sometimes be wrong, then making wrong guesses safe: consensus ensures only one node can be elected at a time, and fencing ensures a wrongly deposed leader can't do damage. When you hear "we need faster failover", the senior response is to ask what happens when the detector is wrong, because a false failover under load — promoting a follower while the old leader is merely stalled — can cause more disruption than the stall itself.</p>
+
+<h4>Epochs, leases and the clock problem</h4>
+<p>Leases depend on time: the leader assumes it holds leadership until its lease expires, and everyone else assumes it doesn't after that. That only works if clocks advance at roughly the same rate and processes don't pause unexpectedly. A virtual machine can be suspended for seconds during live migration; a garbage-collection pause can exceed a lease; a clock can jump when synchronised. Martin Kleppmann's well-known analysis of distributed locks shows a lock holder paused past its lease writing to storage after another holder took over. The robust fix is the fencing token: the lock or leadership service issues a strictly increasing number with each grant, and the storage refuses writes with a token lower than one it has already seen. Raft's term numbers and ZooKeeper's zxid play exactly this role, which is why replication systems built on them can reject a stale leader's messages without trusting anyone's clock.</p>
+
+<h4>Semi-synchronous replication's subtle windows</h4>
+<p>MySQL's semi-synchronous replication illustrates how precise the details must be. In its original mode (wait point <code>AFTER_COMMIT</code>), the leader committed the transaction to its storage engine, making it visible to other sessions, and only then waited for a replica's acknowledgement. If the leader crashed during that wait, other clients might already have read data that no replica had — a "phantom read" of data that vanished after failover. The lossless mode (<code>AFTER_SYNC</code>, the default since MySQL 5.7) waits for the replica's acknowledgement after writing the binary log but before committing to the engine, so nothing becomes visible until it's on two machines. There's also a timeout after which semi-sync silently degrades to asynchronous if no replica responds, which preserves availability but quietly removes the durability guarantee — a setting worth knowing is there, because it's exactly the kind of fallback that turns into data loss in an incident.</p>
+
+<h4>Replicating the log to storage instead of to databases</h4>
+<p>Cloud-native databases rethink where replication happens. Amazon Aurora doesn't ship pages or rows to replica databases for durability; the database sends only log records to a distributed storage layer that keeps six copies of each piece of data across three availability zones. A write is durable when four of the six storage nodes acknowledge it, and reads need three, so the system survives losing an entire zone plus one more node without losing data, and can keep writing after losing a zone. Read replicas share the same storage and only need the log stream to update their caches, so they lag by milliseconds and can be promoted quickly. Google's AlloyDB, Neon and others use related designs. The idea — the log is the database, and storage replicates the log with quorums — decouples durability from the compute nodes and makes failover mostly a matter of starting a new compute node against the same storage.</p>
+
+<h4>Version vectors and knowing what "newer" means</h4>
+<p>In leaderless and multi-leader systems, "return the newest version" requires knowing which of two versions is newer — or that neither is, because they were written concurrently. Timestamps can't tell concurrent writes apart from ordered ones, and clocks lie. <strong>Version vectors</strong> track, for each replica, how many updates from that replica a version has seen. Version A supersedes B if A's counters are all greater than or equal to B's; if each has a counter greater than the other's, they're concurrent and must be merged or kept as siblings. Dynamo returned all concurrent siblings to the client to merge (the shopping-cart union), while Cassandra chose last-writer-wins by timestamp for simplicity, accepting its data-loss risk. Understanding this is the difference between saying "Cassandra is eventually consistent" and being able to explain exactly which concurrent updates it can lose.</p>
+
+<h4>Replication topology at scale</h4>
+<p>A leader streaming to dozens of followers spends CPU and network on each stream, so large deployments use <strong>cascading replication</strong>: some followers relay the log to others, forming a tree, at the price of extra lag for the leaves. Cross-region followers are often fed from a local relay so only one stream crosses the expensive, high-latency link. And <strong>delayed replicas</strong>, deliberately kept an hour behind (<code>recovery_min_apply_delay</code> in PostgreSQL), provide a fast way to rescue data from a recent mistake — stop replay, read the pre-mistake data — without a full restore, though they complement rather than replace proper backups.</p>
+</section>
+
+<section data-field="prod">
+<h4>What to watch</h4>
+<p><strong>Replication lag</strong>, per replica, in both bytes and seconds: PostgreSQL's <code>pg_stat_replication</code> on the leader shows each follower's sent, write, flush and replay positions and the corresponding lag times; MySQL's <code>SHOW REPLICA STATUS</code> shows <code>Seconds_Behind_Source</code> (which reads zero when the replica isn't receiving anything, so pair it with a heartbeat table). Alert on sustained growth, not on brief spikes. Also watch: whether synchronous standbys are connected (a leader with none has silently stopped being zero-loss, or will block writes); replication slot retention (an abandoned slot makes the leader keep log files forever, filling its disk); query cancellations on standbys; failover events and their duration; and the timestamp of the last successful backup and last successful restore test.</p>
+
+<h4>Characteristic failures</h4>
+<p><strong>Lag spikes.</strong> A bulk update, an index build or a large migration on the leader generates log faster than followers can replay it (replay is often single-threaded), and read replicas fall minutes behind, so users see stale data everywhere. Break bulk work into batches and throttle it on replica lag.</p>
+<p><strong>Disk full from retained logs.</strong> A replication slot for a follower or CDC consumer that has disappeared keeps the leader from recycling log segments; the leader's disk fills and it stops. Monitor slot lag and drop dead slots.</p>
+<p><strong>Silent loss of synchronous protection.</strong> The synchronous standby disconnected days ago; the configuration allowed commits to continue (or semi-sync degraded to async after a timeout), and nobody noticed until a failover lost data.</p>
+<p><strong>Failover flapping.</strong> An overly sensitive detector fails over on transient slowness, the new leader is cold (empty caches, so slower), triggers another failover, and so on. Tune timeouts and require sustained failure.</p>
+<p><strong>Split brain.</strong> Rare with consensus-based tools, but it still happens with hand-rolled scripts, misconfigured fencing, or clients that keep writing to a cached old leader address.</p>
+
+<h4>Knobs</h4>
+<p>Synchronous commit level and which standbys count (<code>synchronous_commit</code>, <code>synchronous_standby_names</code> with <code>FIRST</code> or <code>ANY</code>); failure-detection timeouts and lease TTLs in the failover manager; <code>max_standby_streaming_delay</code> and <code>hot_standby_feedback</code> for read replicas; <code>wal_keep_size</code> and <code>max_slot_wal_keep_size</code> to cap retained log; read-routing policy in the application (leader after write, LSN-aware, sticky per user); and backup schedule, retention and restore-test frequency.</p>
+
+<h4>Real incidents</h4>
+<p><strong>GitHub, October 2018.</strong> A 43-second network partition separated GitHub's primary US East data centre from the rest of its network. Orchestrator, their MySQL failover system backed by Raft consensus, saw the East primaries as unreachable and failed several clusters over to the US West data centre. When the network recovered, the East primaries held several seconds of writes that had never replicated West — one busy cluster had 954 such writes — while the West had already accepted new writes. Worse, applications running in the East performed poorly with every database query now crossing the country. GitHub decided that preserving data mattered more than a quick recovery: rather than discard either side's writes, it "failed forward", restoring from backups, replaying and reconciling writes, and ran degraded for 24 hours and 11 minutes. The lessons: a failover can be correct by the consensus protocol and still be wrong for the system, because topology and latency matter; asynchronous replication turns every failover into a potential reconciliation project; and automatic cross-region promotion needs guardrails.</p>
+<p><strong>GitLab, January 2017.</strong> During a night of fighting database load and a broken replica, an engineer attempting to wipe the replica's data directory to rebuild it ran the command on the primary instead. About 300 GB were deleted before it was stopped. The replica was out of sync, so it couldn't serve as a source. Then the backups failed one by one: the scheduled logical dumps had been silently failing because of a version mismatch, and other mechanisms weren't configured as the team believed. The eventual recovery used a staging snapshot taken six hours earlier, so about six hours of data — issues, merge requests, comments, users — were lost. GitLab's transparent post-mortem makes this lesson's two points vividly: replicas don't protect you from humans, and backups that aren't regularly restored may not exist.</p>
+</section>
+
+<section data-field="lab">
+<p>A short simulation of asynchronous replication, to see read-your-writes break and the log-position fix work. It needs only Python 3 and takes two minutes.</p>
+<pre>import threading, time
+log, replica, applied = [], {}, [0]          # leader's log, replica's data, replica's position
+
+def replicate():                              # the replica replays the log 200 ms behind
+    while True:
+        while applied[0] &lt; len(log):
+            key, value = log[applied[0]]
+            time.sleep(0.2)                   # network + replay delay
+            replica[key] = value
+            applied[0] += 1
+        time.sleep(0.01)
+threading.Thread(target=replicate, daemon=True).start()
+
+def write(key, value):                        # commit on the leader; return the log position
+    log.append((key, value)); return len(log)
+
+def read_replica(key, min_pos=0):             # optionally wait until the replica has caught up
+    while applied[0] &lt; min_pos:
+        time.sleep(0.01)
+    return replica.get(key)
+
+pos = write("name", "Mei")
+print("read right after write:        ", read_replica("name"))
+print("read waiting for log position: ", read_replica("name", min_pos=pos))</pre>
+<p>Output:</p>
+<pre>read right after write:         None
+read waiting for log position:  Mei</pre>
+<p><strong>What it shows.</strong> The first read goes straight to the replica, which hasn't replayed the write yet, so the user's own change seems to be missing — a read-your-writes violation. The second read carries the log position returned by the write and waits until the replica has applied at least that much, which is exactly what LSN-aware routing does with <code>pg_current_wal_lsn()</code> on the leader and <code>pg_last_wal_replay_lsn()</code> on a PostgreSQL replica.</p>
+<p><strong>Think it through.</strong> (1) Change <code>write</code> to wait until <code>applied[0] &gt;= len(log)</code> before returning: you've made replication synchronous — what happened to write latency? (2) Imagine the leader crashes right after <code>write</code> returns in the original version, and the replica is promoted: which write is lost, and would the synchronous version have lost it? (3) With N = 5 replicas, which values of W and R guarantee overlap while tolerating two failed replicas for both reads and writes? (Answer: W = 3, R = 3.)</p>
+</section>
+
+<section data-field="drill">
+<b>Diagnose it</b>
+<p>After moving reads to three async Postgres replicas, users report: (1) "I changed my display name, saved, and the old one came back"; (2) "My order list showed 3 orders, I refreshed, it showed 2, refreshed again, 3"; (3) during a failover last month, some orders confirmed to customers disappeared. Explain each and fix it.</p>
+<details><summary>Answer</summary>
+<p><strong>(1) Read-your-writes violation.</strong> The save went to the leader; the next read hit a replica that hadn't replayed it yet. Fix: after a user writes, route that user's reads to the leader for a short window (for example 10-30 s, tracked in the session), or record the leader's WAL position (LSN) with the write and only read from a replica that has replayed past it. Data the user edits themselves (their profile) can simply always be read from the leader.</p>
+<p><strong>(2) Monotonic-reads violation.</strong> Successive refreshes hit replicas with different amounts of lag, so the user saw newer data and then older data. Fix: pin each user or session to one replica (for example by a hash of the user ID), falling back to another only if it's unhealthy.</p>
+<p><strong>(3) Lost acknowledged writes on failover.</strong> With purely asynchronous replication, the leader acknowledged commits that hadn't reached any replica before it died; the promoted replica never had them, and rewinding the old leader to rejoin discarded them. Fix: synchronous replication to at least one standby for critical data (<code>synchronous_commit = on</code> with <code>synchronous_standby_names = 'ANY 1 (…)'</code> across two standbys so one failure doesn't block writes), accepting a millisecond or two per commit; a consensus-based failover manager so promotion picks a synchronous standby and the old leader is fenced; and order confirmation that is idempotent and reconciled against payment records.</p></details>
+</section>

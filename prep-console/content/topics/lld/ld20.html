@@ -1,0 +1,164 @@
+<!-- topic source for lld/ld20; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld20",
+  "t": "Implement deadlock-free money transfer",
+  "tag": "Concurrency",
+  "sum": "Two locks, two threads, opposite order — the classic deadlock and the three ways out.",
+  "qa": [
+    [
+      "E",
+      "How do two threads deadlock transferring money?",
+      "Thread one transfers A to B and takes A's lock; thread two transfers B to A and takes B's lock. Each now waits for the lock the other holds. No error, no CPU use, no timeout — both threads simply stop forever."
+    ],
+    [
+      "M",
+      "What is the standard fix?",
+      "Impose a global ordering on locks and always acquire in that order — for example, lower account id first. Any two threads contending for the same pair then agree which to take first, so a cycle is impossible. One comparison removes the whole class of bug."
+    ],
+    [
+      "M",
+      "Why is a self-transfer check load-bearing?",
+      "Because if both accounts are the same, the code acquires the same non-reentrant lock twice from one thread and deadlocks instantly and deterministically. It is the first thing that breaks when a user transfers to themselves."
+    ],
+    [
+      "H",
+      "Why does try-lock with retry need random backoff?",
+      "Without it, two threads retry in lockstep, each repeatedly grabbing and releasing without progressing — livelock. That is arguably worse than deadlock, because CPU is busy and the system appears to be working while nothing completes."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "Deadlock",
+      "The four Coffman conditions, and the standard prevention strategies mapped to each.",
+      "https://en.wikipedia.org/wiki/Deadlock"
+    ],
+    [
+      "docs",
+      "Dining philosophers problem",
+      "The same circular-wait structure as a teaching problem, with the resource-hierarchy solution that lock ordering generalises.",
+      "https://en.wikipedia.org/wiki/Dining_philosophers_problem"
+    ],
+    [
+      "docs",
+      "PostgreSQL: explicit locking and deadlock detection",
+      "How a database handles the same problem — detection and victim abort rather than prevention — and why you must order your updates anyway.",
+      "https://www.postgresql.org/docs/current/explicit-locking.html"
+    ],
+    [
+      "docs",
+      "Lock (computer science)",
+      "Granularity, striping and the trade-offs between coarse and fine-grained locking.",
+      "https://en.wikipedia.org/wiki/Lock_(computer_science)"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+
+</section>
+
+<section data-field="primer">
+<h4>Start here — the smallest possible deadlock</h4>
+  <p>Transfer money from account A to B. You must lock both, or another thread could read a half-completed transfer. So:</p>
+  <pre><span class="k">def</span> transfer(a, b, amount):
+    <span class="k">with</span> a.lock:
+        <span class="k">with</span> b.lock:
+            a.balance -= amount
+            b.balance += amount</pre>
+  <p>Correct, and it deadlocks. Thread 1 transfers A→B and takes A's lock. Thread 2 simultaneously transfers B→A and takes B's lock. Thread 1 now waits for B; thread 2 waits for A. <strong>Neither will ever proceed.</strong> No error, no timeout, no CPU usage — the two threads are simply gone, and if those are request threads, two requests hang forever.</p>
+  <h4>The four conditions</h4>
+  <p>A deadlock requires all four of these simultaneously, and breaking <em>any one</em> prevents it:</p>
+  <ul>
+  <li><strong>Mutual exclusion</strong> — the resource cannot be shared. (Rarely removable.)</li>
+  <li><strong>Hold and wait</strong> — a thread holds one lock while requesting another.</li>
+  <li><strong>No preemption</strong> — a lock cannot be taken away from its holder.</li>
+  <li><strong>Circular wait</strong> — a cycle in the "waiting for" graph.</li>
+  </ul>
+  <p>The practical fix attacks <strong>circular wait</strong>, and it is almost embarrassingly simple.</p>
+  <h4>The answer</h4>
+  <p><strong>Impose a global ordering on locks and always acquire in that order.</strong> If every thread takes the lower-numbered account's lock first, a cycle is impossible: any two threads contending for the same pair agree on which to take first, so one of them gets both. One comparison removes an entire class of bug.</p>
+</section>
+
+<section data-field="body">
+<h4>Requirements</h4>
+  <p>Transfer between accounts atomically and thread-safely, with no deadlock under any interleaving, correct under self-transfer, and detectable insufficient funds. Clarify: must a failed transfer be retryable? Are multi-account transfers (three-way) required? Both change the approach.</p>
+  <h4>Solution 1 — lock ordering (the default)</h4>
+  <pre><span class="k">class</span> Account:
+    <span class="k">def</span> __init__(self, id):
+        self.id, self.balance, self.lock = id, 0, threading.Lock()
+
+<span class="k">def</span> transfer(a, b, amount):
+    <span class="k">if</span> a.id == b.id:
+        <span class="k">raise</span> ValueError(<span class="c">"cannot transfer to self"</span>)   <span class="c"># else self-deadlock</span>
+    first, second = (a, b) <span class="k">if</span> a.id &lt; b.id <span class="k">else</span> (b, a)
+    <span class="k">with</span> first.lock:
+        <span class="k">with</span> second.lock:
+            <span class="k">if</span> a.balance &lt; amount:
+                <span class="k">raise</span> InsufficientFunds
+            a.balance -= amount
+            b.balance += amount</pre>
+  <p><strong>The self-transfer check is not decoration.</strong> Without it, <code>a</code> and <code>b</code> being the same account means acquiring the same non-reentrant lock twice from one thread, which deadlocks instantly and deterministically — a bug that shows up the first time a user transfers to themselves.</p>
+  <p><strong>Ordering by a stable identity.</strong> Use a permanent account id, not a memory address or hash, which can vary between processes or runs. If no natural ordering exists, assign every lockable object a monotonically increasing sequence number at creation.</p>
+  <h4>Solution 2 — try-lock with backoff</h4>
+  <pre><span class="k">def</span> transfer(a, b, amount, tries=100):
+    <span class="k">for</span> _ <span class="k">in</span> range(tries):
+        <span class="k">if</span> a.lock.acquire(timeout=0.001):
+            <span class="k">try</span>:
+                <span class="k">if</span> b.lock.acquire(timeout=0.001):
+                    <span class="k">try</span>:
+                        <span class="k">return</span> self._apply(a, b, amount)
+                    <span class="k">finally</span>: b.lock.release()
+            <span class="k">finally</span>: a.lock.release()
+        time.sleep(random.uniform(0, 0.001))   <span class="c"># jitter, or they re-collide</span>
+    <span class="k">raise</span> CouldNotAcquire</pre>
+  <p>Breaks <em>hold and wait</em>: if the second lock is unavailable, release the first and retry. Useful when no natural ordering exists. <strong>The random backoff is essential</strong> — without it, two threads retry in lockstep and livelock, each repeatedly grabbing and releasing, making no progress while burning CPU. That is arguably worse than a deadlock, because it looks like the system is working.</p>
+  <h4>Solution 3 — a single coarse lock</h4>
+  <p>One global lock for all transfers. Trivially deadlock-free and correct. It serialises every transfer in the system, which at low volume is entirely fine — and saying "I would start here and only shard the locking if measurement showed contention" is a legitimate, mature answer rather than a cop-out.</p>
+  <h4>Extensions</h4>
+  <ul><li><strong>Multi-account transactions:</strong> lock ordering generalises directly — sort all participating accounts by id and acquire in order. Try-lock does not generalise nearly as well.</li>
+  <li><strong>Lock striping:</strong> with millions of accounts, a lock per account is a lot of objects. Hash accounts into N locks; ordering still works on lock index, but two accounts may share a lock, so you must handle "both map to the same lock" without double-acquiring.</li>
+  <li><strong>The database version:</strong> the same problem exists in SQL, and the same fix applies — update rows in a consistent order (say, ascending primary key) or the database will detect a deadlock and abort one transaction, which you must then retry.</li></ul>
+<h4>Complexity and trade-offs</h4><p>Lock ordering: O(1) extra work per transfer and no retries — the default answer. Try-lock with backoff: no global order needed but can livelock without randomised backoff. A single global lock: trivially correct and fully serialised — acceptable at low throughput. In databases the same problem appears as row-lock ordering.</p><h4>Test plan — say these out loud, then write the first three</h4><ul><li>Single transfer moves money and preserves the total across accounts.</li><li>Insufficient funds → rejected with no change to either account.</li><li>Transfer to self is rejected or a no-op (and does not deadlock by locking the same account twice).</li><li>Thousands of random concurrent transfers in both directions between the same accounts complete without deadlock, and the total is unchanged.</li><li>Amounts are integers in minor units; negative amounts rejected.</li></ul><h4>Edge cases checklist</h4><ul><li>Accounts with equal ids or identity-based ordering on objects without stable ids.</li><li>Transfers involving more than two accounts — sort all locks.</li><li>Timeouts on lock acquisition for liveness diagnostics.</li><li>Auditing: every transfer recorded atomically with the balance change.</li></ul><h4>Follow-ups, with the answer in one breath</h4><ul><li><strong>Why does ordering prevent deadlock?</strong> It removes the circular-wait condition: every thread acquires locks in the same global order, so no cycle can form.</li><li><strong>How is this done in a database?</strong> Update rows in a consistent order (by account id) inside one transaction, or use a single UPDATE with a CASE; the database detects any remaining deadlocks and aborts one transaction, which you retry.</li><li><strong>Across services?</strong> No shared locks — use a ledger service with double-entry postings in one database, or a saga with idempotent steps.</li><li><strong>Why integers for money?</strong> Exact arithmetic; floats accumulate rounding errors and break reconciliation.</li></ul>
+</section>
+
+<section data-field="deep">
+<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Lock ordering must be a documented, enforced invariant, not a local convention.</strong> It only works if <em>every</em> code path obeys it, so one function somewhere taking B before A reintroduces the cycle. Encode it: wrap multi-lock acquisition in a single helper that sorts, and make direct <code>lock.acquire()</code> on these objects private. Some teams go further and assert lock-ordering at runtime in debug builds, tracking which locks a thread holds and failing loudly on an out-of-order acquisition — which turns a rare production deadlock into a deterministic test failure.</li>
+  <li><strong>Deadlocks are invisible in ordinary monitoring,</strong> which is why they are so damaging. The threads consume no CPU, throw nothing and log nothing; they simply stop. The service's error rate may not move at all — requests time out at the client instead. Detection therefore has to be deliberate: a watchdog that periodically checks for threads blocked beyond a threshold, lock acquisition timeouts so a wait becomes an exception rather than an eternity, and thread dumps on demand. <em>Always prefer a timed acquire in production code</em>, because a timeout converts an undiagnosable hang into a logged error with a stack trace.</li>
+  <li><strong>The atomicity requirement is what forces two locks, so question it.</strong> If transfers were modelled as an append-only ledger — insert a debit row and a credit row in one transaction — you would not lock two mutable balances at all, and balances become derived. That is the payments-ledger design, and it sidesteps this entire problem. Raising it shows you can question the premise: the deadlock is a consequence of mutable per-account state, not an inherent property of transferring money.</li>
+  <li><strong>Testing for deadlock needs stress plus a watchdog, not unit tests.</strong> Run many threads performing random transfers among a small set of accounts — a small set is essential, because it maximises contention — with a test-level timeout that fails if the run does not complete. Assert afterwards that the total balance across all accounts is unchanged, which catches both lost updates and partial transfers. Deterministic unit tests will never produce the interleaving.</li>
+  <li><strong>Know which solution to pick and why.</strong> Lock ordering when a stable ordering exists, which is nearly always — it is deterministic, has no retry loop, and has no livelock risk. Try-lock when ordering is impossible, for example when the set of resources is discovered during the operation. A single coarse lock when contention is genuinely low; complexity you do not need is its own kind of bug.</li>
+  </ul>
+</section>
+
+<section data-field="prod">
+
+</section>
+
+<section data-field="lab">
+
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+    <p>A payments service processes 500 transfers/s among 10,000 accounts. It uses per-account locks with no ordering. One account — the platform's fee account — is a party to 40% of all transfers.</p>
+    <p>(a) What is the probability of a deadlock-prone pair, and how often will it happen? (b) What is the effect of the hot fee account? (c) Fix both problems.</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Deadlock frequency.</strong> A deadlock requires two concurrent transfers over the same pair of accounts in opposite directions, overlapping in the window between acquiring the first lock and the second — a window of perhaps a microsecond.</p>
+    <p>For two random accounts out of 10,000 the chance of any given pair colliding is minuscule. But the calculation that matters is not per-pair, it is over time: with 500 transfers/s over months, a rare interleaving is a certainty. This is the defining characteristic of the bug — <strong>it is vanishingly unlikely in testing and inevitable in production</strong>, so it surfaces as an unexplained hang weeks after release, typically under peak load when the windows widen.</p>
+    <p>And the fee account changes the arithmetic completely. 40% of 500/s = 200 transfers/s touch it, so at any moment there are typically several concurrent transfers involving that one account, many in opposite directions (fees in, payouts out). The pair (fee_account, X) and (X, fee_account) now collide frequently rather than rarely — <strong>deadlocks go from a monthly mystery to a daily incident.</strong></p>
+    <p><strong>(b) The hot account has a second, separate problem.</strong> Even with deadlocks fixed, every one of those 200 transfers/s must serialise on the fee account's single lock. If a transfer holds it for 50 µs, the maximum throughput through that lock is 20,000/s — fine at 200/s, but the lock is now a global serialisation point and any increase in critical-section duration (a slow disk write, a log line, a network call inside the lock) directly caps the whole platform. <em>Never do I/O inside a lock</em> is the practical rule this illustrates.</p>
+    <p><strong>(c) The fixes.</strong></p>
+    <ul>
+    <li><strong>Lock ordering by account id</strong> — one comparison, eliminates deadlock entirely and deterministically. Do this first; it is free.</li>
+    <li><strong>Enforce it structurally:</strong> a single <code>with_accounts_locked(*accounts)</code> helper that sorts and acquires, with direct lock access made private. A convention that lives in developers' heads will be violated.</li>
+    <li><strong>Timed acquisition</strong> so that even if something slips through, a thread raises after a second rather than hanging forever — and logs a stack trace identifying the participants.</li>
+    <li><strong>Shard the hot account.</strong> Split the fee account into N sub-accounts (<code>fee_00</code> … <code>fee_15</code>), pick one at random per transfer, and treat the logical balance as their sum. Contention drops by a factor of N, and the sum is computed on read. This is the same hot-key fix as the cache, the partitioned log and the feed — worth naming as the recurring pattern it is.</li>
+    <li><strong>Or remove the mutable balance entirely</strong> — an append-only ledger with derived balances has no per-account lock to contend on, because appends to different rows do not conflict. This is the structurally best answer and the largest change.</li>
+    </ul>
+    <p><strong>What to say in the interview:</strong> lead with lock ordering because it is correct and costs one line, then immediately point out that ordering fixes the deadlock but not the contention, and that the hot account needs sharding or a different data model. Recognising that there are <em>two</em> problems here — a correctness bug and a scalability bottleneck, with different fixes — is what the question is designed to surface.</p></details>
+</section>

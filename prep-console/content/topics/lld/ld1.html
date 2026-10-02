@@ -1,0 +1,797 @@
+<!-- topic source for lld/ld1; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld1",
+  "t": "LRU cache with O(1) get and put",
+  "tag": "Data structures",
+  "sum": "The canonical machine-coding warm-up: clarify, build a naive cache, then a hash map plus doubly linked list with sentinels, test it against a reference, and handle thread safety, TTL, byte budgets and why Redis only approximates LRU.",
+  "prereq": [
+    [
+      "py2",
+      "A dict gives average O(1) lookup by key; a list gives O(1) append but O(n) insert or delete in the middle, because everything after the position shifts."
+    ],
+    [
+      "py6",
+      "Classes, __slots__, dunder methods such as __len__ and __contains__, and how attributes live on instances."
+    ],
+    [
+      "py9",
+      "Threads share memory; the GIL makes single bytecodes atomic but not multi-step updates, so shared structures need a lock."
+    ],
+    [
+      "swe5",
+      "Unit tests, test doubles and the idea of comparing an implementation against a simple trusted reference."
+    ]
+  ],
+  "myths": [
+    [
+      "A singly linked list is enough if the hash map points at the nodes.",
+      "The map gets you to the node, but unlinking a node means changing its predecessor's <code>next</code> pointer, and a singly linked node does not know its predecessor. Finding it means walking from the head, which is O(n) and defeats the design. The second pointer is the whole trick."
+    ],
+    [
+      "get() only reads, so a thread-safe cache can let many readers in at once.",
+      "In an LRU cache every successful <code>get</code> moves the node to the front, which rewrites four pointers. It is a write to the structure. A read-write lock buys nothing; real implementations use one lock, shard the cache, or switch to an approximate policy that does not reorder on read."
+    ],
+    [
+      "LRU is the best general-purpose eviction policy.",
+      "LRU is a good default for workloads with recency, but a single scan (a batch job reading every key once) flushes the entire hot set for data that will never be read again. Frequency-aware policies such as W-TinyLFU beat it on most real traces, and Redis does not even run exact LRU; it samples."
+    ],
+    [
+      "Python's dict is ordered, so a dict already is an LRU cache.",
+      "A dict keeps insertion order, not access order. Reading a key does not move it. You can emulate a refresh by deleting and reinserting, which works but is clumsy; <code>OrderedDict.move_to_end</code> does it directly in O(1), and that is the honest ten-line answer."
+    ],
+    [
+      "Capacity means number of entries, so the cache bounds memory.",
+      "Entries vary from a few bytes to megabytes. A cache of 1,000 entries can hold 10 KB or 10 GB. Production caches bound bytes, which turns the single eviction in <code>put</code> into a loop that may evict several entries to fit one large value."
+    ],
+    [
+      "Using None as the miss value is fine.",
+      "Only if None can never be stored. If callers cache a legitimately empty result (a user with no profile, a function that returned None), a None miss marker makes every such hit look like a miss and the cache recomputes forever. Use a private sentinel object or raise KeyError."
+    ]
+  ],
+  "recap": [
+    "An LRU cache holds at most a fixed number of entries and, when full, evicts the one used longest ago, betting on temporal locality.",
+    "The O(1) design pairs a hash map from key to node with a doubly linked list ordered by recency: the map finds a node in O(1), the two pointers let you unlink it in O(1).",
+    "Sentinel head and tail nodes make every real node have real neighbours, so unlink and push-to-front are a few pointer assignments with no special cases.",
+    "Every get moves the node to the front; put updates in place without evicting when the key exists, and only evicts the node before the tail when inserting a new key into a full cache.",
+    "Each node stores its key so that eviction, which starts from the list, can delete the matching map entry.",
+    "The invariant to protect is: the map and the list contain the same nodes, and their count never exceeds capacity; a fuzz test against OrderedDict checks it over thousands of random operations.",
+    "Thread safety needs a lock around get as well as put, because get rewires the list; sharding by key hash reduces contention at the price of approximate global recency.",
+    "Production systems approximate LRU (Redis samples keys, CLOCK uses a reference bit) or use frequency-aware admission like W-TinyLFU, because exact LRU costs memory and is defeated by scans."
+  ],
+  "glossary": [
+    [
+      "Amortised O(1)",
+      "An operation that is constant time on average over a long sequence, even though an occasional call (such as a dict resize) costs more."
+    ],
+    [
+      "Byte budget",
+      "A cache capacity expressed in bytes instead of entry count, so eviction continues until the total size of stored values fits."
+    ],
+    [
+      "Cache",
+      "A small, fast store that keeps copies of data that is expensive to fetch or compute, so repeated requests are answered quickly."
+    ],
+    [
+      "Cache stampede",
+      "Many concurrent requests miss on the same key at once and all recompute or refetch it, overloading the backend; also called thundering herd."
+    ],
+    [
+      "CDN",
+      "Content delivery network: a fleet of caching servers close to users that store copies of web content."
+    ],
+    [
+      "CLOCK",
+      "An LRU approximation that keeps entries in a circle with one reference bit each; a hand sweeps the circle, clearing bits and evicting the first entry whose bit is already clear."
+    ],
+    [
+      "Doubly linked list",
+      "A sequence of nodes where each node points to both the next and the previous node, so any node can be removed in O(1) once you hold it."
+    ],
+    [
+      "Eviction",
+      "Removing an entry from a full cache to make room for a new one."
+    ],
+    [
+      "Eviction policy",
+      "The rule that decides which entry to evict: least recently used, least frequently used, random, first in first out, and so on."
+    ],
+    [
+      "Fuzz test",
+      "A test that runs many randomly generated operations and checks the result after each, usually against a simple trusted reference implementation."
+    ],
+    [
+      "GIL",
+      "Global interpreter lock: the lock in standard CPython that lets only one thread execute Python bytecode at a time; it does not make multi-step updates atomic."
+    ],
+    [
+      "Hit rate",
+      "The fraction of lookups answered from the cache; the main measure of whether a cache is worth having."
+    ],
+    [
+      "Invariant",
+      "A condition that must be true between every public operation, such as 'the map and the list hold the same nodes'."
+    ],
+    [
+      "LFU",
+      "Least frequently used: an eviction policy that removes the entry accessed the fewest times."
+    ],
+    [
+      "LRU",
+      "Least recently used: an eviction policy that removes the entry whose last access is oldest."
+    ],
+    [
+      "MRU",
+      "Most recently used: the entry accessed last; in this design it sits right after the head sentinel."
+    ],
+    [
+      "OrderedDict",
+      "A dict subclass in Python's collections module that remembers order and can move a key to either end in O(1) with move_to_end."
+    ],
+    [
+      "Scan",
+      "An access pattern that touches many keys once each, such as a batch export; it pollutes an LRU cache with entries that will not be reused."
+    ],
+    [
+      "Sentinel node",
+      "A permanent dummy node at the head or tail of a linked list that holds no data and exists so that no operation needs an empty-list or end-of-list special case."
+    ],
+    [
+      "Sharding",
+      "Splitting one structure into N independent parts chosen by hash(key) mod N, so operations on different parts do not contend for the same lock."
+    ],
+    [
+      "Temporal locality",
+      "The tendency of programs to access again, soon, the data they accessed recently."
+    ],
+    [
+      "TTL",
+      "Time to live: how long an entry stays valid after it is written; after that it must be treated as absent."
+    ],
+    [
+      "W-TinyLFU",
+      "A cache policy (used by Java's Caffeine) that keeps approximate access frequencies in a small sketch and admits a new entry only if it is more popular than the entry it would evict."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why must the linked list be doubly linked?",
+      "Because removing a node from the middle in O(1) requires changing its predecessor's next pointer. The hash map takes you straight to the node, but a singly linked node does not know its predecessor, so you would have to walk from the head to find it, which is O(n) and defeats the design."
+    ],
+    [
+      "E",
+      "What do sentinel head and tail nodes buy you?",
+      "Every real node always has a real neighbour on both sides, so unlink and push-to-front never need a null check or a special case for an empty list, the first node or the last node. It removes the most common class of pointer bugs, and the code shrinks to a few assignments.",
+      "Follow-up: can you do it with one sentinel? — Yes: make the list circular with a single root whose next is the MRU and whose prev is the LRU. CPython's pure-Python lru_cache does exactly that."
+    ],
+    [
+      "E",
+      "Why does each node store its key and not just its value?",
+      "Eviction starts from the list: you take the node before the tail. To keep the map consistent you must delete that node's map entry, and the only way to know which key to delete is if the node carries it."
+    ],
+    [
+      "M",
+      "Walk me through what put does when the key already exists and the cache is full.",
+      "It finds the node through the map, overwrites the value, unlinks it and pushes it to the front, then returns. It must not evict, because the number of entries does not change. Checking capacity before checking for an existing key is the classic bug: it evicts a live entry, possibly the very key being updated.",
+      "Follow-up: what test catches that bug? — Fill a cache of capacity 2, update one existing key, then read the other: it must still be there and the eviction counter must be zero."
+    ],
+    [
+      "M",
+      "How would you test this implementation?",
+      "A few named unit tests for the cases people get wrong (update when full, capacity 1, storing None, eviction order after a mixed sequence), plus a fuzz test that runs thousands of random gets and puts against OrderedDict as a reference and compares the full recency order after every step. An invariant checker that walks the list and compares it with the map turns pointer bugs into immediate assertion failures.",
+      "Follow-up: why compare the whole order, not just the return values? — A pointer bug can corrupt order long before it changes a returned value; comparing order finds it at the operation that caused it."
+    ],
+    [
+      "M",
+      "Why does get need the lock in a thread-safe version?",
+      "Because get moves the node to the front, which rewrites four pointers. Two threads doing that concurrently can leave a node pointing at a neighbour that no longer points back, and the list is corrupted. It is a writer of the structure, so a read-write lock gives no concurrency."
+    ],
+    [
+      "M",
+      "How would you add a per-key TTL?",
+      "Store an expiry time in each node. On get, if the node has expired, remove it and report a miss (lazy expiry). Because expired entries still occupy capacity until touched, either evict expired entries before live ones when full or run a bounded background sweep. Use a monotonic clock, not wall time, so clock adjustments cannot expire or resurrect everything.",
+      "Follow-up: what if TTLs vary widely? — Keep a min-heap or timer wheel keyed by expiry so the sweeper finds the next expiring entry without scanning everything."
+    ],
+    [
+      "M",
+      "When would you just use OrderedDict or functools.lru_cache?",
+      "In real code, almost always: OrderedDict with move_to_end and popitem(last=False) gives the same O(1) bounds in ten lines and is implemented in C, so it is faster than a hand-written node class. lru_cache is right for memoising a pure function. In the interview, say so, then build the linked list because that is what is being assessed."
+    ],
+    [
+      "M",
+      "How do you bound the cache by bytes instead of entries?",
+      "Pass or compute a size for each value, keep a running total, and after inserting evict from the tail in a loop until the total fits. Reject or bypass values larger than the whole budget, otherwise the loop evicts everything and still does not fit.",
+      "Follow-up: how do you measure a Python object's size? — sys.getsizeof is shallow; use the serialised length if values are bytes or strings, or let the caller supply a size function."
+    ],
+    [
+      "H",
+      "Why do production caches not use exact LRU?",
+      "Two reasons. Exact LRU costs memory and work per access (two pointers per entry and a list update on every read), which Redis explicitly rejected in favour of sampling a few keys and evicting the oldest of them. And exact LRU is defeated by scans: one pass over cold data flushes the hot set. Frequency-aware policies such as W-TinyLFU admit a new item only if it is more popular than the victim, which resists scans."
+    ],
+    [
+      "H",
+      "Make this cache scale to 32 threads on a busy server.",
+      "First measure: if the lock is not the bottleneck, stop. If it is, shard into N independent caches by hash(key) mod N so threads mostly take different locks. Global recency becomes approximate and one shard may evict while another has room, which is usually acceptable. Beyond that, move to a design that does not reorder on read: a reference bit per entry (CLOCK) or a buffer of recent reads applied in batches, which is what Caffeine does.",
+      "Follow-up: does Python's GIL make this moot? — On the default build the GIL serialises bytecode, so sharding mostly reduces lock hand-offs rather than adding parallel CPU; on the free-threaded 3.13+ build real parallelism exists and the locking matters more."
+    ],
+    [
+      "H",
+      "Two requests miss on the same expensive key at the same time. What happens and how do you fix it?",
+      "Both compute the value, and under load hundreds can, which is a cache stampede that can take the backend down. Fix it with single-flight: the first miss records an in-progress marker (a Future) for the key, later misses wait on that Future instead of recomputing, and everyone gets the one result. Handle failure by removing the marker so the next request retries.",
+      "Follow-up: what about popular keys expiring? — Refresh slightly before expiry, with a small random jitter, so a hot key is recomputed by one request before everyone misses."
+    ],
+    [
+      "H",
+      "The interviewer asks for an LFU cache with O(1) operations. How does the design change?",
+      "Keep a map from key to node and a map from frequency to a doubly linked list of nodes with that frequency, plus a min-frequency counter. A get moves the node from list f to list f+1 and bumps min-frequency if list f emptied; eviction takes the LRU node from the min-frequency list; a new key starts at frequency 1 and resets min-frequency to 1. Every step is O(1). The trade-off to mention is that pure LFU never forgets old popularity, so real systems decay counts."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "Redis: Key eviction",
+      "Primary source for how a real cache does it: approximated LRU by sampling (maxmemory-samples 5 by default), a pool of candidates since Redis 3.0, and LFU with lfu-log-factor and lfu-decay-time. States that true LRU was rejected because it costs more memory.",
+      "https://redis.io/docs/latest/develop/reference/eviction/"
+    ],
+    [
+      "code",
+      "CPython Lib/functools.py: _lru_cache_wrapper",
+      "The pure-Python fallback of functools.lru_cache: a circular doubly linked list with one root sentinel, links stored as four-element lists, and a lock because the linked-list updates are not thread-safe.",
+      "https://github.com/python/cpython/blob/3.12/Lib/functools.py"
+    ],
+    [
+      "docs",
+      "functools.lru_cache",
+      "The standard-library memoiser: maxsize, typed, cache_info, cache_clear, and the warning about caching methods.",
+      "https://docs.python.org/3/library/functools.html#functools.lru_cache"
+    ],
+    [
+      "docs",
+      "collections.OrderedDict",
+      "move_to_end and popitem(last=False), the two methods that make the ten-line LRU possible; the docs include an LRU recipe.",
+      "https://docs.python.org/3/library/collections.html#collections.OrderedDict"
+    ],
+    [
+      "post",
+      "Caffeine: Efficiency",
+      "Hit-rate benchmarks of LRU against W-TinyLFU on real traces, showing how badly exact LRU handles scans.",
+      "https://github.com/ben-manes/caffeine/wiki/Efficiency"
+    ],
+    [
+      "paper",
+      "TinyLFU: A Highly Efficient Cache Admission Policy",
+      "Einziger, Friedman and Manes: the frequency sketch and admission filter behind modern caches.",
+      "https://arxiv.org/abs/1512.00727"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Picture a service that turns a user id into a profile by calling a database that takes 20 milliseconds per query. The same few thousand active users ask for their profiles again and again, so the service answers the same question thousands of times a minute, paying 20 milliseconds each time. The obvious fix is to remember answers in a dict. A week later the process has been killed for running out of memory, because the dict remembered every user who ever logged in and never forgot any of them.</p>
+<p>What you actually want is a store that remembers a limited number of answers and, when it is full, forgets the one least likely to be needed again. You cannot know the future, but programs have a strong habit: what was used a moment ago is likely to be used again soon. That habit is called <strong>temporal locality</strong>, and it suggests a simple rule. When you must forget something, forget the entry that was used longest ago. That rule is <strong>least recently used</strong>, or <strong>LRU</strong>, and a bounded store that follows it is an LRU cache.</p>
+<p>The rule is easy to say and surprisingly easy to implement slowly. Finding "the entry used longest ago" naively means scanning every entry, so each insertion into a full cache costs time proportional to the cache size. A cache of a million entries that scans a million entries per insert is slower than the database it was meant to protect. The interview question exists because the fast version needs two data structures working together, and the way they cooperate (one finds things, the other orders them) is a pattern you will reuse in half of the later machine-coding cases.</p>
+<p>That is why LRU is the standard opener of a machine-coding round. In 45 minutes the interviewer watches whether you clarify before typing, pick a clean interface, reach the right structure by reasoning rather than recall, keep the two structures consistent, test the edge cases where implementations usually break, and discuss what changes when the cache must be thread-safe, expire entries, or hold values of very different sizes.</p>
+<p>This lesson follows the round in order. It starts with the questions to ask, names the pieces and their responsibilities, sketches the interface, then builds the cache in stages: a correct but slow dict-with-timestamps version, a version built on a Python list, the ten-line OrderedDict version, and finally the hash map plus doubly linked list that the round is really about, traced pointer by pointer. Then come the full tested solution, the edge cases, the extensions an interviewer asks for, complexity, and why Redis and Caffeine do not use exact LRU at all.</p>
+</section>
+
+<section data-field="primer">
+<h4>Start here: what a machine-coding round marks</h4>
+<p>A machine-coding round is not a harder algorithm puzzle. You are asked to build a small, working component, the kind of class a colleague would import, in about 45 minutes, while talking. The interviewer is marking roughly four things: whether you pin down the requirements before you type, whether your interface and decomposition are clean, whether the code is correct on the cases that usually break, and how well you discuss the extensions you will not have time to build. A dense, clever, uncommented solution that you cannot explain scores worse than plain code with a clear invariant and three good tests.</p>
+<h4>The analogy: a desk with limited space</h4>
+<p>Think of a desk that holds eight folders. Every time you use a folder you put it on top of the pile. When a ninth folder arrives and the desk is full, you take the one at the bottom of the pile, the one you have not touched for longest, and put it back in the filing cabinet. The pile is the recency order; the bottom of the pile is the eviction candidate. That is LRU exactly.</p>
+<p>The analogy breaks in one useful place. On a real desk, finding a particular folder in the pile means looking through it, and pulling it out of the middle means lifting the folders above it. A computer has the same two problems. Finding a key in an ordered sequence is slow unless you also have an index, and removing from the middle of an array is slow because everything after it shifts. The design you are about to learn solves each problem with a separate structure.</p>
+<h4>Two structures, two jobs</h4>
+<p>A <strong>hash map</strong> (Python's <code>dict</code>) answers "where is the entry for this key?" in O(1) on average. O(1), read "order one" or "constant time", means the cost does not grow with the number of entries; O(n) means it grows in proportion to the number of entries n. The dict cannot tell you which entry is least recently used, because it does not keep access order.</p>
+<p>A <strong>doubly linked list</strong> answers "what is the order of use?" Each node holds one entry and two pointers, <code>prev</code> and <code>next</code>, to its neighbours. Removing a node you are already holding takes four pointer changes, no matter how long the list is, and adding a node at the front takes four more. What a list cannot do is find a node by key without walking it.</p>
+<p>Put them together and each covers the other's weakness. The dict maps every key to its node in the list. To read a key: the dict finds the node in O(1), you unlink it in O(1) and re-link it at the front in O(1). To evict: the node at the back of the list is the least recently used, so you unlink it in O(1) and delete its key from the dict in O(1). Every operation is a constant number of steps.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="A dict maps keys A, B, C to nodes in a doubly linked list ordered from most recently used after the head sentinel to least recently used before the tail sentinel">
+<defs><marker id="ld1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="20" style="fill:var(--ink);font-weight:600">dict: key → node</text>
+<rect x="20" y="30" width="110" height="28" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="75" y="49" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">"C" → ●</text>
+<rect x="20" y="58" width="110" height="28" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="75" y="77" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">"A" → ●</text>
+<rect x="20" y="86" width="110" height="28" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="75" y="105" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">"B" → ●</text>
+<rect x="40" y="170" width="80" height="44" rx="6" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+<text x="80" y="196" text-anchor="middle" style="fill:var(--muted)">head</text>
+<rect x="170" y="170" width="80" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="210" y="190" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">C:3</text>
+<text x="210" y="206" text-anchor="middle" style="fill:var(--muted)">MRU</text>
+<rect x="300" y="170" width="80" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="340" y="196" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">A:1</text>
+<rect x="430" y="170" width="80" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+<text x="470" y="190" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">B:2</text>
+<text x="470" y="206" text-anchor="middle" style="fill:var(--muted)">LRU</text>
+<rect x="560" y="170" width="70" height="44" rx="6" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+<text x="595" y="196" text-anchor="middle" style="fill:var(--muted)">tail</text>
+<line x1="120" y1="184" x2="168" y2="184" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="168" y1="200" x2="122" y2="200" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="250" y1="184" x2="298" y2="184" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="298" y1="200" x2="252" y2="200" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="380" y1="184" x2="428" y2="184" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="428" y1="200" x2="382" y2="200" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="510" y1="184" x2="558" y2="184" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="558" y1="200" x2="512" y2="200" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<path d="M130,44 C170,60 200,120 210,168" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--accent)"/>
+<path d="M130,72 C230,90 320,120 340,168" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--accent)"/>
+<path d="M130,100 C300,110 440,130 468,168" marker-end="url(#ld1-arrow)" style="fill:none;stroke:var(--accent)"/>
+<text x="330" y="240" text-anchor="middle" style="fill:var(--ink-2)">next → points right, prev ← points left; evict = take tail.prev</text>
+</g>
+</svg>
+<figcaption>The dict jumps straight to any node; the list holds recency. Nodes nearer the head were used more recently. The dashed head and tail are sentinels that never hold data, so every real node always has two real neighbours.</figcaption>
+</figure>
+<h4>Sentinels: the detail that signals experience</h4>
+<p>A <strong>sentinel node</strong> is a permanent dummy node that holds no data. This design uses two, a head and a tail, created once in the constructor and never removed. Because they are always there, every real node always has a node before it and a node after it, so the code that unlinks or inserts a node never has to ask "is the list empty?" or "is this the first node?". Without sentinels each of those questions becomes an <code>if</code> with its own chance of a bug. With them, unlinking is one line and inserting at the front is three.</p>
+<h4>The questions to ask before typing</h4>
+<p>Spend the first few minutes asking, because the answers change the code. What should a miss return: <code>-1</code>, <code>None</code>, or raise? Can <code>None</code> be stored as a value? Is capacity counted in entries or bytes? Must it be thread-safe? Should entries expire after a time? Does reading a key count as "use" (in LRU it does)? Interviewers often answer "keep it simple, single-threaded, entries, return None", and then bring the others back as extensions later; asking shows you know they exist.</p>
+<h4>The shape of the answer</h4>
+<p>A reader who stops here has the right picture: a dict from key to node, a doubly linked list in recency order bounded by two sentinels, <code>get</code> as "find, unlink, push to front", and <code>put</code> as "update in place if present, otherwise evict the node before the tail if full, then insert at the front". The rest of the lesson builds that up in stages, proves it with tests, and explains what real systems do differently.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Entities &amp; API</span></div><div class="ck"><span class="ck-m">10–15</span><span class="ck-t">Naive version</span></div><div class="ck"><span class="ck-m">15–30</span><span class="ck-t">Correct version</span></div><div class="ck"><span class="ck-m">30–37</span><span class="ck-t">Edge cases &amp; tests</span></div><div class="ck"><span class="ck-m">37–45</span><span class="ck-t">Extensions</span></div></div>
+<h4>1 · Clarify the requirements</h4>
+<p>Write the agreed requirements as a short comment at the top of your file, so both you and the interviewer can point at them later. A typical agreed list looks like this. The cache has a fixed positive capacity counted in entries. <code>get(key)</code> returns the value if present and marks the entry as most recently used; otherwise it returns a default. <code>put(key, value)</code> inserts or updates and marks the entry most recently used; if inserting a new key would exceed capacity, it first evicts the least recently used entry. Both operations must be O(1). Single-threaded for now. Values may be <code>None</code>.</p>
+<p>Two of those answers deserve a sentence each because they change code. "Values may be None" means <code>None</code> cannot also be the miss signal, so you need either a <code>default</code> argument, a private sentinel object, or an exception. "O(1)" rules out everything that scans, which is exactly where the naive versions will fail. Non-functional requirements matter too: say that you will add a check for capacity zero or negative, and that you will keep statistics (hits, misses, evictions) because a cache without a hit rate cannot be tuned.</p>
+<h4>2 · Entities and responsibilities</h4>
+<p>Even a small problem rewards naming the pieces before writing them. There are three. The <strong>node</strong> holds one entry: its key, its value, and its two neighbour pointers. It has no behaviour; it is a record. The <strong>recency list</strong> owns ordering: it can unlink a node it is given and push a node to the front, and it knows which node is last. The <strong>cache</strong> owns the policy: it holds the dict and the list, decides when to evict, and keeps the two consistent. Separating "how to move a node" (two tiny private methods) from "when to move it" (the public methods) keeps every public method short enough to read in one glance, which is what the interviewer checks.</p>
+<p>The <strong>invariant</strong>, the condition that must hold between any two public calls, is worth saying out loud and writing as a comment: the dict and the list contain exactly the same nodes; the node for key k is <code>map[k]</code>; and their count never exceeds capacity. Every bug in this problem is a path that breaks one of those three statements.</p>
+<h4>3 · The interface</h4>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Class diagram: LRUCache has a dict of key to Node and two sentinel Nodes; Node has key, value, prev, next; ThreadSafeLRU extends LRUCache with a lock; ShardedLRU holds N ThreadSafeLRU instances">
+<defs><marker id="ld1-tri" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--surface);stroke:var(--ink-2)"/></marker><marker id="ld1-dia" viewBox="0 0 12 12" refX="1" refY="6" markerWidth="10" markerHeight="10" orient="auto"><path d="M1,6 L6,1 L11,6 L6,11 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="20" y="20" width="240" height="150" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="140" y="38" text-anchor="middle" style="fill:var(--ink);font-weight:600">LRUCache[K, V]</text>
+<line x1="20" y1="46" x2="260" y2="46" style="stroke:var(--line-2)"/>
+<text x="28" y="64" style="fill:var(--ink-2);font-family:var(--mono)">capacity: int</text>
+<text x="28" y="80" style="fill:var(--ink-2);font-family:var(--mono)">_map: dict[K, Node]</text>
+<text x="28" y="96" style="fill:var(--ink-2);font-family:var(--mono)">_head, _tail: Node</text>
+<line x1="20" y1="104" x2="260" y2="104" style="stroke:var(--line-2)"/>
+<text x="28" y="122" style="fill:var(--ink);font-family:var(--mono)">get(key, default) → V</text>
+<text x="28" y="138" style="fill:var(--ink);font-family:var(--mono)">put(key, value)</text>
+<text x="28" y="154" style="fill:var(--muted);font-family:var(--mono)">-_unlink(n) -_push_front(n)</text>
+<rect x="380" y="20" width="220" height="104" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="490" y="38" text-anchor="middle" style="fill:var(--ink);font-weight:600">_Node (record)</text>
+<line x1="380" y1="46" x2="600" y2="46" style="stroke:var(--line-2)"/>
+<text x="388" y="64" style="fill:var(--ink-2);font-family:var(--mono)">key, value</text>
+<text x="388" y="80" style="fill:var(--ink-2);font-family:var(--mono)">prev, next: Node</text>
+<text x="388" y="100" style="fill:var(--muted)">__slots__: no per-instance dict</text>
+<line x1="262" y1="80" x2="378" y2="80" marker-start="url(#ld1-dia)" style="fill:none;stroke:var(--ink-2)"/>
+<text x="320" y="72" text-anchor="middle" style="fill:var(--muted)">owns 2 + n</text>
+<rect x="20" y="210" width="240" height="40" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="140" y="228" text-anchor="middle" style="fill:var(--ink);font-weight:600">ThreadSafeLRU</text>
+<text x="140" y="244" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">_lock; get/put/delete under lock</text>
+<line x1="140" y1="208" x2="140" y2="172" marker-end="url(#ld1-tri)" style="fill:none;stroke:var(--ink-2)"/>
+<text x="148" y="195" style="fill:var(--muted)">extends</text>
+<rect x="380" y="210" width="220" height="40" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="490" y="228" text-anchor="middle" style="fill:var(--ink);font-weight:600">ShardedLRU</text>
+<text x="490" y="244" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">shards[hash(k) % N]</text>
+<line x1="378" y1="230" x2="262" y2="230" marker-start="url(#ld1-dia)" style="fill:none;stroke:var(--ink-2)"/>
+<text x="320" y="222" text-anchor="middle" style="fill:var(--muted)">has N</text>
+</g>
+</svg>
+<figcaption>Only two public methods carry the problem; the two private pointer helpers do all the list surgery. Thread safety and sharding are added by wrapping, not by editing the core class, so the single-threaded version stays simple and testable.</figcaption>
+</figure>
+<p>The public surface is deliberately tiny: a constructor taking capacity, <code>get(key, default=None)</code>, <code>put(key, value)</code>, plus <code>__len__</code> and <code>__contains__</code> so it behaves like a Python container. Note one design decision: <code>__contains__</code> does <em>not</em> refresh recency. A membership test is a peek, and if peeking counted as use, diagnostic code that checks for keys would change what gets evicted. Say this decision out loud; it shows you thought about what "use" means.</p>
+<p>Making the class generic, <code>LRUCache[K, V]</code>, costs nothing at runtime and documents that keys must be hashable and values can be anything. Type hints are optional in an interview but read as care.</p>
+<h4>4 · Stage one: a dict with timestamps</h4>
+<p>Always start with something correct, even if slow, and say its complexity. The simplest correct cache stores, for each key, the value and the time of last use, using a counter that increases on every operation so ties cannot happen.</p>
+<pre>class NaiveLRU:
+    def __init__(self, capacity):
+        self.capacity, self.data, self.clock = capacity, {}, 0   # key -&gt; [value, last_used]
+
+    def get(self, key, default=None):
+        if key not in self.data:
+            return default
+        self.clock += 1
+        self.data[key][1] = self.clock
+        return self.data[key][0]
+
+    def put(self, key, value):
+        self.clock += 1
+        if key not in self.data and len(self.data) == self.capacity:
+            oldest = min(self.data, key=lambda k: self.data[k][1])   # O(n) scan
+            del self.data[oldest]
+        self.data[key] = [value, self.clock]</pre>
+<p>This is correct. <code>get</code> is O(1). But every <code>put</code> of a new key into a full cache runs <code>min</code> over all n entries, which is O(n). With n = 100,000 and an eviction on most inserts, that is 100,000 comparisons per insert. The fix is not to compute the order on demand but to maintain it as you go, so the oldest entry is always at a known position.</p>
+<h4>5 · Stage two: a dict plus a Python list in recency order</h4>
+<p>Keep a list of keys with the least recently used at index 0. A miss on eviction is now cheap: <code>keys.pop(0)</code> names the victim. But "mark as used" means finding the key in the list and moving it to the end: <code>keys.remove(key)</code> searches linearly, and both <code>remove</code> and <code>pop(0)</code> shift every later element one place left, because a Python list is a contiguous array. Both are O(n). We have moved the cost from eviction to every access, which is worse.</p>
+<p>This stage teaches the real requirement. We need a sequence where (a) we can reach any element directly, without searching, and (b) removing an element from the middle does not shift anything. A dict gives (a) if it points at the element. A linked list gives (b), because removing a node only changes its neighbours' pointers. That is the whole design, derived rather than remembered, and narrating that derivation is worth more marks than the final code.</p>
+<h4>6 · Stage three: OrderedDict, the honest ten-line answer</h4>
+<p>Python already ships the structure. <code>collections.OrderedDict</code> is a dict that remembers order and maintains it with an internal doubly linked list, and it exposes the two operations we need in O(1): <code>move_to_end(key)</code> and <code>popitem(last=False)</code>, which removes the first (oldest) item.</p>
+<pre>from collections import OrderedDict
+
+class OrderedDictLRU:
+    def __init__(self, capacity):
+        self.capacity, self.od = capacity, OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self.od:
+            return default
+        self.od.move_to_end(key)                 # mark as most recent
+        return self.od[key]
+
+    def put(self, key, value):
+        if key in self.od:
+            self.od.move_to_end(key)
+        self.od[key] = value
+        if len(self.od) &gt; self.capacity:
+            self.od.popitem(last=False)          # evict least recent</pre>
+<p>In production Python this is the version to write, and it is faster than a hand-written node class because OrderedDict is implemented in C: on this machine with Python 3.12, a hit through this class took about 0.1 microseconds against about 0.3 for the node-based class below. Say that in the interview, then say "I'll implement the underlying structure, since I assume that's what you want to see." Most interviewers will say yes; a few will accept this version and move straight to extensions, so it is worth knowing both.</p>
+<p>A plain <code>dict</code> is ordered too since Python 3.7, but it keeps insertion order and has no <code>move_to_end</code>. You can emulate a refresh with <code>value = d.pop(key); d[key] = value</code>, and evict with <code>del d[next(iter(d))]</code>. It works, and knowing it shows fluency, but it leans on details that are easy to get wrong under pressure.</p>
+<h4>7 · Stage four: the hash map plus doubly linked list</h4>
+<p>Now the version the round is about. Define the node with <code>__slots__</code>, which tells Python to store the four attributes in fixed slots instead of a per-instance dict. That saves memory per node and catches typos, because assigning an attribute not in the slots raises an error.</p>
+<p>The constructor creates the two sentinels and links them to each other: <code>head.next = tail</code> and <code>tail.prev = head</code>. An empty cache is a list with only sentinels. Two private helpers do all the pointer work. <code>_unlink(n)</code> makes n's neighbours point at each other, which removes n from the chain: <code>n.prev.next, n.next.prev = n.next, n.prev</code>. <code>_push_front(n)</code> places n between the head and the current first node: set n's own pointers first, then make the old first node point back at n, then make the head point forward at n.</p>
+<p>Order matters in <code>_push_front</code>. If you write <code>self._head.next = n</code> first, you have lost the only reference to the old first node, and the next line, which should set the old first node's <code>prev</code>, now sets <code>n.prev</code> instead. The safe habit is: set the new node's pointers first (they reference nodes that do not change yet), then update the neighbours.</p>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="get(B) on list head, C, A, B, tail: step 1 unlink B by pointing A and tail at each other, step 2 push B to front giving head, B, C, A, tail">
+<defs><marker id="ld1-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="20" style="fill:var(--ink);font-weight:600">get("B") with order head, C, A, B, tail</text>
+<text x="20" y="48" style="fill:var(--muted)">before</text>
+<g style="font-family:var(--mono)">
+<rect x="90" y="32" width="60" height="26" rx="5" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/><text x="120" y="50" text-anchor="middle" style="fill:var(--muted)">head</text>
+<rect x="190" y="32" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="220" y="50" text-anchor="middle" style="fill:var(--ink)">C</text>
+<rect x="290" y="32" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="320" y="50" text-anchor="middle" style="fill:var(--ink)">A</text>
+<rect x="390" y="32" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="420" y="50" text-anchor="middle" style="fill:var(--ink)">B</text>
+<rect x="490" y="32" width="60" height="26" rx="5" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/><text x="520" y="50" text-anchor="middle" style="fill:var(--muted)">tail</text>
+</g>
+<line x1="150" y1="45" x2="188" y2="45" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="250" y1="45" x2="288" y2="45" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="350" y1="45" x2="388" y2="45" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="450" y1="45" x2="488" y2="45" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<text x="20" y="108" style="fill:var(--muted)">1 unlink</text>
+<g style="font-family:var(--mono)">
+<rect x="90" y="92" width="60" height="26" rx="5" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/><text x="120" y="110" text-anchor="middle" style="fill:var(--muted)">head</text>
+<rect x="190" y="92" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="220" y="110" text-anchor="middle" style="fill:var(--ink)">C</text>
+<rect x="290" y="92" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="320" y="110" text-anchor="middle" style="fill:var(--ink)">A</text>
+<rect x="390" y="126" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="420" y="144" text-anchor="middle" style="fill:var(--ink)">B</text>
+<rect x="490" y="92" width="60" height="26" rx="5" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/><text x="520" y="110" text-anchor="middle" style="fill:var(--muted)">tail</text>
+</g>
+<line x1="150" y1="105" x2="188" y2="105" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="250" y1="105" x2="288" y2="105" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="350" y1="105" x2="488" y2="105" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+<text x="470" y="140" style="fill:var(--ink-2);font-family:var(--sans)">A.next = tail; tail.prev = A</text>
+<text x="20" y="200" style="fill:var(--muted)">2 push front</text>
+<g style="font-family:var(--mono)">
+<rect x="90" y="184" width="60" height="26" rx="5" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/><text x="120" y="202" text-anchor="middle" style="fill:var(--muted)">head</text>
+<rect x="190" y="184" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="220" y="202" text-anchor="middle" style="fill:var(--ink)">B</text>
+<rect x="290" y="184" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="320" y="202" text-anchor="middle" style="fill:var(--ink)">C</text>
+<rect x="390" y="184" width="60" height="26" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="420" y="202" text-anchor="middle" style="fill:var(--ink)">A</text>
+<rect x="490" y="184" width="60" height="26" rx="5" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/><text x="520" y="202" text-anchor="middle" style="fill:var(--muted)">tail</text>
+</g>
+<line x1="150" y1="197" x2="188" y2="197" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+<line x1="250" y1="197" x2="288" y2="197" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+<line x1="350" y1="197" x2="388" y2="197" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="450" y1="197" x2="488" y2="197" marker-end="url(#ld1-a2)" style="fill:none;stroke:var(--ink-2)"/>
+<text x="20" y="240" style="fill:var(--ink-2)">B.prev = head; B.next = C   →   C.prev = B   →   head.next = B   (new node's pointers first)</text>
+<text x="20" y="260" style="fill:var(--muted)">Only forward arrows drawn; every forward change has a matching prev change. 4 + 4 pointer writes, no traversal.</text>
+</g>
+</svg>
+<figcaption>A hit is two constant-time moves. Unlinking B touches only A and the tail; pushing it to the front touches only the head and C. Nothing else in the list is read or written, which is why the cost does not depend on the cache size.</figcaption>
+</figure>
+<p>With the helpers in place the public methods are short. <code>get</code> looks the key up in the dict; on a miss it returns the default; on a hit it unlinks the node, pushes it to the front and returns the value. <code>put</code> has two paths and their order is the most tested detail in this problem. First, if the key exists, overwrite the value, move the node to the front, and return: the number of entries does not change, so nothing may be evicted. Only then, on the new-key path, check whether the cache is full; if it is, the victim is <code>tail.prev</code>, so unlink it and delete <code>map[victim.key]</code>. Finally create the node, store it in the dict and push it to the front.</p>
+<p>Here is a trace with capacity 2, writing the list from most to least recent:</p>
+<table><thead><tr><th>Call</th><th>What happens</th><th>List (MRU first)</th><th>Map keys</th></tr></thead><tbody>
+<tr><td><code>put(1, "a")</code></td><td>new key, not full, insert at front</td><td>1</td><td>{1}</td></tr>
+<tr><td><code>put(2, "b")</code></td><td>new key, not full, insert at front</td><td>2, 1</td><td>{1, 2}</td></tr>
+<tr><td><code>get(1)</code></td><td>hit; unlink 1, push front; returns "a"</td><td>1, 2</td><td>{1, 2}</td></tr>
+<tr><td><code>put(3, "c")</code></td><td>new key, full; victim tail.prev = 2; delete map[2]; insert 3</td><td>3, 1</td><td>{1, 3}</td></tr>
+<tr><td><code>put(1, "z")</code></td><td>existing key; overwrite, push front; no eviction</td><td>1, 3</td><td>{1, 3}</td></tr>
+<tr><td><code>get(2)</code></td><td>miss; returns default</td><td>1, 3</td><td>{1, 3}</td></tr>
+</tbody></table>
+<p>Notice the fourth row. Eviction starts from the list, so the code holds a node, not a key. To remove the matching dict entry it needs the key, which is why every node stores its key even though the dict already knows it. Forgetting that leaves the evicted key in the dict pointing at an orphaned node, and the next <code>get</code> for it "hits" a node that is no longer in the list.</p>
+<h4>8 · The full solution</h4>
+<p>The complete file below is what you would aim to have on screen at the end of the round, plus the test functions you would write if time allows. It adds a few things beyond the core: statistics, <code>delete</code>, a <code>keys_mru_first</code> helper used by the tests, and an invariant checker that walks the list and confirms each back-pointer and each dict entry. It also contains the thread-safe and sharded wrappers discussed in the extensions. It runs on Python 3.12 with only the standard library; every test passes, including a 20,000-operation fuzz test and an eight-thread stress test.</p>
+<pre>"""LRU cache with O(1) get and put: hash map + doubly linked list with sentinels.
+Python 3.12, standard library only. Run: python lru.py"""
+from __future__ import annotations
+
+import random
+import threading
+from collections import OrderedDict
+from typing import Generic, Hashable, TypeVar
+
+K = TypeVar("K", bound=Hashable)
+V = TypeVar("V")
+_MISSING = object()          # miss marker, so None can be a legitimate value
+
+
+class _Node:
+    __slots__ = ("key", "value", "prev", "next")
+
+    def __init__(self, key=None, value=None):
+        self.key, self.value = key, value
+        self.prev: _Node | None = None
+        self.next: _Node | None = None
+
+
+class LRUCache(Generic[K, V]):
+    """Most-recently used node sits right after head; least-recently used right before tail."""
+
+    def __init__(self, capacity: int) -&gt; None:
+        if capacity &lt;= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = capacity
+        self._map: dict[K, _Node] = {}
+        self._head, self._tail = _Node(), _Node()          # sentinels, never removed
+        self._head.next, self._tail.prev = self._tail, self._head
+        self.hits = self.misses = self.evictions = 0
+
+    # --- the two pointer primitives everything else is built from ---
+    def _unlink(self, n: _Node) -&gt; None:
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    def _push_front(self, n: _Node) -&gt; None:
+        n.prev, n.next = self._head, self._head.next
+        self._head.next.prev = n
+        self._head.next = n
+
+    # --- public API ---
+    def get(self, key: K, default=None):
+        n = self._map.get(key)
+        if n is None:
+            self.misses += 1
+            return default
+        self.hits += 1
+        self._unlink(n)
+        self._push_front(n)                                 # a read refreshes recency
+        return n.value
+
+    def put(self, key: K, value: V) -&gt; None:
+        n = self._map.get(key)
+        if n is not None:                                   # update path: never evicts
+            n.value = value
+            self._unlink(n)
+            self._push_front(n)
+            return
+        if len(self._map) == self.capacity:                 # insert path: make room first
+            lru = self._tail.prev
+            self._unlink(lru)
+            del self._map[lru.key]                          # why the node stores its key
+            self.evictions += 1
+        n = _Node(key, value)
+        self._map[key] = n
+        self._push_front(n)
+
+    def delete(self, key: K) -&gt; bool:
+        n = self._map.pop(key, None)
+        if n is None:
+            return False
+        self._unlink(n)
+        return True
+
+    def __len__(self) -&gt; int:
+        return len(self._map)
+
+    def __contains__(self, key: K) -&gt; bool:                 # peek: does NOT refresh recency
+        return key in self._map
+
+    def keys_mru_first(self) -&gt; list[K]:
+        out, n = [], self._head.next
+        while n is not self._tail:
+            out.append(n.key)
+            n = n.next
+        return out
+
+    def check_invariants(self) -&gt; None:
+        """len(map) == nodes between sentinels &lt;= capacity, and prev/next agree."""
+        count, n = 0, self._head
+        while n.next is not self._tail:
+            assert n.next.prev is n, "broken back-pointer"
+            n = n.next
+            count += 1
+            assert self._map[n.key] is n, "map and list disagree"
+        assert count == len(self._map) &lt;= self.capacity
+
+
+class ThreadSafeLRU(LRUCache[K, V]):
+    """One lock around both structures. get() needs it too: it rewires the list."""
+
+    def __init__(self, capacity: int) -&gt; None:
+        super().__init__(capacity)
+        self._lock = threading.Lock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            return super().get(key, default)
+
+    def put(self, key, value) -&gt; None:
+        with self._lock:
+            super().put(key, value)
+
+    def delete(self, key) -&gt; bool:
+        with self._lock:
+            return super().delete(key)
+
+
+class ShardedLRU:
+    """N independent locked caches chosen by hash(key) % N: less contention, approximate global LRU."""
+
+    def __init__(self, capacity: int, shards: int = 8) -&gt; None:
+        per = max(1, capacity // shards)
+        self._shards = [ThreadSafeLRU(per) for _ in range(shards)]
+
+    def _shard(self, key) -&gt; ThreadSafeLRU:
+        return self._shards[hash(key) % len(self._shards)]
+
+    def get(self, key, default=None):
+        return self._shard(key).get(key, default)
+
+    def put(self, key, value) -&gt; None:
+        self._shard(key).put(key, value)
+
+    def __len__(self) -&gt; int:
+        return sum(len(s) for s in self._shards)
+
+
+# ---------------------------------------------------------------- tests
+def test_basic_eviction() -&gt; None:
+    c = LRUCache[int, str](2)
+    c.put(1, "a"); c.put(2, "b")
+    assert c.get(1) == "a"                 # 1 becomes MRU, so 2 is now LRU
+    c.put(3, "c")                          # evicts 2
+    assert 2 not in c and c.get(1) == "a" and c.get(3) == "c"
+    assert c.keys_mru_first() == [3, 1]
+
+
+def test_update_does_not_evict() -&gt; None:
+    c = LRUCache[int, str](2)
+    c.put(1, "a"); c.put(2, "b"); c.put(1, "z")
+    assert c.get(2) == "b" and c.get(1) == "z" and c.evictions == 0
+
+
+def test_none_value_and_capacity_one() -&gt; None:
+    c = LRUCache[str, object](1)
+    c.put("x", None)
+    assert c.get("x", _MISSING) is None    # a stored None is a hit, not a miss
+    c.put("y", 1)
+    assert c.get("x", _MISSING) is _MISSING and len(c) == 1
+    try:
+        LRUCache(0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("capacity 0 accepted")
+
+
+def test_fuzz_against_ordereddict(ops: int = 20_000) -&gt; None:
+    rng = random.Random(7)
+    for cap in (1, 2, 3, 8):
+        c, ref = LRUCache[int, int](cap), OrderedDict()
+        for _ in range(ops // 4):
+            k = rng.randrange(cap * 3)
+            if rng.random() &lt; 0.5:
+                got = c.get(k, _MISSING)
+                if k in ref:
+                    ref.move_to_end(k)
+                    assert got == ref[k]
+                else:
+                    assert got is _MISSING
+            else:
+                c.put(k, k * 10)
+                ref[k] = k * 10
+                ref.move_to_end(k)
+                if len(ref) &gt; cap:
+                    ref.popitem(last=False)
+            assert c.keys_mru_first() == list(reversed(ref))
+        c.check_invariants()
+
+
+def test_threads(workers: int = 8, ops: int = 5_000) -&gt; None:
+    for cache in (ThreadSafeLRU[int, int](64), ShardedLRU(64, shards=8)):
+        def worker(seed: int) -&gt; None:
+            rng = random.Random(seed)
+            for _ in range(ops):
+                k = rng.randrange(200)
+                v = cache.get(k)
+                assert v is None or v == k * 2
+                cache.put(k, k * 2)
+        ts = [threading.Thread(target=worker, args=(i,)) for i in range(workers)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        assert len(cache) &lt;= 64
+        if isinstance(cache, ThreadSafeLRU):
+            cache.check_invariants()
+
+
+if __name__ == "__main__":
+    for t in (test_basic_eviction, test_update_does_not_evict, test_none_value_and_capacity_one,
+              test_fuzz_against_ordereddict, test_threads):
+        t()
+        print("ok ", t.__name__)</pre>
+<p>Two choices in that file deserve a word. The miss marker in the tests is a private <code>_MISSING = object()</code>: a fresh object that can never equal any stored value, so <code>None</code> remains a storable value. And the thread-safe class wraps the base methods instead of putting locks inside the core class, so the single-threaded class stays free of locking overhead and can be tested on its own.</p>
+<h4>9 · Edge cases</h4>
+<p>Walk through these aloud before the interviewer asks, because each is where some implementation breaks. <strong>Capacity zero or negative</strong>: decide. Rejecting it in the constructor with <code>ValueError</code> is cleanest; a cache that silently stores nothing hides configuration mistakes. <strong>Capacity one</strong>: every new key evicts the previous one, and the victim is the only node, so <code>tail.prev</code> is also <code>head.next</code>; sentinels make this case need no special code, which is a good thing to point out. <strong>Updating an existing key in a full cache</strong> must not evict. <strong>Storing None</strong>: if allowed, the miss signal cannot be <code>None</code>. <strong>get on a missing key</strong> must change nothing, including recency. <strong>Unhashable keys</strong> such as lists raise <code>TypeError</code> from the dict; let them, because guessing a conversion would silently merge different keys.</p>
+<p>A subtler case is a key whose hash or equality is unusual: <code>1</code>, <code>1.0</code> and <code>True</code> are equal and have the same hash in Python, so they are the same key. <code>functools.lru_cache</code> has a <code>typed=True</code> option for exactly this reason. Mentioning it is a small, cheap signal of depth.</p>
+<h4>10 · Testing: invariants and a reference</h4>
+<p>Pointer code fails in ways that unit tests with three operations rarely reveal. The strongest test is a <strong>fuzz test</strong>: generate thousands of random <code>get</code> and <code>put</code> calls on a small key space (so hits, misses, updates and evictions all happen often), apply each to your cache and to a trusted reference, here an OrderedDict driven the same way, and compare the entire recency order after every step. Comparing the whole order, not just return values, matters: a broken back-pointer corrupts the order many steps before it changes a value you return, and comparing order pinpoints the operation that caused it.</p>
+<p>Run the fuzz test at capacities 1, 2, 3 and a larger one. Capacity 1 and 2 hit the boundary conditions constantly; a large capacity rarely evicts. Pair it with <code>check_invariants</code>, which walks from the head checking that every node's <code>next.prev</code> is itself, that each node is the one the dict holds for its key, and that the count equals the dict's size and is within capacity. Calling it at the end of each fuzz run catches pointer errors that the order comparison could miss, such as a dangling back-pointer that forward iteration never follows.</p>
+<h4>11 · Extensions the interviewer will ask for</h4>
+<p><strong>Thread safety.</strong> Add one lock and hold it for the whole of <code>get</code>, <code>put</code> and <code>delete</code>. People are often surprised that <code>get</code> needs it: it rewrites pointers, so two concurrent gets can each read a neighbour the other is about to change and leave the list with a node whose <code>next</code> and <code>prev</code> disagree. Python's global interpreter lock (the GIL, a lock in CPython that lets only one thread run Python bytecode at a time) does not save you, because unlinking is several bytecodes and a thread switch can happen between them. If one lock becomes a bottleneck, <strong>shard</strong>: keep N independent locked caches and pick one with <code>hash(key) % N</code>. Contention falls roughly N-fold, at the cost that recency is now per shard: one shard may evict a fairly recent key while another holds an older one.</p>
+<p><strong>Time to live.</strong> Store an expiry timestamp in each node, taken from <code>time.monotonic()</code> (a clock that never goes backwards, unlike wall time). On <code>get</code>, an expired node is removed and reported as a miss. Expired nodes still occupy capacity until someone touches them, so when evicting prefer expired entries, or run a sweep that removes a bounded number per tick.</p>
+<p><strong>Capacity in bytes.</strong> Track a size per entry and a total. After inserting, evict from the tail in a loop until the total fits. Reject values larger than the budget up front; otherwise the loop empties the cache and still overflows.</p>
+<p><strong>LFU.</strong> Least frequently used needs a map from frequency to a doubly linked list of nodes with that frequency, plus a minimum-frequency pointer. The LFU answer below walks through it among the interview questions; it is a common second half of this round.</p>
+<p><strong>Compute on miss.</strong> Wrap the cache in a <code>get_or_compute(key, fn)</code>. In a threaded server, avoid running <code>fn</code> while holding the lock (it may be slow), and avoid many threads computing the same key at once, which is the single-flight pattern discussed in the production section.</p>
+<h4>12 · Complexity</h4>
+<p><code>get</code> and <code>put</code> are O(1): one dict operation and a constant number of pointer writes. The dict's O(1) is <strong>amortised</strong>: occasionally a dict grows and rehashes all entries, so one insert is expensive, but averaged over many inserts the cost per insert is constant. Memory is O(capacity). In concrete terms, on Python 3.12 with integer keys, measured with <code>tracemalloc</code>, the node-based cache used about 148 bytes per entry against about 137 for OrderedDict and 84 for a plain dict: each entry pays for a dict slot, a 64-byte node object and the key itself. That overhead is one reason production caches written in lower-level languages pack these fields tightly, and why Redis chose not to keep a full linked list at all.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why exact LRU is a weak policy on real traffic</h4>
+<p>LRU assumes the recent past predicts the near future. That holds for many workloads, but it fails badly on a <strong>scan</strong>: a batch job, a backup or a crawler that reads a large set of keys once each. Every key it reads becomes most recently used, and each one pushes a genuinely hot entry off the tail. After the scan the cache is full of keys that will never be read again, and the hot set must be refetched from the backend. The cache did the worst possible thing at the moment it mattered. This is not hypothetical: database buffer pools, CDN caches and operating system page caches all add protection against it.</p>
+<p>The classic protection is <strong>segmented LRU</strong>. New entries go into a small probationary segment; only an entry that is accessed a second time is promoted to the protected segment. A scan fills the probation area and evicts itself, while the protected hot set survives. Linux's page cache uses a related idea with active and inactive lists, and MySQL's InnoDB buffer pool inserts newly read pages at a midpoint of its LRU list rather than at the head, so a full table scan cannot flush the whole pool.</p>
+<h4>Frequency matters as much as recency: TinyLFU and W-TinyLFU</h4>
+<p>LFU keeps hit counts and evicts the least popular entry. It resists scans, because a key read once has a count of one, but pure LFU never forgets: a key that was hugely popular yesterday stays cached forever, and keeping an exact counter per key, including keys not in the cache, costs memory. <strong>TinyLFU</strong> fixes both. It keeps approximate frequencies for all recently seen keys in a compact count-min sketch (a small table of counters indexed by several hash functions; the estimate for a key is the minimum of its counters), and periodically halves every counter so popularity decays. It is used as an <strong>admission filter</strong>: when the cache is full and a new key arrives, compare the new key's estimated frequency with the eviction victim's; admit the newcomer only if it is more popular. A scan's keys all have frequency one, so they are rejected at the door.</p>
+<p><strong>W-TinyLFU</strong>, used by Java's Caffeine library, adds a small "window" LRU of about one percent of capacity in front, so a brand-new key that is about to become popular gets a short chance to build up frequency before facing the filter. Caffeine's published benchmarks show it beating LRU on hit rate across database, search and web traces, often by a wide margin on scan-heavy ones. You do not need to implement it in an interview; you need to explain why it beats LRU in two sentences.</p>
+<h4>Approximating LRU: CLOCK and Redis sampling</h4>
+<p>Exact LRU has a cost beyond memory: every read is a write to shared structure. On a busy multi-threaded server that means every <code>get</code> takes a lock and dirties cache lines that other cores also read. <strong>CLOCK</strong> avoids it. Entries sit in a circular array, each with one reference bit. A read only sets the bit, which is cheap and does not reorder anything. To evict, a "hand" sweeps around the circle: if an entry's bit is set, clear it and move on (a second chance); if it is clear, evict it. Entries that are read often keep getting their bit set and survive; entries untouched for a full revolution go. Operating systems have used CLOCK variants for page replacement for decades because of this.</p>
+<p>Redis takes a different shortcut. It stores a small last-access timestamp in each key's object header and, when it must evict, samples a few random keys (five by default, set by <code>maxmemory-samples</code>) and evicts the one idle longest. Since Redis 3.0 it also keeps a pool of good candidates across evictions, which brings the result close to true LRU; the Redis documentation says that with ten samples the approximation is very close to theoretical LRU, and that the reason for not implementing true LRU is that it costs more memory. Redis also offers an LFU mode that stores a logarithmic, decaying counter in the same header field. The lesson for an interview: exact LRU is a teaching device; real systems trade a little accuracy for less memory and less write traffic.</p>
+<h4>What the GIL does and does not protect</h4>
+<p>In CPython, the global interpreter lock lets one thread execute bytecode at a time, so individual operations such as a single dict assignment are effectively atomic. That tempts people to skip the lock. But <code>_unlink</code> is a tuple assignment that compiles to several loads and stores, and a thread switch can occur between them. Two threads moving neighbouring nodes can interleave so that A's <code>next</code> points to C while C's <code>prev</code> still points to B, which is now detached. Later traversal loops forever or loses entries. The pure-Python fallback of <code>functools.lru_cache</code> in CPython's source takes an <code>RLock</code> for exactly this reason, with a comment that the linked-list updates are not thread-safe. On the free-threaded build available from Python 3.13, where there is no GIL, the need for explicit locking is even more direct.</p>
+<h4>Sharding and what it costs</h4>
+<p>Sharding into N caches divides contention because two threads only compete when their keys hash to the same shard. The costs are worth naming. Recency becomes local: the cache evicts the oldest entry of one shard, not the oldest overall. Capacity becomes fragmented: if keys are unevenly distributed, one shard evicts while another has free space. And global operations such as "clear" or "size" now visit every shard. These are usually acceptable, and they generalise: whenever a single lock protects a structure with no cross-key invariant, splitting by key is the first scaling move.</p>
+<h4>Memory per entry and why it matters at scale</h4>
+<p>The measured 148 bytes per entry on Python 3.12 breaks down into a dict slot plus hash table spare capacity, a 64-byte node with four slots, and the key object. For a million small entries that is about 150 MB of overhead before counting values. In C or Rust the same structure might be 32 to 48 bytes per entry. This is why language matters for caches and why designs like Redis's, which store a 24-bit access clock in an existing header instead of two 8-byte pointers per key, are attractive at hundreds of millions of keys.</p>
+<h4>Caching function results: lru_cache's sharp edges</h4>
+<p><code>functools.lru_cache</code> builds its key from the call arguments, so arguments must be hashable, and calls whose arguments are equal but of different types (1 versus 1.0) are usually treated as the same call unless <code>typed=True</code> (the docs note some types, such as int and str, may be cached separately anyway). Applied to a method, the cache holds a reference to <code>self</code> in every key, which keeps every instance alive as long as the cache lives; the Python documentation warns about this and suggests caching at module level or using <code>cached_property</code> for per-instance values. And the cache returns the same object to every caller: if a cached function returns a list and one caller appends to it, every later caller sees the change. Return immutable values (tuples, frozen dataclasses) from cached functions.</p>
+</section>
+
+<section data-field="prod">
+<h4>How caches fail in production</h4>
+<p>The most common failure is not a bug in the eviction code but a <strong>low hit rate</strong> nobody measured. A cache with a 5 percent hit rate adds memory, latency for the lookup and invalidation complexity, and saves almost nothing. Always export hits, misses and evictions as counters, compute the hit rate on a dashboard, and look at the eviction rate alongside it: a high eviction rate with a low hit rate usually means the cache is too small for the working set, while a low eviction rate with a low hit rate means the keys are not being reused at all, and no size will help.</p>
+<p>The second is the <strong>cache stampede</strong>, also called thundering herd. A popular key expires or is evicted, and hundreds of concurrent requests miss at once and all call the backend. The backend slows down, requests time out, clients retry, and the load grows. The standard fixes are single-flight (the first miss stores an in-progress marker such as a <code>concurrent.futures.Future</code> under the key; later misses wait on it instead of recomputing), early refresh (recompute a hot key shortly before it expires, with a little random jitter so many keys do not refresh at the same instant), and serving the stale value while one request refreshes it.</p>
+<p>The third is <strong>unbounded growth</strong>, the problem this lesson opened with: an <code>@lru_cache(maxsize=None)</code> or a module-level dict used as a cache. It looks fine in tests and runs out of memory after a week in production. A bounded cache is the fix, and a byte budget is better than an entry count when value sizes vary.</p>
+<h4>Correctness failures: stale and shared data</h4>
+<p>A cache returns what was true when the entry was stored. If the underlying data changes, readers see the old value until the entry is evicted or expires. For a profile name that is harmless; for a permission check it is a security bug (a revoked user keeps access until the entry ages out). Decide per key type how stale data may be, and either delete the entry on write (invalidation) or set a short TTL. A related bug is returning a mutable cached object: one request mutates it and every other request sees the mutation. Copy on the way out or cache immutable values.</p>
+<h4>Metrics and knobs</h4>
+<p>Track hit rate, eviction rate, size in entries and bytes, and the latency of the miss path, because the miss path is what users feel when the cache is cold, for example right after a deploy restarts every process. Redis exposes <code>keyspace_hits</code>, <code>keyspace_misses</code> and <code>evicted_keys</code> in <code>INFO stats</code>; an in-process cache should expose the same three counters. The knobs are size, policy and TTL. Size is tuned by plotting hit rate against capacity, often from a replay of logged keys: the curve flattens once the working set fits, and memory beyond that point is wasted. Redis adds <code>maxmemory-policy</code> (for example <code>allkeys-lru</code>, <code>allkeys-lfu</code> or <code>volatile-ttl</code>) and <code>maxmemory-samples</code>.</p>
+<h4>Cold starts and deploys</h4>
+<p>An in-process cache is empty after every restart. If a fleet of 50 instances deploys at once, the backend suddenly sees 50 caches' worth of misses. Rolling deploys spread this out; some systems warm the cache from a snapshot or from a shared cache tier before taking traffic. Measuring the miss path's latency and the backend's headroom tells you whether a simultaneous restart is survivable.</p>
+<h4>The real case: why Redis approximates LRU</h4>
+<p>Redis is the most widely deployed cache in the industry, and its key-eviction documentation is an unusually honest design note. When memory reaches <code>maxmemory</code>, Redis evicts according to the configured policy, and its LRU is approximate: it samples <code>maxmemory-samples</code> keys (default five) and evicts the one idle longest, and since 3.0 it keeps a pool of good candidates between evictions. The documentation states that true LRU was not implemented because it costs more memory, shows plots comparing the approximation with theoretical LRU, notes that ten samples come very close, and adds that under power-law access patterns, where a few keys get most of the traffic, the difference is minimal. It also offers LFU policies with a logarithmic counter controlled by <code>lfu-log-factor</code> and decayed over time by <code>lfu-decay-time</code>. The design choice is the senior lesson of this case: the interview structure (exact order, two pointers per key) is correct and teaches the right reasoning, but a system holding hundreds of millions of keys chooses an approximation whose memory cost is a few bits per key, and measures hit rate to show the approximation is good enough.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the full solution from the body, then extend it, break it and measure it. Python 3.12, standard library only; each step takes a few minutes.</p>
+<ol>
+<li>Save the full solution as <code>lru.py</code> and run <code>python lru.py</code>. All five tests print <code>ok</code>. The fuzz test is the one doing the real work: it compares the recency order with an OrderedDict after each of thousands of random operations.</li>
+<li><strong>Break it.</strong> In <code>put</code>, move the capacity check above the update check (the bug from the drill). Run again: the update test fails, and the fuzz test fails at the first operation that updates a key in a full cache. Then restore it and swap the first two lines of <code>_push_front</code> so the head is updated first; watch <code>check_invariants</code> report a broken back-pointer.</li>
+<li><strong>Measure it.</strong> Time a million hits with <code>timeit</code> for <code>LRUCache</code> and for the OrderedDict version in the body. On a typical laptop the C-implemented OrderedDict is about three times faster; that is the argument for using it in real code.</li>
+<li><strong>Extend it.</strong> Add a <code>ttl</code> argument to <code>put</code>: store <code>time.monotonic() + ttl</code> in the node and treat expired nodes as misses in <code>get</code>, removing them. Add a test that uses a fake clock (pass a <code>clock</code> callable to the constructor) so the test does not sleep.</li>
+<li><strong>Scan test.</strong> Fill a capacity-100 cache with a hot set of 50 keys read repeatedly, then read 1,000 new keys once each, then read the hot set again. Count misses on the final pass: every hot key misses. That is the scan problem the deep section describes.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>Trace this implementation with capacity 2 and explain what is wrong with it:</p>
+<pre>def put(self, k, v):
+    if len(self.map) == self.cap:
+        lru = self.tail.prev
+        self._unlink(lru); del self.map[lru.key]
+    if k in self.map:
+        n = self.map[k]; n.value = v
+        self._unlink(n); self._push_front(n); return
+    n = _Node(k, v)
+    self.map[k] = n; self._push_front(n)</pre>
+<p>Run: <code>put(1,'a')</code>, <code>put(2,'b')</code>, <code>put(2,'z')</code>, then <code>get(1)</code>. What is returned, and what should be?</p>
+<details><summary>Answer</summary>
+<p><strong>The bug: the eviction check runs before the update check.</strong> The two blocks are in the wrong order, so updating an existing key in a full cache evicts something.</p>
+<table><thead><tr><th>Call</th><th>What happens</th><th>State (MRU first)</th></tr></thead><tbody>
+<tr><td>put(1,'a')</td><td>size 0, not full; key new; insert</td><td>1</td></tr>
+<tr><td>put(2,'b')</td><td>size 1, not full; key new; insert</td><td>2, 1</td></tr>
+<tr><td>put(2,'z')</td><td>size is 2, so it <strong>evicts tail.prev, which is key 1</strong>, an unrelated live entry; then finds key 2 and updates it</td><td>2</td></tr>
+<tr><td>get(1)</td><td>key 1 is gone: miss</td><td>2</td></tr>
+</tbody></table>
+<p><strong>Returns the miss value. Should return 'a'.</strong> An update does not change the number of entries, so it must never evict; this version threw away a live entry and left the cache holding one item when it should hold two.</p>
+<p>Now try <code>put(1,'a')</code>, <code>put(2,'b')</code>, <code>put(1,'z')</code>, <code>get(2)</code>. Here the victim is key 1, the very key being updated, so the code evicts it and re-inserts it fresh, and <code>get(2)</code> correctly returns 'b'. The answer is right by luck, yet an eviction happened that should not have. A test that only checks return values passes; a test that also checks the eviction counter, or the fuzz test comparing full order, fails. That is why the full solution counts evictions.</p>
+<p><strong>The fix</strong> is to handle the update path first and return, then check capacity only on the new-key path. <strong>The lesson to say in the interview</strong> is that every mutating path must preserve the invariant "the map and the list hold the same nodes, never more than capacity". Write the invariant before the method and this class of bug becomes visible while you type; an invariant check in the tests finds it on the first run.</p>
+</details>
+</section>

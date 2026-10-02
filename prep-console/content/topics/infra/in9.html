@@ -1,0 +1,398 @@
+<!-- topic source for infra/in9; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "in9",
+  "t": "Design real-time analytics and counting (ad clicks, leaderboards)",
+  "tag": "Streaming",
+  "sum": "Counting billions of events per day with second-level freshness: event-time windows and watermarks, exact counts for money with deduplication and exactly-once sinks, approximate counts where 1% is fine — HyperLogLog for unique users in 12 KB, count-min sketch plus a heap for top-k — sharded counters and sorted sets for leaderboards, hot-key pre-aggregation, batch reconciliation, and how Reddit counts post views.",
+  "prereq": [
+    ["in1", "A partitioned log delivers events per key in order; consumer groups process partitions in parallel; transactions give exactly-once within Kafka."],
+    ["sc18", "Stream processors aggregate over windows; event time is when something happened, processing time is when the system sees it; batch jobs recompute over complete data."],
+    ["in3", "An in-memory store like Redis serves counters and sorted sets at hundreds of thousands of operations per second; hot keys overload one node."],
+    ["sc11", "Idempotent writes and deduplication by event ID make retried or replayed events harmless."],
+    ["sc7", "Partitioning by key spreads load; a hot key lands on one partition."],
+    ["in6", "Time-series storage rolls raw points up into coarser intervals for cheap long-range queries."]
+  ],
+  "myths": [
+    ["You can add daily unique-user counts to get the weekly uniques.", "A user active on three days is counted three times. Distinct counts don't sum; you need the union of the underlying sets. HyperLogLog sketches can be merged (register-wise maximum) to get the union's estimate, which is why they're stored per day or per hour."],
+    ["Approximate counting is fine for everything at scale.", "Approximations are right for dashboards, trends and 'roughly how many people saw this'. Anything that moves money — ad billing, payouts, quotas that customers pay for — needs exact counts with deduplication and reconciliation, even if a fast approximate number is shown first."],
+    ["Process events in the order they arrive and bucket them by arrival time.", "Mobile clients buffer events offline, networks delay them, and pipelines replay after failures. Bucketing by processing time puts a 09:59 click into the 10:00 window or into whatever hour the replay happened. Window by event time, use watermarks to decide when a window is complete, and handle late events explicitly."],
+    ["A count-min sketch can under-count.", "It only over-counts: every item's counters are incremented, and collisions only add other items' counts. The estimate is the minimum across rows, which is always at least the true count and, with the right width and depth, at most the true count plus εN with high probability."],
+    ["Exactly-once means each event is delivered once.", "Delivery is at-least-once almost everywhere. Exactly-once is an effect: the pipeline checkpoints its state and input offsets together and writes output transactionally or idempotently, so a replay after a crash doesn't double count. Outside that boundary, deduplicate by event ID."],
+    ["A global leaderboard is just a sorted list in a database.", "Updating a rank in a sorted table on every score change is expensive at scale. A Redis sorted set gives O(log N) score updates and rank queries over millions of entries in memory; very hot or huge boards add sharding by region or score band, and approximate ranks for the long tail."]
+  ],
+  "recap": [
+    "Real-time counting turns a stream of events into fresh aggregates — clicks per ad per minute, unique viewers per post, top items, player ranks — within seconds.",
+    "Aggregates are computed over event-time windows; watermarks estimate when a window has all its events, and late events are added with an allowed lateness or sent to a correction path.",
+    "Counts that move money must be exact: deduplicate by event ID, checkpoint state with input offsets, write idempotently or transactionally, and reconcile with a batch recomputation.",
+    "HyperLogLog estimates distinct counts by tracking the longest run of leading zeros in hashed IDs across 16,384 registers, giving about 0.81% standard error in 12 KB regardless of cardinality.",
+    "HyperLogLog sketches merge by taking the register-wise maximum, so hourly sketches combine into daily, weekly or per-campaign uniques without raw data.",
+    "A count-min sketch estimates frequencies with d rows of w counters; it never under-counts, and with w = e/ε and d = ln(1/δ) its error is at most εN with probability 1−δ.",
+    "Top-k heavy hitters come from a count-min sketch plus a small heap of the current leaders.",
+    "Leaderboards use sorted sets with O(log N) updates and rank lookups; global counters that are too hot are split into sub-counters and summed on read.",
+    "Hot keys are handled by pre-aggregating near the source and two-stage aggregation with salted keys, so one huge advertiser can't stall the whole pipeline.",
+    "Reddit counts post views with Kafka consumers, a rules stage that filters repeat views, Redis HyperLogLogs (12 KB per post for over a million viewers) and Cassandra for persistence."
+  ],
+  "glossary": [
+    ["Allowed lateness", "How long after a window closes the system still accepts late events and updates the result."],
+    ["Count-min sketch", "A table of d rows by w counters; each item increments one counter per row chosen by a hash, and its estimated count is the minimum of those counters."],
+    ["Event time", "The time an event actually happened, recorded by its source."],
+    ["Exactly-once (effect)", "Each event changes the result exactly once even though it may be delivered or processed more than once."],
+    ["Heavy hitters", "The items with the highest counts in a stream, also called top-k."],
+    ["HyperLogLog (HLL)", "A sketch that estimates the number of distinct items using small registers recording the longest run of leading zeros in hashed values."],
+    ["Lambda architecture", "Running a fast approximate stream path and a slower exact batch path side by side and serving the batch result once it is ready."],
+    ["Kappa architecture", "Using a single stream-processing path for everything, recomputing by replaying the log when logic changes."],
+    ["Linear counting", "Estimating distinct counts from the fraction of empty buckets; accurate for small cardinalities, used inside HLL for small ranges."],
+    ["Pre-aggregation", "Combining events close to the source (for example per second per key) before sending them downstream."],
+    ["Processing time", "The time the system processes an event, which can be much later than its event time."],
+    ["Reconciliation", "Comparing real-time totals with an exact batch recomputation and correcting the difference."],
+    ["Register (HLL)", "One of the m small counters in a HyperLogLog, each storing the maximum leading-zero rank seen for its bucket."],
+    ["Sharded counter", "A logical counter split into several sub-counters that are updated independently and summed on read, to spread a hot key."],
+    ["Sketch", "A compact data structure that summarises a large stream approximately, with known error bounds."],
+    ["Sliding window", "Overlapping windows, such as the last 5 minutes recomputed every minute."],
+    ["Sorted set", "A Redis structure holding members ordered by score, with O(log N) updates and rank queries."],
+    ["Tumbling window", "Fixed, non-overlapping windows, such as each calendar minute."],
+    ["Watermark", "A marker in an event-time stream asserting that no more events older than a given time are expected."],
+    ["Standard error", "The typical size of an estimate's error, expressed as a fraction of the true value."]
+  ],
+  "qa": [
+    ["E", "Why not count unique viewers with a set per post?", "Memory grows with the number of viewers: one million 8-byte user IDs is 8 MB for one post, and millions of posts multiply that. Checking and inserting into big sets is also CPU-heavy. A HyperLogLog gives about 1% accuracy in a fixed 12 KB per post, which is what Reddit chose.", "Follow-up: When would you keep the exact set? — For small cardinalities (HLL implementations use an exact sparse representation there anyway) or when the exact list is itself needed."],
+    ["E", "What's the difference between event time and processing time?", "Event time is when the click happened on the user's device; processing time is when your pipeline sees it. They differ by network delay, offline buffering and replays, sometimes by hours, so windows must use event time to put events in the right minute.", "Follow-up: How do you know a window is complete? — Watermarks: the source estimates that no events older than T remain, and windows ending before T can be emitted."],
+    ["E", "How do you build a game leaderboard with millions of players?", "A Redis sorted set keyed by board, with ZINCRBY or ZADD to update a player's score in O(log N) and ZREVRANGE / ZREVRANK to read the top 100 or a player's rank. 10 million members fit in a few GB of memory.", "Follow-up: Ties? — Encode the tiebreaker into the score, for example score × 10^10 + (MAX_TS − achieved_at), so earlier achievers rank higher."],
+    ["M", "Explain how HyperLogLog works.", "Hash each item to 64 bits. The first p bits pick one of m = 2^p registers; in the remaining bits, find the position of the first 1 — long runs of leading zeros are rare, so the longest run seen hints at how many distinct items were hashed. Each register keeps its maximum; the estimate combines registers with a harmonic mean and a correction constant. Standard error is about 1.04/√m: 0.81% with 16,384 registers.", "Follow-up: Why the harmonic mean? — It damps the effect of a few registers with unusually large values from lucky hashes."],
+    ["M", "How do you size a count-min sketch?", "Choose ε (error as a fraction of total count N) and δ (failure probability): width w = ⌈e/ε⌉ and depth d = ⌈ln(1/δ)⌉. For ε = 0.1% and δ = 1%, w = 2,719 and d = 5: 13,595 counters, about 53 KB, whatever the number of distinct items.", "Follow-up: Why is the error relative to N, not to the item's count? — Collisions add other items' counts; for rare items the error can exceed their true count, so CMS is good for heavy hitters, poor for the tail."],
+    ["M", "How do you get the top 50 ads by clicks in the last 10 minutes from a stream?", "Per window, update a count-min sketch for every click and maintain a min-heap of 50 candidates by estimated count; an item enters the heap if its estimate beats the smallest. Emit the heap when the window closes. For exact top-k, aggregate counts per ad in the stream processor keyed by ad and run a top-k over the aggregated results.", "Follow-up: Click-through rate instead of clicks? — Keep impressions and clicks per ad and rank by ratio with a minimum impression threshold so tiny denominators don't win."],
+    ["M", "How do you make ad-click counts correct enough to bill on?", "Assign every click a unique ID at the edge, deduplicate on it in the stream (keyed state with a TTL longer than any plausible duplicate delay), aggregate by event-time window, and write results transactionally or idempotently keyed by (ad, window). Then reconcile daily with a batch recomputation over the raw log and issue corrections.", "Follow-up: What about click fraud? — A separate filtering stage before counting flags bots and repeat clicks; billing uses the filtered count."],
+    ["M", "What do you do with events that arrive after the window closed?", "Allow some lateness (keep window state a while longer and emit updated results), route very late events to a side output for a correction job, and make downstream stores accept updates for past windows. Choose the lateness from the measured delay distribution, e.g. the 99.9th percentile of event-time lag.", "Follow-up: What does too small a watermark delay cost? — Many late events and frequent corrections; too large delays every result."],
+    ["H", "One advertiser is 40% of all impressions. What breaks and what do you do?", "Keyed by ad, its events land on one partition and one task, which falls behind; since watermarks are the minimum across inputs, the whole job's event time stalls and every advertiser's windows stop closing. Pre-aggregate near the source (per second per ad), use two-stage aggregation with salted keys and a merge step, and isolate the whale in its own pipeline.", "Follow-up: Does salting work for unique counts? — Yes if each salted shard keeps an HLL; HLLs merge exactly."],
+    ["H", "Lambda or kappa architecture for a click analytics system?", "Lambda runs a fast stream path and an exact batch path and serves batch results when ready: robust, but two codebases that must agree. Kappa uses one streaming path and replays the log to recompute: one codebase, but needs long log retention and a processor that can reprocess quickly. Many teams run kappa for analytics and keep a batch reconciliation only for billing.", "Follow-up: What makes kappa reprocessing feasible? — Retaining raw events (tiered storage, in1) and an engine that can run a second copy of the job from offset 0 into a new output table, then switch readers."],
+    ["H", "How would you count unique users per ad per day for 2 million ads cheaply?", "One HLL per (ad, day) — but dense HLLs at 12 KB each would be 24 GB, mostly wasted on ads with few viewers. Use the sparse representation (exact list of register updates) for small cardinalities, which HLL++ and Redis do, switching to dense only when it pays; persist sketches per hour so any period is a merge.", "Follow-up: How do you get uniques across all ads of a campaign? — Merge the campaign's ad sketches; the result is the union, not the sum."],
+    ["H", "You're metering LLM token usage per customer in real time for rate limits and billing. Design it.", "Gateways emit one usage event per request with a request ID, customer, model and input/output tokens; a stream job deduplicates by request ID and keeps per-customer counters in event-time windows (per minute for rate limits, per hour for billing). Rate limiting reads a fast, slightly approximate counter (local plus periodic sync, or Redis INCRBY with expiry); billing uses the exact deduplicated aggregates, reconciled daily with provider and gateway logs.", "Follow-up: A streaming response is cut off mid-way. — Emit usage when the stream ends or is cancelled, with the tokens actually generated, and make the final event idempotent by request ID."]
+  ],
+  "refs": [
+    ["post", "View Counting at Reddit (2017, archived)", "Reddit's design: Kafka, the Nazar rules stage, the Abacus counter, Redis HyperLogLogs and Cassandra persistence.", "https://web.archive.org/web/20231214162908/https://www.redditinc.com/blog/view-counting-at-reddit/"],
+    ["paper", "HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm", "Flajolet, Fusy, Gandouet and Meunier, 2007 — the algorithm and its 1.04/√m standard error.", "https://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf"],
+    ["paper", "HyperLogLog in Practice (HyperLogLog++)", "Heule, Nunkesser and Hall (Google), EDBT 2013 — 64-bit hashing, bias correction and the sparse representation.", "https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/40671.pdf"],
+    ["paper", "An Improved Data Stream Summary: The Count-Min Sketch and its Applications", "Cormode and Muthukrishnan — the sketch, its error bounds and heavy-hitter applications.", "https://dsf.berkeley.edu/cs286/papers/countmin-latin2004.pdf"],
+    ["paper", "The Dataflow Model (VLDB 2015)", "Akidau et al. — event time, windows, watermarks and triggers for unbounded data.", "https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf"],
+    ["docs", "Redis HyperLogLog", "PFADD, PFCOUNT and PFMERGE: 12 KB per key and 0.81% standard error.", "https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/"],
+    ["docs", "Redis sorted sets", "The leaderboard data structure and its complexity.", "https://redis.io/docs/latest/develop/data-types/sorted-sets/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>An advertiser launches a campaign at 9 a.m. and wants to see, by 9:01, how many people saw the ad, how many clicked, how many distinct users that was, and which creative is winning. A content platform wants to show a post's author "37.4k views" that keeps ticking up. A game shows each player their global rank after every match. An AI platform shows each customer how many tokens they've used this minute and stops them at their limit. All of these are the same problem: <strong>count things in a huge, never-ending stream of events, and keep the counts fresh</strong>.</p>
+<p>The naive version — write every event to a database row and run <code>SELECT COUNT(*)</code> — collapses at the first real traffic. A billion clicks a day is over eleven thousand writes a second on average and many times that at peak; counting distinct users means remembering every user ID ever seen for every ad; a popular post's counter becomes one red-hot row that every server is trying to update. And the answers have to be right in a specific sense: an advertiser who is billed per click must not be charged for a click counted twice because a server retried, while a view counter that's off by 0.5% harms no one.</p>
+<p>That distinction drives the design. Some counts are money and must be exact, with deduplication, careful handling of failures and late data, and a reconciliation path. Others are insight, where a 1% error is invisible and lets you replace gigabytes of state with kilobytes — HyperLogLog for distinct counts, count-min sketches for frequencies and top-k. Reddit's engineers faced exactly this when they launched view counts in 2017: a single popular post had over a million unique viewers, and storing them exactly would have cost 8 MB per post; they used 12 KB.</p>
+<p>This lesson designs a real-time analytics and counting system in interview order: requirements, estimates, API, data model, architecture, then deep dives into windows and watermarks, exact counting for billing, HyperLogLog, count-min sketch and top-k, leaderboards and hot counters, and hot-key skew. It ends with Reddit's view-counting design and a lab that builds both sketches and checks their accuracy against exact counts.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: tally clerks at a stadium</h4>
+<p>Picture counting fans entering a stadium with 40 gates. Each gate has a clerk with a clicker. Every minute, a runner collects each clicker's number and adds them up on a big board: "Gate total, 10:41: 3,912". That's the simplest real-time count — <strong>partitioned counting with periodic aggregation</strong>. Now complications arrive. A runner gets delayed and brings gate 7's 10:41 number at 10:44: does the board show the 10:41 total as final yet? (That's the <strong>event time versus processing time</strong> and <strong>watermark</strong> problem.) A fan exits and re-enters through another gate: are they one fan or two? (That's <strong>distinct counting</strong>.) The owner wants to know which gate is busiest right now. (That's <strong>top-k</strong>.) And if the clickers are used for paying the gate staff per fan, double-counting a fan is a real cost, so someone audits the turnstile logs overnight. (That's <strong>exact counting with reconciliation</strong>.)</p>
+<p>For distinct fans, a clerk can't remember every face. But imagine each fan has a random ticket number, and each clerk only notes the most unusual number seen — say, the one that starts with the longest run of zeros. If someone has seen a number starting with ten zeros, roughly a thousand different fans must have passed (since only about one in 2<sup>10</sup> = 1,024 random numbers starts that way). One such observation is noisy; average thousands of them from different "buckets" and the estimate becomes good to within about 1%. That's HyperLogLog, and it's why a few kilobytes can count millions.</p>
+<p>Where the analogy breaks: in software the "gates" are hundreds of partitions on many machines, runners can deliver the same tally twice after a crash, and one gate can get half the crowd. Most of this lesson is about those three facts.</p>
+
+<h4>Why "approximately right" is often the right answer</h4>
+<p>It can feel like cheating to show an advertiser an estimate. But a number on a dashboard is already noisy in ways nobody notices: bots that slipped through the filter, users counted twice because they cleared cookies, events still in flight from phones that are offline. A sketch that adds a known, bounded ±0.8% error to a quantity that already carries a few percent of real-world noise changes nothing a person would act on, and in exchange turns terabytes of per-user state into gigabytes. The discipline is to decide, metric by metric, who acts on the number and what an error costs them — then use exact machinery only where an error costs money or trust.</p>
+
+<h4>Exact versus approximate, decided up front</h4>
+<table><thead><tr><th>Question</th><th>Typical tolerance</th><th>Tool</th></tr></thead><tbody>
+<tr><td>Clicks to bill an advertiser</td><td>exact, auditable</td><td>dedup by click ID, exactly-once aggregation, batch reconciliation</td></tr>
+<tr><td>Unique viewers of a post</td><td>±1–2%</td><td>HyperLogLog</td></tr>
+<tr><td>Top 100 trending items</td><td>right items, approximate counts</td><td>count-min sketch + heap</td></tr>
+<tr><td>Player rank on a leaderboard</td><td>exact for top, approximate tail OK</td><td>sorted set</td></tr>
+<tr><td>Requests per minute for a rate limit</td><td>roughly right, fast</td><td>in-memory counters, windowed</td></tr>
+</tbody></table>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Real-time counting pipeline: clients and edges send events to a log; a stream processor filters, deduplicates and aggregates by event-time windows into exact counters, sketches and sorted sets; a batch job reconciles from the raw archive">
+  <defs><marker id="in9-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="90" width="90" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="112" text-anchor="middle" style="fill:var(--ink)">Clients /</text>
+    <text x="55" y="130" text-anchor="middle" style="fill:var(--ink)">ad servers</text>
+    <rect x="120" y="90" width="90" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="165" y="112" text-anchor="middle" style="fill:var(--ink)">Collectors</text>
+    <text x="165" y="130" text-anchor="middle" style="fill:var(--muted)">ID, pre-agg</text>
+    <rect x="230" y="90" width="80" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="270" y="112" text-anchor="middle" style="fill:var(--ink)">Log</text>
+    <text x="270" y="130" text-anchor="middle" style="fill:var(--muted)">(Kafka)</text>
+    <rect x="330" y="70" width="120" height="96" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="390" y="90" text-anchor="middle" style="fill:var(--ink)">Stream job</text>
+    <text x="390" y="108" text-anchor="middle" style="fill:var(--muted)">filter bots</text>
+    <text x="390" y="124" text-anchor="middle" style="fill:var(--muted)">dedup by ID</text>
+    <text x="390" y="140" text-anchor="middle" style="fill:var(--muted)">event-time windows</text>
+    <text x="390" y="156" text-anchor="middle" style="fill:var(--muted)">checkpoints</text>
+    <rect x="475" y="30" width="155" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="552" y="55" text-anchor="middle" style="fill:var(--ink)">Exact counts (OLAP)</text>
+    <rect x="475" y="85" width="155" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="552" y="110" text-anchor="middle" style="fill:var(--ink)">Sketches: HLL, CMS</text>
+    <rect x="475" y="140" width="155" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="552" y="165" text-anchor="middle" style="fill:var(--ink)">Sorted sets, counters</text>
+    <rect x="230" y="205" width="220" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="340" y="224" text-anchor="middle" style="fill:var(--ink)">Raw archive → nightly batch</text>
+    <text x="340" y="240" text-anchor="middle" style="fill:var(--muted)">exact recount, reconcile</text>
+    <line x1="100" y1="118" x2="118" y2="118" marker-end="url(#in9-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="210" y1="118" x2="228" y2="118" marker-end="url(#in9-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="310" y1="118" x2="328" y2="118" marker-end="url(#in9-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="450" y1="95" x2="473" y2="52" marker-end="url(#in9-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="450" y1="112" x2="473" y2="106" marker-end="url(#in9-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="450" y1="140" x2="473" y2="158" marker-end="url(#in9-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="270" y1="146" x2="300" y2="203" marker-end="url(#in9-arrow)" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <path d="M 450 227 Q 560 227 552 72" marker-end="url(#in9-arrow)" style="fill:none;stroke:var(--accent);stroke-dasharray:4 3"/>
+    <text x="560" y="210" style="fill:var(--accent)">corrections</text>
+  </g>
+</svg>
+<figcaption>Events become counts in three kinds of store, chosen by tolerance: exact windowed aggregates for money, sketches for distinct counts and top-k, and sorted sets or counters for leaderboards and limits. The raw log is archived so a batch job can recount exactly and correct the fast path.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–18</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">18–26</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">26–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> Ingest impression and click events from ad servers and clients. Show advertisers, per ad and campaign: impressions, clicks, click-through rate and unique users, per minute and rolled up per hour and day, filterable by country and device. Show the top 50 ads by clicks over the last 10 minutes. Provide exact daily click totals for billing. Separately, a leaderboard for a game feature: update scores, get the top 100 and any player's rank.</p>
+<p><strong>Non-functional.</strong> Freshness: dashboard numbers within 10–30 seconds of the event. Billing counts exact, deduplicated, auditable, and final within a day. Dashboard counts may be approximate (±1–2%) and may be corrected later. Survive processor crashes without losing or double counting. Handle peaks of several times average and single huge advertisers. Queries over the last 90 days in seconds.</p>
+<p><strong>Clarifying questions.</strong> "Which numbers are billed?" "How late can events arrive — mobile apps offline for days?" "What dimensions do advertisers filter by, and how many distinct values?" (Each dimension multiplies the rows to store.) "Do unique users need to be exact?" (Almost never; say so and use sketches.)</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Scenario: <strong>100 billion impressions</strong> and <strong>1 billion clicks per day</strong>, <strong>2 million active ads</strong>, events of about <strong>200 bytes</strong>.</p>
+<p><strong>Event rates.</strong> Impressions: 100 × 10<sup>9</sup> ÷ 86,400 ≈ <strong>1.16 million/s</strong> on average; peak at 3× is about 3.5 million/s. Clicks: 10<sup>9</sup> ÷ 86,400 ≈ <strong>11,600/s</strong>, peaking around 35,000/s.</p>
+<p><strong>Bandwidth and raw storage.</strong> 1.16M/s × 200 B = 232 MB/s of impressions, about <strong>20 TB/day</strong> raw; with compression in the log and archive (say 5×), 4 TB/day. Clicks are 1% of that. Raw events are kept for reconciliation and reprocessing — 30 days of compressed impressions is 120 TB.</p>
+<p><strong>Aggregated rows.</strong> Per (ad, minute) with country (say 50 values with traffic) and device (3): worst case 2M × 50 × 3 = 300M rows per minute — impossible, and also wrong, since most ads don't get impressions from every country every minute. Realistically, if each active ad produces on average 20 non-empty (country, device) combinations per minute: 2M × 20 = 40M rows per minute, 57.6 billion per day at ~50 bytes = 2.9 TB/day — still large. So keep minute granularity for a short window (say 48 hours), roll up to hour × (country, device) after that (60× fewer rows), and to day for long retention. Dimension count is the cost driver, exactly as in in6's cardinality lesson.</p>
+<p><strong>Unique users.</strong> Exact distinct counting per ad per day would store every user ID: an ad reaching 5 million users needs 40 MB for one day. With HyperLogLog, 12 KB per (ad, day) when dense: 2M × 12 KB = 24 GB — and much less in practice because most ads have few users and use the sparse representation. Per hour, for flexible merging: 24 times more sketches, but each mostly sparse.</p>
+<p><strong>Top-k.</strong> A count-min sketch for ε = 0.1%, δ = 1% is 5 × 2,719 counters ≈ 53 KB per window — trivial — plus a heap of 50 to a few hundred candidates.</p>
+<p><strong>Leaderboard.</strong> 10 million players in a Redis sorted set: each member costs roughly 50–100 bytes with its score and index structures, so about <strong>1 GB</strong>. At 50,000 score updates per second at peak, one Redis instance (on the order of 100,000 simple operations per second) is near its limit — shard by region or season, or batch updates.</p>
+<p><strong>Stream processing capacity.</strong> At 3.5 million events/s peak and, say, 100,000 events/s per processing core including deserialisation, dedup lookups and window updates, that's 35 cores' worth — a modest cluster — provided the work spreads evenly. It won't, which is the hot-key dive.</p>
+
+<h4>3 · API</h4>
+<pre># ingestion (from ad servers / client SDKs, batched)
+POST /v1/events   [{"event_id": "c_8f3…", "type": "click", "ad_id": "a_91", "user_id": "u_42",
+                    "ts": "2026-10-02T09:41:12.381Z", "country": "IN", "device": "ios"}, …]
+
+# queries
+GET /v1/ads/{ad_id}/stats?from=…&amp;to=…&amp;granularity=minute&amp;group_by=country
+    -&gt; [{window, impressions, clicks, ctr, unique_users_est}]
+GET /v1/top-ads?window=10m&amp;metric=clicks&amp;k=50
+GET /v1/billing/clicks?advertiser=…&amp;day=2026-10-01      # exact, final after reconciliation
+
+# leaderboard
+POST /v1/boards/{board}/scores   {"player": "p_7", "delta": 120}
+GET  /v1/boards/{board}/top?n=100
+GET  /v1/boards/{board}/rank/{player}</pre>
+<p>Two things to call out. Every event carries an <code>event_id</code> generated at the source, and a timestamp of when it happened (<code>ts</code>, event time). Everything about exactness and windows depends on those two fields. And stats responses label approximate numbers (<code>unique_users_est</code>) separately from exact ones, so nobody bills on an estimate.</p>
+
+<h4>4 · Data model</h4>
+<ul>
+<li><strong>Raw events</strong> in the log (partitioned by ad_id) and archived to object storage as columnar files by hour.</li>
+<li><strong>Aggregates</strong> in an analytical (OLAP) store — a column store such as Druid, Pinot or ClickHouse built for fast filtering and summing — keyed by (ad_id, window_start, country, device) with impressions and clicks, replaced idempotently per key when recomputed.</li>
+<li><strong>Sketches</strong>: HLL per (ad_id, hour) and per (campaign, hour), serialised as bytes in the same store or a key-value store; count-min sketch and heap per (window) in the stream job's state.</li>
+<li><strong>Dedup state</strong> in the stream job: recently seen event IDs per key with a TTL (say 24 hours).</li>
+<li><strong>Billing ledger</strong>: daily exact clicks per advertiser, versioned, with corrections as new versions.</li>
+<li><strong>Leaderboards</strong>: Redis sorted sets per board, persisted periodically.</li>
+</ul>
+
+<h4>5 · High-level architecture</h4>
+<p><strong>Collectors</strong> at the edge accept batched events, assign IDs if the source didn't, validate, and write to the log. For extremely hot keys they pre-aggregate (more below). <strong>The log</strong> (Kafka, in1) buffers and partitions by ad_id, retaining raw events for replay. <strong>The stream job</strong> (Flink or similar) reads it, filters bots and repeat clicks, deduplicates by event_id, assigns events to event-time windows, maintains counts, sketches and top-k in its state, checkpoints that state together with the input offsets, and writes results to the serving stores. <strong>Serving</strong>: the OLAP store for dashboards, a cache in front for hot queries, Redis for leaderboards and rate-limit counters. <strong>The batch path</strong> runs nightly over the archived raw events, recomputes exact counts, compares them with the stream's results and publishes corrections and the final billing numbers.</p>
+<p>A click's journey: the user taps an ad at 09:41:12; the SDK sends it 300 ms later; the collector writes it to partition 17; the stream job reads it within a second, finds its event_id not seen before, adds it to the 09:41 window for ad a_91, updates the HLL for (a_91, 09:00 hour) with the user ID, and updates the top-k sketch. When the watermark passes 09:42 plus the allowed delay, the 09:41 window is emitted to the OLAP store. The dashboard shows it about 10–30 seconds after the tap.</p>
+
+<h4>6 · Deep dive: windows, watermarks and late events</h4>
+<p>A <strong>tumbling window</strong> is a fixed, non-overlapping bucket — each calendar minute. A <strong>sliding window</strong> overlaps — "the last 10 minutes, updated every minute" — and can be computed by summing the last ten one-minute buckets. Windows are defined in <strong>event time</strong>, because processing time mixes up minutes whenever events are delayed or replayed.</p>
+<p>The hard question is when a window is complete. A <strong>watermark</strong> is the stream's estimate that no events with timestamps earlier than T are still to come. Sources produce watermarks, usually "the largest event time seen minus a bound" (for example, minus 10 seconds), and a job's watermark is the minimum over all its inputs — one slow partition holds back the whole job, which matters for skew. When the watermark passes the end of a window, the window fires. Events that arrive later still — a phone that was offline for an hour — are <strong>late</strong>. Options: an <strong>allowed lateness</strong> during which the window's state is kept and an updated result is emitted (the OLAP store must accept upserts for past windows); a <strong>side output</strong> for very late events handled by a correction job; or drop them and let the batch reconciliation catch up. Choose the watermark delay and lateness from the measured distribution of event-time lag: if 99.9% of events arrive within 30 seconds, a 30-second watermark delay with a 1-hour allowed lateness covers nearly everything without delaying every result by an hour. Google's Dataflow model paper lays out this vocabulary — windows, watermarks, triggers and accumulation — and is the standard reference.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Event time versus processing time: events plotted by when they happened and when they arrived; the watermark line trails; a late event arrives after its window fired">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="60" y1="190" x2="620" y2="190" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="60" y1="190" x2="60" y2="20" style="fill:none;stroke:var(--line-2)"/>
+    <text x="340" y="215" text-anchor="middle" style="fill:var(--muted)">processing time (when the job sees it) →</text>
+    <text x="20" y="100" style="fill:var(--muted)" transform="rotate(-90 20 100)">event time →</text>
+    <line x1="60" y1="190" x2="230" y2="20" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <text x="236" y="28" style="fill:var(--muted)">ideal: no delay</text>
+    <path d="M 60 190 L 140 170 L 220 150 L 300 120 L 380 100 L 460 80 L 540 60 L 610 45" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+    <text x="520" y="40" style="fill:var(--accent)">watermark</text>
+    <rect x="60" y="130" width="560" height="30" style="fill:var(--s2);opacity:0.12"/>
+    <text x="70" y="149" style="fill:var(--ink-2)">window 09:41 (event time)</text>
+    <circle cx="180" cy="148" r="4" style="fill:var(--ink-2)"/>
+    <circle cx="210" cy="140" r="4" style="fill:var(--ink-2)"/>
+    <circle cx="245" cy="152" r="4" style="fill:var(--ink-2)"/>
+    <line x1="330" y1="125" x2="330" y2="190" style="fill:none;stroke:var(--good);stroke-dasharray:4 3"/>
+    <text x="330" y="182" text-anchor="middle" style="fill:var(--good)">fires</text>
+    <circle cx="470" cy="145" r="5" style="fill:var(--crit)"/>
+    <text x="482" y="150" style="fill:var(--crit)">late event (phone was offline)</text>
+    <text x="482" y="166" style="fill:var(--crit)">→ allowed lateness: update window</text>
+  </g>
+</svg>
+<figcaption>Events arrive later than they happened, by varying amounts. The watermark trails the data and decides when the 09:41 window fires; an event for 09:41 arriving after that is late and either updates the window within the allowed lateness or goes to a correction path.</figcaption>
+</figure>
+
+<h4>7 · Deep dive: exact counting for money</h4>
+<p>Duplicates enter everywhere: an SDK retries a click upload after a timeout, a collector retries a write to the log, the log redelivers after a consumer-group rebalance, the stream job restarts from a checkpoint and reprocesses events since then. Each would bill the advertiser twice. Four layers make the billed count exact.</p>
+<ol>
+<li><strong>A unique ID per event at the source</strong> — a random 128-bit ID generated when the click happens, so every retry carries the same ID.</li>
+<li><strong>Deduplication in the stream job</strong>: keyed state of event IDs seen in the last 24 hours (longer than any retry or redelivery); an event whose ID is present is dropped. At 35,000 clicks/s × 86,400 s ≈ 3 billion IDs a day at 16 bytes ≈ 48 GB of state across the job — fine for clicks, too much for impressions, which is another reason impressions are often counted approximately or deduplicated only in the batch path.</li>
+<li><strong>Exactly-once state</strong>: the job periodically checkpoints its state (counts, dedup set) atomically with its input offsets. After a crash it restores the checkpoint and resumes from those offsets, so every event is reflected in the state exactly once.</li>
+<li><strong>Exactly-once output</strong>: results are written transactionally (committed only when the checkpoint completes, as with Kafka transactions from in1) or idempotently — an upsert keyed by (ad, window) that overwrites the previous value rather than adding to it. "Add 52 clicks" is not idempotent; "the 09:41 total for a_91 is 3,912" is.</li>
+</ol>
+<p>Then <strong>reconcile</strong>. Every night a batch job recounts the previous day from the raw archive, applying the same filters and deduplication, and compares per advertiser. Differences — from very late events, bugs or replays — are published as corrections, and billing uses the batch number. Running both paths (fast approximate-ish stream plus exact batch) is the <strong>lambda architecture</strong>; using only the stream path and recomputing by replaying the log is the <strong>kappa architecture</strong>. For billing, most teams keep a batch check regardless, because it's an independent audit.</p>
+
+<h4>8 · Deep dive: HyperLogLog for distinct counts</h4>
+<p>Hash each user ID to 64 random-looking bits. In a uniformly random bit string, the chance that the first bit is 0 is 1/2, that the first two are 0 is 1/4, that the first k are 0 is 1/2<sup>k</sup>. So if, after hashing many IDs, the longest run of leading zeros you've seen is 20, you've probably hashed around 2<sup>20</sup> ≈ a million distinct IDs. Duplicates don't change the answer — the same ID always hashes to the same bits — which is exactly what distinct counting needs. One observation is very noisy, though: a single lucky hash could suggest a million when there were ten.</p>
+<p>HyperLogLog fixes the noise with <strong>many independent estimates</strong>. Use the first p bits of the hash to choose one of m = 2<sup>p</sup> <strong>registers</strong>; in the remaining bits, compute the "rank" — the position of the first 1 bit — and store in that register the maximum rank it has seen. With p = 14 there are 16,384 registers, each needing only 6 bits (ranks never exceed 64), so 16,384 × 6 bits = 98,304 bits = <strong>12 KB</strong>. The estimate combines registers using a harmonic mean (which damps outliers) times a correction constant, α<sub>m</sub> × m<sup>2</sup> ÷ Σ 2<sup>−register</sup>. The analysis by Flajolet and colleagues gives a standard error of about <strong>1.04/√m</strong>: with m = 16,384, 1.04 ÷ 128 = <strong>0.81%</strong>, which is exactly what Redis documents for its implementation.</p>
+<p>For small cardinalities many registers are still 0 and the raw estimate is biased, so implementations switch to <strong>linear counting</strong> — m × ln(m ÷ number of empty registers) — below about 2.5m. Google's HyperLogLog++ improves the small and middle ranges further with empirical bias correction and a <strong>sparse representation</strong> that stores only the registers actually touched, so a sketch for a post with 30 viewers costs bytes, not 12 KB. In the lab, the estimate for 1,000 users is essentially exact (linear counting), for 100,000 users +0.31%, and for 1,000,000 users −0.44% — all within the 0.81% standard error, in 12 KB of registers versus 8 MB to store a million 8-byte IDs.</p>
+<p>The property that matters most operationally is <strong>mergeability</strong>: the union of two sets has register values equal to the maximum of the two sketches' registers. So store one sketch per (ad, hour), and you can answer "unique users this week" or "unique users across the whole campaign" by merging sketches, with the same accuracy, without raw data. In the lab, merging day 1 (users 0–59,999) and day 2 (users 40,000–99,999) gives about 100,300 — the true union is 100,000, while adding the two days' counts would have said 120,000. HLL can't answer intersections or "was this user counted?" reliably; it answers "how many distinct", and that's all.</p>
+
+<h4>9 · Deep dive: count-min sketch and top-k</h4>
+<p>To find the most-clicked ads in a window without a counter per ad, use a <strong>count-min sketch</strong>: a table of d rows and w columns of counters, with d independent hash functions. To add an item, increment one counter in each row — the column chosen by that row's hash. To estimate an item's count, look at its d counters and take the <strong>minimum</strong>. Each counter holds the item's true count plus the counts of whatever other items collided into that cell, so every counter over-estimates, and the minimum is the least-polluted. It never under-counts.</p>
+<p>The guarantee: with w = ⌈e/ε⌉ columns and d = ⌈ln(1/δ)⌉ rows, the estimate exceeds the true count by at most εN (N being the total of all counts) with probability at least 1 − δ. For ε = 0.001 and δ = 0.01: w = ⌈2.718/0.001⌉ = 2,719 and d = ⌈ln 100⌉ = ⌈4.6⌉ = 5 — 13,595 counters, about 53 KB with 4-byte counters, regardless of whether there are a thousand distinct ads or a billion. In the lab, with 300,000 clicks over about 27,000 distinct ads, the maximum over-estimate was 91 against a bound of εN = 300, with a mean of about 15, and no item was under-counted.</p>
+<p>Because the error is relative to the total N, the sketch is accurate for heavy hitters and useless for rare items (an ad with 3 clicks might be estimated at 18). That's fine for top-k: keep a <strong>min-heap</strong> of the k current leaders by estimated count; after each update, if the item's estimate exceeds the heap's minimum, it replaces it. The lab's sketch-based top 5 matched the exact top 5. For a sliding "last 10 minutes" view, keep one sketch per minute and sum the last ten (sketches add cell by cell), or use exact per-key aggregation for the candidates.</p>
+
+<h4>10 · Deep dive: leaderboards and hot counters</h4>
+<p>A <strong>sorted set</strong> keeps members ordered by score in a structure (in Redis, a skip list plus a hash table) that supports update, rank lookup and range reads in O(log N). <code>ZINCRBY board 120 p_7</code> adds to a player's score; <code>ZREVRANGE board 0 99 WITHSCORES</code> returns the top 100; <code>ZREVRANK board p_7</code> returns a player's rank. With 10 million players, log<sub>2</sub>(10<sup>7</sup>) ≈ 23 steps per operation — microseconds. Ties are broken by encoding a second key into the score, for instance multiplying the points by 10<sup>10</sup> and adding (a large constant − the timestamp the score was reached), so earlier achievers rank higher.</p>
+<p>Beyond one instance's capacity, split boards by natural boundaries (region, season, game mode) and compute a global top-100 by merging each shard's top-100. Exact global rank for a mid-table player across shards is harder: either keep a histogram of scores (count of players in each score bucket) and compute an approximate rank as "number of players in higher buckets plus position within the bucket", or accept that ranks beyond the top few thousand are shown as percentiles ("top 12%"). Most products do exactly that.</p>
+<p>A single <strong>global counter</strong> — total likes on a viral post, the platform-wide click total — updated by every server becomes a hot key on one node. A <strong>sharded counter</strong> splits it into, say, 16 sub-keys updated at random and summed on read; writes spread 16 ways, and reads cost 16 lookups (or a cached sum refreshed every second). Pre-aggregating in each server for a second and sending one increment cuts writes further.</p>
+
+<h4>11 · Failure modes and trade-offs</h4>
+<p><strong>A processor crashes</strong>: restore from checkpoint and replay from the checkpointed offsets; exactly-once state and idempotent outputs prevent double counting. <strong>A huge advertiser</strong>: one partition overloads, its consumer lags, the job's watermark — the minimum over inputs — stops advancing, and every advertiser's windows stop closing; the drill works through the fixes. <strong>A late-data storm</strong> (a mobile release that queued events offline): allowed lateness absorbs some; the correction path and batch reconciliation absorb the rest. <strong>Bot traffic</strong>: filter before counting, with signals for repeat views and suspicious patterns — Reddit's rules stage exists for exactly this. <strong>Dimension explosion</strong>: an extra group-by dimension multiplies stored rows; cap dimensions or pre-aggregate only common combinations. <strong>Serving hot spots</strong>: a dashboard viewed by thousands during a big launch; cache query results for a few seconds.</p>
+<p><strong>The trade-offs to state in the close:</strong> exact versus approximate per metric; freshness versus completeness (watermark delay); state size versus deduplication window; one streaming codebase versus a separate batch audit; and memory versus accuracy in every sketch.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why the harmonic mean, and what bias correction does</h4>
+<p>Each HLL register is a noisy estimate of log<sub>2</sub>(n/m). If you averaged 2<sup>register</sup> arithmetically, a single register that happened to see an unusually long zero run (rank 30 when 15 is typical) would inflate the estimate enormously. The harmonic mean — m divided by the sum of 2<sup>−register</sup> — weights large values down, because 2<sup>−30</sup> adds almost nothing to the sum. The constant α<sub>m</sub> (about 0.7213/(1 + 1.079/m) for large m) corrects the remaining systematic bias. In the intermediate range, where linear counting is no longer good and the raw estimate is still biased, HLL++ uses an empirically measured table of bias corrections. And using a 64-bit hash, rather than the original 32-bit, removes the large-range correction entirely, since collisions only matter far beyond any real cardinality — Redis notes its HLL can estimate up to 2<sup>64</sup> members.</p>
+
+<h4>Deduplication at impression scale</h4>
+<p>Exact dedup for 3.5 million impressions per second with a 24-hour window would hold 100 billion IDs — terabytes of state. Practical designs combine approaches: deduplicate impressions only within a short window (minutes) where retries actually happen, using a Bloom filter per window (about 10 bits per ID for 1% false positives — 1% of distinct impressions wrongly dropped, which is acceptable for a non-billed metric, or not, which is why billed impressions go through the batch path); bill on clicks, which are a hundred times rarer; and have ad servers generate impression IDs deterministically so the batch job can deduplicate exactly over the archive.</p>
+
+<h4>Two-stage aggregation and the watermark problem</h4>
+<p>With keys salted into 32 sub-keys (<code>ad_id#0</code> … <code>ad_id#31</code>), the first stage aggregates each salted key in parallel and emits partial results per window; the second stage, keyed by ad_id, sums counts, merges HLLs and combines top-k candidates. This works because the aggregates are <em>associative and commutative</em> — counts add, HLLs merge by max, count-min sketches add cell-wise. Aggregates that aren't (exact medians, for example) need sketches designed to merge, such as quantile sketches. Separately, isolate freshness: if one partition's lag holds back the global watermark, use per-partition or per-key watermark handling where the engine supports it, mark idle partitions as idle so they don't freeze progress, and route the largest tenants to their own job.</p>
+
+<h4>OLAP stores and pre-aggregation trade-offs</h4>
+<p>Column stores built for analytics (Druid, Pinot, ClickHouse) can ingest from the log and roll up at ingestion: rows with the same (ad, minute, country, device) are combined into one row with summed metrics, and HLL columns are merged. That trades flexibility for cost — you can't later query a dimension you rolled away. The usual compromise is tiers: full detail for a day or two, rolled up for months, with raw events in object storage for anything unanticipated. Query latency comes from columnar layout (read only the columns needed), compression and indexes on dimensions; caching the last few minutes' hot queries absorbs dashboard refresh storms during big launches.</p>
+
+<h4>Percentiles and other mergeable summaries</h4>
+<p>Counts and distinct counts aren't the only aggregates people want: "p95 time from impression to click", "median session length per country". Exact percentiles need every value, and percentiles of partial results don't combine (the same trap as averaging p99s in in6). Mergeable quantile sketches solve it the way HLL solves distinct counts: a t-digest keeps a few hundred weighted centroids concentrated near the tails, and DDSketch keeps counts in logarithmically sized buckets that guarantee a fixed relative error on every quantile. Both merge across partitions and time windows, so the two-stage aggregation pattern still works. The general rule for streaming design: prefer aggregates that are associative and mergeable — sums, counts, max, sketches — because they parallelise, survive repartitioning and roll up over time.</p>
+
+<h4>Privacy and counting</h4>
+<p>Unique-user counts reveal information when slices are small: "1 unique user from this postcode clicked this ad" identifies someone. Analytics products apply minimum thresholds (suppress counts below k), coarsen dimensions, and sometimes add calibrated noise (differential privacy) to published aggregates. HLL sketches themselves can leak membership information if exposed raw, so they should be treated as sensitive data, not as anonymised output.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: view counting at Reddit (2017)</h4>
+<p>In May 2017 Reddit's data engineering team described how they built view counts for posts. Their four requirements are a crisp statement of this lesson's trade-offs: counts must be real time or near real time ("no daily or hourly aggregates"); each user must be counted only once within a short time window; the displayed count must be within a few percentage points of the actual tally; and the system must process events within a few seconds at production scale.</p>
+<p>Exact counting was ruled out by memory: "several popular posts have over one million unique viewers", and storing a million 8-byte user IDs would take 8 MB per post, while frequent lookups into such sets would be "extremely taxing on both memory and CPU". They compared linear probabilistic counting (accurate, but memory grows linearly) with HyperLogLog (sub-linear growth, slightly less accurate), noting that good implementations combine the two as "sparse" and "dense" representations, as described in Google's HyperLogLog++ paper. Their choice was Redis's HLL implementation, which could "count over 1 million IDs using just 12 kilobytes of space" — 0.15% of the exact approach — and moved the CPU- and memory-heavy work onto dedicated servers.</p>
+<p>The pipeline maps onto this lesson's architecture. View events go to an event collector, which batches them into <strong>Kafka</strong>. A first consumer, <strong>Nazar</strong>, applies rules — using Redis to keep state — to decide whether each view should count, for example rejecting repeat views from the same user over a short period; it adds a flag to the event and writes it back to Kafka. A second consumer, <strong>Abacus</strong>, reads Nazar's output and, for countable events, issues a <code>PFADD</code> to the post's HLL in Redis. If the post's HLL isn't in Redis (typically an older post whose counter was evicted), Abacus loads it from <strong>Cassandra</strong>, which persists both the HLL filters and the raw counts; Abacus periodically writes HLLs and counts back to Cassandra, batched in 10-second groups per post to avoid overloading the cluster.</p>
+<p>Note what the design did <em>not</em> need: no exactly-once machinery, no batch reconciliation, no per-user state beyond the short window Nazar uses to reject repeat views. Those would be required if views were billed; for a number shown to authors and moderators, "within a few percentage points" was the requirement, and the architecture is correspondingly simple. The lessons generalise: separate filtering (who counts) from counting; pick approximate structures when the requirement says "within a few percentage points"; keep hot state in memory and cold state durable with a load-on-miss path; and batch writes to the durable store.</p>
+
+<h4>What goes wrong, and what to watch</h4>
+<p><strong>Consumer lag and watermark lag</strong> per partition — the first signal of a hot key or an overloaded job. <strong>Late-event rate</strong> and how many fall outside allowed lateness. <strong>Dedup hit rate</strong> — a sudden jump means an upstream retry storm or a replay. <strong>Checkpoint duration and failures</strong> — long checkpoints mean big state and slow recovery. <strong>Reconciliation deltas</strong> between stream and batch per day — should be tiny and stable; a jump means a bug. <strong>Sketch accuracy</strong> — periodically compute exact uniques for a sample of keys offline and compare. <strong>Serving latency</strong> for dashboard queries during launches.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> build a HyperLogLog and a count-min sketch from scratch, and compare them with exact counting on memory and accuracy; merge two HLLs to get a union; find the top ads with a sketch and a heap. Python 3.12, standard library only, about 6 seconds.</p>
+<pre>"""HyperLogLog (unique counts in 12 KB) and a count-min sketch with top-k
+(heavy hitters), compared with exact counting. Python 3.12 stdlib only."""
+import hashlib, heapq, math, random
+from collections import Counter
+
+def h64(x, seed=0):
+    return int.from_bytes(hashlib.blake2b(f"{seed}:{x}".encode(), digest_size=8).digest(), "big")
+
+class HLL:
+    def __init__(self, p=14):                      # m = 2^14 = 16,384 registers (as Redis)
+        self.p, self.m, self.reg = p, 1 &lt;&lt; p, bytearray(1 &lt;&lt; p)
+    def add(self, x):
+        v = h64(x)
+        idx = v &gt;&gt; (64 - self.p)                   # first p bits pick a register
+        rest = v &amp; ((1 &lt;&lt; (64 - self.p)) - 1)
+        rank = (64 - self.p) - rest.bit_length() + 1   # position of first 1-bit
+        if rank &gt; self.reg[idx]: self.reg[idx] = rank
+    def count(self):
+        m = self.m
+        est = 0.7213 / (1 + 1.079 / m) * m * m / sum(2.0 ** -r for r in self.reg)
+        zeros = self.reg.count(0)
+        if est &lt;= 2.5 * m and zeros:               # small range: linear counting
+            est = m * math.log(m / zeros)
+        return est
+    def merge(self, other):                        # union = register-wise max
+        self.reg = bytearray(max(a, b) for a, b in zip(self.reg, other.reg))
+
+print("HLL with 16,384 registers (6 bits each = 12 KB); theory: 1.04/sqrt(m) = "
+      f"{1.04 / math.sqrt(1 &lt;&lt; 14):.2%} standard error")
+for n in (1_000, 100_000, 1_000_000):
+    hll = HLL()
+    for i in range(n): hll.add(f"user-{i}")
+    print(f"  {n:&gt;9,} unique users -&gt; estimate {hll.count():&gt;11,.0f} "
+          f"({hll.count() / n - 1:+.2%}); exact set of 8-byte IDs = {8 * n / 1e6:.3f} MB")
+a, b = HLL(), HLL()
+for i in range(60_000): a.add(f"user-{i}")             # day 1 viewers
+for i in range(40_000, 100_000): b.add(f"user-{i}")    # day 2 viewers (20k overlap)
+a.merge(b)
+print(f"  merged day1 ∪ day2 -&gt; estimate {a.count():,.0f} (exact 100,000)")
+
+class CountMin:
+    def __init__(self, eps, delta):
+        self.w, self.d = math.ceil(math.e / eps), math.ceil(math.log(1 / delta))
+        self.t = [[0] * self.w for _ in range(self.d)]
+    def add(self, x, c=1):
+        for r in range(self.d): self.t[r][h64(x, r) % self.w] += c
+    def est(self, x):
+        return min(self.t[r][h64(x, r) % self.w] for r in range(self.d))
+
+rng = random.Random(7)
+ads = [f"ad-{i}" for i in range(50_000)]
+weights = [1 / (i + 1) ** 1.1 for i in range(len(ads))]   # skewed click distribution
+clicks = rng.choices(ads, weights, k=300_000)
+exact = Counter(clicks)
+cms = CountMin(eps=0.001, delta=0.01)                    # error &lt;= 0.1% of N, 99% of the time
+top = []                                                 # min-heap of (estimate, ad) for top 10
+for ad in clicks:
+    cms.add(ad)
+    e = cms.est(ad)
+    if ad in (x for _, x in top):
+        top = [(e if x == ad else c, x) for c, x in top]; heapq.heapify(top)
+    elif len(top) &lt; 10: heapq.heappush(top, (e, ad))
+    elif e &gt; top[0][0]: heapq.heapreplace(top, (e, ad))
+print(f"\nCount-min sketch {cms.d} x {cms.w} = {cms.d * cms.w:,} counters "
+      f"(~{cms.d * cms.w * 4 / 1024:.0f} KB) for {len(exact):,} distinct ads, N = {len(clicks):,}")
+over = [cms.est(a) - exact[a] for a in exact]
+print(f"  overestimate: mean {sum(over) / len(over):.1f}, max {max(over)} "
+      f"(bound eps*N = {0.001 * len(clicks):.0f}); never under: {min(over) &gt;= 0}")
+print("  top-5 by sketch:", [x for _, x in sorted(top, reverse=True)[:5]])
+print("  top-5 exact:    ", [x for x, _ in exact.most_common(5)])</pre>
+<p><strong>Run it:</strong> save as <code>count_lab.py</code> and run <code>python count_lab.py</code>. (The registers are stored one per byte for simplicity — 16 KB — though each needs only 6 bits, which is how Redis packs them into 12 KB.)</p>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li>HLL estimates: about exact for 1,000 users (the small-range linear counting branch), within ±0.5% for 100,000 and 1,000,000 — inside the 0.81% standard error — while an exact set of 8-byte IDs would need 8 MB at a million.</li>
+<li>Merging day 1 and day 2 sketches estimates the union (≈100,300 for a true 100,000). Adding the days' counts would say 120,000: distinct counts don't add, sketches merge.</li>
+<li>The count-min sketch (5 × 2,719 counters, about 53 KB) never under-counts; its worst over-estimate (about 91) is well within εN = 300, and the mean is about 15.</li>
+<li>The heap of candidates driven by sketch estimates recovers the same top 5 as exact counting.</li>
+</ol>
+<p><strong>Try next:</strong> set <code>p=10</code> (1,024 registers) and watch the error grow toward 1.04/√1024 ≈ 3.25%; shrink the sketch to <code>eps=0.01</code> and see which mid-ranked ads it over-estimates into the top 10.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+    <p>An ad platform serves 2M impressions/s. You must report per ad: total impressions, unique users, and the top 50 ads by click-through rate — updated every 10 seconds, over a 1M-ad catalogue with 400M monthly users.</p>
+    <p>(a) What does exact unique-user counting cost? (b) What does HyperLogLog cost? (c) One advertiser runs 40% of all impressions. What breaks and what do you do?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Exact uniques.</strong> To count distinct users per ad per day you must remember which users you have seen. A large ad might reach 5M users; storing 5M × 8-byte IDs is 40 MB <em>for one ad for one day</em>. Across 100,000 active ads that is <strong>4 TB of state per day</strong>, held in memory by the stream processor so lookups are fast. That isn't affordable, and it doesn't shard away — the set for one ad must be in one place to deduplicate against.</p>
+    <p>Worse, the numbers don't compose. Exact daily uniques for 30 days tell you nothing about monthly uniques, because distinct counts can't be summed. You'd have to keep the full sets for a month.</p>
+    <p><strong>(b) HyperLogLog.</strong> A sketch with 2<sup>14</sup> registers gives about <strong>0.81% standard error in about 12 KB</strong>, independent of how many items it counted. Across 100,000 active ads: 100,000 × 12 KB = <strong>1.2 GB</strong> — comfortably in memory, more than a <strong>3,000× reduction</strong>, and less with sparse sketches for small ads.</p>
+    <p>The property that matters even more is <strong>mergeability</strong>. Store one sketch per (ad, hour) and you can answer uniques for any period by merging hourly sketches, for any campaign by merging its ads' sketches, and for any country slice you kept separately — all without touching raw events. Exact counters can't do this: summing hourly uniques double-counts anyone who appeared in two hours. <em>The flexibility is the real win; the space saving is a bonus.</em></p>
+    <p>For the top 50 by click-through rate, keep per-ad impression and click counts (exact or count-min) and a heap of candidates, with a minimum-impressions threshold so an ad with 2 impressions and 1 click (50% CTR) doesn't top the chart.</p>
+    <p><strong>(c) The 40% advertiser.</strong> Partitioning by <code>ad_id</code> means 800,000 impressions/s land on <strong>one partition and one task</strong>. It can't keep up, its lag grows without bound, and because the job's watermark is the minimum across its inputs, <em>the entire pipeline's event time stalls</em> — windows for every other advertiser stop closing and the whole dashboard goes stale. One advertiser has frozen the platform's reporting, which is the non-obvious part.</p>
+    <p>The fixes, in order:</p>
+    <ul>
+    <li><strong>Pre-aggregate in the collector.</strong> Buffer 1 second and emit <code>(ad_id, impressions: 800000)</code> per collector instead of 800,000 messages. The stream volume for that key drops by orders of magnitude and the partition is no longer hot. Decisive, and needs no repartitioning. The cost is per-event granularity in the fast path, which the raw archive still has.</li>
+    <li><strong>Two-stage aggregation for anything that can't be pre-combined.</strong> Salt the key (<code>ad_id#0</code> … <code>ad_id#31</code>), aggregate in parallel across 32 partitions, then combine the partials in a second stage. Counts add, and HyperLogLog sketches <em>merge</em> — which is why mergeability matters operationally, not just theoretically.</li>
+    <li><strong>Isolate the whale.</strong> Route the largest advertisers to a dedicated partition set or job, so their volume can't stall everyone else's watermark.</li>
+    <li><strong>Decouple watermarks</strong> where the engine allows it, so one lagging partition degrades its own freshness rather than the global one.</li>
+    </ul>
+    <p><strong>The recurring lesson:</strong> this is the same skew failure as the Kafka consumer group, the celebrity in a feed and the viral cache key — a single hot key defeating a partitioned system. What's specific here is the blast radius: because watermarks are global, the hot key doesn't just slow itself, it stops <em>everyone's</em> results from being emitted.</p></details>
+
+<b>Estimate it</b>
+    <p>A game has 50 million players. Scores update 200,000 times per second at peak. Players want the global top 100 and their own exact rank. Can one Redis sorted set do it? If not, what do you build?</p>
+    <details><summary>Answer</summary>
+    <p>Memory: 50M members at roughly 80 bytes each ≈ 4 GB — fits. Throughput: 200,000 ZINCRBY/s is about twice what one Redis instance handles comfortably for O(log N) operations, so one set is too hot. Shard by player ID into, say, 8 sorted sets of about 6M players: writes spread to 25,000/s each. The global top 100 is the merge of each shard's top 100 (800 candidates, trivial), cached for a second. Exact global rank needs the count of players with a higher score across all shards: ask each shard <code>ZCOUNT board (score +inf</code> (O(log N)) and sum the 8 answers — exact, 8 small queries. Alternatively shard by score range so rank is a local rank plus the sizes of higher ranges, at the cost of moving players between shards as scores change. Batch updates per player per second at the game servers to cut write volume further.</p></details>
+</section>

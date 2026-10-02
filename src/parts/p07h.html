@@ -1,0 +1,334 @@
+
+/* ============================================================
+   DATA — infrastructure building blocks, part three.
+   Stream aggregation, experimentation, and prefix search.
+   ============================================================ */
+INFRA.push(
+
+{ id:"in9", t:"Design real-time analytics and counting (ad clicks, leaderboards)", tag:"Streaming", sum:"Windowed aggregation, late data, and the sketches that make exact counting unnecessary.",
+  primer:`<h4>Start here — why counting is hard at scale</h4>
+  <p>"Count the clicks per advert per minute." Trivially easy at a thousand events a second and genuinely hard at a million, for reasons that are not about arithmetic:</p>
+  <ul>
+  <li><strong>Events arrive late and out of order.</strong> A phone in a tunnel uploads its clicks twenty minutes afterwards. Does that click belong to the minute it happened or the minute it arrived? Those are different numbers, and you must choose.</li>
+  <li><strong>Events arrive twice.</strong> At-least-once delivery means retries, so a naive counter over-counts — and over-counting clicks means over-billing an advertiser, which is a refund and a lawsuit rather than a rounding error.</li>
+  <li><strong>Some questions cannot be answered by counting at all.</strong> "How many <em>unique</em> users saw this advert?" requires remembering every user id you have seen, which for a billion users is gigabytes per advert per day.</li>
+  <li><strong>Queries want both fresh and historical.</strong> A dashboard shows the last minute and the last ninety days in the same view, and those come from different systems.</li>
+  </ul>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Event time vs processing time</strong> — when it happened versus when you saw it. Aggregating by processing time is easy and wrong; by event time is correct and requires handling late arrivals.</li>
+  <li><strong>Watermark</strong> — a stream's assertion that "no more events older than T are expected". It is how a windowed aggregation decides it can emit a result, and it is always a guess.</li>
+  <li><strong>Tumbling / sliding window</strong> — fixed non-overlapping buckets (each minute), versus overlapping ones (the last 5 minutes, updated every minute).</li>
+  <li><strong>HyperLogLog</strong> — a probabilistic structure estimating <em>distinct count</em> in ~12 KB with about 2% error, regardless of whether you counted a thousand or a billion items. Mergeable, which is what makes it usable across shards.</li>
+  <li><strong>Count-Min Sketch</strong> — estimates the frequency of individual items in fixed space, over-counting slightly but never under-counting. Used for heavy hitters.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p><strong>Decide what accuracy each number actually needs, because exactness is the expensive part.</strong> A billing counter must be exact and deduplicated. A "trending now" list needs to be roughly right and instant. A unique-visitor figure is fine at 2% error. Designing everything to billing standards costs an order of magnitude more than it needs to, and designing billing to dashboard standards is a legal problem.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["Pipeline","12–26"],["Windows & late data","26–38"],["Sketches","38–46"],["Failure","46–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> ingest a high-volume event stream; aggregate by dimensions over time windows; serve both real-time and historical queries; support unique counts and top-k.</li>
+  <li><strong>Out of scope:</strong> the ad-serving decision itself, fraud detection on clicks (name it — it is a separate design), the BI tool.</li>
+  <li><strong>Non-functional:</strong> dashboard numbers within ~10 seconds; billing numbers exact and reconcilable; queries over 90 days in under a second; no event lost.</li>
+  <li><strong>The question that changes the design:</strong> "is this for billing or for a dashboard?" Billing needs exactly-once semantics, an audit trail and reconciliation. A dashboard needs speed and can tolerate approximation. Most real systems need both, which means <em>two paths over one event stream</em> — and identifying that early is the main structural insight.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>1M events/s at peak, ~400 bytes each = <strong>400 MB/s ingest</strong>, 35 TB/day raw.</li>
+  <li>Dimensions: advert × campaign × country × device × hour. If there are 1M adverts, 200 countries and 5 device types, the theoretical cross-product is a billion rows per hour — but real traffic is sparse, so expect perhaps <strong>10M non-empty aggregate rows/hour</strong>. Say this: <em>you size on observed combinations, not on the cross-product,</em> and you must cap cardinality or a bad dimension will produce the cross-product.</li>
+  <li>Aggregated storage: 10M rows/hour × 24 × 90 days × ~100 bytes = <strong>~2 TB</strong>. Very manageable — the aggregation is a 1000× reduction from raw, which is the entire point.</li>
+  <li>Raw retention: 35 TB/day in object storage for reprocessing. Keep 30 days and you can always rebuild an aggregate you got wrong, which is the safety net that makes the rest tolerable.</li></ul>
+
+  <h4>3 · The pipeline — 12–26 min</h4>
+  ${flow([{t:"Collectors",d:"validate, assign event id"},{t:"Kafka",d:"partitioned by ad_id"},{t:"Stream job",d:"windowed aggregation"},{t:"OLAP store",d:"pre-aggregated, queryable"},{t:"Raw archive",d:"object storage, reprocessable"}])}
+  <p><strong>Two paths from one stream,</strong> and be explicit about why:</p>
+  <ul>
+  <li><strong>Speed path:</strong> a stream processor aggregates into short windows and writes to a store optimised for fast aggregate reads. Approximate, a few seconds behind, good enough for dashboards and pacing decisions.</li>
+  <li><strong>Accuracy path:</strong> raw events land in object storage; a batch job reprocesses each day with full deduplication and late-arrival handling, producing the authoritative numbers used for billing. It overwrites the speed path's figures for that period.</li>
+  </ul>
+  <p>This is the <em>lambda architecture</em>, and its well-known cost is maintaining two implementations of the same logic, which drift. The modern alternative (<em>kappa</em>) is one stream engine with replay: to fix history you rewind the stream and reprocess with the corrected code. Say which you chose. Kappa is cleaner if your stream engine has exactly-once state and can replay from retention; lambda is pragmatic when billing genuinely needs a separate, auditable, independently-implemented path.</p>
+  <p><strong>Partition by the aggregation key</strong> (<code>ad_id</code>) so all events for one advert reach one processor and its counter is local — no cross-partition coordination. The cost is the familiar one: a single enormous advertiser hot-spots a partition.</p>
+
+  <h4>4 · Windows and late data — 26–38 min</h4>
+  <p>Aggregate by <strong>event time</strong>. A click at 10:59:58 that arrives at 11:00:03 belongs to the 10:59 minute, or your minute-by-minute chart shifts under network conditions rather than user behaviour.</p>
+  <p>That creates the central question: <strong>when is a window done?</strong> You can never be certain no more events will arrive. The mechanism is a <strong>watermark</strong> — a heuristic, usually "the maximum event time seen, minus a grace period". When the watermark passes the end of a window, emit its result.</p>
+  <ul>
+  <li><strong>Grace period is a trade-off:</strong> 10 seconds means fast dashboards and dropped stragglers; 30 minutes means accurate but stale. Pick per use case, and measure the actual lateness distribution rather than guessing.</li>
+  <li><strong>Allowed lateness:</strong> keep window state a little beyond the watermark and emit an <em>update</em> when a late event arrives. Downstream must then handle retractions, which is why the serving store should support upserts rather than append-only inserts.</li>
+  <li><strong>Very late events</strong> go to a side output rather than being silently discarded. Monitor that stream — a sudden rise means a client or region is broken, and it is a better signal than most explicit error metrics.</li>
+  </ul>
+  <p><strong>Deduplication</strong> needs an event id assigned at the collector, and a per-key seen-set within a window. Store it as a bloom filter or a keyed state with TTL, because keeping every id forever is not viable. Note that dedup is only exact <em>within</em> the retention window — an event arriving two days late may be counted twice, which is precisely why the batch reconciliation path exists.</p>
+
+  <h4>5 · Sketches — 38–46 min</h4>
+  <p>The section that separates candidates, because it turns impossible questions into cheap ones.</p>
+  <ul>
+  <li><strong>Unique users per advert per day.</strong> Exactly: store every user id — 100M ids × 8 bytes = 800 MB per advert per day, impossible across a million adverts. With <strong>HyperLogLog</strong>: ~12 KB per advert per day, about 2% error, and — critically — <em>mergeable</em>, so per-hour sketches combine into a day, and per-shard sketches combine into a total, without re-reading the data. Explaining mergeability is the part that shows you understand why it is chosen over sampling.</li>
+  <li><strong>Top 100 adverts by clicks.</strong> Exactly: a counter per advert, then sort a million counters. With <strong>Count-Min Sketch</strong> plus a small heap: fixed memory, tiny error, and it can run in the stream. The error is one-sided — it may over-count, never under-count — so a heavy hitter is never missed.</li>
+  <li><strong>Percentile latency or spend distribution:</strong> <strong>t-digest</strong> or <strong>DDSketch</strong>, which are mergeable and accurate at the tails where it matters.</li>
+  </ul>
+  <p>State the rule: <strong>sketches for exploratory and dashboard numbers, exact counts for anything with money attached.</strong> A 2% error on unique reach is fine; a 2% error on billable clicks is fraud.</p>
+
+  <h4>6 · Failure and serving — 46–56 min</h4>
+  <ul><li><strong>Stream job restarts:</strong> window state must be checkpointed, and with exactly-once state plus transactional output the job resumes without double-counting. Without it, a restart re-processes and inflates counters — the most common real bug in these systems.</li>
+  <li><strong>Backpressure:</strong> if the processor falls behind, Kafka retains and the job catches up. Alert on consumer lag; a growing lag means dashboards are stale and nobody can tell from the numbers themselves.</li>
+  <li><strong>Serving store:</strong> a columnar OLAP store (Druid, ClickHouse, Pinot) keeps pre-aggregated rollups at several granularities — minute, hour, day — so a 90-day query reads 90 rows rather than 130,000 minutes. Pre-aggregation is what makes the query budget achievable.</li>
+  <li><strong>The correctness escape hatch:</strong> because raw events are retained, any aggregate can be rebuilt. Make reprocessing a routine, tested operation rather than an emergency, and version the aggregates so a rebuild can be compared before it replaces the old numbers.</li>
+  <li><strong>Hot key:</strong> one advert taking 30% of traffic saturates its partition. Pre-aggregate locally in the collector before publishing (combine 1,000 clicks into one count-of-1,000 message), which reduces the stream volume by orders of magnitude for exactly the keys that need it.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the three decisions: event time with watermarks, because processing time produces charts that lie; sketches where approximation is acceptable and exact counts where money is involved; and retained raw events so any mistake is repairable. Then name the operational habit — monitor the very-late-events side output, because it is your earliest signal that a client or region has broken.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>"Exactly-once" in stream processing means something narrower than it sounds.</strong> Flink and Kafka Streams give exactly-once <em>state updates</em> by checkpointing operator state and output offsets atomically — so on restart, state and position are consistent. That is genuinely exactly-once for the internal aggregation. The moment you write to an external store, you need either an idempotent write (upsert keyed by window and dimension) or a transactional sink. Candidates who claim end-to-end exactly-once without naming the sink requirement have not thought it through, and this is a reliable probe.</li>
+  <li><strong>Pre-aggregation at the edge is the highest-leverage optimisation and it changes the shape of the problem.</strong> A collector that buffers for one second and emits <code>(ad_id, count)</code> rather than individual events reduces stream volume by 100× or more for popular keys, which simultaneously fixes hot partitions, cuts Kafka cost and reduces processor load. The cost is one second of extra latency and the loss of per-event detail in the speed path — which you still have in the raw archive. Volunteering this trade shows you optimise where the leverage is rather than where the interest is.</li>
+  <li><strong>Watermark selection is where accuracy is actually decided,</strong> and a fixed grace period is a weak answer. Better: measure the observed distribution of event lateness and set the watermark at a chosen percentile — a grace period covering 99.5% of events, with the remainder handled as updates. Better still, make it adaptive per source, because a mobile client and a server-side integration have completely different lateness profiles, and one global setting serves neither.</li>
+  <li><strong>The lambda architecture's real cost is logic drift, not compute.</strong> Two implementations of the same aggregation — one streaming, one batch — inevitably diverge, and the divergence surfaces as "the dashboard and the invoice disagree", which destroys trust in both. If you keep lambda, the discipline is to share the aggregation logic as one library used by both paths, and to run a continuous comparison that alerts on divergence beyond a threshold. That comparison job is a deliverable, not a nice-to-have.</li>
+  <li><strong>Sketches compose, and that is the property to design around.</strong> Because HyperLogLog and Count-Min are mergeable, you can store a sketch per (dimension, hour) and answer any roll-up — by day, by country, by campaign — by merging, without re-reading raw events. This means you can answer questions you did not anticipate at write time, which exact pre-aggregated counters cannot do (you cannot recover unique counts by summing per-hour uniques). That flexibility is often a stronger argument than the space saving.</li>
+  <li><strong>Click fraud makes the counting problem adversarial.</strong> A meaningful fraction of ad traffic is bots, and the numbers you compute are what someone is billed. That means deduplication is not enough — you need filtering that is auditable and defensible, applied in the accuracy path, with the raw stream retained so a disputed invoice can be reconstructed. It also means the speed path and the billing path will legitimately show different numbers, and the product must explain that to advertisers rather than hide it.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>An ad platform serves 2M impressions/s. You must report per-advert: total impressions, unique users, and the top 50 adverts by click-through rate — updated every 10 seconds, over a 1M-advert catalogue with 400M monthly users.</p>
+    <p>(a) What does exact unique-user counting cost? (b) What does HyperLogLog cost? (c) One advertiser runs 40% of all impressions. What breaks and what do you do?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Exact uniques.</strong> To count distinct users per advert per day you must remember which users you have seen. A realistic advert might reach 5M users; storing 5M × 8-byte ids is 40 MB <em>for one advert for one day</em>. Across even 100,000 active adverts that is <strong>4 TB of state, per day</strong>, held in memory by the stream processor so lookups are fast. That is not affordable, and it does not shard away — the set for one advert must be in one place to deduplicate against.</p>
+    <p>Worse, the numbers do not compose. Having exact daily uniques for 30 days tells you nothing about monthly uniques, because you cannot sum distinct counts. You would have to retain the full sets for a month.</p>
+    <p><strong>(b) HyperLogLog.</strong> A sketch with 2<sup>14</sup> registers gives about <strong>0.8% standard error in ~12 KB</strong>, independent of how many items it counted. Across 100,000 active adverts: 100,000 × 12 KB = <strong>1.2 GB</strong> — comfortably in memory, a <strong>3,000× reduction</strong>.</p>
+    <p>The property that matters more than the space, though, is <strong>mergeability</strong>. Store one sketch per (advert, hour) and you can answer uniques for any period by merging hourly sketches, for any campaign by merging its adverts' sketches, and for any country slice you kept separately — all without touching raw events. Exact counters cannot do this at all: summing hourly uniques double-counts anyone who appeared in two hours. <em>The flexibility is the real win; the space saving is a bonus.</em></p>
+    <p>For the top-50-by-CTR, a Count-Min Sketch plus a heap of candidates gives heavy hitters in fixed memory, with one-sided error so a genuine heavy hitter is never missed.</p>
+    <p><strong>(c) The 40% advertiser.</strong> Partitioning by <code>ad_id</code> means 800,000 impressions/s land on <strong>one partition and one processor</strong>. That processor cannot keep up, its lag grows without bound, and because watermarks advance with the slowest partition, <em>the entire pipeline's watermark stalls</em> — so windows for every other advertiser stop closing and the whole dashboard goes stale. One advertiser has frozen the platform's reporting, which is the non-obvious part.</p>
+    <p>The fixes, in order:</p>
+    <ul>
+    <li><strong>Pre-aggregate in the collector.</strong> Buffer 1 second and emit <code>(ad_id, impressions: 800000)</code> instead of 800,000 messages. The stream volume for that key drops by ~6 orders of magnitude and the partition is no longer hot. This is decisive and needs no repartitioning. The only loss is per-event granularity in the speed path, which the raw archive still has.</li>
+    <li><strong>Two-stage aggregation for anything that cannot be pre-combined.</strong> Add a random salt to the key (<code>ad_id:0</code> … <code>ad_id:31</code>), aggregate in parallel across 32 partitions, then combine the 32 partials in a second stage. Counts sum trivially, and HyperLogLog sketches <em>merge</em> — which is exactly why mergeability matters operationally, not just theoretically.</li>
+    <li><strong>Isolate the whale.</strong> Route the largest advertisers to a dedicated partition set or job, so their volume cannot stall everyone else's watermark. Operationally honest for a genuinely outsized tenant.</li>
+    <li><strong>Decouple watermarks per partition</strong> where the engine allows it, so one lagging partition degrades its own freshness rather than the global one.</li>
+    </ul>
+    <p><strong>The recurring lesson:</strong> this is the same skew failure as the Kafka consumer group, the celebrity in a feed and the viral cache key — a single hot key defeating a partitioned system. What is specific here is the blast radius: because watermarks are global, the hot key does not just slow itself, it stops <em>everyone's</em> results from being emitted. Partition-level isolation of freshness is the defence worth naming.</p></details>`,
+
+  refs:[
+    ["paper","The Dataflow Model","Akidau et al., VLDB 2015 — event time, watermarks, triggers and the correctness/latency/cost trade-off. The paper that made windowing rigorous.","https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/"],
+    ["paper","HyperLogLog in Practice","Heule et al., 2013 — Google's engineering of HLL including sparse representation and bias correction. The source of the space and error figures used above.","https://research.google/pubs/hyperloglog-in-practice-algorithmic-engineering-of-a-state-of-the-art-cardinality-estimation-algorithm/"],
+    ["docs","Count–min sketch","The frequency-estimation structure behind heavy hitters, including why its error is one-sided.","https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch"],
+    ["docs","Redis probabilistic data types","HyperLogLog, Count-Min, t-digest and Bloom filters with a working API — the fastest way to build intuition for what they cost.","https://redis.io/docs/latest/develop/data-types/probabilistic/"],
+    ["docs","Flink: event time and watermarks","How watermarks, allowed lateness and side outputs actually work in a production stream engine.","https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/"],
+    ["docs","Apache Druid design","A columnar store built for exactly this serving layer — rollup at ingestion, and the segment model behind sub-second 90-day queries.","https://druid.apache.org/docs/latest/design/"]
+  ]},
+
+{ id:"in10", t:"Design an A/B testing platform", tag:"Experimentation", sum:"Assignment, metrics, and the statistics that decide whether you shipped an improvement or noise.",
+  primer:`<h4>Start here — the platform exists to prevent a specific mistake</h4>
+  <p>Someone ships a change, the metric goes up, and everyone concludes the change worked. Usually it did not — metrics move constantly for reasons unrelated to your release. An experimentation platform exists to <strong>attribute a change in a metric to a change in the product</strong>, with a stated level of confidence.</p>
+  <p>The engineering is not especially hard. The statistics are where designs fail, and interviewers know it.</p>
+  ${flow([{t:"Assign",d:"user → variant, deterministic"},{t:"Expose",d:"log that they saw it"},{t:"Measure",d:"join events to assignments"},{t:"Decide",d:"is the difference real?"}])}
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Variant / arm</strong> — control (existing behaviour) and one or more treatments.</li>
+  <li><strong>Assignment (bucketing)</strong> — deciding which variant a user gets. Must be <em>deterministic</em>: the same user always gets the same variant, without a database lookup.</li>
+  <li><strong>Exposure</strong> — a log line recording that a user actually <em>experienced</em> the variant. Distinct from assignment, and the distinction matters enormously.</li>
+  <li><strong>Guardrail metric</strong> — something that must not get worse (latency, crash rate, unsubscribes) even if the primary metric improves.</li>
+  <li><strong>p-value</strong> — the probability of seeing a difference this large if there were genuinely no effect. Below 0.05 by convention, and routinely misinterpreted.</li>
+  <li><strong>Statistical power</strong> — the probability of detecting a real effect of a given size. Under-powered tests produce a flat result that everyone misreads as "no difference".</li>
+  <li><strong>Peeking</strong> — checking results repeatedly and stopping when significant. It inflates false positives dramatically and is the single most common way experimentation platforms mislead.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p><strong>The platform's job is to make the correct analysis the default and the incorrect one hard.</strong> Anyone can split traffic; the value is in refusing to show a result before the test is powered, computing the right variance, flagging sample-ratio mismatch, and stopping teams from peeking. The statistics are the product.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–11"],["Assignment","11–24"],["Measurement","24–36"],["Statistics","36–48"],["Failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> define an experiment; assign users to variants; log exposures; join to metric events; compute results with confidence intervals; guardrails and automatic shutdown.</li>
+  <li><strong>Out of scope:</strong> feature-flag lifecycle management (adjacent and often the same system — say so), the BI tool, personalisation models.</li>
+  <li><strong>Non-functional:</strong> assignment adds under 1 ms and never fails (a broken experiment service must not break the product); results within hours; correct statistics by construction.</li>
+  <li><strong>The question to ask:</strong> "what is the randomisation unit?" User, session, device, or account? It must match the level at which the effect and the metric operate — randomising by session when the change affects a user's whole journey leaks treatment into control and biases the result toward zero.</li></ul>
+
+  <h4>2 · Numbers — 5–11 min</h4>
+  <ul><li>50M daily active users, 300 concurrent experiments. Assignment happens on nearly every request: <strong>~200,000 assignments/s</strong>, which is why it cannot be a network call.</li>
+  <li>Exposure logs: if a user hits 20 experiments per session and has 3 sessions/day, that is 50M × 60 = <strong>3B exposure events/day</strong>. Deduplicate aggressively — one exposure per user per experiment per day is enough for analysis and is 15B fewer rows.</li>
+  <li><strong>The power calculation is the number that matters,</strong> and doing it out loud is the strongest move in this interview. To detect a 1% relative lift on a metric with a 10% baseline conversion rate at 80% power and 5% significance, you need roughly <strong>1.5M users per arm</strong>. At 50M DAU that is achievable in under a day; for a metric with a 0.5% baseline it could take weeks. <em>Many experiments a team wants to run are simply not detectable at their traffic</em>, and the platform should say so before the test runs, not after.</li></ul>
+
+  <h4>3 · Assignment — 11–24 min</h4>
+  <p>Assignment must be <strong>deterministic, uniform and instant</strong>. The standard construction:</p>
+  <pre>bucket = hash(experiment_salt + ":" + user_id) % 10000
+variant = the arm whose allocation range contains bucket</pre>
+  <ul>
+  <li><strong>Deterministic:</strong> no storage, no lookup, no state. Any service in any language computes the same answer for the same user, which means assignment works on the client, at the edge and in a batch job identically.</li>
+  <li><strong>Salted per experiment:</strong> without the salt, a user landing in the bottom decile would land there for <em>every</em> experiment, so the same population always receives every treatment and effects correlate across unrelated tests.</li>
+  <li><strong>Sticky by construction.</strong> Users must not flip between variants — an inconsistent experience is both bad product and invalid data. Determinism gives this free, as long as the user id is stable (which is why logged-out experimentation on a cookie id is fraught).</li>
+  </ul>
+  <p><strong>Configuration distribution:</strong> experiment definitions are small and change rarely, so push them to every service and cache in memory with a background refresh. Assignment then never makes a network call, and if the config service is down, services keep using the last known config. <strong>Fail static, never fail closed</strong> — an experiment platform outage must not take down the product.</p>
+  <p><strong>Overlapping experiments</strong> are the scaling question. Running 300 experiments sequentially on all traffic is impossibly slow. Run them concurrently on the same users, with independent salts, so assignments are independent and interactions average out. When two experiments genuinely conflict — both redesigning the same checkout — put them in a mutually exclusive <em>layer</em> so no user is in both.</p>
+
+  <h4>4 · Measurement — 24–36 min</h4>
+  <p><strong>Log exposure, not assignment.</strong> This distinction is the one that separates a working platform from a subtly broken one. Every user is <em>assigned</em> to a variant of the checkout experiment, including the 95% who never reach checkout. Analysing on assignment dilutes the effect with people who could not possibly have been affected — a real 10% improvement among checkout visitors becomes an undetectable 0.5% overall. Log an exposure at the moment the user actually encounters the differing code path, and analyse on that.</p>
+  <p><strong>The analysis pipeline:</strong> exposures and metric events land in the warehouse; a daily (or hourly) job joins them by user, aggregates per variant, and computes the statistics. Points to make:</p>
+  <ul>
+  <li><strong>Attribute post-exposure events only.</strong> A purchase before the user saw the treatment cannot have been caused by it.</li>
+  <li><strong>Define metrics centrally,</strong> versioned and shared, or two teams will compute "conversion rate" differently and argue about whose dashboard is right.</li>
+  <li><strong>Compute guardrails automatically</strong> on every experiment — latency, error rate, crash rate, unsubscribes — without the team opting in. The whole point is catching harm nobody thought to look for.</li>
+  </ul>
+
+  <h4>5 · The statistics — 36–48 min</h4>
+  <p>Spend real time here; it is what the interviewer is checking.</p>
+  <ul>
+  <li><strong>Sample ratio mismatch (SRM) is the first check and the most valuable.</strong> If you allocated 50/50 and observe 50.4/49.6 across millions of users, that is statistically impossible by chance and means something is broken — a bot filter treating variants differently, a crash in one arm removing its worst users, an assignment bug. <strong>When SRM fires, the result is invalid and must not be shown</strong>, regardless of how good it looks. A platform that surfaces SRM automatically prevents more bad decisions than any other feature.</li>
+  <li><strong>Peeking inflates false positives.</strong> Checking a fixed-horizon test daily and stopping when p &lt; 0.05 raises the true false-positive rate far above 5% — plausibly above 30% for frequent checks — because you take many chances at crossing the threshold. Two correct fixes: fix the sample size in advance and only look at the end, or use a method designed for continuous monitoring (sequential testing, always-valid confidence intervals). <em>The platform should enforce this by not displaying significance until the test is powered.</em></li>
+  <li><strong>Randomisation unit and analysis unit must match.</strong> Randomising by user but analysing per-session treats one user's ten sessions as ten independent observations, understating variance and producing spurious significance. Either aggregate to the user, or use a variance estimator that accounts for clustering (the delta method).</li>
+  <li><strong>Multiple comparisons:</strong> testing twenty metrics at p&lt;0.05 gives roughly a 64% chance at least one is "significant" by chance. Nominate one primary metric in advance; treat everything else as exploratory and correct for it.</li>
+  <li><strong>Variance reduction</strong> is the free win: CUPED uses each user's pre-experiment behaviour as a covariate, typically cutting variance substantially and shortening tests by a meaningful fraction — the same conclusion from less traffic, which is worth more than any infrastructure optimisation here.</li>
+  </ul>
+
+  <h4>6 · Failure and operations — 48–56 min</h4>
+  <ul><li><strong>Config service down:</strong> services use the cached config. Never block a request on the experiment platform.</li>
+  <li><strong>A bad treatment harms users:</strong> guardrail monitoring with automatic ramp-down. Ship to 1%, watch guardrails, then 5%, 25%, 50%. Automatic rollback on a guardrail breach is the feature that makes teams willing to experiment at all.</li>
+  <li><strong>Interaction effects:</strong> mostly negligible with independent salts, but detectable — run an automated scan for pairs of experiments whose combination differs from the sum of their parts, and investigate the few that surface.</li>
+  <li><strong>Novelty and primacy effects:</strong> users react to change itself, so an early lift may decay. Run long enough to see the curve flatten, and be suspicious of large day-one effects.</li>
+  <li><strong>Experiment hygiene:</strong> old experiments left running are dead code and a source of unexplained behaviour. Expire them, and require a decision — ship, revert or extend — rather than letting them run indefinitely.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the framing you opened with: assignment is a hash and therefore easy, and the platform's value is in making correct analysis the default — exposure-based analysis, automatic SRM detection, powered-before-significant, guardrails on by default. Then name the honest limitation: most experiments are flat, and a platform that makes it easy to declare victory is worse than no platform at all.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>SRM is the single highest-value check and deserves to be the headline.</strong> In published industry experience, a meaningful minority of experiments exhibit sample ratio mismatch, and essentially all of them are broken rather than interesting. Causes are mundane and diverse: a redirect that fails more often in one arm, bot filtering that keys off a code path that differs between variants, an app crash in treatment that removes the least patient users from the data. Because the mechanism removes a <em>non-random</em> subset, the resulting bias can easily exceed the effect you are measuring. Automatic detection plus refusing to render results is the correct product behaviour, and being firm about "invalid, do not interpret" is the senior position.</li>
+  <li><strong>Network and marketplace effects break the independence assumption entirely.</strong> A/B testing assumes one user's treatment does not affect another's outcome. That fails for social features (treatment users invite control users), marketplaces (treatment drivers take rides control drivers would have taken, so control looks worse and you overstate the effect), and anything with shared inventory or capacity. The fixes are cluster randomisation (randomise by geography or social cluster rather than user) or switchback tests (alternate the whole market between states over time). Both cost enormous statistical power. Identifying that a proposed experiment has interference — and that the standard design would give a confidently wrong answer — is a genuinely senior contribution.</li>
+  <li><strong>Sequential testing is what teams actually need,</strong> because nobody will agree to not look. Fixed-horizon tests are statistically correct and behaviourally unrealistic: the moment results exist, someone checks. Always-valid confidence intervals and group sequential designs let you monitor continuously with correct error control, at the cost of requiring somewhat more data for the same power. That is a good trade, because the alternative in practice is not a disciplined fixed-horizon test — it is peeking with invalid statistics.</li>
+  <li><strong>Most experiments do not work, and the platform should normalise that.</strong> Published rates from large companies put the share of experiments producing a positive, significant result at roughly a third or less, with many flat and some actively harmful. A platform whose UI implies every test should win pressures teams toward p-hacking, metric-shopping and early stopping. Pre-registering the primary metric and the sample size, and showing the full history of a team's experiments, are cultural mechanisms implemented in software — and describing them as such shows you understand what the product is for.</li>
+  <li><strong>Long-term effects are frequently opposite to short-term ones.</strong> A more aggressive notification, a pushier upsell, or a darker pattern reliably improves a short-window engagement metric and degrades retention over months. Defences: holdback groups kept out of a shipped change for an extended period so you can measure its long-run effect, and surrogate metrics validated against known long-term outcomes. Mentioning holdbacks unprompted is unusual and signals real experience.</li>
+  <li><strong>Know when not to run an experiment.</strong> If the change is a legal requirement, a security fix, or too small to be detectable at your traffic, an experiment costs time and delivers no information. If a power calculation says the test needs nine weeks, the honest answer is "we cannot learn this" — and proposing a larger, bolder change that <em>is</em> detectable is better advice than running an underpowered test and reading tea leaves.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A team tests a new checkout flow. Baseline conversion is 8%. They expect a 3% relative lift (8% → 8.24%). Traffic is 200,000 checkout visitors/day, split 50/50. They check results daily and on day 4 see treatment at 8.4% vs control 8.1%, p = 0.043, and want to ship.</p>
+    <p>(a) How long should this test run? (b) Is the day-4 result trustworthy? (c) They also notice 412,000 exposures in control and 408,000 in treatment. What does that mean?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Required sample size.</strong> For a two-proportion test at 80% power and 5% significance, the sample per arm is roughly <code>16 × p(1−p) / Δ²</code>, where Δ is the absolute difference. Here p = 0.08 and Δ = 0.0024.</p>
+    <p>16 × 0.08 × 0.92 ÷ 0.0024² = 1.178 ÷ 0.00000576 ≈ <strong>204,000 per arm</strong>... which at 100,000 visitors per arm per day is only <strong>2 days</strong>. That looks encouraging, but the standard formula understates what you need in practice — it assumes 80% power (a 20% chance of missing a real effect) and no correction for the several metrics they will inevitably look at. Targeting 90% power and a single pre-registered primary metric pushes this to roughly <strong>270,000 per arm, about 3 days</strong>, and running a full week is the usual recommendation anyway to cover weekday/weekend variation. <em>A test that spans only part of a weekly cycle measures a different population, not just a smaller one.</em></p>
+    <p><strong>(b) The day-4 result.</strong> p = 0.043 is below 0.05, so it looks significant. It is not trustworthy, for three separate reasons:</p>
+    <ul>
+    <li><strong>They peeked.</strong> Checking daily for 4 days means 4 chances to cross the threshold. Under the null hypothesis, the probability of <em>at least one</em> of those checks showing p &lt; 0.05 is well above 5% — for daily checks over a week it is commonly cited as around 20–30%. A p-value is only valid at a pre-specified stopping point. Stopping <em>because</em> it became significant is precisely the behaviour that invalidates it.</li>
+    <li><strong>p = 0.043 is weak evidence even taken at face value.</strong> It is barely under the line, and the observed lift (8.4 vs 8.1 = 3.7% relative) is larger than the 3% they expected — early significant results are systematically overstated, because the ones that cross the line early are the ones where noise happened to align with the effect. Expect the true effect to be smaller.</li>
+    <li><strong>The weekly cycle.</strong> Four days is not a full week; checkout behaviour differs markedly between weekdays and weekends.</li>
+    </ul>
+    <p>The right answer: <strong>run to the pre-registered horizon</strong> — a full week — and read the result then. If they genuinely need to monitor continuously, the platform should be using always-valid confidence intervals, which remain correct under any amount of peeking at the cost of slightly more data.</p>
+    <p><strong>(c) 412,000 vs 408,000 — sample ratio mismatch, and this is the finding that matters most.</strong> With a 50/50 split and 820,000 total, the expected split is 410,000 each with a standard deviation of about √(820,000 × 0.25) ≈ 453. The observed imbalance is 2,000, which is roughly <strong>4.4 standard deviations</strong> — a probability of about 1 in 100,000 by chance.</p>
+    <p>This is not a rounding issue. Something is systematically removing users from the treatment arm, and the likely explanations all bias the result in the same direction:</p>
+    <ul>
+    <li>The new checkout <strong>crashes or errors</strong> for some users, who never log an exposure. Those users would disproportionately have failed to convert, so removing them <em>inflates</em> treatment's conversion rate.</li>
+    <li>The new flow is <strong>slower to load</strong>, so users on poor connections abandon before the exposure fires — again removing likely non-converters from treatment.</li>
+    <li>A <strong>bot filter or redirect</strong> behaves differently between arms.</li>
+    </ul>
+    <p><strong>The conclusion: the result is invalid and must not be shipped</strong>, and notice that the bias plausibly explains the entire observed 0.3pp lift. The correct action is to stop the experiment, find the missing 2,000 users, fix the cause, and restart. A platform that displayed "significant, +3.7%, ship it" alongside an unflagged SRM would have caused a bad decision — which is exactly why automatic SRM detection with a hard block is the most valuable feature in the whole system.</p></details>`,
+
+  refs:[
+    ["paper","Online Controlled Experiments at Large Scale","Kohavi et al., KDD 2013 — the platform paper: assignment, layers, SRM, and lessons from thousands of real experiments at Microsoft.","https://exp-platform.com/Documents/2013%20controlledExperimentsAtScale.pdf"],
+    ["post","Diagnosing Sample Ratio Mismatch in Online Controlled Experiments","Fabijan et al. — the taxonomy of SRM causes and why the result must be discarded rather than adjusted.","https://exp-platform.com/"],
+    ["post","How Not To Run An A/B Test","Evan Miller — the clearest explanation of why peeking inflates false positives, with a simulation you can follow.","https://www.evanmiller.org/how-not-to-run-an-ab-test.html"],
+    ["docs","Trustworthy Online Controlled Experiments","Kohavi, Tang and Xu — the standard book. The companion site has the rules of thumb and the CUPED and interference chapters summarised.","https://experimentguide.com/"],
+    ["paper","Improving the Sensitivity of Online Controlled Experiments (CUPED)","Deng et al., WSDM 2013 — variance reduction using pre-experiment data, the cheapest way to shorten every test you run.","https://exp-platform.com/Documents/2013-02-CUPED-ImprovingSensitivityOfControlledExperiments.pdf"],
+    ["docs","Statistical power and sample size","The calculation behind part (a) of the drill, and why an underpowered flat result does not mean 'no effect'.","https://en.wikipedia.org/wiki/Power_(statistics)"]
+  ]},
+
+{ id:"in11", t:"Design typeahead / autocomplete at scale", tag:"Search", sum:"Tries, top-k per prefix, and why the hard part is ranking rather than matching.",
+  primer:`<h4>Start here — the constraint that shapes everything</h4>
+  <p>A user types <code>l</code>, <code>lo</code>, <code>lon</code>. Each keystroke fires a request and the suggestions must be on screen before the next one lands — a budget of roughly <strong>100 milliseconds end to end</strong>, including the network. And a single search box can generate more requests per second than the search itself, because every query produces several prefix lookups.</p>
+  <p>So: extremely high QPS, a very tight latency budget, and — the part people underestimate — the matching is easy while the <em>ranking</em> is what makes it useful. Any structure can find the words starting with <code>lon</code>. Deciding that <code>london weather</code> beats <code>lonely island</code> today is the product.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Trie (prefix tree)</strong> — a tree where each edge is a character, so a prefix is a path from the root. Finding all completions of <code>lon</code> means walking three edges and then collecting the subtree.</li>
+  <li><strong>Top-k per node</strong> — the optimisation that makes it fast: store the best k completions <em>at</em> each node, precomputed. Then a lookup is a walk plus a read, with no subtree traversal at all.</li>
+  <li><strong>FST (finite state transducer)</strong> — a compressed automaton that merges common suffixes as well as prefixes, giving far smaller memory than a plain trie. What Lucene actually uses.</li>
+  <li><strong>Fuzzy matching</strong> — tolerating typos, usually via edit distance within 1 or 2.</li>
+  <li><strong>Query log</strong> — the source of both the suggestion corpus and the popularity signal. Suggestions come from what people actually searched, not from a dictionary.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p><strong>Precompute everything; the serving path should do no thinking.</strong> The read path is a prefix walk and a memory read. All the intelligence — which completions, in what order, with what personalisation — happens in an offline or near-line pipeline that produces an immutable index. Serving is then a fast, boring cache lookup, which is the only way to hit the latency budget at this volume.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["The index","12–26"],["Ranking","26–38"],["Serving","38–48"],["Failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> return the top 10 suggestions for a prefix; rank by popularity and recency; tolerate typos; update as trends change; personalise lightly.</li>
+  <li><strong>Out of scope:</strong> full search result ranking, natural-language query understanding, spelling correction of the final query. Say so.</li>
+  <li><strong>Non-functional:</strong> p99 under 50 ms server-side; hundreds of thousands of QPS; new trending terms appear within minutes; suggestions must never be offensive or leak private data.</li>
+  <li><strong>The question to ask:</strong> "suggesting queries, or suggesting entities?" Query suggestions come from the search log and are ranked by popularity. Entity suggestions (products, users, files) come from a catalogue, are personalised, and need permission filtering. These are different designs and it is worth pinning down which.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>5B searches/day. Each typed query fires a request roughly every 2–3 characters, say 4 per search, giving <strong>20B typeahead requests/day ≈ 230,000/s</strong>, peaking perhaps 600,000/s. <em>Typeahead QPS exceeds search QPS by several times</em> — say this, it justifies every optimisation that follows.</li>
+  <li>Corpus: distinct queries seen in a month might be 500M, but the long tail is mostly typos and one-offs. Keeping those seen at least 5 times cuts it to perhaps <strong>50M suggestions</strong> — a 10× reduction that costs almost nothing in coverage.</li>
+  <li>Index size: a trie over 50M strings averaging 20 characters, with top-10 completions cached per node, is on the order of <strong>a few GB</strong> — comfortably in memory on one machine, which is the key structural fact. An FST compresses this several-fold further.</li>
+  <li>Latency budget: 100 ms total, minus ~40 ms network round trip, minus client rendering, leaves <strong>~30–50 ms server-side</strong>. That rules out anything touching disk on the hot path.</li></ul>
+
+  <h4>3 · The index — 12–26 min</h4>
+  <p>Build a trie over the suggestion corpus. The naive lookup — walk to the prefix node, then traverse its entire subtree collecting and sorting completions — is too slow: the prefix <code>a</code> has millions of descendants.</p>
+  <p><strong>The fix is to precompute the top k at every node.</strong> During the build, propagate the best 10 completions upward from the leaves: each node's top-10 is the merge of its children's top-10 lists plus its own terminal entry if it is a word. Query time is then a walk of length |prefix| followed by reading a stored list — <strong>O(prefix length)</strong>, independent of corpus size, with no sorting at serving time.</p>
+  <p>The cost is memory (10 entries stored at every node) and build time. Mitigate by storing ids rather than strings, and by only materialising top-k at nodes above a depth threshold — very deep nodes have few descendants and can afford a small traversal.</p>
+  <p><strong>Compression:</strong> a plain trie wastes memory on long non-branching chains. A radix tree collapses them into single edges. An FST goes further by sharing suffixes as well as prefixes, turning the tree into a DAG — typically several times smaller, at the cost of a more complex build. Mention FSTs; it signals you know what production systems use.</p>
+  <p><strong>The index is immutable and versioned.</strong> Build offline, validate, then atomically swap it in. That means no locking on the read path, trivial rollback, and the ability to serve while building the next version.</p>
+
+  <h4>4 · Ranking — 26–38 min</h4>
+  <p>This is the product, and where a good answer separates itself. The score behind each completion is not just a raw count:</p>
+  <ul>
+  <li><strong>Popularity with time decay.</strong> A query's frequency, weighted so recent searches count more. Without decay, last year's news story outranks today's — and with too much decay, stable evergreen queries flicker.</li>
+  <li><strong>Trend detection.</strong> A query whose rate has risen sharply should be boosted even at low absolute volume. This is the heavy-hitters problem from the analytics design, and it is why that pipeline feeds this one.</li>
+  <li><strong>Completion rate, not just search count.</strong> A suggestion that users <em>click</em> is better than one they scroll past. Log impressions and selections per suggestion and rank on click-through, which turns typeahead into a feedback loop that improves itself.</li>
+  <li><strong>Context:</strong> the user's language and region (<code>foot</code> means different things in London and Chicago), their own recent searches, and the current session. Keep personalisation as a light re-rank of the precomputed top ~20, never as a per-user index.</li>
+  </ul>
+  <p><strong>Why personalisation must be a re-rank:</strong> a personalised index per user is impossible at 50M users. Fetch the global top 20 for the prefix, blend in the user's own recent queries matching that prefix (stored client-side or in a small per-user cache), and return 10. The expensive part stays global and cacheable; the cheap part is per-user.</p>
+
+  <h4>5 · Serving — 38–48 min</h4>
+  ${flow([{t:"Client",d:"debounce, cancel, cache"},{t:"Edge / CDN",d:"cache short prefixes"},{t:"Trie servers",d:"in-memory, replicated"},{t:"Re-rank",d:"personalise top 20"}])}
+  <ul>
+  <li><strong>Do work on the client first.</strong> Debounce by ~50 ms so a fast typist fires one request rather than five; cancel in-flight requests when a new keystroke arrives; and cache locally, because backspacing to a previous prefix should never hit the network. These three cut request volume by more than half and cost nothing server-side.</li>
+  <li><strong>Cache short prefixes at the edge.</strong> The distribution is brutally skewed — one- and two-character prefixes are an enormous share of all requests and their answers are identical for everyone in a locale. Serving them from a CDN removes most traffic before it reaches you.</li>
+  <li><strong>Replicate rather than shard.</strong> Because the index fits in memory on one machine, every server can hold a full copy, so any request goes to any server and scaling is pure replication. <em>Avoiding sharding avoids scatter-gather and its tail-latency problem entirely</em> — and saying why you do not need to shard is a stronger answer than describing how you would.</li>
+  <li><strong>If it does not fit:</strong> shard by first character or first two characters, and route accordingly, so each request still touches exactly one shard. Never shard in a way that requires fan-out.</li>
+  </ul>
+  <p><strong>Typo tolerance</strong> is expensive and should be a fallback: try the exact prefix first, and only if it returns too few results, run a fuzzy match within edit distance 1 (a bounded traversal of the trie allowing one mismatch). Doing fuzzy matching on every request would blow the latency budget for the 95% of requests that do not need it.</p>
+
+  <h4>6 · Failure and safety — 48–56 min</h4>
+  <ul><li><strong>Index build fails or produces a bad index:</strong> keep serving the previous version. Validate a new index against a golden set of prefixes before promoting it — an empty or corrupt index is worse than a stale one.</li>
+  <li><strong>Trie server dies:</strong> another replica serves. Stateless plus fully replicated means failure is trivial, which is the payoff for the memory-resident design.</li>
+  <li><strong>Safety is a hard requirement here, not a nicety.</strong> Suggestions are attributed to your product and appear beside a user's own words, so an offensive or defamatory completion is a public incident. Maintain a blocklist applied at build time and at serve time, suppress suggestions on sensitive prefixes (names of private individuals, medical and legal terms), and require a minimum distinct-user threshold so one person cannot inject a suggestion by repeating a query.</li>
+  <li><strong>Privacy:</strong> the corpus is derived from user queries, which contain personal data. Only admit a query as a suggestion if it was issued by at least k distinct users (k-anonymity), or you will eventually suggest someone's private search to a stranger.</li>
+  <li><strong>Freshness:</strong> a breaking-news term must appear within minutes, but a full index rebuild takes longer. Serve a small, frequently-rebuilt "fresh" trie alongside the large base index and merge the two results — the same tiering as the web-search design.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the structural decisions: top-k precomputed per node so lookup is independent of corpus size, an immutable in-memory index replicated rather than sharded so there is no fan-out, and ranking done offline with only a light personalisation re-rank on the hot path. Then name the non-technical requirement that decides whether you can ship it — safety and k-anonymity on the suggestion corpus, because the suggestions speak in your product's voice.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>The real optimisation is on the client, and it is worth leading with.</strong> Debouncing, request cancellation, and a local cache of prefixes already fetched routinely eliminate 60–80% of requests, which is a larger win than any server-side change and costs nothing to run. Going further: because suggestions for a short prefix are a superset of those for longer prefixes that extend it, the client can filter its cached result for <code>lon</code> locally when the user types <code>lond</code>, and only refetch when the local result thins out. That turns several requests per query into roughly one.</li>
+  <li><strong>Precomputing top-k per node trades memory for a fundamental complexity change,</strong> and stating it that way is the point: without it, lookup is O(size of subtree) and the shortest, most popular prefixes are the slowest — exactly backwards. With it, lookup is O(prefix length), so <code>a</code> costs one edge traversal and a memory read. The system's worst case becomes its best case. That inversion is the kind of observation interviewers remember.</li>
+  <li><strong>Deletion and correction are awkward in a precomputed index,</strong> and the question comes up. If a suggestion must be removed urgently — it is defamatory, or a person has exercised a right to erasure — you cannot wait for the next build. So the serving layer needs a real-time blocklist consulted after the trie lookup, applied to the returned top-k before the response. That also means you should fetch more than you need (top 20 for a top-10 response), or blocking two entries leaves you short.</li>
+  <li><strong>Entity autocomplete is a different problem and the distinction matters.</strong> Suggesting <em>files the user can see</em> or <em>people in their organisation</em> means the result set is per-user, so a global precomputed top-k is invalid — you would suggest documents they cannot open, which leaks their existence. The design shifts to a per-user or per-tenant index, or a global index with post-filtering plus over-fetching, and it inherits the filtered-search selectivity problem from the vector-index design: a user who can see 0.1% of the corpus gets an empty result unless you fall back to searching their subset directly.</li>
+  <li><strong>Multilingual and non-Latin scripts break naive prefix logic.</strong> Chinese and Japanese input is typed phonetically and converted, so the prefix a user types does not appear in the target string at all — you must index romanised readings alongside the term. Arabic and Hebrew are right-to-left. Accents need normalisation so <code>cafe</code> matches <code>café</code>, and Unicode has multiple encodings of the same visible character, so normalise (NFKC) at both build and query time or identical-looking strings will not match.</li>
+  <li><strong>Measure the metric that reflects the purpose.</strong> Suggestion click-through rate is the obvious one and it is gameable — showing only the single most popular query maximises it while making the feature useless. Better: keystrokes saved (how much of the query the user did not type), and the downstream success of searches that began from a suggestion versus those typed fully. If suggestion-originated searches convert worse, the feature is steering people toward queries that do not serve them, which no matching-quality metric would reveal.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>Your typeahead serves 400,000 requests/s. The suggestion corpus is 40M queries. Measurements show the prefix-length distribution is: 1 char 22%, 2 chars 26%, 3 chars 21%, 4 chars 14%, 5+ chars 17%. Each trie server holds the full index in 6 GB of RAM and handles 25,000 requests/s.</p>
+    <p>(a) How many servers, and what does edge caching change? (b) A prefix like <code>a</code> has 8M completions in its subtree. What is the lookup cost with and without precomputed top-k? (c) The product wants personalised suggestions. How do you do it without exploding the design?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Fleet size.</strong> 400,000 ÷ 25,000 = <strong>16 servers</strong> at full utilisation, so 24–32 with headroom and replication. Each holds the full 6 GB index, so this is pure replication — no sharding, no fan-out, no scatter-gather tail latency. Scaling is adding machines.</p>
+    <p><strong>Now the edge cache.</strong> Prefixes of 1 and 2 characters are <strong>48% of all requests</strong>, and for a given locale their answers are identical for every user — there are only about 26 + 676 = 702 such prefixes. Caching those at the CDN with a short TTL removes nearly half the traffic before it reaches your servers. Add 3-character prefixes (another 21%, ~17,500 distinct keys, still trivial to cache) and you have removed <strong>69%</strong> of requests.</p>
+    <p>Remaining load: 400,000 × 0.31 = 124,000/s, needing <strong>5 servers</strong> rather than 16. That is a two-thirds reduction in fleet from caching 18,000 keys, and it works precisely because short prefixes are simultaneously the most requested and the least personalised. Worth stating the general principle: <em>the skew that makes a workload dangerous is often the same skew that makes it cacheable.</em></p>
+    <p><strong>(b) The cost of <code>a</code>.</strong></p>
+    <p><em>Without precomputed top-k:</em> walk one edge to the <code>a</code> node, then traverse its entire subtree — <strong>8 million nodes</strong> — collecting terminal entries, then sort or heap them by score to take the top 10. Even at 100M node visits per second that is ~80 ms for the traversal alone, before sorting. Completely outside the budget, and it is the <em>most common</em> request. The system would be slowest exactly where it is busiest.</p>
+    <p><em>With precomputed top-k:</em> walk one edge, read a stored list of 10 entries. <strong>One pointer dereference and a memory read — well under a microsecond.</strong> Cost is O(prefix length), so a 1-character prefix is the cheapest possible request rather than the most expensive.</p>
+    <p>The memory price: storing 10 ids (say 4 bytes each) at every node adds 40 bytes per node. Over tens of millions of nodes that is a few hundred megabytes — a fraction of the 6 GB, for a five-order-of-magnitude latency improvement on the hottest path. This is the trade that makes the whole design work.</p>
+    <p><strong>(c) Personalisation without exploding it.</strong> The wrong answer is a per-user index: 50M users × any index is impossible, and it would also destroy the edge cache, which is currently removing 69% of your traffic.</p>
+    <p>The right structure is a <strong>global fetch plus a local re-rank</strong>:</p>
+    <ul>
+    <li>Fetch the global <strong>top 20</strong> for the prefix — still cacheable at the edge, still identical for everyone in a locale.</li>
+    <li>Blend in the user's own recent queries matching that prefix. These are few (tens of items) and can live <strong>in the client</strong>, which means zero server cost and no privacy exposure — a genuinely better answer than a server-side per-user cache.</li>
+    <li>Apply light contextual re-ranking (locale, current session context) over the 20, and return 10.</li>
+    </ul>
+    <p>The expensive, high-volume part stays global and cached; the personal part is small, per-user, and computed where the data already is. Two things to flag: over-fetching 20 for a 10-item response also gives you room to drop blocked suggestions without returning short, and doing personalisation client-side means your edge cache hit rate is preserved — a server-side personalised response would be uncacheable and would take you straight back to 16+ servers.</p></details>`,
+
+  refs:[
+    ["docs","Trie","The base structure, with the space/time characteristics that motivate radix trees and FSTs.","https://en.wikipedia.org/wiki/Trie"],
+    ["post","Index 1,600,000,000 keys with automata and Rust","Andrew Gallant — the clearest explanation anywhere of finite state transducers and why they beat tries on memory. Long but worth it.","https://blog.burntsushi.net/transducers/"],
+    ["docs","Elasticsearch suggesters","The completion suggester is an FST-backed implementation you can read the behaviour and limitations of, including why it is built at index time.","https://www.elastic.co/guide/en/elasticsearch/reference/current/search-suggesters.html"],
+    ["docs","Levenshtein distance","The edit-distance metric behind fuzzy matching, and the automaton construction that makes bounded-distance trie traversal feasible.","https://en.wikipedia.org/wiki/Levenshtein_distance"],
+    ["docs","k-anonymity","The privacy property the suggestion corpus must satisfy before a query can be shown to other users.","https://en.wikipedia.org/wiki/K-anonymity"],
+    ["docs","Apache Lucene","The FST implementation and the suggester package — the reference for how this is built in practice.","https://lucene.apache.org/core/"]
+  ]}
+
+);

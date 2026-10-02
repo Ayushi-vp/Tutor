@@ -1,0 +1,786 @@
+<!-- topic source for lld/ld2; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld2",
+  "t": "Rate limiter: token bucket and sliding window",
+  "tag": "Systems",
+  "sum": "Build a rate limiter the way the round expects: clarify what it protects, start with a fixed-window counter, find its boundary bug, then build the sliding-window log, sliding-window counter and token bucket, make it per-key and thread-safe, and take it distributed with Redis.",
+  "prereq": [
+    [
+      "py2",
+      "A dict gives average O(1) lookup by key; collections.deque gives O(1) appends and pops at both ends."
+    ],
+    [
+      "py6",
+      "Classes, dataclasses (frozen=True gives immutable records) and typing.Protocol for describing an interface by its methods."
+    ],
+    [
+      "py9",
+      "Threads share memory and can switch between any two bytecodes, so a read-then-write on shared state needs a lock."
+    ],
+    [
+      "swe2",
+      "Depend on an interface and inject collaborators (here, the clock) so code can be tested without real time."
+    ],
+    [
+      "swe7",
+      "HTTP APIs answer with status codes and headers; 429 means Too Many Requests."
+    ],
+    [
+      "ld1",
+      "A cache with a hash map plus per-key state, the invariant-first way of writing a small data structure, and sharding a lock by key."
+    ]
+  ],
+  "myths": [
+    [
+      "A fixed-window counter enforces N requests per minute.",
+      "It enforces N per calendar window. A client can send N in the last second of one window and N in the first second of the next: 2N in about two seconds, while every window is within its limit. The trailing-60-second rate, which is what 'per minute' means to a user, is double."
+    ],
+    [
+      "A token bucket needs a background thread to add tokens.",
+      "Refill can be computed lazily: store the token count and the time of the last update, and on each request add elapsed × rate, capped at capacity. A million idle buckets cost nothing until they are touched, and there is no timer to drift or die."
+    ],
+    [
+      "The sliding-window counter is exact.",
+      "It assumes requests in the previous window were spread evenly. If they were all at the end of that window, the estimate undercounts. Cloudflare measured the error on 400 million requests: 0.003 percent of decisions were wrong, which is why it is the usual production choice, but it is an approximation and you should say so."
+    ],
+    [
+      "Redis MULTI/EXEC makes read-check-write atomic.",
+      "A transaction queues commands and runs them together, but you cannot read a value inside it and branch on that value. The check 'are there enough tokens?' must happen between the read and the write, so the standard answer is a Lua script, which Redis runs to completion without interleaving other commands."
+    ],
+    [
+      "Rate limiting and load shedding are the same thing.",
+      "A rate limiter enforces a per-client budget whatever the server's health. A load shedder drops work based on the server's own state (queue depth, CPU, in-flight requests) to stay alive. Stripe runs both: request-rate and concurrency limiters per user, and fleet-level load shedders that protect critical traffic when the system is under stress."
+    ],
+    [
+      "Fail open is always the safe choice when the limiter's store is down.",
+      "It keeps the product up but removes protection exactly when the system is already unhealthy, and for a paid quota it gives away the product. The right choice depends on why the limiter exists: protection limiters usually fail open with a local backstop limit; billing quotas usually fail closed."
+    ]
+  ],
+  "recap": [
+    "A rate limiter caps how much a caller may do per unit of time, to protect a service, share capacity fairly, or enforce a paid quota; which purpose applies decides how exact it must be and how it fails.",
+    "The first clarifying question is whether bursts are acceptable: token buckets allow controlled bursts, windows and leaky buckets smooth traffic.",
+    "A fixed-window counter is O(1) but lets a client send twice the limit across a window boundary.",
+    "A sliding-window log is exact but stores one timestamp per accepted request; a sliding-window counter weights the previous window's count by the share still in view and is O(1) with small error.",
+    "A token bucket has two independent knobs, refill rate for sustained throughput and capacity for burst size, and refills lazily from elapsed time, so it needs no background thread.",
+    "Inject the clock and use a monotonic one: tests advance a fake clock instead of sleeping, and production is immune to wall-clock jumps.",
+    "Per-key limiting needs a map of limiters, a lock that makes check-and-update atomic, and a sweep that forgets idle keys.",
+    "Across many servers the state moves to a shared store such as Redis, updated atomically with a Lua script; local token leases trade a little accuracy for no network hop on most requests.",
+    "A good limiter answers 429 with Retry-After and advertises its policy and remaining quota in headers so well-behaved clients can pace themselves."
+  ],
+  "glossary": [
+    [
+      "429 Too Many Requests",
+      "The HTTP status code a server returns when a client has exceeded its rate limit."
+    ],
+    [
+      "Burst",
+      "A short run of requests well above the average rate, such as 50 requests in one second from a client that is idle most of the time."
+    ],
+    [
+      "Capacity (bucket)",
+      "The maximum number of tokens a token bucket can hold; it sets the largest burst the bucket will allow."
+    ],
+    [
+      "Fail closed",
+      "When the limiter cannot decide (for example its store is down), reject the request."
+    ],
+    [
+      "Fail open",
+      "When the limiter cannot decide, allow the request."
+    ],
+    [
+      "Fake clock",
+      "A test double for time that returns a value the test controls and advances explicitly, so time-dependent code can be tested instantly and deterministically."
+    ],
+    [
+      "Fixed window",
+      "A rate-limiting algorithm that counts requests in calendar-aligned windows (for example each minute) and resets the count at each boundary."
+    ],
+    [
+      "GCRA",
+      "Generic cell rate algorithm: a formulation of the token bucket that stores a single 'theoretical arrival time' per key instead of a token count and timestamp."
+    ],
+    [
+      "Lazy refill",
+      "Computing how many tokens a bucket has gained from the time elapsed since its last update, at the moment of a request, instead of adding tokens on a timer."
+    ],
+    [
+      "Leaky bucket",
+      "An algorithm that queues requests and releases them at a fixed rate, smoothing bursts into a steady stream."
+    ],
+    [
+      "LLM",
+      "Large language model: a neural network that generates text; LLM APIs bill and limit by tokens, the word pieces the model reads and writes."
+    ],
+    [
+      "Load shedding",
+      "Deliberately dropping some requests based on the server's own health so that the rest can be served."
+    ],
+    [
+      "Lua script (Redis)",
+      "A small program sent to Redis and executed on the server as one atomic step: no other command runs in the middle of it."
+    ],
+    [
+      "Monotonic clock",
+      "A clock that only moves forward and is unaffected by changes to the system's wall-clock time; time.monotonic() in Python."
+    ],
+    [
+      "NTP",
+      "Network time protocol: how computers synchronise their wall clocks with time servers; corrections can move the wall clock forwards or backwards."
+    ],
+    [
+      "Quota",
+      "A budget of requests or units a client may use over a long period, often tied to a billing plan."
+    ],
+    [
+      "Rate limiter",
+      "A component that decides whether a caller may perform an action now, based on how much it has done recently."
+    ],
+    [
+      "Refill rate",
+      "How many tokens per second a token bucket gains; it sets the long-run sustained throughput."
+    ],
+    [
+      "Retry-After",
+      "An HTTP response header telling the client how many seconds to wait before trying again."
+    ],
+    [
+      "RPS",
+      "Requests per second."
+    ],
+    [
+      "Shadow mode",
+      "Running a new limiter so that it records what it would have rejected without actually rejecting anything, to tune limits safely before enforcement."
+    ],
+    [
+      "Sliding-window counter",
+      "An approximation of a trailing-window count: the current window's count plus the previous window's count weighted by the fraction of it still inside the trailing window."
+    ],
+    [
+      "Sliding-window log",
+      "An exact trailing-window limiter that stores the timestamp of every accepted request and counts those within the window."
+    ],
+    [
+      "Token bucket",
+      "A limiter that holds up to a fixed number of tokens, gains tokens at a fixed rate, and spends one (or a cost) per request; empty means reject."
+    ],
+    [
+      "Token lease",
+      "A block of tokens a server claims from a shared limiter and spends locally, reducing calls to the shared store at the cost of some accuracy."
+    ],
+    [
+      "TTL",
+      "Time to live: how long an entry is kept before it is treated as expired."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Which single question picks the rate-limiting algorithm?",
+      "Whether bursts are acceptable. If a client idle for an hour may send 50 requests at once, a token bucket fits, because its capacity sets exactly how big a burst is allowed. If the downstream cannot absorb spikes, use a sliding window or a leaky bucket that smooths traffic."
+    ],
+    [
+      "E",
+      "What is the fixed-window boundary problem?",
+      "A counter reset each minute lets a client send N requests just before the boundary and N just after: 2N in a couple of seconds while every window stays within its limit. The trailing-60-second rate is double the stated limit, which is why sliding windows exist."
+    ],
+    [
+      "E",
+      "Why inject the clock instead of calling time.time() inside the limiter?",
+      "So tests can control time: a fake clock advanced by the test makes a refill test instant and deterministic, where sleeping would be slow and flaky. In production, inject time.monotonic, which never jumps backwards when the system clock is corrected."
+    ],
+    [
+      "M",
+      "Walk me through a token bucket with rate 2 per second and capacity 10 when a client idle for 30 seconds sends 15 requests at once.",
+      "Thirty idle seconds would add 60 tokens, but the bucket caps at 10, so it holds 10. The first 10 requests succeed immediately; the 11th sees 0 tokens and gets Retry-After of 0.5 seconds, since one token takes 1/rate seconds. The remaining five succeed at 0.5, 1.0, 1.5, 2.0 and 2.5 seconds if retried then.",
+      "Follow-up: how do you express '100 per minute but never more than 10 at once'? — Rate 100/60 per second, capacity 10; the two knobs are independent, which windows cannot express."
+    ],
+    [
+      "M",
+      "How does the sliding-window counter estimate the rate, and when is it wrong?",
+      "It keeps the counts of the current and previous fixed windows and estimates the trailing-window count as current plus previous times the share of the previous window still inside the trailing window. At 15 seconds into a minute, 75 percent of the previous minute is still in view. It is wrong when the previous window's requests were bunched at one end, because it assumes they were spread evenly; Cloudflare measured 0.003 percent wrong decisions on real traffic."
+    ],
+    [
+      "M",
+      "Why must distributed rate limiting with Redis use a Lua script rather than GET then SET?",
+      "Because two app servers can both read 'one token left', both decide to allow, and both write, letting two requests through. Redis runs a Lua script to completion without interleaving other commands, so read, decide and write happen as one step. MULTI/EXEC does not help, because you cannot branch on a value read inside the transaction.",
+      "Follow-up: whose clock does the script use? — Redis's own, via the TIME command inside the script, so app servers with skewed clocks cannot add or remove tokens."
+    ],
+    [
+      "M",
+      "How do you make an in-process limiter safe with many threads?",
+      "Make the check and the update one atomic step: a lock per key held around try_acquire, plus a short lock on the dict that creates limiters. Without it two threads can both see one token and both spend it. Sharding the lock per key means unrelated tenants never contend.",
+      "Follow-up: how do you avoid the dict growing forever? — Record last-seen time and sweep keys idle longer than a TTL; a full bucket is equivalent to no bucket, so forgetting it is safe."
+    ],
+    [
+      "M",
+      "What should the HTTP response look like when a request is limited?",
+      "Status 429 with a Retry-After computed from the algorithm (for a token bucket, the missing tokens divided by the rate), and quota headers on every response, not just rejections. The IETF draft defines RateLimit-Policy (the quota and window) and RateLimit (remaining and seconds to reset) so clients can pace themselves before they are rejected."
+    ],
+    [
+      "M",
+      "How would you limit by cost rather than by request count, for example LLM tokens?",
+      "Charge the bucket the estimated cost up front (prompt tokens plus maximum output tokens) and refund or charge the difference when the real usage is known. The bucket can then briefly go negative, so decide whether to allow that or to require the full estimate to be available. Reject costs larger than capacity outright, since they can never succeed."
+    ],
+    [
+      "H",
+      "Your limiter adds a Redis round trip to every request at 50,000 RPS. What do you do?",
+      "Lease tokens: each instance claims a block, say 100 tokens, from Redis and serves them from an in-process bucket, fetching another block when low. Most requests never leave the process. Enforcement becomes approximate, up to instances times lease size over the limit transiently, so size the lease against how exact the limit must be, and return unused tokens on shutdown.",
+      "Follow-up: what if one tenant's traffic is spread over 200 instances? — Leases then waste quota on idle instances; shrink the lease adaptively or route that tenant's traffic consistently to fewer instances."
+    ],
+    [
+      "H",
+      "Redis is down. Does the limiter fail open or closed?",
+      "It depends on the purpose. A protection limiter usually fails open with a conservative local limit per instance as a backstop and a loud alert, because turning a cache outage into a full outage is worse. A billing quota fails closed or falls back to a cached allowance, because unlimited free usage is a revenue bug. Say which and why."
+    ],
+    [
+      "H",
+      "Compare token bucket and GCRA.",
+      "They enforce the same policy. A token bucket stores a token count and a timestamp and refills on each request. GCRA stores one value, the theoretical arrival time: a request is allowed if that time minus now is within the burst tolerance, and then the time advances by one emission interval. One number per key means less storage and a simpler atomic update, which is why redis-cell implements GCRA."
+    ],
+    [
+      "H",
+      "Design rate limits for a public API with free and paid tiers, expensive endpoints and anonymous traffic.",
+      "Use a hierarchy of keys: per IP for anonymous traffic, per API key overall with the tier's rate and burst, and a smaller per (API key, endpoint class) bucket for expensive endpoints, plus a concurrency limit on in-flight requests for the heaviest ones. Check the cheapest, most specific limit first and stop at the first rejection. Behind them, a load shedder protects the fleet when it is unhealthy regardless of client budgets, as Stripe describes."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "Amazon API Gateway: Throttle requests to your REST APIs",
+      "A real gateway's description of the token bucket: steady-state rate plus a burst that is the maximum bucket size, 429 responses, and the order in which per-client, per-method, account and Region limits apply. The quotas page gives the default 10,000 RPS with a 5,000-request bucket.",
+      "https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html"
+    ],
+    [
+      "post",
+      "Cloudflare: How we built rate limiting capable of scaling to millions of domains",
+      "The sliding-window counter with a worked example (42 × 0.75 + 18 = 49.5) and measured error: 0.003% wrong decisions over 400 million requests from 270,000 sources.",
+      "https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"
+    ],
+    [
+      "post",
+      "Stripe: Scaling your API with rate limiters",
+      "The four limiters Stripe runs: request rate (token bucket in Redis), concurrent requests, fleet usage load shedder and worker utilisation load shedder.",
+      "https://stripe.com/blog/rate-limiters"
+    ],
+    [
+      "docs",
+      "IETF draft: RateLimit header fields for HTTP",
+      "Defines the RateLimit-Policy and RateLimit response fields for advertising quota and remaining allowance.",
+      "https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/"
+    ],
+    [
+      "code",
+      "redis-cell",
+      "A Redis module implementing GCRA, the one-timestamp formulation of the token bucket.",
+      "https://github.com/brandur/redis-cell"
+    ],
+    [
+      "docs",
+      "Redis: Rate limiting",
+      "Redis's own overview of rate-limiting patterns and the need for atomic updates.",
+      "https://redis.io/glossary/rate-limiting/"
+    ],
+    [
+      "docs",
+      "Amazon API Gateway quotas",
+      "Default account throttle quota per Region and the token-bucket burst capacity.",
+      "https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A small company exposes an API. One customer writes a script with a bug: it retries every failure immediately, in a loop, from forty machines. Within a minute that one customer is sending 30,000 requests a second. The database behind the API saturates, every other customer's requests start timing out, and the company's status page goes red, not because the system was too small for its real users but because nothing stopped one caller from taking all of it.</p>
+<p>A <strong>rate limiter</strong> is the component that would have stopped it. Before doing any work, the server asks the limiter "may this caller do this now?", and the limiter answers yes or no based on how much that caller has done recently. A no is cheap: the server returns an error immediately, and well-behaved clients slow down. The runaway script gets errors; everyone else carries on.</p>
+<p>Rate limiters exist for three different reasons, and an interviewer will notice whether you ask which one applies. <strong>Protection</strong>: stop any single caller from overloading a shared service. Here the limiter must be fast and cheap, and approximate is fine. <strong>Fairness</strong>: share limited capacity between tenants so a noisy one cannot starve the others. <strong>Monetisation</strong>: a paid plan allows more than a free one, so the limit is part of the product, must be enforced accurately and must be explainable to the customer. The same algorithms serve all three, but the purpose decides how exact the count must be and what happens when the limiter itself breaks.</p>
+<p>The coding question looks small: write a class with a method <code>allow()</code>. It earns its place in interviews because the obvious first version has a subtle bug, the correct versions differ in ways that matter (bursts, memory, exactness), testing anything time-based is a skill of its own, and the follow-ups lead straight into concurrency and distributed systems: what happens with many threads, with many servers, when the shared store is down.</p>
+<p>This lesson follows the round. It clarifies requirements, names the parts and their interface, then builds four algorithms in order of sophistication: a fixed-window counter and its boundary bug, the exact sliding-window log, the sliding-window counter that Cloudflare uses, and the token bucket that AWS API Gateway and Stripe use. Then it makes the limiter per-key and thread-safe, covers edge cases and the extensions an interviewer will ask for, takes it across many servers with Redis, and ends with the response headers that make a limiter friendly to its clients.</p>
+</section>
+
+<section data-field="primer">
+<h4>The question that picks the algorithm</h4>
+<p>Before any code, ask: <strong>"are bursts acceptable?"</strong> Suppose a client has been quiet for an hour and then sends 50 requests in one second. Is that fine? For a public API used by humans and scripts, usually yes: real traffic is bursty (a page load fires ten requests at once), and punishing that makes the API feel broken. For a downstream system that falls over under spikes, such as a legacy database or a payment processor with a strict contract, no. The answer chooses between two families. Algorithms that <em>allow controlled bursts</em> (the token bucket) and algorithms that <em>enforce a smooth rate</em> (sliding windows, the leaky bucket).</p>
+<h4>The token bucket, the mental model to carry</h4>
+<p>Picture a bucket that holds at most 10 tokens. A tap drips tokens into it at 2 per second; when the bucket is full, extra drips overflow and are lost. Each request must take one token out. If there is a token, the request proceeds; if the bucket is empty, the request is rejected (or told when to come back). Two numbers describe it completely. The <strong>refill rate</strong> (2 per second) sets the long-run sustained throughput: over a long time, nobody can average more than 2 requests per second. The <strong>capacity</strong> (10) sets the largest burst: a client who has been idle can spend up to 10 tokens at once. Those are independent knobs, which is exactly what most APIs want to say: "100 per minute on average, but never more than 10 at once".</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Token level over 12 seconds for rate 2 per second and capacity 10: full at 10, a burst of 10 empties it at t=2, it refills at 2 per second, requests at a steady 2 per second keep it at zero, then idle refills it to the cap">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="18" style="fill:var(--ink);font-weight:600">Tokens in the bucket (rate 2/s, capacity 10)</text>
+<line x1="60" y1="200" x2="620" y2="200" style="fill:none;stroke:var(--line-2)"/>
+<line x1="60" y1="40" x2="60" y2="200" style="fill:none;stroke:var(--line-2)"/>
+<line x1="60" y1="50" x2="620" y2="50" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 4"/>
+<text x="52" y="54" text-anchor="end" style="fill:var(--muted)">10</text>
+<text x="52" y="128" text-anchor="end" style="fill:var(--muted)">5</text>
+<text x="52" y="204" text-anchor="end" style="fill:var(--muted)">0</text>
+<text x="600" y="44" text-anchor="end" style="fill:var(--muted)">capacity: refill above this overflows</text>
+<path d="M60,50 L140,50 L140,200 L327,50 L374,50 L374,200 L420,200 L467,200 L513,200 L513,200 L620,110" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<text x="140" y="218" text-anchor="middle" style="fill:var(--ink-2)">t=2: burst of 10</text>
+<text x="235" y="140" style="fill:var(--ink-2)">refill 2/s</text>
+<text x="374" y="218" text-anchor="middle" style="fill:var(--ink-2)">t=7: burst of 10</text>
+<text x="445" y="190" text-anchor="middle" style="fill:var(--ink-2)">steady 2/s: level stays 0</text>
+<text x="570" y="150" style="fill:var(--ink-2)">idle</text>
+<text x="60" y="240" style="fill:var(--muted)">0 s</text>
+<text x="620" y="240" text-anchor="end" style="fill:var(--muted)">12 s</text>
+</g>
+</svg>
+<figcaption>The level falls by one per request and climbs at the refill rate, but never above capacity. Idle time is not banked forever: after five seconds the bucket is full and further waiting earns nothing. A client sending exactly the refill rate keeps the bucket near zero and is never rejected.</figcaption>
+</figure>
+<h4>Lazy refill: no background thread</h4>
+<p>A beginner's instinct is a timer that adds tokens to every bucket every second. With a million clients that is a million updates a second for buckets nobody is using. The standard trick is to compute refill <em>lazily</em>. Store two numbers per bucket: how many tokens it had, and when that was. When a request arrives, compute the elapsed time, add <code>elapsed × rate</code>, cap at capacity, then decide. An idle bucket costs nothing, and the answer is exactly what the timer would have produced. The same idea, storing a timestamp and computing state on demand, recurs in TTL caches and timeouts later in this family.</p>
+<h4>Windows, the other family</h4>
+<p>A <strong>fixed window</strong> counts requests per calendar minute and resets at each minute boundary. It is the first thing anyone writes, and it has a bug the interviewer is waiting for you to find: the boundary. A <strong>sliding-window log</strong> fixes the bug exactly by remembering every request's time. A <strong>sliding-window counter</strong> fixes it approximately with only two counters. The body builds all three so you can see each problem cause the next design.</p>
+<h4>Rejecting is a feature, not a failure</h4>
+<p>Beginners sometimes treat a rejection as the limiter failing. It is the opposite: a fast, cheap rejection with a clear "try again in 0.5 seconds" is the service working as designed. The alternative to rejecting excess load is not serving it; it is serving everyone slowly, then timing out, which wastes the work already done and makes clients retry even harder. A limiter turns an overload that would hurt everyone into an error that affects only the caller who exceeded its budget, and tells that caller exactly how to recover.</p>
+<h4>Where the analogy breaks</h4>
+<p>A real bucket holds whole objects; a token bucket holds a real number, so after 0.3 seconds at 2 per second it holds 0.6 of a token. That is fine and in fact necessary: rounding refills to whole tokens would lose fractions on every request and slowly undercount. Requests can also cost more than one token, which lets one bucket limit by work done (bytes, database rows, LLM tokens) rather than by request count.</p>
+<h4>What the round expects you to produce</h4>
+<p>A <code>Limiter</code> interface with one method, <code>try_acquire(cost)</code>, returning a small result: allowed or not, how much is left, and when to retry. Two or more implementations behind it. A per-key front end so each API key gets its own limiter. Tests that use a fake clock. And a clear spoken plan for the distributed version. The body walks through each piece in that order.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Entities &amp; API</span></div><div class="ck"><span class="ck-m">10–15</span><span class="ck-t">Fixed window</span></div><div class="ck"><span class="ck-m">15–30</span><span class="ck-t">Sliding &amp; bucket</span></div><div class="ck"><span class="ck-m">30–37</span><span class="ck-t">Per-key, threads, tests</span></div><div class="ck"><span class="ck-m">37–45</span><span class="ck-t">Distributed &amp; extensions</span></div></div>
+<h4>1 · Clarify the requirements</h4>
+<p>Ask, and write down the answers. What is limited, and per what key: per API key, per user, per IP address, per endpoint? What is the limit, and over what window: 100 per minute, 10 per second? Are bursts acceptable, and how large? Does every request cost the same, or do some cost more? Single process or many servers? Must it be thread-safe? What should a rejected caller receive: an error now, or a wait? How exact must it be: is 1 percent over the limit acceptable for a few seconds? What happens if the limiter's own storage fails?</p>
+<p>A typical agreed scope for the coding part: per-key limits, in-process, thread-safe, a configurable algorithm, requests may carry a cost, reject immediately with a retry hint. The distributed version is discussed, not coded. Say the non-functional targets aloud as well: the check must be O(1) per request and must not allocate unbounded memory per key, because a limiter that is slower than the request it guards, or that grows forever, has failed at its job.</p>
+<h4>2 · Entities and responsibilities</h4>
+<p>Four pieces. A <strong>Limiter</strong> is one rate-limit state machine for one key: given a cost, it decides. A <strong>Decision</strong> is the immutable answer: allowed, remaining, retry-after. A <strong>clock</strong> is a function returning the current time in seconds; injecting it is what makes everything testable. A <strong>KeyedRateLimiter</strong> owns the map from key to limiter, creates limiters on first use, makes each decision atomic under concurrency, and forgets idle keys. Keeping the algorithm (Limiter) separate from the bookkeeping (KeyedRateLimiter) means you can swap algorithms without touching the concurrency code, and test each algorithm single-threaded.</p>
+<h4>3 · The interface</h4>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Class diagram: Limiter protocol with try_acquire returning Decision; FixedWindow, SlidingWindowLog, SlidingWindowCounter and TokenBucket implement it; KeyedRateLimiter holds a dict of key to limiter and lock, created by a factory; all take an injected clock">
+<defs><marker id="ld2-tri" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--surface);stroke:var(--ink-2)"/></marker><marker id="ld2-dia" viewBox="0 0 12 12" refX="1" refY="6" markerWidth="10" markerHeight="10" orient="auto"><path d="M1,6 L6,1 L11,6 L6,11 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="200" y="14" width="240" height="56" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="320" y="32" text-anchor="middle" style="fill:var(--ink);font-weight:600">«Protocol» Limiter</text>
+<text x="320" y="54" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">try_acquire(cost=1) → Decision</text>
+<rect x="470" y="14" width="160" height="56" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="550" y="32" text-anchor="middle" style="fill:var(--ink);font-weight:600">Decision (frozen)</text>
+<text x="550" y="54" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">allowed, remaining, retry_after</text>
+<g style="font-family:var(--mono)">
+<rect x="10" y="120" width="140" height="44" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="80" y="138" text-anchor="middle" style="fill:var(--ink)">FixedWindow</text><text x="80" y="155" text-anchor="middle" style="fill:var(--muted)">window_id, count</text>
+<rect x="165" y="120" width="145" height="44" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="237" y="138" text-anchor="middle" style="fill:var(--ink)">SlidingWindowLog</text><text x="237" y="155" text-anchor="middle" style="fill:var(--muted)">deque of times</text>
+<rect x="325" y="120" width="160" height="44" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="405" y="138" text-anchor="middle" style="fill:var(--ink)">SlidingWindowCounter</text><text x="405" y="155" text-anchor="middle" style="fill:var(--muted)">prev, curr</text>
+<rect x="500" y="120" width="130" height="44" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="565" y="138" text-anchor="middle" style="fill:var(--ink)">TokenBucket</text><text x="565" y="155" text-anchor="middle" style="fill:var(--muted)">tokens, last</text>
+</g>
+<line x1="80" y1="118" x2="260" y2="72" marker-end="url(#ld2-tri)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="237" y1="118" x2="295" y2="72" marker-end="url(#ld2-tri)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="405" y1="118" x2="345" y2="72" marker-end="url(#ld2-tri)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="565" y1="118" x2="385" y2="72" marker-end="url(#ld2-tri)" style="fill:none;stroke:var(--ink-2)"/>
+<rect x="140" y="200" width="360" height="52" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="320" y="218" text-anchor="middle" style="fill:var(--ink);font-weight:600">KeyedRateLimiter</text>
+<text x="320" y="238" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">dict[key → (Limiter, Lock, last_seen)]; factory; sweep()</text>
+<line x1="320" y1="198" x2="320" y2="168" marker-start="url(#ld2-dia)" style="fill:none;stroke:var(--ink-2)"/>
+<text x="330" y="186" style="fill:var(--muted)">one per key</text>
+<text x="520" y="230" style="fill:var(--muted)">clock: () → float</text>
+<text x="520" y="246" style="fill:var(--muted)">injected everywhere</text>
+</g>
+</svg>
+<figcaption>One small protocol, four interchangeable algorithms, and a separate class for the per-key bookkeeping and locking. The algorithms never see threads; the keyed front end never sees algorithm details. That split is what lets you test each half alone.</figcaption>
+</figure>
+<p>Python's <code>typing.Protocol</code> describes the interface by shape: any class with a matching <code>try_acquire</code> method satisfies it, with no inheritance needed. The <code>Decision</code> is a frozen dataclass, an immutable record, so callers cannot accidentally modify a result they were handed. Returning a <code>Decision</code> rather than a bare boolean pays off immediately: the HTTP layer needs <code>retry_after</code> for its header, and dashboards want <code>remaining</code>.</p>
+<h4>4 · Stage one: a fixed-window counter</h4>
+<p>The simplest limiter. Divide time into windows of, say, 60 seconds, numbered by <code>floor(now / 60)</code>. Keep the current window's number and a count. On each request, if the window number changed, reset the count to zero; then allow if <code>count + cost &lt;= limit</code>. It is O(1) in time and memory, easy to make atomic, and maps directly onto Redis's <code>INCR</code> plus <code>EXPIRE</code>.</p>
+<pre>class FixedWindow:
+    def __init__(self, limit, window, clock):
+        self.limit, self.window, self.clock = limit, window, clock
+        self.window_id, self.count = None, 0
+
+    def try_acquire(self, cost=1):
+        now = self.clock()
+        wid = math.floor(now / self.window)
+        if wid != self.window_id:
+            self.window_id, self.count = wid, 0
+        if self.count + cost &lt;= self.limit:
+            self.count += cost
+            return Decision(True, self.limit - self.count, 0.0)
+        return Decision(False, self.limit - self.count, (wid + 1) * self.window - now)</pre>
+<p>Now find the bug. Limit 100 per 60 seconds. A client sends 100 requests at <code>t = 59.9</code>, all allowed because window 0 has room. At <code>t = 60.1</code>, a new window starts and the count resets; the client sends 100 more, all allowed. That is 200 requests in 0.2 seconds, twice the limit, and the limiter never broke its own rule. The test <code>test_fixed_window_boundary_burst</code> in the full solution demonstrates exactly this. For protection against overload that may be tolerable, since the long-run average is still bounded; for a contract that says "never more than 100 in any 60 seconds" it is wrong.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Fixed windows at 0-60 and 60-120 seconds; 100 requests at 59.9 and 100 at 60.1 both allowed; the trailing 60-second window around the boundary contains 200. Sliding-window counter at t=75: 42 previous plus 18 current gives 42 times 0.75 plus 18 equals 49.5">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="18" style="fill:var(--ink);font-weight:600">Fixed window: 2× the limit across the boundary</text>
+<rect x="40" y="30" width="280" height="40" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<rect x="320" y="30" width="280" height="40" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="180" y="54" text-anchor="middle" style="fill:var(--muted)">window 0 (0–60 s)</text>
+<text x="460" y="54" text-anchor="middle" style="fill:var(--muted)">window 1 (60–120 s)</text>
+<rect x="306" y="30" width="12" height="40" style="fill:var(--crit)"/>
+<rect x="322" y="30" width="12" height="40" style="fill:var(--crit)"/>
+<text x="312" y="88" text-anchor="end" style="fill:var(--ink-2)">100 at 59.9 s ✓</text>
+<text x="328" y="88" style="fill:var(--ink-2)">100 at 60.1 s ✓</text>
+<rect x="180" y="96" width="280" height="14" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/>
+<text x="320" y="124" text-anchor="middle" style="fill:var(--crit)">any trailing 60 s window around the boundary holds 200</text>
+<text x="20" y="154" style="fill:var(--ink);font-weight:600">Sliding-window counter at t = 75 s (limit 50)</text>
+<rect x="40" y="166" width="280" height="30" style="fill:var(--s2);opacity:0.35"/>
+<rect x="320" y="166" width="280" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<rect x="110" y="162" width="280" height="38" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<text x="180" y="186" text-anchor="middle" style="fill:var(--ink)">prev: 42</text>
+<text x="355" y="186" text-anchor="middle" style="fill:var(--ink)">curr: 18</text>
+<text x="250" y="216" text-anchor="middle" style="fill:var(--ink-2)">trailing 60 s covers 45 s of prev (75%) + 15 s of curr → 42 × 0.75 + 18 = 49.5</text>
+</g>
+</svg>
+<figcaption>Top: each fixed window is within its limit, yet a 60-second span straddling the boundary holds double. Bottom: the sliding-window counter estimates the trailing window by assuming the previous window's 42 requests were spread evenly, so 75 percent of them still count. These are the numbers from Cloudflare's write-up.</figcaption>
+</figure>
+<h4>5 · Stage two: the sliding-window log, exact but costly</h4>
+<p>To enforce "no more than N in any trailing window", remember when each accepted request happened. Keep a <code>deque</code> of timestamps. On each request, pop timestamps from the left while they are older than <code>now - window</code>; then allow if the deque's length plus the cost is within the limit, and append the current time once per unit of cost. The answer is exact: the deque is literally the list of accepted requests in the last 60 seconds.</p>
+<p>The retry hint is exact too. If the deque is full, the request can succeed once enough of the oldest entries slide out; for cost 1 that is when the oldest timestamp turns <code>window</code> seconds old, so <code>retry_after = log[0] + window - now</code>. In the boundary scenario above, after 100 requests at 59.9 seconds, a request at 60.1 is rejected with a retry of 59.8 seconds. The cost is memory: one float per accepted request per key. A limit of 10,000 per hour for a million keys is billions of floats. That is why the log is used for low limits or audit-grade enforcement, not for everything.</p>
+<h4>6 · Stage three: the sliding-window counter, O(1) and nearly exact</h4>
+<p>Keep only two counters per key: the count in the current fixed window and the count in the previous one. To estimate how many requests fell in the trailing window, assume the previous window's requests were spread evenly. If you are <code>elapsed</code> seconds into the current window, the trailing window still covers <code>window - elapsed</code> seconds of the previous one, so estimate <code>prev × (window - elapsed) / window + curr</code>. When a new window begins, the current count becomes the previous one; if two or more windows passed with no traffic, both reset to zero. This is the code's <code>_roll</code> method.</p>
+<p>Cloudflare's write-up gives a worked example, reproduced as a test in the full solution: 42 requests in the previous minute, 18 so far in this one, 15 seconds in. The estimate is <code>42 × 0.75 + 18 = 49.5</code>. With a limit of 50, one more request would push it over. The estimate is wrong only when the previous window's traffic was bunched at one end; Cloudflare measured it across 400 million requests from 270,000 sources and found 0.003 percent of decisions wrong, with the estimated rate on average 6 percent from the real one. That is the trade the industry usually takes: constant memory, two integers per key, and an error that is small and bounded.</p>
+<h4>7 · Stage four: the token bucket</h4>
+<p>The token bucket is the most common answer and the one to have fluent. State: <code>tokens</code> (a float) and <code>last</code> (the time of the last update). Start full, so a new client may burst immediately. On each request: compute <code>elapsed = now - last</code>, add <code>elapsed × rate</code>, cap at <code>capacity</code>, set <code>last = now</code>. If <code>tokens &gt;= cost</code>, subtract and allow; otherwise reject with <code>retry_after = (cost - tokens) / rate</code>, the time until enough tokens will have dripped in. Two guard rails: clamp elapsed at zero, so a clock that misbehaves never refills backwards; and reject a cost greater than capacity up front, because such a request can never succeed and would otherwise get a misleading retry hint forever.</p>
+<p>Trace it with rate 2 per second and capacity 10. A client idle for 30 seconds would earn 60 tokens, but the cap holds it at 10. It sends 15 requests at once: 10 succeed; the 11th sees 0 tokens and gets a retry hint of 0.5 seconds. After another 2.5 seconds, 5 tokens have dripped in, and 5 more succeed. These exact numbers are the first test in the full solution.</p>
+<p>A <strong>leaky bucket</strong> is the mirror image: requests go into a queue and leave it at a fixed rate, so the output is smooth even when the input is bursty. Used as a meter (reject when the queue would overflow) it makes the same decisions as a token bucket; used as a queue it adds delay instead of rejecting. Choose it when the thing downstream cannot take a burst at all, such as an SMS gateway with a strict per-second contract.</p>
+<h4>8 · Per-key limiting and thread safety</h4>
+<p>Real limiters hold one state per key. <code>KeyedRateLimiter</code> keeps a dict from key to a tuple of the limiter, a lock, and a last-seen time. The race to prevent is the classic check-then-act: two threads both read "one token left", both decide "allow", and both subtract. The fix is to hold that key's lock around the whole <code>try_acquire</code>, making check and update a single step. A separate short lock guards the dict itself while creating a new entry, so two threads seeing a new key at the same moment do not create two limiters, one of which would be lost.</p>
+<p>Why a lock per key rather than one lock for everything? Because unrelated tenants should not wait for each other. This is the sharding idea from the LRU case taken to its limit: one lock per key. The stress test in the solution starts 16 threads behind a <code>threading.Barrier</code> (so they all start at the same moment) and makes 800 attempts against a bucket of 100 tokens that effectively never refills; exactly 100 must be granted, and they are.</p>
+<p>Keys must also be forgotten. Every IP address that ever touched the service would otherwise stay in the dict forever. <code>sweep()</code> deletes keys whose last-seen time is older than an idle TTL. This is safe for a token bucket because a key idle long enough has a full bucket, which is exactly what a freshly created limiter has, so forgetting it changes no decision.</p>
+<h4>9 · The full solution</h4>
+<p>The file below contains all four algorithms, the keyed front end, a header helper and seven tests, including the Cloudflare example, the boundary burst and the 16-thread stress test. It runs on Python 3.12 with the standard library; all tests pass. Notice that the tests never sleep: they construct a <code>FakeClock</code>, pass it in, and move it forward.</p>
+<pre>"""Rate limiters: fixed window, sliding-window log, sliding-window counter, token bucket,
+plus a per-key, thread-safe front end. Python 3.12, standard library only.
+Run: python ratelimit.py"""
+from __future__ import annotations
+
+import math
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Callable, Protocol
+
+Clock = Callable[[], float]
+
+
+@dataclass(frozen=True)
+class Decision:
+    allowed: bool
+    remaining: int          # whole requests still allowed right now
+    retry_after: float      # seconds until a rejected request could succeed (0 if allowed)
+
+
+class Limiter(Protocol):
+    def try_acquire(self, cost: int = 1) -&gt; Decision: ...
+
+
+class FixedWindow:
+    """One counter per window of `window` seconds. Simple; allows 2x limit across a boundary."""
+
+    def __init__(self, limit: int, window: float, clock: Clock) -&gt; None:
+        self.limit, self.window, self.clock = limit, window, clock
+        self.window_id, self.count = None, 0
+
+    def try_acquire(self, cost: int = 1) -&gt; Decision:
+        now = self.clock()
+        wid = math.floor(now / self.window)
+        if wid != self.window_id:                       # a new window: reset the counter
+            self.window_id, self.count = wid, 0
+        if self.count + cost &lt;= self.limit:
+            self.count += cost
+            return Decision(True, self.limit - self.count, 0.0)
+        return Decision(False, self.limit - self.count, (wid + 1) * self.window - now)
+
+
+class SlidingWindowLog:
+    """Exact: keep the timestamp of every accepted request in the trailing window. O(limit) memory."""
+
+    def __init__(self, limit: int, window: float, clock: Clock) -&gt; None:
+        self.limit, self.window, self.clock = limit, window, clock
+        self.log: deque[float] = deque()
+
+    def try_acquire(self, cost: int = 1) -&gt; Decision:
+        now = self.clock()
+        while self.log and self.log[0] &lt;= now - self.window:   # drop entries that slid out
+            self.log.popleft()
+        if len(self.log) + cost &lt;= self.limit:
+            self.log.extend([now] * cost)
+            return Decision(True, self.limit - len(self.log), 0.0)
+        # the oldest needed entry must slide out before `cost` slots are free
+        needed = len(self.log) + cost - self.limit
+        return Decision(False, self.limit - len(self.log), self.log[needed - 1] + self.window - now)
+
+
+class SlidingWindowCounter:
+    """Two fixed-window counters; estimate = current + previous * (unexpired share of previous)."""
+
+    def __init__(self, limit: int, window: float, clock: Clock) -&gt; None:
+        self.limit, self.window, self.clock = limit, window, clock
+        self.window_id, self.curr, self.prev = None, 0, 0
+
+    def _roll(self, now: float) -&gt; float:
+        wid = math.floor(now / self.window)
+        if self.window_id is None or wid &gt; self.window_id + 1:
+            self.prev, self.curr = 0, 0                     # idle for 2+ windows
+        elif wid == self.window_id + 1:
+            self.prev, self.curr = self.curr, 0
+        self.window_id = wid
+        elapsed = now - wid * self.window
+        return self.prev * (self.window - elapsed) / self.window + self.curr
+
+    def try_acquire(self, cost: int = 1) -&gt; Decision:
+        now = self.clock()
+        estimate = self._roll(now)
+        if estimate + cost &lt;= self.limit:
+            self.curr += cost
+            return Decision(True, int(self.limit - estimate - cost), 0.0)
+        return Decision(False, max(0, int(self.limit - estimate)), self.window / max(self.limit, 1))
+
+
+class TokenBucket:
+    """Refill `rate` tokens/second up to `capacity`; each request spends `cost` tokens.
+    Refill is computed lazily from elapsed time: no background thread."""
+
+    def __init__(self, rate: float, capacity: float, clock: Clock) -&gt; None:
+        if rate &lt;= 0 or capacity &lt;= 0:
+            raise ValueError("rate and capacity must be positive")
+        self.rate, self.capacity, self.clock = rate, capacity, clock
+        self.tokens, self.last = capacity, clock()          # start full: allow an initial burst
+
+    def _refill(self, now: float) -&gt; None:
+        elapsed = max(0.0, now - self.last)                  # never refill backwards
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+        self.last = now
+
+    def try_acquire(self, cost: int = 1) -&gt; Decision:
+        if cost &gt; self.capacity:
+            raise ValueError("cost exceeds bucket capacity: can never succeed")
+        now = self.clock()
+        self._refill(now)
+        if self.tokens &gt;= cost:
+            self.tokens -= cost
+            return Decision(True, int(self.tokens), 0.0)
+        return Decision(False, int(self.tokens), (cost - self.tokens) / self.rate)
+
+
+class KeyedRateLimiter:
+    """One limiter per key (API key, user, IP), created on first use, dropped when idle.
+    A lock per key keeps check-and-update atomic; a short global lock guards the dict."""
+
+    def __init__(self, factory: Callable[[], Limiter], clock: Clock, idle_ttl: float = 600.0) -&gt; None:
+        self.factory, self.clock, self.idle_ttl = factory, clock, idle_ttl
+        self._entries: dict[str, tuple[Limiter, threading.Lock, list[float]]] = {}
+        self._dict_lock = threading.Lock()
+
+    def try_acquire(self, key: str, cost: int = 1) -&gt; Decision:
+        with self._dict_lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = self._entries[key] = (self.factory(), threading.Lock(), [0.0])
+        limiter, lock, last_seen = entry
+        with lock:                                          # check-and-update as one step
+            last_seen[0] = self.clock()
+            return limiter.try_acquire(cost)
+
+    def sweep(self) -&gt; int:
+        """Forget keys idle longer than idle_ttl (a full token bucket is the same as no bucket)."""
+        cutoff = self.clock() - self.idle_ttl
+        with self._dict_lock:
+            stale = [k for k, (_, _, seen) in self._entries.items() if seen[0] &lt; cutoff]
+            for k in stale:
+                del self._entries[k]
+        return len(stale)
+
+
+def headers(policy: str, limit: int, window: int, d: Decision) -&gt; dict[str, str]:
+    """Response headers in the style of the IETF RateLimit draft, plus Retry-After on 429."""
+    h = {"RateLimit-Policy": f'"{policy}";q={limit};w={window}',
+         "RateLimit": f'"{policy}";r={d.remaining};t={math.ceil(d.retry_after)}'}
+    if not d.allowed:
+        h["Retry-After"] = str(max(1, math.ceil(d.retry_after)))
+    return h
+
+
+# ---------------------------------------------------------------- tests
+class FakeClock:
+    def __init__(self, t: float = 0.0) -&gt; None:
+        self.t = t
+
+    def __call__(self) -&gt; float:
+        return self.t
+
+    def advance(self, dt: float) -&gt; None:
+        self.t += dt
+
+
+def test_token_bucket_burst_then_refill() -&gt; None:
+    clk = FakeClock()
+    tb = TokenBucket(rate=2, capacity=10, clock=clk)
+    clk.advance(30)                                         # idle: still capped at 10, not 60
+    results = [tb.try_acquire().allowed for _ in range(15)]
+    assert results.count(True) == 10
+    d = tb.try_acquire()
+    assert not d.allowed and math.isclose(d.retry_after, 0.5)
+    clk.advance(2.5)                                        # 5 more tokens
+    assert sum(tb.try_acquire().allowed for _ in range(6)) == 5
+
+
+def test_fixed_window_boundary_burst() -&gt; None:
+    clk = FakeClock(59.9)
+    fw = FixedWindow(limit=100, window=60, clock=clk)
+    a = sum(fw.try_acquire().allowed for _ in range(100))
+    clk.advance(0.2)                                        # t = 60.1, a new window
+    b = sum(fw.try_acquire().allowed for _ in range(100))
+    assert a + b == 200                                     # 2x the limit in 0.2 seconds
+
+
+def test_sliding_log_is_exact() -&gt; None:
+    clk = FakeClock(59.9)
+    log = SlidingWindowLog(limit=100, window=60, clock=clk)
+    assert sum(log.try_acquire().allowed for _ in range(100)) == 100
+    clk.advance(0.2)
+    d = log.try_acquire()
+    assert not d.allowed and math.isclose(d.retry_after, 59.8)
+
+
+def test_sliding_counter_matches_cloudflare_example() -&gt; None:
+    # Cloudflare's post: 42 requests in the previous minute, 18 so far, 15 s into this minute
+    clk = FakeClock(0)
+    sw = SlidingWindowCounter(limit=1000, window=60, clock=clk)   # generous while filling
+    for _ in range(42):
+        sw.try_acquire()
+    clk.t = 60
+    for _ in range(18):
+        sw.try_acquire()
+    clk.t = 75
+    sw.limit = 50                                           # now apply the real limit
+    assert math.isclose(sw._roll(clk()), 42 * 0.75 + 18)   # 49.5
+    assert sw.try_acquire().allowed is False                # 49.5 + 1 &gt; 50
+
+
+def test_keyed_limiter_threads_never_overspend() -&gt; None:
+    clk = FakeClock()
+    rl = KeyedRateLimiter(lambda: TokenBucket(rate=1e-9, capacity=100, clock=clk), clk)
+    allowed = [0]
+    count_lock = threading.Lock()
+    start = threading.Barrier(16)
+
+    def hammer() -&gt; None:
+        start.wait()
+        for _ in range(50):
+            if rl.try_acquire("tenant-1").allowed:
+                with count_lock:
+                    allowed[0] += 1
+    ts = [threading.Thread(target=hammer) for _ in range(16)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert allowed[0] == 100, allowed[0]                    # 800 attempts, exactly capacity granted
+
+
+def test_idle_keys_are_swept_and_headers() -&gt; None:
+    clk = FakeClock()
+    rl = KeyedRateLimiter(lambda: TokenBucket(rate=1, capacity=5, clock=clk), clk, idle_ttl=60)
+    for k in ("a", "b", "c"):
+        rl.try_acquire(k)
+    clk.advance(61)
+    rl.try_acquire("a")
+    assert rl.sweep() == 2 and set(rl._entries) == {"a"}
+    tb = TokenBucket(rate=1, capacity=1, clock=clk)
+    tb.try_acquire()
+    h = headers("default", 1, 1, tb.try_acquire())
+    assert h["Retry-After"] == "1" and h["RateLimit"] == '"default";r=0;t=1'
+
+
+def test_real_clock_smoke() -&gt; None:
+    tb = TokenBucket(rate=1000, capacity=5, clock=time.monotonic)
+    assert sum(tb.try_acquire().allowed for _ in range(5)) == 5
+
+
+if __name__ == "__main__":
+    for t in (test_token_bucket_burst_then_refill, test_fixed_window_boundary_burst,
+              test_sliding_log_is_exact, test_sliding_counter_matches_cloudflare_example,
+              test_keyed_limiter_threads_never_overspend, test_idle_keys_are_swept_and_headers,
+              test_real_clock_smoke):
+        t()
+        print("ok ", t.__name__)</pre>
+<h4>10 · Edge cases</h4>
+<p>Go through these aloud. <strong>Clock going backwards</strong>: wall-clock time is adjusted by time synchronisation (NTP, the network time protocol) and can jump; use <code>time.monotonic()</code> and clamp elapsed at zero anyway. <strong>Cost greater than capacity</strong>: reject with a clear error. <strong>Very low rates</strong> such as 1 per hour: the retry hint is up to 3,600 seconds and the float arithmetic is fine. <strong>Very high rates</strong> such as 100,000 per second: refill per request is tiny, and float precision is still ample, but the lock becomes the bottleneck long before the arithmetic does. <strong>Fractional tokens</strong>: keep them; rounding down on each refill loses tokens systematically. <strong>First request</strong>: decide whether a new bucket starts full (allow an initial burst, the usual choice) or empty. <strong>Zero or negative configuration</strong>: reject in the constructor. <strong>Key cardinality</strong>: a flood of spoofed or rotating keys can grow the dict; sweep it and cap its size.</p>
+<h4>11 · Testing time-based code</h4>
+<p>Tests that call <code>time.sleep</code> are slow and flaky: a loaded CI machine sleeps longer than asked, and the refill you expected has become two refills. Inject the clock instead. <code>FakeClock</code> is three lines: it stores a float, returns it when called, and has <code>advance(dt)</code>. A refill test then reads like a specification: advance 2.5 seconds, expect exactly 5 more successes. The same technique, a controllable collaborator passed in rather than reached for, is dependency injection from the SWE track, and it recurs in every time-based case later in this family.</p>
+<h4>12 · Taking it distributed</h4>
+<p>With twenty application servers behind a load balancer, twenty in-process limiters each allow the full limit, so a client spread across them gets twenty times its quota. The state must be shared. The usual store is Redis, an in-memory key-value server. The naive version reads the bucket, computes in the application, and writes it back, and it races exactly like the threads did: two servers read "one token", both allow. The fix is to run the whole read-decide-write inside Redis as a <strong>Lua script</strong>; Redis executes a script to completion without running any other command in between, so it is atomic. A sketch of the script:</p>
+<pre>-- KEYS[1] = bucket key; ARGV = rate, capacity, cost
+local t = redis.call('TIME')                       -- Redis's clock, not the app server's
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'last')
+local rate, cap, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local tokens = tonumber(b[1]) or cap
+local last = tonumber(b[2]) or now
+tokens = math.min(cap, tokens + math.max(0, now - last) * rate)
+local allowed = tokens &gt;= cost
+if allowed then tokens = tokens - cost end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'last', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(cap / rate) * 2)  -- idle keys vanish
+return {allowed and 1 or 0, tostring(tokens)}</pre>
+<p>Three details earn credit. Using Redis's <code>TIME</code> inside the script gives every server one clock, so servers whose clocks disagree cannot mint or destroy tokens. The <code>EXPIRE</code> does the idle sweep for free. And the script is the same algorithm as the Python class, which is the point: the algorithm does not change when it goes distributed; only where the state lives and how updates are made atomic.</p>
+<h4>13 · Extensions the interviewer will ask for</h4>
+<p><strong>Cost-based limits</strong>: pass a cost per request (bytes, rows, LLM tokens). <strong>Multiple limits</strong>: a per-second and a per-day limit together; check both and only spend from either if both allow, or the per-second bucket is drained by requests the daily one rejects. <strong>Hierarchies</strong>: per IP for anonymous callers, per API key, and per (key, endpoint class) for expensive endpoints; check the cheapest and most specific first and stop at the first rejection. <strong>Waiting instead of rejecting</strong>: return the retry hint and let the caller sleep, or offer an <code>acquire(timeout)</code> that blocks, which turns the limiter into a pacer for outbound calls to someone else's API. <strong>Concurrency limits</strong>: "at most 20 requests in flight" is a different control, a counting semaphore incremented on start and decremented on finish, and Stripe runs it alongside its rate limiter.</p>
+<h4>14 · Choosing between the four</h4>
+<table><thead><tr><th>Algorithm</th><th>Memory per key</th><th>Exact?</th><th>Bursts</th><th>Use when</th></tr></thead><tbody>
+<tr><td>Fixed window</td><td>2 numbers</td><td>Per calendar window only</td><td>Up to 2× at boundaries</td><td>Coarse protection, daily quotas</td></tr>
+<tr><td>Sliding-window log</td><td>1 timestamp per request</td><td>Yes</td><td>None beyond the limit</td><td>Low limits, audit-grade enforcement</td></tr>
+<tr><td>Sliding-window counter</td><td>3 numbers</td><td>Close (assumes even spread)</td><td>Smoothed</td><td>High-volume per-key limits</td></tr>
+<tr><td>Token bucket</td><td>2 numbers</td><td>Yes, for its policy</td><td>Controlled by capacity</td><td>Public APIs, separate burst and rate</td></tr>
+</tbody></table>
+<p>In an interview, the strongest answer picks one with a reason tied to the requirements you clarified: "bursts are fine and we want separate burst and sustained limits, so a token bucket", or "the downstream contract says never more than 100 in any minute, and limits are small, so a sliding-window log". Then mention the one you rejected and why. Being able to justify the choice in one sentence is worth more than implementing all four.</p>
+<h4>15 · Complexity</h4>
+<p>Fixed window, sliding-window counter and token bucket are O(1) time and O(1) memory per key: two or three numbers. The sliding-window log is O(1) amortised time per request (each timestamp is appended once and popped once) but O(limit) memory per key. The keyed front end adds one dict lookup and one lock acquisition per request, and O(active keys) memory, bounded by the idle sweep.</p>
+</section>
+
+<section data-field="deep">
+<h4>GCRA: the token bucket in one number</h4>
+<p>The generic cell rate algorithm (GCRA), from telecom traffic shaping, enforces exactly the token bucket's policy while storing a single value per key: the <strong>theoretical arrival time</strong> (TAT), the time at which the next request would arrive if the client sent at exactly the allowed rate. Let the emission interval be <code>T = 1 / rate</code> and the burst tolerance <code>τ = T × (capacity - 1)</code>. A request at time <code>now</code> is allowed if <code>TAT - now &lt;= τ</code>; if so, set <code>TAT = max(TAT, now) + T</code>. Intuitively, TAT runs ahead of real time by one interval per recent request, and the bucket is "empty" when it has run ahead by more than the burst allows. One number per key means a smaller, simpler atomic update, which is why the redis-cell module implements GCRA. Being able to derive it from the token bucket is a strong senior signal.</p>
+<h4>Why the sliding-window counter's error is small in practice</h4>
+<p>The estimate is wrong only when the previous window's requests were unevenly distributed and the current total is close to the limit. Clients far below the limit are never affected, and clients far above it are rejected either way. Only the narrow band near the threshold sees errors, and an error there means allowing or rejecting a request that was within a few percent of the line. Cloudflare's numbers (0.003 percent wrong decisions, and the few false negatives were clients less than 15 percent over the threshold) reflect exactly that. When exactness matters more than memory, for example a billing quota, use the log or a per-second sub-window counter.</p>
+<h4>Leasing tokens to remove the network hop</h4>
+<p>A Redis round trip inside the datacentre costs perhaps half a millisecond to a millisecond, and the limiter is on every request. At high request rates that is a real share of the latency budget and a real load on Redis. The standard mitigation is a <strong>lease</strong>: each server takes a block of, say, 100 tokens from the shared bucket in one call, and spends them from a local in-process bucket. Only one request in a hundred touches Redis. The cost is accuracy: in the worst case each of N servers holds an unspent lease, so a client can briefly exceed the limit by up to N times the lease size, and tokens leased to an idle server are temporarily unavailable to busy ones. Size the lease against both: small enough that the overshoot is acceptable, large enough that Redis traffic falls meaningfully. Returning unspent tokens on graceful shutdown limits the waste.</p>
+<h4>Fail open, fail closed, and the backstop</h4>
+<p>When Redis is unreachable, the limiter cannot know the shared state. Failing open (allow everything) keeps the product working but removes protection at the moment the system is already in trouble, since the cause of a Redis outage is often overload. Failing closed (reject everything) protects the backend but turns a limiter outage into a full outage. Mature designs fail open to a <strong>local backstop</strong>: each server enforces a conservative in-process limit, such as the global limit divided by the number of servers, so protection degrades rather than disappears, and an alert fires. For a monetisation quota the answer flips toward failing closed or using a cached allowance, because giving the paid product away is a business failure. The point to make in the interview is that the answer depends on the purpose you clarified at the start.</p>
+<h4>Clocks, skew and monotonicity</h4>
+<p>Every algorithm here depends on elapsed time. Inside one process, use a monotonic clock: <code>time.time()</code> reports wall-clock time, which the operating system adjusts, sometimes backwards, when synchronising with a time server, and a backwards jump makes elapsed negative. Across servers, the problem is skew: two machines' clocks differ by milliseconds or more, and if server A refills using its clock and server B using its own, tokens appear or disappear. Using one authority (Redis's <code>TIME</code> in the script) removes the disagreement. This is a general lesson for distributed design: when several machines must agree about time, pick one clock, or design so that agreement is not needed.</p>
+<h4>Fairness, priorities and the noisy neighbour</h4>
+<p>A per-key limiter stops one key from exceeding its own budget, but it does not by itself keep the total within the system's capacity: 10,000 tenants each within their limit can still overload the backend. Two further controls handle that. A <strong>global limiter</strong> or concurrency cap bounds the total. And <strong>load shedding</strong>, as Stripe describes, rejects low-priority work first when the fleet is busy, for example by reserving a fraction of capacity for critical endpoints such as creating charges and shedding non-critical ones such as listing them. Weighted fair queuing goes further and gives each tenant a share of capacity proportional to a weight, which is how multi-tenant inference platforms share GPUs between customers.</p>
+<h4>Cost-based limiting for AI products</h4>
+<p>LLM APIs limit by tokens per minute as well as requests per minute, because one request with a 100,000-token prompt costs far more than one with 200. The cost is not fully known in advance: output length depends on the model. The usual approach is to charge the bucket an estimate up front (prompt tokens plus the requested maximum output) and reconcile when the response completes, refunding unused tokens. That means a bucket can briefly hold less than zero after reconciliation, and you must decide whether a negative balance blocks the next request until it recovers, which is the fair choice, or is forgiven.</p>
+</section>
+
+<section data-field="prod">
+<h4>How rate limiters fail in production</h4>
+<p>The first failure mode is <strong>the limiter becoming the outage</strong>. Every request touches it, so a slow Redis, a hot key (one huge tenant whose bucket all servers hammer) or a lock held too long adds latency to everything. Watch the limiter's own latency percentiles and its error rate as first-class metrics. Hot keys are handled with leases or by splitting one tenant's budget across several sub-keys that are summed approximately.</p>
+<p>The second is <strong>retry storms</strong>. A client that receives 429 and immediately retries makes the problem worse; thousands of such clients turn a brief overload into a sustained one. The server's part of the fix is a precise <code>Retry-After</code> (the token bucket knows exactly when the next token arrives) and quota headers on every response, so clients can pace themselves before they are rejected. The client's part, covered in the resilient-client case later in this family, is exponential backoff with jitter.</p>
+<p>The third is <strong>misattributed keys</strong>. Limiting by IP address punishes everyone behind one corporate proxy or carrier network address translation, where thousands of phones share a single public IP, and is trivially bypassed by attackers who rotate addresses. Limiting by API key is precise for authenticated traffic. Most systems combine them: per-key limits for authenticated callers, generous per-IP limits plus other abuse signals for anonymous ones.</p>
+<h4>What to measure</h4>
+<p>Per limit: requests allowed and rejected, broken down by key class or tier, and the top rejected keys. A sudden rise in rejections for many keys at once usually means a misconfiguration or a bad deploy of a client library, not abuse. A single key with a high rejection rate is a runaway client, and a short message to that customer is often the best fix. Also measure the limiter's decision latency, its store's latency and error rate, and, for leased designs, how often leases are refreshed and how many tokens expire unspent.</p>
+<h4>Knobs and how they are tuned</h4>
+<p>Rate and capacity are set from observed traffic: take the distribution of per-key request rates and set the limit well above the normal heavy user, so that only genuine runaways are throttled. Capacity is set from real burst sizes, for example the number of requests a client library fires at startup. Limits per endpoint class reflect cost: a search or export endpoint gets a much smaller budget than a cheap read. All of this is configuration, ideally per tier and changeable without a deploy.</p>
+<h4>Rolling out a new limit safely</h4>
+<p>Turning on a new or stricter limit is a production change with real blast radius: set it too low and you reject paying customers' legitimate traffic. The standard practice is a <strong>shadow mode</strong> (also called dry run): the limiter makes its decision and records it in metrics and logs, but the request proceeds regardless. After a few days of real traffic you can see exactly which keys would have been rejected and how often, contact the customers who would be affected, and adjust limits before enforcing. Stripe's post gives the same advice: dark launch each limiter to watch the traffic it would block, and put limiters behind feature flags (kill switches) so a human can turn one off quickly if it starts rejecting the wrong traffic. Once enforcing, change limits gradually and watch the rejection rate per tier; a step change in rejections right after a limit change is a configuration mistake until proven otherwise.</p>
+<h4>The real case: a token bucket in AWS API Gateway</h4>
+<p>Amazon API Gateway's documentation describes its throttling in exactly this lesson's terms. It "throttles requests to your API using the token bucket algorithm, where a token counts for a request", examining a steady-state rate and a burst, and returns <code>429 Too Many Requests</code> when both are exceeded. The burst is described as the maximum bucket size. The default account-level quota per Region is 10,000 requests per second with a burst capacity provided by the token bucket of 5,000 requests. Limits apply in a hierarchy: per-client or per-method limits in a usage plan first, then per-method limits for a stage, then the account level, then AWS's Regional limits. The documentation also warns that throttles are applied on a best-effort basis and should be treated as targets rather than guaranteed ceilings, which is the distributed-accuracy trade-off from the deep section stated plainly by a vendor. Stripe's engineering post describes the same algorithm from the inside: a token bucket per user held in Redis, alongside a concurrency limiter and two load shedders, with the request-rate limiter rejecting millions of requests a month, mostly from scripts that had gotten out of hand.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the full solution, then extend it, break it and measure it. Python 3.12, standard library only.</p>
+<ol>
+<li>Save the full solution as <code>ratelimit.py</code> and run <code>python ratelimit.py</code>. Seven tests print <code>ok</code> in well under a second, even though they simulate minutes of time: that is the fake clock at work.</li>
+<li><strong>Break it.</strong> In <code>KeyedRateLimiter.try_acquire</code>, remove the <code>with lock:</code> line (dedent its body) and add <code>time.sleep(0)</code> between the token check and the subtraction inside <code>TokenBucket.try_acquire</code> to widen the race window. Run the thread test several times: it should now grant more than 100. Put the lock back and the count returns to exactly 100.</li>
+<li><strong>Measure it.</strong> Feed each algorithm the boundary scenario (100 requests at 59.9 s, 100 at 60.1 s) and print how many each allows: fixed window 200, log 100, sliding counter about 100, and a token bucket with rate 100/60 and capacity 100 allows 100 plus whatever refilled in 0.2 seconds.</li>
+<li><strong>Extend it.</strong> Implement GCRA from the deep section as a fifth <code>Limiter</code> storing only <code>tat</code>, and check it makes the same decisions as <code>TokenBucket</code> over a random request stream.</li>
+<li><strong>Extend it again.</strong> Add a <code>MultiLimit</code> that combines a per-second and a per-day bucket and only spends from both if both allow.</li>
+<li><strong>Shadow mode.</strong> Add a <code>shadow=True</code> flag to <code>KeyedRateLimiter</code> that records rejections in a counter but always returns allowed. Drive it with a burst and confirm the counter shows what enforcement would have rejected.</li>
+</ol>
+<p>What to take away: every algorithm is a few lines, the hard parts are atomicity, time and memory, and the fake clock makes all three testable.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A sliding-window-counter limiter allows 100 requests per minute. At 12:00:45 a client asks for permission. The 11:59–12:00 window recorded 90 requests; the 12:00–12:01 window so far has 42.</p>
+<p>(a) Is the request allowed? (b) A fixed-window limiter with the same limit: what is the worst burst a client can achieve, and when? (c) Your token bucket has rate 2/s, capacity 10. A client idle for 30 seconds sends 15 requests instantly. How many succeed, and how long until the 15th?</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> The estimate weights the previous window by the fraction of it still inside the trailing 60 seconds. At 45 seconds into the current minute, 15 seconds (25 percent) of the previous window remains in view. Estimated count = 42 + 90 × 0.25 = 42 + 22.5 = <strong>64.5</strong>. Adding this request gives 65.5, below 100, so it is <strong>allowed</strong>.</p>
+<p>Name the approximation: this assumes the 90 requests were spread evenly through the previous minute. If they all came in its last 15 seconds, the true trailing count is 132 and the request should be denied. The error is bounded and rare in practice (Cloudflare measured 0.003 percent of decisions), which is why the algorithm is the standard compromise, but present it as an estimate.</p>
+<p><strong>(b) Fixed window worst case: 200 requests in a fraction of a second</strong>: 100 at 11:59:59.9 and 100 at 12:00:00.1. Each window respects its own limit; the client gets twice the intended rate across the boundary. That is the whole reason sliding windows exist.</p>
+<p><strong>(c) Token bucket.</strong> Thirty idle seconds would add 60 tokens, but the capacity caps it at <strong>10</strong>. The burst of 15 gets <strong>10 immediately</strong>; the other 5 must wait for refill at 2 per second, one every 0.5 seconds: 0.5, 1.0, 1.5, 2.0 and <strong>2.5 seconds for the 15th</strong>, assuming the client retries at the hinted times.</p>
+<p><strong>The design point:</strong> capacity and rate are independent controls. If a 10-request burst is too generous, lower the capacity without touching the sustained rate; if sustained throughput is too low, raise the rate without changing burst tolerance. A window algorithm folds both into one number and cannot express "100 per minute sustained but never more than 10 at once", which is what most APIs actually want.</p>
+</details>
+</section>

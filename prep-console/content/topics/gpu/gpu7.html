@@ -1,0 +1,491 @@
+<!-- topic source for gpu/gpu7; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "gpu7",
+  "t": "FlashAttention: IO-aware exact attention",
+  "tag": "Kernels",
+  "sum": "Why textbook attention is memory-bound, how FlashAttention tiles Q, K and V through on-chip memory with an online softmax so the N×N matrix never reaches HBM, how the backward pass recomputes instead of storing — and what FlashAttention-2, -3 and -4 and Flash-Decoding changed for each GPU generation and for inference.",
+  "prereq": [
+    [
+      "lm2",
+      "Self-attention computes scores S = QKᵀ/√d between every query and key, turns each row into weights with a softmax, and outputs the weighted sum of the values, O = softmax(S)V."
+    ],
+    [
+      "gpu2",
+      "An operation's time is bounded by FLOPs ÷ peak or bytes ÷ bandwidth; chains of memory-bound kernels pay for every pass over HBM."
+    ],
+    [
+      "gpu6",
+      "Fusion keeps intermediate results in registers or shared memory instead of writing them to HBM; operations that need a whole previous result, such as a softmax between two matmuls, are the hard case."
+    ]
+  ],
+  "myths": [
+    [
+      "FlashAttention is an approximation of attention.",
+      "It computes exactly the same result as standard attention, up to floating-point rounding. The online softmax is an algebraic rearrangement, not an approximation: rescaling the partial sums by exp(old max − new max) gives the same final numbers as computing the softmax over the whole row at once. Approximate methods (sparse, low-rank, linear attention) are a different family."
+    ],
+    [
+      "FlashAttention reduces the FLOPs of attention.",
+      "The forward pass does the same O(N²·d) matrix FLOPs, and training does more, because the backward pass recomputes the score blocks rather than reading them from memory. It is faster because it moves far fewer bytes through HBM and fuses everything into one kernel. Long contexts are still quadratic in compute."
+    ],
+    [
+      "Once you have FlashAttention, attention is no longer a bottleneck.",
+      "For training and prefill it removes the memory problem and runs attention near tensor-core speed, but the quadratic FLOPs remain and dominate at very long contexts. For decoding, attention reads the whole KV cache for every token with intensity equal to the GQA group size; it stays memory-bound and is often the largest part of a long-context decode step."
+    ],
+    [
+      "PyTorch's scaled_dot_product_attention always uses FlashAttention.",
+      "It dispatches to one of several back ends — FlashAttention, memory-efficient attention, cuDNN attention or a plain 'math' implementation — depending on dtype, head dimension, mask type, hardware and whether gradients are needed. An FP32 input or an arbitrary dense mask can silently select the math path, which materialises the full N × N matrix and can run out of memory at long sequence lengths."
+    ],
+    [
+      "A kernel tuned for one GPU generation carries over to the next.",
+      "Each FlashAttention version was a rewrite for new hardware. FlashAttention-2 reached only about 35% of an H100's peak; FlashAttention-3 needed Hopper's TMA and warp specialisation to reach 75%. Blackwell doubled tensor-core speed but not the exponential units or shared memory, so FlashAttention-4 had to compute some exponentials in software on the FMA units."
+    ]
+  ],
+  "recap": [
+    "Standard attention writes the N × N score and probability matrices to HBM and reads them back, so for typical head dimensions it is memory-bound and needs quadratic memory: 2 GiB per head at 32K tokens in BF16.",
+    "FlashAttention processes a block of queries at a time, streams blocks of keys and values past it through shared memory and registers, and never writes the N × N matrix to HBM.",
+    "The online softmax makes tiling exact: keep a running maximum and running sum per row, and when a new block raises the maximum, rescale the accumulated sum and output by exp(old max − new max).",
+    "The backward pass saves only the output and one log-sum-exp per row and recomputes score blocks, trading cheap tensor-core FLOPs for expensive HBM traffic and quadratic memory.",
+    "The result is exact attention with memory linear in sequence length and, at its introduction, 2-4× faster training — it is the canonical example of IO-aware algorithm design.",
+    "FlashAttention-2 improved parallelism and work partitioning (50-73% of A100 peak); FlashAttention-3 used Hopper's asynchronous TMA, warp specialisation and FP8 (up to 740 TFLOP/s, 75% of H100); FlashAttention-4 targets Blackwell, where exponentials became the bottleneck (about 1,605 TFLOP/s on B200).",
+    "In decoding there is one query per sequence, so Flash-Decoding splits the KV cache into chunks processed in parallel and merges the partial results with their log-sum-exps — up to 8× faster at long context.",
+    "In PyTorch the kernels sit behind scaled_dot_product_attention, whose back-end choice should be checked, while serving engines combine them with paged KV caches and variable-length batches."
+  ],
+  "glossary": [
+    [
+      "Causal mask",
+      "The rule that each token may only attend to itself and earlier tokens; blocks entirely above the diagonal can be skipped, halving attention work."
+    ],
+    [
+      "Flash-Decoding",
+      "A decoding-time variant that splits a sequence's KV cache into chunks, computes partial attention on each in parallel, and combines them using log-sum-exps."
+    ],
+    [
+      "FlexAttention",
+      "A PyTorch API that generates fused FlashAttention-style kernels from small Python functions describing score modifications and block masks."
+    ],
+    [
+      "IO-aware",
+      "Designed around the cost of moving data between memory levels (HBM, L2, shared memory), not only the number of arithmetic operations."
+    ],
+    [
+      "Log-sum-exp (LSE)",
+      "log Σ exp(sᵢ) for a row of scores; stored per row by FlashAttention so softmax probabilities can be recomputed exactly in the backward pass and partial results can be merged."
+    ],
+    [
+      "MUFU (special function unit)",
+      "The hardware unit that computes exponentials, logarithms and reciprocals; far slower than the tensor cores, which makes softmax a bottleneck on new GPUs."
+    ],
+    [
+      "Online softmax",
+      "Computing a softmax in one streaming pass by keeping a running maximum and sum and rescaling earlier contributions when the maximum changes."
+    ],
+    [
+      "Paged KV cache",
+      "Storing each sequence's keys and values in fixed-size blocks allocated on demand, like virtual-memory pages, so memory isn't reserved for the maximum length (PagedAttention)."
+    ],
+    [
+      "Recomputation",
+      "Recalculating intermediate values in the backward pass instead of storing them from the forward pass, trading FLOPs for memory and bandwidth."
+    ],
+    [
+      "Ring attention / context parallelism",
+      "Splitting a very long sequence across GPUs, each holding a block of queries, and passing key/value blocks around so every GPU sees all of them, merging with the online softmax."
+    ],
+    [
+      "scaled_dot_product_attention (SDPA)",
+      "PyTorch's attention function, which dispatches to FlashAttention, memory-efficient, cuDNN or plain implementations depending on inputs and hardware."
+    ],
+    [
+      "Score matrix",
+      "The N × N matrix S = QKᵀ/√d of attention scores for one head; its row-wise softmax is the probability matrix P."
+    ],
+    [
+      "Split-KV",
+      "Dividing the key/value sequence of one query among several thread blocks so that decoding with few queries still uses all SMs."
+    ],
+    [
+      "Tile / block",
+      "A small rectangular piece of Q, K, V or the output (for example 128 rows × the head dimension) that fits in shared memory and registers."
+    ],
+    [
+      "Warp specialisation",
+      "Assigning some warps only to load data (for example with TMA) and others only to compute, so memory movement and arithmetic overlap."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What problem does FlashAttention solve?",
+      "Standard attention computes the N × N score matrix, writes it to HBM, reads it back for the softmax, writes the probabilities, and reads them again for the product with V. For typical head dimensions that traffic, not the FLOPs, sets the speed, and storing the matrices takes quadratic memory. FlashAttention computes attention in tiles held in on-chip memory with an online softmax, so the N × N matrix never touches HBM — exact results, much less memory traffic, memory linear in N."
+    ],
+    [
+      "E",
+      "How much memory does the attention score matrix take at long context?",
+      "N² values per head: at N = 32,768 in BF16, 32,768² × 2 bytes = 2 GiB per head, so 64 GiB for 32 heads of one layer for one sequence, before the probabilities and their gradients. That is why long-context training was impractical before FlashAttention, which stores only one log-sum-exp per row."
+    ],
+    [
+      "M",
+      "How does the online softmax work? Walk through it.",
+      "Process a row's scores block by block, keeping a running maximum m, a running sum l of exp(score − m), and a running output o = Σ exp(score − m)·v. When a new block has a larger maximum m', multiply l and o by exp(m − m') — this re-expresses everything accumulated so far relative to the new maximum — then add the new block's terms computed with m'. After the last block, o / l equals exactly the softmax-weighted sum of the values.",
+      "Follow-up: Why subtract the maximum at all? — To avoid overflow in exp: scores of 100 would overflow even FP32's exponential, while exp(score − max) is at most 1."
+    ],
+    [
+      "M",
+      "Why does FlashAttention recompute attention in the backward pass instead of storing it?",
+      "The backward pass needs the probabilities P. Storing them costs N² memory per head and HBM traffic to write and read them. FlashAttention stores only the output and a log-sum-exp per row, and recomputes each score block from Q and K in the backward kernel; with the LSE, exp(S − LSE) gives P exactly. The extra FLOPs run on tensor cores and are cheaper than the memory traffic they replace, so it is both faster and uses far less memory."
+    ],
+    [
+      "M",
+      "What did FlashAttention-2 change compared with the original?",
+      "Three things. It parallelises over the sequence dimension as well as batch and heads, so long sequences with small batches still fill all SMs. It reduces non-matmul FLOPs — for example rescaling the output once at the end rather than every step — because on an A100 those run 16× slower than tensor-core FLOPs. And it partitions work across warps by splitting queries rather than keys, avoiding shared-memory communication between warps. It roughly doubled speed, reaching 50-73% of A100 peak.",
+      "Follow-up: Why did it reach only about 35% on an H100? — It didn't use Hopper's asynchronous features (TMA, wgmma, warp specialisation), so loads, softmax and matmuls couldn't overlap; that is what FlashAttention-3 added."
+    ],
+    [
+      "M",
+      "How does causal masking interact with FlashAttention's tiling?",
+      "In a causal model, query i only attends to keys at positions up to i. In the grid of query-block × key-block tiles, blocks entirely above the diagonal contribute nothing and are skipped, blocks entirely below it need no mask, and only diagonal blocks apply the mask element by element. Skipping the upper triangle roughly halves the work, which is why causal attention is about twice as fast as full attention at the same length."
+    ],
+    [
+      "M",
+      "How do you make sure PyTorch is actually using a FlashAttention kernel?",
+      "Call torch.nn.functional.scaled_dot_product_attention with BF16 or FP16 inputs, a supported head dimension, and either is_causal=True or no mask; profile and look for a flash kernel name. Use the torch.nn.attention.sdpa_kernel context manager to restrict it to the flash back end, which raises an error instead of silently falling back. Common causes of fallback to the math path are FP32 inputs, arbitrary dense masks, and unsupported head sizes — and the symptom is out-of-memory errors that scale with N²."
+    ],
+    [
+      "H",
+      "What does Flash-Decoding change for inference, and why is it needed?",
+      "In decoding each sequence has a single new query, so FlashAttention's parallelism over query blocks has almost nothing to split: with a small batch, a few thread blocks each stream a long KV cache while most SMs sit idle. Flash-Decoding splits the KV sequence into chunks, has separate blocks compute partial attention for each chunk (with its own max and sum), and merges the partial outputs in a small reduction using their log-sum-exps, exactly as the online softmax would. That uses the whole GPU and gave up to 8× faster decoding at very long contexts.",
+      "Follow-up: How is the merge exact? — Each chunk returns o_k normalised by its own sum and LSE_k; the final output is Σ o_k·exp(LSE_k − LSE) with LSE = log Σ exp(LSE_k), the same rescaling as the online softmax."
+    ],
+    [
+      "H",
+      "Explain the IO complexity result for FlashAttention and what it means in practice.",
+      "With on-chip memory of size M, FlashAttention needs Θ(N²d²/M) HBM accesses versus Θ(Nd + N²) for standard attention; the paper also shows no exact algorithm can do asymptotically better for all M. The saving factor is roughly M/d²: with about 100-200 KB of SRAM and d = 64-128, a few to about ten times fewer bytes. In practice the gain is larger than the minimum count suggests, because standard implementations make several passes over the N × N matrix (mask, softmax, dropout), and because FlashAttention's repeated reads of K and V often hit the L2 cache.",
+      "Follow-up: Why does a larger head dimension make FlashAttention less advantageous? — The d² term: bigger heads need bigger tiles for the same reuse, and fewer fit in shared memory, which is also why very large head dimensions are less efficient."
+    ],
+    [
+      "H",
+      "What did FlashAttention-3 add for Hopper?",
+      "It uses the Tensor Memory Accelerator for asynchronous tile loads and warp specialisation — producer warps load K and V blocks while consumer warpgroups compute — so data movement overlaps with math. It overlaps the softmax of one block with the matmuls of another ('ping-pong' scheduling between warpgroups and pipelining within a warpgroup), because on an H100 the exponential units deliver only about 3.9 TFLOP/s against 989 for FP16 matmuls. And it supports FP8 with block quantisation and incoherent processing (a Hadamard rotation that spreads outliers). It reached up to 740 TFLOP/s in FP16 (75% of peak) and close to 1.2 PFLOP/s in FP8."
+    ],
+    [
+      "H",
+      "Why did Blackwell need another FlashAttention rewrite?",
+      "Blackwell roughly doubled tensor-core throughput, but the special-function units that compute exponentials and the shared-memory bandwidth scaled much less. Softmax exponentials, which were partly hidden behind matmuls on Hopper, became the bottleneck. FlashAttention-4 emulates part of the exponentials with polynomial approximations on the ordinary FMA units, skips most output rescalings unless the running maximum grows by enough to matter, and uses Blackwell's fully asynchronous MMA with tensor memory and larger tiles. It reports about 1,605 TFLOP/s in BF16 on a B200 (71% utilisation), up to 1.3× faster than cuDNN 9.13.",
+      "Follow-up: What's the general lesson? — As hardware scales unevenly, the bottleneck moves to whichever unit didn't scale, and kernels must be co-designed with the algorithm for each generation."
+    ],
+    [
+      "H",
+      "How is attention computed for a single sequence that doesn't fit on one GPU?",
+      "With context parallelism: split the sequence across G GPUs, each holding a block of queries and the matching keys and values. In ring attention, GPUs pass their K and V blocks around a ring; each GPU computes attention of its queries against each arriving block and merges the results with the online softmax, overlapping communication with computation. Alternatively, the K and V blocks are all-gathered before computing, which Llama 3 used for its 128K-context training with a context-parallel degree of 16. With causal masks the work is unbalanced across GPUs, so sequences are split into interleaved chunks to even it out."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness",
+      "Dao et al. (2022) — tiling, online softmax, recomputation and the IO-complexity analysis.",
+      "https://arxiv.org/abs/2205.14135"
+    ],
+    [
+      "paper",
+      "FlashAttention-2",
+      "Dao (2023) — better parallelism and work partitioning; 50-73% of A100 peak.",
+      "https://arxiv.org/abs/2307.08691"
+    ],
+    [
+      "paper",
+      "FlashAttention-3",
+      "Shah et al. (2024) — asynchrony, warp specialisation and FP8 on Hopper; up to 740 TFLOP/s.",
+      "https://arxiv.org/abs/2407.08608"
+    ],
+    [
+      "paper",
+      "FlashAttention-4",
+      "Zadouri, Dao et al. (2026) — algorithm and pipeline co-design for Blackwell's asymmetric scaling.",
+      "https://arxiv.org/abs/2603.05451"
+    ],
+    [
+      "post",
+      "Flash-Decoding for long-context inference",
+      "Stanford CRFM (2023) — splitting the KV cache to parallelise single-query attention.",
+      "https://crfm.stanford.edu/2023/10/12/flashdecoding.html"
+    ],
+    [
+      "paper",
+      "Online normalizer calculation for softmax",
+      "Milakov and Gimelshein (2018) — the online softmax that FlashAttention builds on.",
+      "https://arxiv.org/abs/1805.02867"
+    ],
+    [
+      "docs",
+      "torch.nn.functional.scaled_dot_product_attention",
+      "PyTorch's attention entry point, its back ends and how to select or restrict them.",
+      "https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html"
+    ],
+    [
+      "code",
+      "Dao-AILab/flash-attention",
+      "The reference implementation of FlashAttention-2, -3 and -4, including variable-length and paged-KV interfaces.",
+      "https://github.com/Dao-AILab/flash-attention"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>In 2022 the largest language models handled 2,048 tokens of context, and everyone wanted more. The obstacle was attention. For N tokens, each head computes an N × N matrix of scores — every token against every other — and the standard implementation stored that matrix in GPU memory, twice (scores and probabilities), plus their gradients for training. At 2,048 tokens that is manageable; at 32,768 tokens it is 2 GiB per head, 64 GiB for the 32 heads of a single layer of a single sequence. And it was slow as well as big: engineers profiling training runs found attention taking far more time than its FLOPs justified, because the GPU spent it shuffling those matrices between HBM and the SMs.</p>
+<p>Many researchers attacked the problem by approximating attention — sparse patterns, low-rank projections, kernel tricks — trading accuracy for speed. Most of those methods were rarely adopted, because on real GPUs they often weren't faster in wall-clock time. Tri Dao and colleagues at Stanford took the opposite approach: keep attention <em>exact</em> and fix the way it is computed. Their observation was that the FLOPs were never the problem; the bytes were. If the N × N matrix never left the chip's fast on-chip memory, attention would be both faster and far smaller. The paper, "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness", reported 3× faster GPT-2 training at 1K context and a 15% end-to-end speed-up on BERT-large over the MLPerf 1.1 record, with memory that grows linearly rather than quadratically in sequence length.</p>
+<p>FlashAttention is now inside essentially every training and inference stack — PyTorch's <code>scaled_dot_product_attention</code>, vLLM, SGLang, TensorRT-LLM — and it is a favourite interview topic because it ties together everything in this track: the roofline (gpu2), the memory hierarchy (gpu1), tiling and shared memory (gpu5), fusion (gpu6), and numerical stability (gpu4). This lesson derives why standard attention is memory-bound, builds the online softmax step by step with real numbers, walks through the forward and backward algorithms, and then follows the kernel through four GPU generations — FlashAttention-2, -3 and -4 — and into inference with Flash-Decoding, ending with how to make sure your code actually uses it.</p>
+</section>
+
+<section data-field="primer">
+<h4>Averaging exam scores you can only see a few at a time</h4>
+<p>Suppose you must compute a weighted average of a thousand exam scores, where each weight depends on how good the paper is compared with the <em>best</em> paper. The obvious way: spread all thousand papers across a huge table, find the best one, compute every weight, then add everything up. That needs a table big enough for all of them — the N × N matrix in HBM. The clever way: take the papers ten at a time from a pile, keeping on a notepad only three things — the best score seen so far, the running total of weights, and the running weighted sum. When a new batch contains a better paper than any before, you can't redo the old weights, but you can <em>adjust</em> your running totals by one correction factor, because every old weight was computed relative to the old best and shifts by the same ratio. At the end your notepad holds exactly the answer the big-table method would have produced. The notepad is the SM's on-chip memory; the correction factor is the heart of the <strong>online softmax</strong>.</p>
+<p>Where the analogy falls short: a GPU runs this for thousands of rows at once, in parallel across its SMs, and the "papers" are vectors multiplied by tensor cores, not numbers read one at a time.</p>
+<h4>The two versions, side by side</h4>
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Standard attention writes S and P to HBM and reads them back across several kernels; FlashAttention loads Q, K and V tiles into shared memory and registers, computes scores, softmax and the output there, and writes only O and the log-sum-exp">
+  <defs><marker id="gpu7-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="18" style="fill:var(--ink);font-weight:600">Standard: several kernels, N × N matrices through HBM</text>
+    <g style="fill:var(--surface-2);stroke:var(--line-2)">
+      <rect x="20" y="30" width="110" height="30" rx="4"/><rect x="170" y="30" width="110" height="30" rx="4"/><rect x="320" y="30" width="110" height="30" rx="4"/><rect x="470" y="30" width="110" height="30" rx="4"/>
+    </g>
+    <g style="fill:var(--ink);font-size:11px">
+      <text x="75" y="50" text-anchor="middle">S = QKᵀ</text><text x="225" y="50" text-anchor="middle">mask, scale</text><text x="375" y="50" text-anchor="middle">P = softmax(S)</text><text x="525" y="50" text-anchor="middle">O = PV</text>
+    </g>
+    <rect x="20" y="96" width="600" height="28" rx="4" style="fill:var(--accent);opacity:0.25;stroke:var(--line-2)"/>
+    <text x="320" y="114" text-anchor="middle" style="fill:var(--ink)">HBM: Q, K, V (N × d) and S, P (N × N per head)</text>
+    <g style="stroke:var(--crit);stroke-width:1.5;fill:none">
+      <line x1="110" y1="62" x2="110" y2="94" marker-end="url(#gpu7-arrow)"/>
+      <line x1="200" y1="94" x2="200" y2="62" marker-end="url(#gpu7-arrow)"/><line x1="260" y1="62" x2="260" y2="94" marker-end="url(#gpu7-arrow)"/>
+      <line x1="350" y1="94" x2="350" y2="62" marker-end="url(#gpu7-arrow)"/><line x1="410" y1="62" x2="410" y2="94" marker-end="url(#gpu7-arrow)"/>
+      <line x1="500" y1="94" x2="500" y2="62" marker-end="url(#gpu7-arrow)"/>
+    </g>
+    <text x="320" y="142" text-anchor="middle" style="fill:var(--crit);font-size:11px">red arrows each move an N × N matrix: 134 MB per head at N = 8,192</text>
+    <text x="20" y="178" style="fill:var(--ink);font-weight:600">FlashAttention: one kernel, tiles on chip</text>
+    <rect x="150" y="188" width="340" height="44" rx="6" style="fill:var(--good);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="320" y="206" text-anchor="middle" style="fill:var(--ink);font-size:11px">for each K,V tile: S_tile = Q_tile·K_tileᵀ → online softmax</text>
+    <text x="320" y="222" text-anchor="middle" style="fill:var(--ink);font-size:11px">→ O_tile += P_tile·V_tile   (shared memory + registers)</text>
+    <rect x="20" y="260" width="600" height="28" rx="4" style="fill:var(--accent);opacity:0.25;stroke:var(--line-2)"/>
+    <text x="320" y="278" text-anchor="middle" style="fill:var(--ink)">HBM: read Q, K, V tiles · write O and one LSE per row — no N × N matrix</text>
+    <g style="stroke:var(--good);stroke-width:1.5;fill:none">
+      <line x1="200" y1="258" x2="200" y2="234" marker-end="url(#gpu7-arrow)"/><line x1="440" y1="234" x2="440" y2="258" marker-end="url(#gpu7-arrow)"/>
+    </g>
+  </g>
+</svg>
+<figcaption>The arithmetic is identical. The difference is where the N × N intermediates live: in HBM, crossing the slow link several times, or only as small tiles on the chip that are used and discarded.</figcaption>
+</figure>
+<p>Three ideas make the second version work. <strong>Tiling</strong>: split Q into blocks of rows and K and V into blocks, small enough to fit in shared memory and registers. <strong>Online softmax</strong>: compute each row's softmax incrementally as key blocks stream past, correcting earlier partial results when the row's maximum grows, so that the result is exact. <strong>Recomputation</strong>: for training, don't store the probabilities for the backward pass; store one number per row (the log-sum-exp) and recompute the scores when needed. Together they make attention a single fused kernel whose time is spent mostly in tensor-core matmuls — and whose memory grows linearly with sequence length.</p>
+<h4>The size of the win, at a glance</h4>
+<p>For one head at 8,192 tokens with head dimension 128 on an H100: the attention FLOPs (34 GFLOPs) need about 35 µs at peak. A typical eager implementation also moves about 1.1 GB through HBM for the N × N intermediates — about 320 µs — so it runs roughly ten times slower than its arithmetic allows. FlashAttention moves tens to a few hundred megabytes, depending on how many K and V re-reads the L2 cache absorbs, and spends most of its time in the matmuls. And the memory for that head's intermediates falls from about 270 MB (S and P) to 32 KB of per-row statistics. What does <em>not</em> change is the quadratic growth of FLOPs with sequence length: doubling the context still quadruples attention's arithmetic, which is a separate problem that sparse, sliding-window and linear-attention architectures address.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Attention, with shapes and costs</h4>
+<p>For one head, with N tokens and head dimension d, the inputs are Q, K and V, each N × d. Attention computes:</p>
+<pre>S = Q Kᵀ / √d          # N × N scores
+P = softmax(S, rows)    # N × N probabilities (after masking)
+O = P V                 # N × d output</pre>
+<p>FLOPs: QKᵀ is 2·N·N·d, and PV is another 2·N·N·d, so 4N²d per head (the softmax adds a few per score). With N = 8,192 and d = 128: 34 GFLOPs per head, about 1.1 TFLOPs for the 32 heads of one layer of an 8B-class model — about 1.1 ms on an H100 at peak BF16. The inputs and output are small: Q, K, V and O together are 4 × 8,192 × 128 × 2 bytes = 8.4 MB per head. The intermediates are not: S and P are each 8,192<sup>2</sup> = 67 million values, 134 MB per head in BF16.</p>
+
+<h4>2. Why the textbook implementation is memory-bound</h4>
+<p>Written in eager PyTorch, attention is a chain of kernels: a matmul writes S; a kernel scales and masks it (read S, write S); a softmax kernel reads it and writes P; in training, dropout reads P and writes it again; a final matmul reads P. Each arrow is a full pass over an N × N matrix — around eight passes in training, six at inference. For our example that is 8 × 134 MB ≈ 1.07 GB per head, 34 GB for 32 heads, which takes about 10 ms at 3.35 TB/s — ten times the 1.1 ms the FLOPs need. Standard attention at this length is memory-bound by an order of magnitude, even though its FLOPs are the same as FlashAttention's.</p>
+<p>Training makes it worse: the backward pass needs P, so it is kept in memory from the forward pass, and the backward computes an N × N gradient too. The memory is quadratic — at 32,768 tokens, 2 GiB per head per matrix — which is what capped context lengths before 2022.</p>
+
+<h4>3. The softmax problem</h4>
+<p>Fusing the chain into one kernel seems natural (gpu6) — except for the softmax in the middle. Softmax over a row needs two whole-row quantities: the maximum (subtracted for numerical stability, gpu4 — exp of a raw score of 100 overflows even FP32) and the sum of exponentials (the normaliser). A kernel that sees only one block of keys at a time doesn't know either. The naive fix — one pass to find the max and sum, a second pass to compute outputs — reads K twice and still needs synchronisation across the row. The online softmax removes the problem.</p>
+
+<h4>4. The online softmax, with numbers</h4>
+<p>Keep, for each query row, three running values: m (the largest score seen so far), l (the sum of exp(score − m) so far) and o (the sum of exp(score − m) × value so far — a vector of length d). When a new block of scores arrives:</p>
+<pre>m_new = max(m, max(block))
+l     = l · exp(m − m_new) + Σ exp(s − m_new)          over the block
+o     = o · exp(m − m_new) + Σ exp(s − m_new) · v_s    over the block
+m     = m_new
+... after the last block:  output = o / l</pre>
+<p>The factor exp(m − m_new) is the correction from the analogy: every old term was exp(s − m), and exp(s − m) × exp(m − m_new) = exp(s − m_new), so multiplying the accumulated sums by it re-expresses them all relative to the new maximum. Nothing is approximated.</p>
+<p>Trace it with one query row, four keys in two blocks of two, and one-dimensional values. Scores s = [1, 2 | 4, 3], values v = [10, 20 | 30, 40].</p>
+<ul>
+<li><strong>Block 1</strong> (scores 1, 2): m = 2. l = e<sup>1−2</sup> + e<sup>0</sup> = 0.368 + 1 = 1.368. o = 0.368 × 10 + 1 × 20 = 23.68.</li>
+<li><strong>Block 2</strong> (scores 4, 3): m_new = 4. Correction exp(2 − 4) = 0.135. l = 1.368 × 0.135 + e<sup>0</sup> + e<sup>−1</sup> = 0.185 + 1 + 0.368 = 1.553. o = 23.68 × 0.135 + 1 × 30 + 0.368 × 40 = 3.20 + 30 + 14.72 = 47.92.</li>
+<li><strong>Result:</strong> o / l = 47.92 / 1.553 = <strong>30.86</strong>.</li>
+</ul>
+<p>Check against the direct softmax: weights ∝ e<sup>1</sup>, e<sup>2</sup>, e<sup>4</sup>, e<sup>3</sup> = 2.72, 7.39, 54.6, 20.1, sum 84.8; weighted average (27.2 + 147.8 + 1,638 + 803) / 84.8 = 2,616 / 84.8 = 30.86. Identical. The lab runs the same check on random 64-token inputs and finds agreement to about 10<sup>−16</sup>. The idea predates FlashAttention — Milakov and Gimelshein at NVIDIA published the "online normalizer calculation for softmax" in 2018 — but FlashAttention was the first to fuse it with both matmuls.</p>
+
+<h4>5. The FlashAttention forward pass</h4>
+<p>Now combine the online softmax with tiling. Split Q into blocks of B<sub>r</sub> rows (say 128) and K, V into blocks of B<sub>c</sub> rows (say 64-128). One thread block handles one Q block of one head; different Q blocks, heads and batch elements run on different SMs in parallel.</p>
+<pre>for each query block Q_i  (in parallel across SMs):
+    load Q_i into shared memory / registers
+    m = -inf, l = 0, O_i = 0                     # per row, kept on chip in FP32
+    for each key/value block K_j, V_j:
+        load K_j, V_j into shared memory
+        S = Q_i K_jᵀ · scale                     # tensor cores, B_r × B_c, stays on chip
+        (apply mask to S if this block needs it)
+        m_new = max(m, rowmax(S));  P = exp(S − m_new)
+        l   = l · exp(m − m_new) + rowsum(P)
+        O_i = O_i · exp(m − m_new) + P V_j        # tensor cores
+        m   = m_new
+    write O_i / l and LSE_i = m + log(l) to HBM  # one number per row for the backward pass</pre>
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Grid of query blocks by key blocks for causal attention: one thread block per query-block row sweeps across key blocks left to right; blocks above the diagonal are skipped, diagonal blocks are masked, blocks below are computed in full">
+  <defs><marker id="gpu7-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="250" y="18" text-anchor="middle" style="fill:var(--ink);font-weight:600">key/value blocks j →</text>
+    <text x="30" y="160" text-anchor="middle" transform="rotate(-90 30 160)" style="fill:var(--ink);font-weight:600">query blocks i ↓</text>
+    <g style="stroke:var(--line-2)">
+      <rect x="60" y="30" width="48" height="48" style="fill:var(--s3);opacity:0.5"/>
+      <rect x="108" y="30" width="48" height="48" style="fill:var(--surface-2)"/><rect x="156" y="30" width="48" height="48" style="fill:var(--surface-2)"/><rect x="204" y="30" width="48" height="48" style="fill:var(--surface-2)"/><rect x="252" y="30" width="48" height="48" style="fill:var(--surface-2)"/>
+      <rect x="60" y="78" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="108" y="78" width="48" height="48" style="fill:var(--s3);opacity:0.5"/>
+      <rect x="156" y="78" width="48" height="48" style="fill:var(--surface-2)"/><rect x="204" y="78" width="48" height="48" style="fill:var(--surface-2)"/><rect x="252" y="78" width="48" height="48" style="fill:var(--surface-2)"/>
+      <rect x="60" y="126" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="108" y="126" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="156" y="126" width="48" height="48" style="fill:var(--s3);opacity:0.5"/>
+      <rect x="204" y="126" width="48" height="48" style="fill:var(--surface-2)"/><rect x="252" y="126" width="48" height="48" style="fill:var(--surface-2)"/>
+      <rect x="60" y="174" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="108" y="174" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="156" y="174" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="204" y="174" width="48" height="48" style="fill:var(--s3);opacity:0.5"/>
+      <rect x="252" y="174" width="48" height="48" style="fill:var(--surface-2)"/>
+      <rect x="60" y="222" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="108" y="222" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="156" y="222" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="204" y="222" width="48" height="48" style="fill:var(--good);opacity:0.45"/><rect x="252" y="222" width="48" height="48" style="fill:var(--s3);opacity:0.5"/>
+    </g>
+    <line x1="70" y1="198" x2="240" y2="198" marker-end="url(#gpu7-arrow2)" style="stroke:var(--ink);stroke-width:2;fill:none"/>
+    <text x="330" y="200" style="fill:var(--ink);font-size:11px">one thread block sweeps its row of tiles,</text>
+    <text x="330" y="216" style="fill:var(--ink);font-size:11px">updating m, l and O on chip after each tile</text>
+    <g style="font-size:11px">
+      <rect x="330" y="40" width="14" height="14" style="fill:var(--good);opacity:0.45"/><text x="352" y="52" style="fill:var(--ink)">computed in full (no mask needed)</text>
+      <rect x="330" y="66" width="14" height="14" style="fill:var(--s3);opacity:0.5"/><text x="352" y="78" style="fill:var(--ink)">diagonal: mask applied inside the tile</text>
+      <rect x="330" y="92" width="14" height="14" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="352" y="104" style="fill:var(--ink)">above diagonal: skipped entirely</text>
+    </g>
+    <text x="330" y="140" style="fill:var(--ink-2);font-size:11px">Each row of tiles runs on a different SM,</text>
+    <text x="330" y="156" style="fill:var(--ink-2);font-size:11px">in parallel with other rows, heads and batches.</text>
+    <text x="60" y="292" style="fill:var(--muted);font-size:11px">Causal attention skips about half the tiles, so it costs about half as much as full attention.</text>
+  </g>
+</svg>
+<figcaption>The N × N matrix exists only as a grid of tiles, each computed, used and discarded on chip. With a causal mask, tiles above the diagonal are never computed and only diagonal tiles need element-wise masking.</figcaption>
+</figure>
+<p>Where does the data live? Q<sub>i</sub>, the running O<sub>i</sub> (in FP32) and the statistics m and l stay on chip for the whole sweep. Each K<sub>j</sub>, V<sub>j</sub> is loaded once per query block. The score tile S and probabilities P exist only in registers and shared memory. HBM sees Q, K, V read in, O and one log-sum-exp per row written out — no N × N matrix.</p>
+
+<h4>6. The backward pass: recompute, don't store</h4>
+<p>Training needs gradients dQ, dK and dV from the output gradient dO. The standard backward pass reads the stored N × N matrix P. FlashAttention stores only O and the per-row log-sum-exp LSE = m + log l from the forward pass. In the backward kernel, for each pair of tiles it recomputes S = QKᵀ·scale and then P = exp(S − LSE) — exactly the forward's probabilities, with no running max needed because the LSE already contains it. With P in hand, the standard formulas apply tile by tile: dV += Pᵀ dO; dP = dO Vᵀ; dS = P ∘ (dP − D), where D = rowsum(dO ∘ O) is a per-row value computed once up front; dQ += dS K; dK += dSᵀ Q (all times the scale).</p>
+<p>Recomputation adds FLOPs: the backward pass does roughly 2.5 times the forward's matmul work instead of 2 times. It is still a clear win, because those FLOPs run on tensor cores, while the alternative — writing P to HBM in the forward pass and reading it back — is the memory traffic that made attention slow, and storing P is the quadratic memory that limited context length. This is the same trade as activation checkpointing (gpu9), applied inside one kernel.</p>
+
+<h4>7. How much traffic is saved, honestly</h4>
+<p>The FlashAttention paper proves that with on-chip memory of size M, the algorithm makes Θ(N²d²/M) HBM accesses, compared with Θ(Nd + N²) for standard attention, and that no exact attention algorithm can do asymptotically better for all M. The factor saved is roughly M/d²: with d = 128 (16,384 elements, 32 KB per tile in BF16) and around 200 KB of shared memory, a few times; with d = 64, more. That minimum count understates the gain in practice for two reasons. The standard implementation makes several passes over the N × N matrix (mask, softmax, dropout), not one; and FlashAttention's only repeated traffic — re-reading K and V once per query block — is often served by the L2 cache, because one head's K and V at 32K tokens is 16 MB and L2 is 50 MB on an H100. The lab computes both bounds: at N = 8,192 a typical eager implementation moves about 1.1 GB per head, FlashAttention about 0.27 GB even if every K/V re-read came from HBM, and about 8 MB if L2 serves them.</p>
+<p>The deeper point is where the time goes afterwards. With the matrix gone, attention's remaining cost is tensor-core matmuls plus the softmax's exponentials — compute, not bandwidth. That is why every later version of FlashAttention is about scheduling compute units rather than saving bytes.</p>
+
+<h4>8. Four versions for four GPU generations</h4>
+<p><strong>FlashAttention (2022, A100).</strong> The algorithm above, with parallelism over batch and heads. Speed-ups of 2-4× over standard attention; 3× faster GPT-2 training at 1K context; memory linear in N, which enabled 16K-64K-token training.</p>
+<p><strong>FlashAttention-2 (2023, A100).</strong> Three engineering changes. It also parallelises over the sequence dimension (each query block is independent), so long sequences with small batches still fill all 108 SMs. It cuts non-matmul FLOPs — for example dividing by l once at the end instead of rescaling the normalised output every step — because an A100's FP32 units are 16 times slower than its tensor cores, so every non-matmul operation is expensive. And it splits each query block among warps by rows of Q rather than by blocks of K, so warps don't have to combine partial results through shared memory. Result: about 2× faster than version 1, 50-73% of A100 peak, and 225 TFLOP/s per A100 in end-to-end GPT training (72% MFU).</p>
+<p><strong>FlashAttention-3 (2024, H100).</strong> FlashAttention-2 reached only about 35% of an H100's peak, because it couldn't use Hopper's asynchronous features. Version 3 is warp-specialised (gpu5): producer warps issue TMA copies of K and V tiles into a circular buffer while consumer warpgroups run <code>wgmma</code> matmuls. It also overlaps the softmax with matmuls, because the exponential is a real bottleneck: an H100 SXM delivers 989 TFLOP/s of FP16 matmul but only about 3.9 TFLOP/s from the special-function units that compute exp. Two warpgroups "ping-pong" — one does its softmax while the other does its matmuls — and within a warpgroup the softmax of one block is pipelined with the matmuls of the next. For FP8 it adds block quantisation and "incoherent processing" (a Hadamard rotation that spreads outliers, gpu4). Result: 1.5-2× faster than version 2, up to 740 TFLOP/s in FP16 (75% of peak) and close to 1.2 PFLOP/s in FP8, with 2.6× lower error than a baseline FP8 attention.</p>
+<p><strong>FlashAttention-4 (2025-26, Blackwell).</strong> Blackwell doubled tensor-core throughput again, but the exponential units and shared-memory bandwidth did not keep pace — "asymmetric scaling". The softmax became the bottleneck. Version 4 computes part of the exponentials in software, with a polynomial approximation on the ordinary fused multiply-add (FMA) units, running alongside the hardware units; it skips most output rescalings, only rescaling when the running maximum has grown enough to threaten accuracy; and it uses Blackwell's fully asynchronous tensor-core instructions with accumulators in tensor memory and larger tiles. It reports up to about 1,605 TFLOP/s in BF16 on a B200 (71% utilisation), up to 1.3× faster than NVIDIA's cuDNN 9.13 attention.</p>
+
+<h4>9. Inference: Flash-Decoding and paged caches</h4>
+<p>Decoding changes the shape of the problem. Each new token has one query per head, attending over a KV cache of perhaps tens of thousands of tokens. FlashAttention parallelises over query blocks, batch and heads — but with one query per sequence and a small batch, there are only (batch × heads) independent pieces of work, each streaming a very long KV cache on one SM while the rest of the GPU idles.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Flash-Decoding: one query's KV cache is split into four chunks processed in parallel by different thread blocks, each producing a partial output and log-sum-exp, which a small reduction merges into the final output">
+  <defs><marker id="gpu7-arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">KV cache of one sequence (e.g. 64K tokens), split into chunks</text>
+    <g style="stroke:var(--line-2)">
+      <rect x="20" y="32" width="145" height="30" style="fill:var(--s1);opacity:0.45"/><rect x="167" y="32" width="145" height="30" style="fill:var(--s2);opacity:0.45"/><rect x="314" y="32" width="145" height="30" style="fill:var(--s3);opacity:0.45"/><rect x="461" y="32" width="145" height="30" style="fill:var(--s4);opacity:0.45"/>
+    </g>
+    <g style="fill:var(--ink);font-size:11px"><text x="92" y="51" text-anchor="middle">chunk 1 → SM a</text><text x="239" y="51" text-anchor="middle">chunk 2 → SM b</text><text x="386" y="51" text-anchor="middle">chunk 3 → SM c</text><text x="533" y="51" text-anchor="middle">chunk 4 → SM d</text></g>
+    <g style="stroke:var(--ink-2);stroke-width:1.5;fill:none">
+      <line x1="92" y1="64" x2="92" y2="94" marker-end="url(#gpu7-arrow3)"/><line x1="239" y1="64" x2="239" y2="94" marker-end="url(#gpu7-arrow3)"/><line x1="386" y1="64" x2="386" y2="94" marker-end="url(#gpu7-arrow3)"/><line x1="533" y1="64" x2="533" y2="94" marker-end="url(#gpu7-arrow3)"/>
+    </g>
+    <g style="fill:var(--surface-2);stroke:var(--line-2)"><rect x="42" y="96" width="100" height="30" rx="4"/><rect x="189" y="96" width="100" height="30" rx="4"/><rect x="336" y="96" width="100" height="30" rx="4"/><rect x="483" y="96" width="100" height="30" rx="4"/></g>
+    <g style="fill:var(--ink);font-size:11px"><text x="92" y="115" text-anchor="middle">o₁, LSE₁</text><text x="239" y="115" text-anchor="middle">o₂, LSE₂</text><text x="386" y="115" text-anchor="middle">o₃, LSE₃</text><text x="533" y="115" text-anchor="middle">o₄, LSE₄</text></g>
+    <g style="stroke:var(--ink-2);stroke-width:1.5;fill:none">
+      <line x1="92" y1="128" x2="300" y2="160" marker-end="url(#gpu7-arrow3)"/><line x1="239" y1="128" x2="310" y2="160" marker-end="url(#gpu7-arrow3)"/><line x1="386" y1="128" x2="330" y2="160" marker-end="url(#gpu7-arrow3)"/><line x1="533" y1="128" x2="340" y2="160" marker-end="url(#gpu7-arrow3)"/>
+    </g>
+    <rect x="200" y="162" width="240" height="32" rx="4" style="fill:var(--good);opacity:0.35;stroke:var(--line-2)"/>
+    <text x="320" y="183" text-anchor="middle" style="fill:var(--ink);font-size:11px">merge: o = Σ oₖ · exp(LSEₖ − LSE)</text>
+    <text x="20" y="220" style="fill:var(--muted);font-size:11px">Without splitting, one SM streams all 64K tokens while the others wait; with it, every SM gets a chunk.</text>
+  </g>
+</svg>
+<figcaption>Flash-Decoding applies the online-softmax merge across thread blocks instead of within one: each chunk's result carries its own log-sum-exp, so combining them is exact and cheap.</figcaption>
+</figure>
+<p><strong>Flash-Decoding</strong> (Stanford CRFM, 2023) splits the KV sequence into chunks and gives each chunk to a separate thread block. Each computes the attention of the query against its chunk — a partial output o<sub>k</sub> normalised within the chunk, and the chunk's log-sum-exp LSE<sub>k</sub>. A small final kernel merges them: LSE = log Σ exp(LSE<sub>k</sub>), and o = Σ o<sub>k</sub> · exp(LSE<sub>k</sub> − LSE). That is the online softmax again, applied across blocks. The authors reported up to 8× faster decoding for very long sequences. The same "split-KV" idea is now standard in decoding kernels (FlashAttention's own decode path, FlashInfer, TensorRT-LLM).</p>
+<p>Serving adds two more requirements. <strong>Paged KV caches</strong> (vLLM's PagedAttention, lm13) store each sequence's keys and values in fixed-size blocks scattered through memory, so the kernel must gather K and V through a block table rather than from one contiguous array. And <strong>variable-length batches</strong>: sequences of different lengths are packed together without padding, described by cumulative offsets (<code>cu_seqlens</code>), so no work is wasted on padding tokens. Grouped-query attention helps decoding directly: the query heads that share a KV head can be processed together, so each K/V block loaded from HBM serves g queries instead of one — the intensity-equals-group-size result from gpu2.</p>
+
+<h4>10. Using it in practice</h4>
+<pre>import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+# q, k, v: [batch, heads, seq, head_dim] in bfloat16 on the GPU
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):    # error instead of silent fallback
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=True)</pre>
+<p><code>scaled_dot_product_attention</code> chooses among FlashAttention, memory-efficient attention, cuDNN attention and a plain "math" implementation; restricting the back end during development catches silent fallbacks. The standalone <code>flash-attn</code> package offers more: variable-length (packed) batches, paged KV caches, sliding windows, and the newest Hopper and Blackwell kernels. For custom attention variants — relative position biases, document masks, soft-capping — PyTorch's <strong>FlexAttention</strong> lets you write the score modification as a small Python function and generates a fused FlashAttention-style kernel for it, skipping fully masked blocks automatically.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why the exponential became the bottleneck</h4>
+<p>Count work per score for d = 128: QKᵀ and PV cost 4d = 512 FLOPs on tensor cores, and the softmax costs one exponential on the special-function unit (MUFU). On an H100, 512 tensor-core FLOPs take 512 / 989 × 10<sup>12</sup> ≈ 0.52 ps of chip time, while one exponential takes 1 / 3.9 × 10<sup>12</sup> ≈ 0.26 ps — half as long as all the matmul work. If softmax and matmul ran one after the other, the exponential alone would cost a third of the kernel's time. That is why FlashAttention-3 overlaps them across warpgroups, and why Blackwell, which roughly doubled tensor throughput without doubling MUFU throughput, forced FlashAttention-4 to compute some exponentials on the FMA units with a polynomial (splitting exp(x) = 2<sup>x·log₂e</sup> into an integer power of two, applied by adjusting the exponent bits, and a polynomial for the fractional part). The general lesson: as one unit gets faster, the next-slowest unit sets the pace, and kernels must be rebalanced.</p>
+<h4>Skipping rescaling</h4>
+<p>Every time a row's running maximum grows, the online softmax rescales O by exp(m − m<sub>new</sub>), a non-matmul operation on a whole B<sub>r</sub> × d tile. In practice the maximum stabilises after the first few blocks. FlashAttention-4 rescales only when the maximum has grown by more than a threshold; otherwise it keeps using the stale maximum, which is still exact at the end (the final division by l uses the same reference) as long as the exponentials can't overflow in FP32 — and the threshold guarantees that. It saves a large share of the rescaling work at no accuracy cost.</p>
+<h4>Context parallelism for sequences that don't fit</h4>
+<p>At a million tokens, even one layer's K and V for one sequence stress one GPU, and the quadratic FLOPs take too long. <strong>Context parallelism</strong> splits the sequence across G GPUs. In <strong>ring attention</strong>, each GPU holds a block of queries and a block of K/V; K/V blocks are passed around a ring of GPUs, and each GPU merges each arriving block's contribution with the online softmax, overlapping the transfer of the next block with the computation on the current one. An alternative is to all-gather K and V first, which is simpler and works well when K and V are much smaller than Q (as with GQA): Llama 3 used all-gather-based context parallelism with degree 16 for its 128K-context training. Causal masks unbalance the work (the GPU holding the first chunk has almost nothing to attend to), so sequences are split into 2G chunks and each GPU takes one early and one late chunk.</p>
+<h4>Determinism and the backward pass</h4>
+<p>In the backward pass, dK and dV are naturally accumulated per key block, but dQ receives contributions from every key block, computed by different thread blocks. FlashAttention-2 accumulates dQ with atomic additions, whose order varies between runs, so gradients differ in the last bits from run to run. The <code>flash-attn</code> package offers a deterministic backward mode that fixes the order at some speed cost; PyTorch's deterministic-algorithms setting selects such paths or raises an error. For bit-exact reproducibility of training runs, this is one of the kernels to check (gpu4).</p>
+<h4>GQA, MQA (multi-query attention: one KV head shared by all query heads) and MLA inside the kernel</h4>
+<p>With grouped-query attention, query heads h and h' that share a KV head read the same K and V. A good kernel loads each K/V tile once and uses it for all g query heads — for decoding, stacking the g single-token queries into one small "query block" so the tile is reused g times, raising intensity from 1 to g. DeepSeek's multi-head latent attention stores a compressed latent per token and, at decode time, can absorb the up-projections into the query and output projections, turning attention into an MQA-like operation over the latent — which needed its own kernels (FlashMLA) because the head dimensions differ from standard attention.</p>
+<h4>The IO-aware lesson beyond attention</h4>
+<p>FlashAttention's lasting contribution is a method: count bytes between memory levels, find the large intermediate that makes an operation memory-bound, and restructure the algorithm — often with an associative "running" formulation like the online softmax — so the intermediate never leaves the chip, accepting recomputation if needed. The same method produced fused linear-cross-entropy (never materialise the logits, gpu3), fused MoE routing kernels, and chunked state-space-model scans.</p>
+</section>
+
+<section data-field="prod">
+<h4>Is the fast kernel actually running?</h4>
+<p>The most common FlashAttention incident isn't a kernel bug but a silent fallback. <code>scaled_dot_product_attention</code> picks a back end per call, and several ordinary choices disqualify FlashAttention: FP32 inputs (for example, a model loaded without a dtype, or autocast not covering attention), an arbitrary dense boolean or float mask instead of <code>is_causal=True</code>, head dimensions the installed kernels don't support, or older GPUs. The fallback "math" path materialises the N × N matrix, so the symptom is an out-of-memory error — or a sharp slowdown — that appears only at long sequence lengths, often during an evaluation run with longer inputs than training. Checks: profile a step and look for flash kernel names; run a development step under <code>sdpa_kernel(SDPBackend.FLASH_ATTENTION)</code> so fallback becomes an error; and log sequence length alongside peak memory.</p>
+<h4>Packing instead of padding</h4>
+<p>Fine-tuning datasets have sequences of very different lengths. Padding every batch to its longest sequence wastes compute on padding tokens — often 30-50% for chat data. The variable-length interface (<code>flash_attn_varlen_func</code>, or packed-sequence support in training frameworks) concatenates sequences into one long row with cumulative offsets, and the kernel restricts attention to each sequence's own tokens. This is one of the largest easy speed-ups in fine-tuning, and it requires the attention kernel to support it; with plain SDPA and a dense mask, packing silently disables the fast path.</p>
+<h4>Serving: kernels, pages and long contexts</h4>
+<p>Inference engines choose among several attention implementations — FlashAttention's decode and paged kernels, FlashInfer, TensorRT-LLM's kernels — per GPU and workload, and the choice shows up directly in inter-token latency at long context. Operators monitor decode attention time as a share of step time: as average context grows (long documents, agent histories), attention's share rises because its bytes grow with context while the weight bytes don't, and the fixes are on the KV side — FP8 KV cache, prefix caching so shared prompts are stored once, and GQA/MLA models. Split-KV decode matters most at small batch and long context; at large batch there is already enough parallelism and splitting adds merge overhead, so kernels choose the number of splits by heuristics.</p>
+<h4>Memory planning after FlashAttention</h4>
+<p>With the N × N matrices gone, attention's memory in training is dominated by Q, K, V and O themselves (saved for the backward pass) and the per-row statistics — linear in N — so activation memory follows gpu3's 34·s·b·h estimate without the 5·a·s²·b term. In inference, the KV cache becomes the dominant long-context memory cost. Capacity planning for long-context features therefore starts from KV bytes per token (gpu3) rather than from attention intermediates, and a sudden quadratic growth in memory with sequence length is itself a diagnostic: some layer is not using a FlashAttention-style kernel.</p>
+<h4>Upgrades and regressions</h4>
+<p>Because each GPU generation needs different kernels, the attention path changes more often than most of the stack: a new PyTorch, cuDNN or <code>flash-attn</code> version can change which kernel runs and its speed or numerics. Teams pin versions, keep an attention microbenchmark (forward and backward, several lengths and head sizes, causal and not) in CI, and compare against the previous version before upgrading. Numerical differences at the 10<sup>−3</sup> level in BF16 are expected; larger ones, or NaNs at long lengths, point to an overflow in a new code path and should be reported upstream with a minimal reproduction.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> implement the online softmax, prove it gives exactly the same answer as ordinary attention, and see how much HBM traffic tiling saves. Pure Python 3.12 — no GPU is present on this machine, so this tests the algorithm, not a kernel.</p>
+<pre>import math, random
+random.seed(0)
+N, d, BLOCK = 64, 16, 16
+Q, K, V = ([[random.gauss(0, 1) for _ in range(d)] for _ in range(N)] for _ in range(3))
+dot = lambda a, b: sum(x * y for x, y in zip(a, b))
+scale = 1 / math.sqrt(d)
+
+def naive(q):                                  # whole row of scores at once
+    s = [dot(q, k) * scale for k in K]
+    m = max(s); p = [math.exp(x - m) for x in s]; z = sum(p)
+    return [sum(p[j] * V[j][c] for j in range(N)) / z for c in range(d)]
+
+def flash(q):                                  # one block of keys at a time
+    m, l, o = -math.inf, 0.0, [0.0] * d
+    for st in range(0, N, BLOCK):
+        s = [dot(q, K[j]) * scale for j in range(st, st + BLOCK)]
+        m_new = max(m, max(s)); corr = math.exp(m - m_new)
+        p = [math.exp(x - m_new) for x in s]
+        l = l * corr + sum(p)
+        o = [o[c] * corr + sum(p[i] * V[st + i][c] for i in range(BLOCK)) for c in range(d)]
+        m = m_new
+    return [x / l for x in o]
+
+print("max difference:", max(abs(a - b) for q in Q for a, b in zip(naive(q), flash(q))))
+
+hd, Br, B2 = 128, 128, 2                        # HBM bytes per head, BF16
+for n in (2048, 8192, 32768):
+    qkvo = 4 * n * hd * B2
+    eager = qkvo + 8 * n * n * B2               # S, mask, softmax, dropout passes
+    flash_hbm = 2 * n * hd * B2 + 2 * n * hd * B2 * (n // Br)   # K,V re-read per Q block
+    print(f"N={n}: eager {eager / 1e6:.0f} MB, flash {flash_hbm / 1e6:.0f} MB "
+          f"(~{qkvo / 1e6:.0f} MB if L2 serves the K,V re-reads)")</pre>
+<p><strong>What to look for.</strong> The maximum difference is about 10<sup>−16</sup>: the online softmax is exact. Then the traffic: at N = 8,192, eager attention moves about 1.1 GB per head; FlashAttention about 0.27 GB even if every K/V re-read went to HBM, and about 8 MB if L2 serves them. Try <code>BLOCK = 1</code> and <code>BLOCK = 64</code> — the answer doesn't change, only the number of rescalings does.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A model with 32 heads (head dimension 128) processes one 32,768-token sequence on an H100. (a) How much memory would the score matrices of one layer take in BF16 with standard attention? (b) What does FlashAttention store instead? (c) Estimate one layer's attention FLOPs and the minimum time, causal and non-causal. (d) Why is FlashAttention faster even though it recomputes scores in the backward pass?</p>
+<details><summary>Answer</summary>
+<p>(a) Per head: 32,768<sup>2</sup> × 2 bytes = <strong>2 GiB</strong>. For 32 heads: <strong>64 GiB for one layer of one sequence</strong> — nearly all of an 80 GB H100, before the probability matrix and its gradient.</p>
+<p>(b) The output O (N × d per head, the same size as Q) and one log-sum-exp per row: 32,768 × 32 × 4 bytes ≈ <strong>4 MB</strong> of statistics. Memory is linear in N.</p>
+<p>(c) 4N<sup>2</sup>d per head = 4 × 32,768<sup>2</sup> × 128 ≈ 5.5 × 10<sup>11</sup> FLOPs; × 32 heads ≈ <strong>17.6 TFLOPs</strong> per layer, about <strong>18 ms</strong> at the H100's 989 TFLOP/s — about 24 ms at FlashAttention-3's 740 TFLOP/s. With a causal mask about half the tiles are skipped: roughly 9-12 ms. Quadratic compute remains: this is why long-context stages are expensive even with FlashAttention (gpu3).</p>
+<p>(d) Standard attention at this length is memory-bound: the time goes to moving N × N matrices through HBM several times (at eight passes, 32 heads × 8 × 2 GiB ≈ 550 GB per layer, about 170 ms). FlashAttention keeps tiles on chip, so its time is mostly tensor-core matmuls near peak. Recomputing scores in the backward pass adds about 25% more matmul FLOPs, but FLOPs are cheap and HBM traffic is expensive — the trade wins on every modern GPU, and it also removes the quadratic memory.</p>
+</details>
+</section>

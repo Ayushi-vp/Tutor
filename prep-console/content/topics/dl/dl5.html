@@ -1,0 +1,665 @@
+<!-- topic source for dl/dl5; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "dl5",
+  "t": "Optimisers in practice: SGD, Adam, AdamW",
+  "tag": "Optimisation",
+  "sum": "From SGD with momentum to Adam and AdamW: one Adam update step worked by hand, why bias correction and decoupled weight decay exist, what each optimiser stores per parameter (16 bytes for mixed-precision Adam), and which recipes LLMs actually use.",
+  "viz": "optimizers",
+  "prereq": [
+    [
+      "ml4",
+      "Gradient descent steps against the gradient by a learning rate; the stable learning rate is limited by the steepest curvature, and momentum and Adam were introduced there."
+    ],
+    [
+      "ml3",
+      "Weight decay shrinks weights each step to regularise; with plain gradient descent it is equivalent to adding an L2 penalty to the loss."
+    ],
+    [
+      "dl1",
+      "Backprop supplies the gradient for every parameter; the optimiser decides how to turn those gradients into weight updates."
+    ],
+    [
+      "dl4",
+      "A normalised layer is scale-invariant, so weight decay controls its effective learning rate rather than its capacity."
+    ]
+  ],
+  "myths": [
+    [
+      "Adam does not need a learning-rate schedule or tuning.",
+      "Adam removes the need to tune the scale of each gradient, but the global learning rate still decides stability and quality, and large-model recipes tune the peak, the warmup and the decay carefully. Adam's steps are about the learning rate in size for every parameter, so a rate that is a few times too high produces loss spikes just as it does with SGD."
+    ],
+    [
+      "AdamW is Adam with an L2 penalty added.",
+      "That is precisely what AdamW is <em>not</em>. Putting an L2 penalty in the loss sends the decay through Adam's division by the root of the second moment, so parameters with large gradients get almost no decay and parameters with small gradients get a lot (in the lab, 10⁻⁶ versus 7×10⁻⁴ per step). AdamW applies the decay directly to the weights, outside the adaptive step, so every parameter shrinks by lr × λ × w (10⁻⁵ in the lab) whatever its gradient."
+    ],
+    [
+      "Adam always generalises as well as SGD, or better, so SGD is obsolete.",
+      "The evidence is mixed and task-dependent. Wilson et al. (2017) showed adaptive methods finding solutions that generalise worse than SGD on several benchmarks, and AdamW (Loshchilov &amp; Hutter) closed much of that gap; SGD with momentum remains competitive for CNNs on ImageNet-style tasks. For transformers, SGD is typically much worse than Adam, and recent work attributes this to the very different curvature of different parameter blocks."
+    ],
+    [
+      "The optimiser's memory cost is small compared with the model.",
+      "With mixed-precision Adam the state is larger than the weights: for every parameter, 2 bytes of bf16 weights, 2 of gradients, 4 of fp32 master weights and 8 for the two moments make 16 bytes, of which the optimiser and master copy account for 12. A 7B model needs 112 GB of training state before a single activation is stored, which is why ZeRO sharding, 8-bit optimisers and LoRA exist."
+    ],
+    [
+      "Bias correction in Adam makes the first steps bigger because the estimates start at zero.",
+      "It is the reverse with the default betas. Without correction, the second-moment estimate is more biased toward zero (a factor 1 − β₂ = 0.001) than the first (1 − β₁ = 0.1), so the uncorrected step is larger by (1 − β₁)/√(1 − β₂) ≈ 3.2 on the very first step. Correction removes this and makes the first step exactly the learning rate in every coordinate; Kingma &amp; Ba show instability without it when β₂ is close to 1."
+    ],
+    [
+      "If the model is trained in bfloat16, the optimiser can update the weights directly in bfloat16.",
+      "A bfloat16 number has only 8 bits of precision, so near 1.0 adjacent values are 0.0078 apart. An update of 3×10⁻⁴ is smaller than half that spacing and is rounded away: in the lab, 1,000 such updates left a bf16 weight at exactly 1.0, whereas an fp32 master copy reached 1.3. That is why mixed-precision training keeps fp32 master weights and fp32 optimiser states."
+    ]
+  ],
+  "recap": [
+    "Every optimiser is 'w ← w − step', where the step is built from the gradient history: plain SGD uses the current gradient, momentum a decaying sum of past gradients, and adaptive methods divide by a running estimate of the gradient's size.",
+    "Adam keeps m, an exponential average of the gradient, and v, an exponential average of its square, divides the bias-corrected m by the square root of the bias-corrected v, and so moves each parameter by about the learning rate whatever the scale of its gradient; on the first step the move is exactly ±lr.",
+    "Bias correction divides m and v by 1 − βᵗ to undo their zero initialisation; with the default β₁ = 0.9 and β₂ = 0.999 skipping it makes the first step about 3.2 times too large.",
+    "Adam's step is roughly lr × (mean gradient) / √(mean gradient² + noise²): about lr for consistent gradients and much smaller for noisy ones, a built-in form of step-size annealing.",
+    "L2 regularisation inside Adam is divided by √v and so decays small-gradient weights harder; AdamW decouples decay by shrinking the weights directly by lr × λ × w, which is why it is the default for transformers and why λ transfers across architectures.",
+    "Mixed-precision Adam costs 16 bytes per parameter (2 + 2 + 4 + 4 + 4) of which 12 are optimiser-side, so a 7B model needs 112 GB of weights, gradients and states; ZeRO shards it, 8-bit optimisers shrink the moments, LoRA avoids most of it.",
+    "Standard LLM recipes use AdamW with β₁ = 0.9, β₂ = 0.95, weight decay 0.1, gradient clipping at 1.0, linear warmup (2,000 to 8,000 steps) and cosine decay to about 10% of the peak learning rate, with peak rates from 3×10⁻⁴ (7–8B) down to 8×10⁻⁵ (405B).",
+    "SGD with momentum still competes on convolutional networks, while transformers need Adam-like per-parameter scaling; newer optimisers (Lion, Adafactor, Muon, LAMB) trade memory, compute or large-batch behaviour against that default.",
+    "Choose and check an optimiser by its state (what is stored), its step size (what the update norm is per parameter) and its interactions (weight decay, schedule, batch size, precision), and log the update-to-weight ratio to see them."
+  ],
+  "glossary": [
+    [
+      "Adafactor",
+      "An optimiser that stores a factored approximation of Adam's second moment (row and column statistics), cutting optimiser memory to almost nothing for large matrices."
+    ],
+    [
+      "AdaGrad",
+      "An optimiser that divides each parameter's step by the square root of the sum of all its past squared gradients, giving rarely updated parameters larger steps; its rates only ever shrink."
+    ],
+    [
+      "Adam",
+      "An optimiser that keeps running averages of the gradient (m) and squared gradient (v) and steps by the bias-corrected m divided by √v, giving every parameter its own step size."
+    ],
+    [
+      "AdamW",
+      "Adam with weight decay applied directly to the weights rather than added to the gradient, so decay is not distorted by the adaptive scaling."
+    ],
+    [
+      "BERT",
+      "Bidirectional Encoder Representations from Transformers, a pretrained encoder that LAMB trained in 76 minutes (dl11)."
+    ],
+    [
+      "Beta (β₁, β₂)",
+      "Adam's averaging factors: β₁ (0.9) for the gradient average and β₂ (0.999, or 0.95 for many LLMs) for the squared-gradient average."
+    ],
+    [
+      "Bias correction",
+      "Dividing Adam's running averages by 1 − βᵗ to undo the bias caused by initialising them at zero."
+    ],
+    [
+      "CIFAR-10",
+      "A small benchmark of 60,000 32×32 colour images in 10 classes."
+    ],
+    [
+      "CNN (convolutional neural network)",
+      "A network whose layers slide small shared filters over an image or sequence (dl6)."
+    ],
+    [
+      "Decoupled weight decay",
+      "Shrinking weights by lr × λ × w outside the gradient-based update, as in AdamW."
+    ],
+    [
+      "Epsilon (ε)",
+      "A small constant (10⁻⁸) added to Adam's denominator to avoid division by zero; it caps the step when gradients are tiny."
+    ],
+    [
+      "Exponential moving average (EMA)",
+      "A running average that weights recent values more: new = β·old + (1 − β)·value."
+    ],
+    [
+      "First moment (m)",
+      "Adam's exponential average of the gradient; it acts as momentum."
+    ],
+    [
+      "FSDP",
+      "Fully Sharded Data Parallel: PyTorch's way of sharding weights, gradients and optimiser state across GPUs (gpu9)."
+    ],
+    [
+      "Fused optimiser",
+      "An implementation that performs the whole update in one GPU kernel over all parameters, reducing memory traffic and launch overhead."
+    ],
+    [
+      "GPU",
+      "Graphics processing unit: the parallel processor used to train neural networks (gpu1)."
+    ],
+    [
+      "Gradient clipping",
+      "Rescaling the gradient when its global norm exceeds a threshold (typically 1.0) (dl3)."
+    ],
+    [
+      "JFT",
+      "Google's large internal image dataset used for pretraining vision models."
+    ],
+    [
+      "L2 regularisation",
+      "A penalty on the squared size of the weights added to the loss (ml3)."
+    ],
+    [
+      "LAMB / LARS",
+      "Optimisers that scale each layer's step by the ratio of its weight norm to its update norm, designed for very large batches."
+    ],
+    [
+      "Lion",
+      "An optimiser found by program search that steps along the sign of an interpolated momentum, storing only one moment per parameter."
+    ],
+    [
+      "LLM (large language model)",
+      "A very large neural network trained to predict the next token of text."
+    ],
+    [
+      "Master weights",
+      "A float32 copy of the weights kept by the optimiser in mixed-precision training so tiny updates are not rounded away."
+    ],
+    [
+      "MLP (multi-layer perceptron)",
+      "A network of fully connected layers with non-linearities between them."
+    ],
+    [
+      "Momentum",
+      "Keeping a decaying sum of past gradients and stepping along it, which damps oscillation and speeds movement along consistent directions."
+    ],
+    [
+      "Muon",
+      "An optimiser that orthogonalises the momentum of each weight matrix before stepping, used for the matrix parameters of some recent LLMs."
+    ],
+    [
+      "Nesterov momentum",
+      "A momentum variant that evaluates the gradient at the look-ahead position."
+    ],
+    [
+      "Optimiser state",
+      "The extra per-parameter numbers an optimiser stores between steps (momentum buffers, Adam's m and v)."
+    ],
+    [
+      "RMSProp",
+      "An optimiser that divides the gradient by the square root of an exponential average of its square."
+    ],
+    [
+      "Second moment (v)",
+      "Adam's exponential average of the squared gradient; its square root estimates the typical gradient size."
+    ],
+    [
+      "SGD (stochastic gradient descent)",
+      "Gradient descent on the gradient of a random mini-batch (ml4)."
+    ],
+    [
+      "SOAP",
+      "An optimiser that runs Adam in the eigenbasis of Shampoo's preconditioner, combining second-order structure with Adam's stability."
+    ],
+    [
+      "T5",
+      "Text-to-Text Transfer Transformer, a Google encoder-decoder model trained with Adafactor."
+    ],
+    [
+      "TPU",
+      "Tensor Processing Unit: Google's custom accelerator chip for neural networks."
+    ],
+    [
+      "Trust ratio",
+      "The ratio of a layer's weight norm to its update norm used by LARS and LAMB to set per-layer step sizes."
+    ],
+    [
+      "Update-to-weight ratio",
+      "The size of one optimiser step relative to the size of the weights it changes; about 10⁻³ is common."
+    ],
+    [
+      "Warmup",
+      "Starting with a small learning rate and raising it to its peak over the first steps (ml4)."
+    ],
+    [
+      "Weight decay",
+      "Shrinking the weights a little every step to regularise them."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What does momentum do, and what does Adam add to it?",
+      "Momentum steps along a decaying sum of past gradients (v ← βv + g), so components that flip sign across a narrow valley cancel while consistent ones accumulate, damping oscillation and speeding up progress. Adam adds a per-parameter step size: it divides the averaged gradient by the square root of a running average of the squared gradient, so a parameter with tiny gradients still moves at a sensible rate and one with huge gradients does not overshoot."
+    ],
+    [
+      "E",
+      "What are Adam's hyperparameters and their usual values?",
+      "Learning rate (about 10⁻³ for small models, 3×10⁻⁴ or lower for transformers, 10⁻⁵ to 5×10⁻⁵ for fine-tuning), β₁ = 0.9 for the gradient average, β₂ = 0.999 for the squared-gradient average (0.95 in most LLM recipes), ε = 10⁻⁸, and for AdamW a weight decay around 0.1 for LLMs (PyTorch's default is 0.01). The learning rate matters most and is paired with warmup and a decay schedule."
+    ],
+    [
+      "E",
+      "What is the difference between L2 regularisation and weight decay?",
+      "For plain SGD they are equivalent: the gradient of (λ/2)‖w‖² is λw, so each step shrinks w by lr·λ·w. For adaptive optimisers they are not: an L2 term added to the gradient is divided by Adam's √v along with the rest, so weights with large gradients are barely decayed. Weight decay applies the shrinkage directly to the weight, which is what AdamW does."
+    ],
+    [
+      "E",
+      "How much memory does Adam need per parameter?",
+      "Two extra numbers: the first moment m and second moment v, normally in float32, so 8 bytes per parameter on top of the weights. In mixed-precision training the full budget is 2 (bf16 weights) + 2 (bf16 gradients) + 4 (fp32 master weights) + 4 (m) + 4 (v) = 16 bytes per parameter, so a 7B model needs about 112 GB before activations."
+    ],
+    [
+      "M",
+      "Why does Adam need bias correction, and what does it do on the first step?",
+      "m and v start at zero, so early on they are biased toward zero: after t steps m holds only a fraction 1 − β₁ᵗ of the true average. Dividing m by 1 − β₁ᵗ and v by 1 − β₂ᵗ corrects this. On step 1 the corrected m̂ is g and v̂ is g², so the step is lr·g/|g| = ±lr for every parameter regardless of its gradient size. Without correction and with the defaults the ratio would be (1 − β₁)/√(1 − β₂) ≈ 3.2, so the first step would be over three times too large.",
+      "Follow-up: Why is warmup still used with Adam? — Even corrected, v̂ after a few steps averages very few gradients and can be too small, so steps are erratic; warmup keeps the learning rate low until the statistics settle."
+    ],
+    [
+      "M",
+      "Walk me through why L2 regularisation and AdamW decay differ, with numbers.",
+      "Take lr = 10⁻³, λ = 0.01 and weight w = 1. Under Adam+L2 the decay adds λw = 0.01 to the gradient, which is then divided by the RMS gradient: for a weight with typical gradient size 10 the shrinkage per step is about 10⁻³ × 0.01/10 = 10⁻⁶; for one with gradient size 0.01 it is about 10⁻³ × 0.01/0.01 = 10⁻³ (7×10⁻⁴ measured, since the decay itself adds to √v). Under AdamW both shrink by lr × λ × w = 10⁻⁵ per step. So Adam+L2 decays the weights that matter least hardest and those that matter most barely; AdamW is uniform and also makes the best λ nearly independent of the learning rate."
+    ],
+    [
+      "M",
+      "Why do LLM recipes use β₂ = 0.95 instead of 0.999?",
+      "β₂ sets how long v remembers: 0.999 averages over about 1,000 steps and reacts slowly when gradients suddenly grow, so after a distribution shift or a bad batch v underestimates the gradient scale and steps are too large, causing loss spikes. β₂ = 0.95 averages over about 20 steps, tracking recent gradient sizes closely at the cost of noisier estimates. LLaMA and Llama-style recipes use 0.95, and PaLM used a β₂ that increases with the step count as 1 − k^−0.8.",
+      "Follow-up: What role does ε play in low precision? — ε = 10⁻⁸ cannot be represented in float16 (smallest subnormal about 6×10⁻⁸), so it becomes 0 and the division can blow up; keep optimiser states in float32."
+    ],
+    [
+      "M",
+      "Why are fp32 master weights needed in mixed-precision training?",
+      "A bfloat16 number has 8 bits of precision, so near 1.0 the spacing between values is 2⁻⁷ ≈ 0.0078. An Adam update of about lr = 3×10⁻⁴ is less than half that spacing and is rounded to nothing: in a test, 1,000 such updates left a bf16 weight at 1.0, while an fp32 copy reached 1.3. The optimiser therefore keeps an fp32 master copy (and fp32 moments), updates that, and casts back to bf16 for the forward and backward passes. That is where the 4 bytes of master weights in the 16 bytes per parameter come from."
+    ],
+    [
+      "M",
+      "When would you choose SGD with momentum over AdamW?",
+      "For convolutional networks on image tasks where you can afford to tune the learning rate and schedule and the best final accuracy matters: SGD with momentum 0.9 and a step or cosine schedule remains competitive and stores only one buffer per parameter. For transformers Adam-style optimisers are the default because SGD performs much worse; Zhang et al. attribute this to 'block heterogeneity', very different Hessian spectra across parameter blocks, which one global learning rate cannot serve. Memory-constrained settings also favour SGD or Adafactor-style states.",
+      "Follow-up: Does AdamW close the generalisation gap? — Loshchilov & Hutter report that decoupled weight decay improved Adam's test error by about 15% relative on CIFAR-10 and let it compete with SGD with momentum on image classification."
+    ],
+    [
+      "H",
+      "Describe the memory footprint of training a 7B model with AdamW and how you would fit it on 8 × 80 GB GPUs.",
+      "Mixed-precision AdamW needs 16 bytes per parameter: 14 GB bf16 weights, 14 GB bf16 gradients, 28 GB fp32 master weights and 56 GB for m and v, 112 GB in total, before activations. Replicating that on every GPU cannot fit in 80 GB. ZeRO-1 shards the 84 GB of optimiser state and master weights (12 bytes per parameter) across the 8 GPUs, leaving 14 + 14 + 10.5 = 38.5 GB per GPU; ZeRO-2 also shards gradients, and ZeRO-3 or FSDP shards everything to about 14 GB per GPU. Add activation checkpointing for activations. Other levers are an 8-bit optimiser (moments from 8 to 2 bytes per parameter), Adafactor, or LoRA, which needs optimiser state only for the small adapters.",
+      "Follow-up: Does sharding the optimiser change the maths? — No: Adam's update is elementwise, so each rank updates its own slice and the results are identical; this is why ZeRO-1 is exact and cheap, unlike optimisers that need whole-matrix operations (Shampoo, Muon)."
+    ],
+    [
+      "H",
+      "Why does Adam behave like sign descent in some regimes, and what does that imply?",
+      "For a parameter whose gradient is consistent, m̂ ≈ g and √v̂ ≈ |g|, so the step is lr·sign(g): its size is set by the learning rate, not by the gradient. For a noisy gradient with mean μ and standard deviation σ the step is about lr·μ/√(μ² + σ²), a signal-to-noise ratio that shrinks steps automatically when the gradient is mostly noise (annealing). Implications: Adam is invariant to rescaling the loss or a parameter's gradient (multiplying the loss by 1000 made SGD diverge and left Adam's trajectory unchanged in the lab), the learning rate has units of 'distance per step per parameter', and per-parameter update magnitudes are roughly uniform, which is the property alternatives such as Lion (an explicit sign) and Muon (matched update RMS) are built around."
+    ],
+    [
+      "H",
+      "What recipe would you use to pretrain a decoder-only LLM, and how does it change with scale?",
+      "AdamW with β₁ = 0.9, β₂ = 0.95, ε = 10⁻⁸, weight decay 0.1 (not on biases and norm scales), global-norm gradient clipping at 1.0, a linear warmup of about 2,000 steps (Llama 3 405B used 8,000), then cosine decay to about 10% of the peak, or to 10⁻² of it for very long runs. The peak learning rate falls with model size: 3×10⁻⁴ for 7–8B, 1.5×10⁻⁴ for 65–70B, 8×10⁻⁵ for 405B. Batch size grows during training (Llama 3: 4M tokens rising to 16M) because the critical batch size grows as the loss falls. For robustness add z-loss or QK-norm if instabilities appear (dl3, dl4).",
+      "Follow-up: Did all large LLMs use AdamW? — No: PaLM used Adafactor with β₁ = 0.9, a learning rate of 10⁻² for 10,000 steps then decayed as 1/√k, and Moonshot's Moonlight trained a 16B-parameter mixture-of-experts on 5.7T tokens with Muon."
+    ],
+    [
+      "H",
+      "How do LARS, LAMB, Lion and Muon differ from Adam, and when would you use them?",
+      "LARS and LAMB scale each layer's step by a trust ratio ‖w‖/‖update‖ so that large batches (tens of thousands of examples) do not destabilise layers with small weights; LAMB trained BERT in 76 minutes on a TPU pod with batches of about 32,000. Lion keeps only one momentum buffer and steps along its sign, saving a third of optimiser memory and giving each parameter the same update size; the authors report better ViT accuracy and up to 5× less pre-training compute on JFT. Muon orthogonalises the momentum of each 2D weight matrix, so the update has uniform singular values; used for the matrix weights with Adam for embeddings and norms, and with a weight-decay and update-scale correction the Moonlight report finds about 2× compute efficiency over AdamW. Use them when their motivating constraint (huge batch, memory, LLM pretraining cost) applies and you can validate against an AdamW baseline."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Decoupled Weight Decay Regularization (AdamW)",
+      "Loshchilov & Hutter, ICLR 2019 — this topic's public case: why L2 and weight decay differ under Adam, and the 15% relative test-error improvement.",
+      "https://arxiv.org/abs/1711.05101"
+    ],
+    [
+      "paper",
+      "Adam: A Method for Stochastic Optimization",
+      "Kingma & Ba, ICLR 2015 — the algorithm, default hyperparameters, bias-correction derivation and the step-size bound.",
+      "https://arxiv.org/abs/1412.6980"
+    ],
+    [
+      "paper",
+      "The Marginal Value of Adaptive Gradient Methods in Machine Learning",
+      "Wilson et al., 2017 — the case that adaptive methods can generalise worse than SGD.",
+      "https://arxiv.org/abs/1705.08292"
+    ],
+    [
+      "paper",
+      "Why Transformers Need Adam: A Hessian Perspective",
+      "Zhang et al., 2024 — block heterogeneity as the reason SGD lags Adam on transformers.",
+      "https://arxiv.org/abs/2402.16788"
+    ],
+    [
+      "paper",
+      "On the Convergence of Adam and Beyond",
+      "Reddi et al., ICLR 2018 — a convex counterexample where Adam fails to converge, and the AMSGrad fix.",
+      "https://arxiv.org/abs/1904.09237"
+    ],
+    [
+      "paper",
+      "8-bit Optimizers via Block-wise Quantization",
+      "Dettmers et al., ICLR 2022 — Adam's moments in 8 bits with 32-bit quality.",
+      "https://arxiv.org/abs/2110.02861"
+    ],
+    [
+      "paper",
+      "Large Batch Optimization for Deep Learning: Training BERT in 76 Minutes",
+      "You et al., ICLR 2020 — LAMB and layer-wise trust ratios.",
+      "https://arxiv.org/abs/1904.00962"
+    ],
+    [
+      "paper",
+      "Muon is Scalable for LLM Training",
+      "Moonshot AI, 2025 — the matrix-orthogonalising optimiser scaled to a 16B mixture-of-experts model on 5.7T tokens.",
+      "https://arxiv.org/abs/2502.16982"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Suppose you have a correct gradient for every one of a model's billions of weights. Backpropagation (dl1) gave it to you, and the gradient of each weight says which way to nudge that weight to reduce the loss. You still have not trained anything. Someone has to decide how <em>far</em> to nudge each weight, whether to trust this step's gradient or the average of the last hundred, and what to do when one weight's gradient is a million times larger than another's. That decision procedure is the <strong>optimiser</strong>, and choosing it well is a large part of what separates a training run that converges in a week from one that diverges on day two.</p>
+<p>The stakes are not academic. In a modern large-model run the optimiser is responsible for a surprising share of both the memory and the risk. With the standard choice, Adam in mixed precision, it stores four extra numbers per weight next to the weight itself — sixteen bytes per parameter in total — so a 7-billion-parameter model needs 112 GB of training state before a single activation is stored, more than one GPU holds. It also carries hyperparameters (two averaging rates, a stabiliser, a weight decay) that decide whether the loss curve is smooth or full of spikes, and a well-known implementation subtlety, the way weight decay is applied, that changed the default choice for transformers. Every LLM technical report lists its optimiser settings for exactly this reason.</p>
+<p>This topic gives you the mechanism first and the practice second. We start from plain SGD and momentum (recalled from ml4), build up RMSProp's per-parameter scaling and then Adam, and work one complete Adam update by hand with real numbers, so that the rule <em>every parameter moves by about the learning rate</em> is something you have computed, not memorised. We derive why bias correction exists and why L2 regularisation and weight decay stop being the same thing under Adam, count the memory of each optimiser, compare Adam and SGD honestly, and look at what the recipes of LLaMA, Llama 3 and PaLM actually use and where newer optimisers such as Lion, LAMB and Muon fit. The public case is the pair of papers behind today's default, Adam and AdamW, checked against their own numbers. The lab reproduces the hand computation, compares optimisers on a badly scaled quadratic, measures the weight-decay difference and shows why weights must be kept in float32.</p>
+</section>
+
+<section data-field="primer">
+<h4>What an optimiser does</h4>
+<p>After backpropagation, every weight has a gradient <code>g</code>. The simplest thing you can do is the update rule from ml4: <code>w ← w − lr × g</code>. That is <strong>stochastic gradient descent (SGD)</strong> — "stochastic" because <code>g</code> comes from a random mini-batch, so it is a noisy estimate. Everything else in this topic is a refinement of one question: instead of using only the current gradient scaled by one global number, what can we remember from the past to take better steps?</p>
+<p>Think of walking down a mountain in fog again (ml4). SGD looks only at the slope under your feet right now. <strong>Momentum</strong> makes you a heavy ball rolling downhill: you keep some of your previous velocity, so you smooth out zig-zags and build speed on consistent slopes. <strong>Adaptive methods</strong> (RMSProp, Adam) add a sense of scale: each direction you can move in gets its own stride length, scaled by how steep that direction has typically been — cautious in directions where the slope is wild, bold where it is gentle and steady. Adam, the combination of both ideas, is the default for training almost everything modern. The analogy fails on one point: in a real network the "directions" are individual parameters, billions of them, each with its own gradient history, so the bookkeeping has a real memory cost.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Adam update pipeline for one parameter. The gradient g feeds two running averages: m, the average of g, and v, the average of g squared. Each is divided by its bias-correction factor, then the step is learning rate times m-hat divided by the square root of v-hat plus epsilon, and the weight is reduced by that step. AdamW additionally shrinks the weight directly by learning rate times weight decay times the weight.">
+  <defs><marker id="dl5-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px" text-anchor="middle">
+    <rect x="8" y="88" width="84" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="50" y="109" style="fill:var(--ink);font-family:var(--mono)">gradient g</text><text x="50" y="127" style="fill:var(--muted)">from backprop</text>
+    <rect x="114" y="26" width="176" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="202" y="48" style="fill:var(--ink)">m ← β₁m + (1−β₁)g</text><text x="202" y="67" style="fill:var(--muted)">average of g (momentum)</text>
+    <rect x="114" y="146" width="176" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="202" y="168" style="fill:var(--ink)">v ← β₂v + (1−β₂)g²</text><text x="202" y="187" style="fill:var(--muted)">average of g² (size of g)</text>
+    <rect x="316" y="26" width="120" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="376" y="48" style="fill:var(--ink)">m̂ = m/(1−β₁ᵗ)</text><text x="376" y="67" style="fill:var(--muted)">bias-corrected</text>
+    <rect x="316" y="146" width="120" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="376" y="168" style="fill:var(--ink)">v̂ = v/(1−β₂ᵗ)</text><text x="376" y="187" style="fill:var(--muted)">bias-corrected</text>
+    <rect x="466" y="86" width="164" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/><text x="548" y="108" style="fill:var(--ink)">step = lr · m̂</text><text x="548" y="127" style="fill:var(--ink)">/ (√v̂ + ε)</text>
+    <rect x="440" y="8" width="190" height="26" rx="6" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/><text x="535" y="25" style="fill:var(--crit)">AdamW also: w ← w − lr·λ·w</text>
+    <text x="548" y="176" style="fill:var(--ink)">w ← w − step</text>
+    <g style="stroke:var(--ink-2);fill:none;stroke-width:1.5">
+      <path d="M 92 105 L 102 105 L 102 53 L 112 53" marker-end="url(#dl5-arrow)"/><path d="M 92 121 L 102 121 L 102 173 L 112 173" marker-end="url(#dl5-arrow)"/>
+      <line x1="290" y1="53" x2="314" y2="53" marker-end="url(#dl5-arrow)"/><line x1="290" y1="173" x2="314" y2="173" marker-end="url(#dl5-arrow)"/>
+      <path d="M 436 53 L 451 53 L 451 106 L 464 106" marker-end="url(#dl5-arrow)"/><path d="M 436 173 L 451 173 L 451 122 L 464 122" marker-end="url(#dl5-arrow)"/>
+      <path d="M 548 140 L 548 162" marker-end="url(#dl5-arrow)"/>
+    </g>
+  </g>
+</svg>
+<figcaption>Adam for one parameter. Two running averages of the gradient (its value and its square) are corrected for starting at zero and divided; the result is a step of about the learning rate whatever the size of the gradient. AdamW adds the dashed decay, applied straight to the weight, outside this pipeline.</figcaption>
+</figure>
+
+<h4>Three ideas, one sentence each</h4>
+<ul>
+<li><strong>Momentum:</strong> keep a decaying running sum of past gradients and move along it. With β = 0.9, four gradients of +1, −1, +1, −1 (a zig-zag) leave a small velocity because the signs cancel, while +1, +1, +1, +1 builds it towards 10 (which is 1/(1 − β)) — the optimiser speeds up where progress is consistent and damps oscillation where it is not.</li>
+<li><strong>Adaptive step sizes:</strong> divide each parameter's step by a running measure of how large its gradients have been, so tiny-gradient parameters are not left behind and huge-gradient ones do not overshoot.</li>
+<li><strong>Adam:</strong> momentum on the numerator, adaptive scaling on the denominator, plus a correction for the fact that both averages start at zero.</li>
+</ul>
+<h4>The price of remembering</h4>
+<p>Remembering is not free. Momentum stores one extra number for every weight, and Adam stores two. A model with 7 billion weights therefore carries 7 billion extra momentum values and 7 billion extra squared-gradient values, in 32-bit precision, next to the weights themselves. That bookkeeping, not the arithmetic, is why optimiser choice shows up in GPU memory budgets, and why techniques such as sharding the optimiser state across GPUs exist. The trade is usually worth it: the extra state buys much faster and more reliable convergence than plain SGD, especially for transformers.</p>
+<h4>The settings you choose</h4>
+<ul>
+<li><strong>Learning rate</strong> — the most important. Typical Adam values: 10⁻³ for small models, 3×10⁻⁴ or lower for transformers (lower for bigger ones), 10⁻⁵ to 5×10⁻⁵ for fine-tuning.</li>
+<li><strong>Weight decay</strong> — shrinks weights every step to regularise; 0.01–0.1 with AdamW.</li>
+<li><strong>Betas</strong> (Adam's two averaging rates) — 0.9 and 0.999 by default; 0.9 and 0.95 for most LLM training.</li>
+<li><strong>Schedule</strong> — warm up, then decay the learning rate (ml4).</li>
+</ul>
+</section>
+
+<section data-field="body">
+<h4>1. All optimisers in one frame</h4>
+<p>Write the update as <code>w ← w − lr · d</code>, where <code>d</code> is the <em>direction</em> built from the gradient history. The optimisers differ only in how they build <code>d</code> and what they store to do it.</p>
+<table>
+<thead><tr><th>Optimiser</th><th>Direction d</th><th>State per parameter</th></tr></thead>
+<tbody>
+<tr><td>SGD</td><td>g (current gradient)</td><td>none</td></tr>
+<tr><td>SGD + momentum</td><td>v, where v ← μv + g</td><td>1 (v)</td></tr>
+<tr><td>AdaGrad</td><td>g / √(Σ g²)</td><td>1 (sum of squares)</td></tr>
+<tr><td>RMSProp</td><td>g / √(EMA of g²)</td><td>1 (EMA of squares)</td></tr>
+<tr><td>Adam</td><td>m̂ / (√v̂ + ε)</td><td>2 (m and v)</td></tr>
+<tr><td>AdamW</td><td>the Adam direction, plus a direct decay lr·λ·w</td><td>2 (m and v)</td></tr>
+</tbody>
+</table>
+<p>EMA means <em>exponential moving average</em>, <code>new = β·old + (1 − β)·value</code>: recent values count most, and an average with β = 0.9 effectively remembers about the last 1/(1 − β) = 10 values, one with β = 0.999 the last 1,000.</p>
+
+<h4>2. SGD and momentum</h4>
+<p>Plain SGD with mini-batches is what ml4 developed: one global learning rate, noise from the mini-batch. It has two weaknesses. In a valley with steep walls and a shallow floor (an ill-conditioned loss), the learning rate must be small enough for the steep direction, so progress along the floor crawls. And every parameter shares one learning rate, although different parameters may deserve very different ones. Momentum addresses the first. PyTorch's form keeps a velocity buffer <code>v ← μ·v + g</code> and steps <code>w ← w − lr·v</code>, with μ = 0.9. On the quadratic loss <code>L = ½(w₁² + 100w₂²)</code>, whose curvatures are 1 and 100, plain SGD's largest stable learning rate is 2/100 = 0.02 (ml4), so w₁ shrinks by only 1 − 0.019 = 0.981 per step and it takes 246 steps to settle below a loss of 10⁻³. With momentum 0.9 and learning rate 0.015 the same problem settles in 107 steps in the lab: the oscillation in the steep direction cancels in the velocity and the shallow direction accumulates up to 1/(1 − μ) = 10 times its raw gradient. <strong>Nesterov momentum</strong> evaluates the gradient at the look-ahead point <code>w − lr·μ·v</code>, which corrects overshoot slightly earlier.</p>
+
+<h4>3. Adaptive step sizes: AdaGrad and RMSProp</h4>
+<p>Momentum still uses one learning rate for all parameters. In many models parameters differ enormously in gradient scale: in a language model an embedding row for a rare word gets a gradient only when that word appears, while a layer-norm scale gets a gradient every step; the last layer's gradients differ in size from the first layer's (dl3). A single learning rate cannot suit both. <strong>AdaGrad</strong> (Duchi et al., 2011) divides each parameter's step by the square root of the <em>sum of all its past squared gradients</em>: parameters with small or rare gradients get bigger steps. Its weakness is that the sum only grows, so every learning rate decays toward zero and training eventually stalls. <strong>RMSProp</strong> (Tieleman &amp; Hinton, 2012) fixes this by using an exponential moving average of the squared gradient instead of the sum, <code>v ← β v + (1 − β) g²</code>, and stepping by <code>g / (√v + ε)</code>: the denominator tracks the <em>recent</em> gradient size. The consequence worth internalising: after dividing by the RMS gradient, the step is about the size of the learning rate for <em>every</em> parameter, whatever its gradient's scale. A gradient of 100 and a gradient of 0.001 both lead to steps of about lr.</p>
+
+<h4>4. Adam: momentum plus scaling, with a correction</h4>
+<p>Kingma and Ba (2014) combined the two: keep <code>m</code>, an EMA of the gradient (momentum), and <code>v</code>, an EMA of the squared gradient (RMSProp), and step by <code>m/(√v + ε)</code>. Their only subtlety is a fix for the start of training. Both averages are initialised at zero, so early in training they are biased toward zero. After one step, <code>m = (1 − β₁)g = 0.1g</code> and <code>v = (1 − β₂)g² = 0.001g²</code>. In general after t steps <code>m</code> is missing a fraction β₁ᵗ of its weight on the (imaginary) initial zero, so the corrected estimates divide by what has accumulated:</p>
+<pre>m_t = β₁ m_{t−1} + (1 − β₁) g_t                 β₁ = 0.9
+v_t = β₂ v_{t−1} + (1 − β₂) g_t²                β₂ = 0.999
+m̂_t = m_t / (1 − β₁ᵗ)        v̂_t = v_t / (1 − β₂ᵗ)      (bias correction)
+w_t = w_{t−1} − lr · m̂_t / ( √v̂_t + ε )         ε = 10⁻⁸</pre>
+<p><strong>One full Adam update, by hand.</strong> Two parameters A and B, both starting at w = 1, learning rate 0.1. A always has gradient 100; B has gradient 0.001, then −0.001, then +0.001 (a noisy sign). Step 1: for A, m = 0.1 × 100 = 10 and v = 0.001 × 10,000 = 10; correction divides by 1 − 0.9 = 0.1 and 1 − 0.999 = 0.001, so m̂ = 100 and v̂ = 10,000, √v̂ = 100; the step is 0.1 × 100/100 = <strong>0.1</strong>. For B: m = 0.0001, v = 10⁻⁹, m̂ = 0.001, v̂ = 10⁻⁶, √v̂ = 0.001; the step is 0.1 × 0.001/0.001 = <strong>0.1</strong>. Two gradients differing by a factor of 100,000 produce identical steps. Continuing:</p>
+<table>
+<thead><tr><th>t</th><th>g_A</th><th>m̂_A</th><th>√v̂_A</th><th>step_A</th><th>w_A</th><th>g_B</th><th>m̂_B</th><th>√v̂_B</th><th>step_B</th><th>w_B</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>100</td><td>100</td><td>100</td><td>0.1000</td><td>0.9000</td><td>0.001</td><td>0.001</td><td>0.001</td><td>0.1000</td><td>0.9000</td></tr>
+<tr><td>2</td><td>100</td><td>100</td><td>100</td><td>0.1000</td><td>0.8000</td><td>−0.001</td><td>−5.3×10⁻⁵</td><td>0.001</td><td>−0.0053</td><td>0.9053</td></tr>
+<tr><td>3</td><td>100</td><td>100</td><td>100</td><td>0.1000</td><td>0.7000</td><td>0.001</td><td>3.4×10⁻⁴</td><td>0.001</td><td>0.0336</td><td>0.8717</td></tr>
+</tbody>
+</table>
+<p>A, whose gradient is consistent, moves 0.1 every step: the step size is the learning rate, independent of the gradient's magnitude. B, whose gradient flips sign, moves 0.1 on the first step (Adam has no history to doubt it), then only −0.005 and +0.034 as the momentum average m̂ shrinks toward zero while √v̂ stays put — the disagreement between consecutive gradients damps its steps. (The lab and PyTorch's <code>torch.optim.Adam</code> reproduce these numbers.) The two behaviours are the whole personality of Adam: <strong>steps of about lr where gradients are consistent, much smaller steps where they are noisy</strong>.</p>
+<p><strong>Why the correction matters, in numbers.</strong> Without it, step 1 for parameter A would use m = 10 and √v = √10 = 3.16, giving 0.1 × 10/3.16 = 0.316: <em>three times larger</em> than intended. The reason is that with the defaults v starts out more biased (a factor 0.001) than m (a factor 0.1), so the ratio is too large by (1 − β₁)/√(1 − β₂) = 0.1/0.0316 = 3.16. Kingma and Ba show that without bias correction and with β₂ near 1, training is unstable in the first epochs; RMSProp, which has no correction, suffers from exactly this. (The intuition "the estimates start too small, so steps are too small" holds for each average separately but not for their ratio.)</p>
+<figure>
+<svg viewBox="0 0 640 296" width="100%" role="img" aria-label="Loss versus step on the ill-conditioned quadratic L = 0.5(w1 squared + 100 w2 squared), log scale. SGD at the largest stable learning rate falls slowly; momentum and Adam fall much faster, reaching 1e-3 in about a hundred steps.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="70" y1="220" x2="590" y2="220" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="224" text-anchor="end" style="fill:var(--muted);font-size:11px">1e-8</text><line x1="70" y1="182" x2="590" y2="182" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="186" text-anchor="end" style="fill:var(--muted);font-size:11px">1e-6</text><line x1="70" y1="144" x2="590" y2="144" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="148" text-anchor="end" style="fill:var(--muted);font-size:11px">1e-4</text><line x1="70" y1="106" x2="590" y2="106" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="110" text-anchor="end" style="fill:var(--muted);font-size:11px">1e-2</text><line x1="70" y1="68" x2="590" y2="68" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="72" text-anchor="end" style="fill:var(--muted);font-size:11px">1e0</text><line x1="70" y1="30" x2="590" y2="30" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="34" text-anchor="end" style="fill:var(--muted);font-size:11px">1e2</text>
+    <line x1="70" y1="30" x2="70" y2="220" style="stroke:var(--line-2);fill:none"/>
+    <polyline points="70.0,33.9 72.6,35.3 75.2,36.7 77.8,38.0 80.4,39.3 83.0,40.6 85.6,41.8 88.2,42.9 90.8,43.9 93.4,44.9 96.0,45.9 98.6,46.8 101.2,47.6 103.8,48.3 106.4,49.1 109.0,49.7 111.6,50.4 114.2,50.9 116.8,51.5 119.4,52.0 122.0,52.5 124.6,53.0 127.2,53.4 129.8,53.8 132.4,54.2 135.0,54.6 137.6,55.0 140.2,55.4 142.8,55.8 145.4,56.1 148.0,56.5 150.6,56.8 153.2,57.2 155.8,57.5 158.4,57.8 161.0,58.2 163.6,58.5 166.2,58.8 168.8,59.1 171.4,59.5 174.0,59.8 176.6,60.1 179.2,60.4 181.8,60.8 184.4,61.1 187.0,61.4 189.6,61.7 192.2,62.0 194.8,62.3 197.4,62.7 200.0,63.0 202.6,63.3 205.2,63.6 207.8,63.9 210.4,64.3 213.0,64.6 215.6,64.9 218.2,65.2 220.8,65.5 223.4,65.8 226.0,66.2 228.6,66.5 231.2,66.8 233.8,67.1 236.4,67.4 239.0,67.7 241.6,68.1 244.2,68.4 246.8,68.7 249.4,69.0 252.0,69.3 254.6,69.6 257.2,70.0 259.8,70.3 262.4,70.6 265.0,70.9 267.6,71.2 270.2,71.5 272.8,71.9 275.4,72.2 278.0,72.5 280.6,72.8 283.2,73.1 285.8,73.4 288.4,73.8 291.0,74.1 293.6,74.4 296.2,74.7 298.8,75.0 301.4,75.3 304.0,75.7 306.6,76.0 309.2,76.3 311.8,76.6 314.4,76.9 317.0,77.2 319.6,77.6 322.2,77.9 324.8,78.2 327.4,78.5 330.0,78.8 332.6,79.1 335.2,79.4 337.8,79.8 340.4,80.1 343.0,80.4 345.6,80.7 348.2,81.0 350.8,81.3 353.4,81.7 356.0,82.0 358.6,82.3 361.2,82.6 363.8,82.9 366.4,83.2 369.0,83.6 371.6,83.9 374.2,84.2 376.8,84.5 379.4,84.8 382.0,85.1 384.6,85.5 387.2,85.8 389.8,86.1 392.4,86.4 395.0,86.7 397.6,87.0 400.2,87.4 402.8,87.7 405.4,88.0 408.0,88.3 410.6,88.6 413.2,88.9 415.8,89.3 418.4,89.6 421.0,89.9 423.6,90.2 426.2,90.5 428.8,90.8 431.4,91.2 434.0,91.5 436.6,91.8 439.2,92.1 441.8,92.4 444.4,92.7 447.0,93.1 449.6,93.4 452.2,93.7 454.8,94.0 457.4,94.3 460.0,94.6 462.6,95.0 465.2,95.3 467.8,95.6 470.4,95.9 473.0,96.2 475.6,96.5 478.2,96.9 480.8,97.2 483.4,97.5 486.0,97.8 488.6,98.1 491.2,98.4 493.8,98.8 496.4,99.1 499.0,99.4 501.6,99.7 504.2,100.0 506.8,100.3 509.4,100.7 512.0,101.0 514.6,101.3 517.2,101.6 519.8,101.9 522.4,102.2 525.0,102.6 527.6,102.9 530.2,103.2 532.8,103.5 535.4,103.8 538.0,104.1 540.6,104.5 543.2,104.8 545.8,105.1 548.4,105.4 551.0,105.7 553.6,106.0 556.2,106.4 558.8,106.7 561.4,107.0 564.0,107.3 566.6,107.6 569.2,107.9 571.8,108.3 574.4,108.6 577.0,108.9 579.6,109.2 582.2,109.5 584.8,109.8 587.4,110.2 590.0,110.5" style="stroke:var(--s2);stroke-width:2.2;fill:none"/><polyline points="70.0,33.9 72.6,41.6 75.2,32.7 77.8,48.6 80.4,34.4 83.0,45.3 85.6,38.8 88.2,40.9 90.8,46.9 93.4,39.6 96.0,59.4 98.6,41.1 101.2,57.5 103.8,45.5 106.4,50.0 109.0,54.2 111.6,47.2 114.2,75.4 116.8,47.6 119.4,70.5 122.0,51.0 124.6,57.3 127.2,57.6 129.8,53.2 132.4,68.0 135.0,52.9 137.6,69.7 140.2,55.3 142.8,62.5 145.4,60.6 148.0,58.9 150.6,68.9 153.2,58.6 155.8,74.9 158.4,60.9 161.0,70.5 163.6,66.3 166.2,66.6 168.8,76.2 171.4,65.8 174.0,92.4 176.6,67.8 179.2,82.6 181.8,72.9 184.4,75.0 187.0,82.9 189.6,72.7 192.2,104.4 194.8,73.6 197.4,90.1 200.0,77.4 202.6,81.1 205.2,84.4 207.8,78.2 210.4,93.4 213.0,78.6 215.6,92.7 218.2,81.7 220.8,87.0 223.4,87.8 226.0,84.4 228.6,97.1 231.2,84.7 233.8,101.7 236.4,87.8 239.0,95.9 241.6,94.3 244.2,92.3 246.8,106.9 249.4,91.9 252.0,126.5 254.6,94.4 257.2,106.4 259.8,100.2 262.4,99.8 265.0,110.9 267.6,98.1 270.2,123.2 272.8,99.6 275.4,111.6 278.0,103.8 280.6,105.4 283.2,111.1 285.8,103.5 288.4,119.0 291.0,104.6 293.6,116.8 296.2,108.5 298.8,112.0 301.4,115.6 304.0,110.2 306.6,126.6 309.2,111.2 311.8,128.5 314.4,115.0 317.0,121.3 319.6,122.6 322.2,118.0 324.8,139.5 327.4,118.1 330.0,147.7 332.6,121.0 335.2,129.8 337.8,127.2 340.4,124.5 343.0,137.9 345.6,123.6 348.2,143.1 350.8,125.6 353.4,134.6 356.0,130.4 358.6,130.1 361.2,138.2 363.8,129.1 366.4,145.1 369.0,131.0 371.6,141.7 374.2,135.6 376.8,137.5 379.4,144.2 382.0,136.2 384.6,158.0 387.2,137.8 389.8,154.5 392.4,142.3 395.0,146.4 397.6,151.2 400.2,143.6 402.8,172.8 405.4,144.1 408.0,165.1 410.6,147.5 413.2,153.2 415.8,154.1 418.4,149.4 421.0,163.8 423.6,149.2 426.2,165.1 428.8,151.8 431.4,158.6 434.0,157.3 436.6,155.3 439.2,165.8 441.8,155.1 444.4,171.8 447.0,157.6 449.6,167.1 452.2,163.3 454.8,163.1 457.4,173.8 460.0,162.4 462.6,192.6 465.2,164.4 467.8,179.0 470.4,169.6 473.0,171.3 475.6,179.7 478.2,169.0 480.8,197.6 483.4,170.0 486.0,185.2 488.6,173.8 491.2,177.1 493.8,180.8 496.4,174.5 499.0,189.4 501.6,175.0 504.2,188.6 506.8,178.3 509.4,183.3 512.0,184.6 514.6,180.9 517.2,194.4 519.8,181.4 522.4,198.9 525.0,184.6 527.6,192.5 530.2,191.3 532.8,188.9 535.4,204.9 538.0,188.5 540.6,220.0 543.2,191.1 545.8,202.4 548.4,196.8 551.0,196.0 553.6,207.3 556.2,194.4 558.8,217.0 561.4,196.0 564.0,207.2 566.6,200.3 569.2,201.5 571.8,207.6 574.4,199.9 577.0,215.4 579.6,201.2 582.2,213.1 584.8,205.2 587.4,208.5 590.0,212.6" style="stroke:var(--s3);stroke-width:2.2;fill:none"/><polyline points="70.0,33.9 72.6,38.5 75.2,44.2 77.8,49.6 80.4,51.0 83.0,48.5 85.6,46.1 88.2,45.2 90.8,45.6 93.4,47.3 96.0,50.3 98.6,54.8 101.2,61.2 103.8,68.6 106.4,69.3 109.0,63.8 111.6,59.6 114.2,57.4 116.8,56.9 119.4,57.7 122.0,60.1 124.6,64.1 127.2,70.6 129.8,80.0 132.4,82.2 135.0,73.9 137.6,68.2 140.2,65.1 142.8,63.8 145.4,64.0 148.0,65.4 150.6,68.1 153.2,72.1 155.8,76.3 158.4,78.3 161.0,76.6 163.6,73.8 166.2,72.0 168.8,71.5 171.4,72.4 174.0,74.8 176.6,79.2 179.2,86.2 181.8,96.6 184.4,96.8 187.0,88.5 189.6,83.6 192.2,81.5 194.8,81.5 197.4,83.4 200.0,87.4 202.6,94.1 205.2,101.7 207.8,99.1 210.4,92.5 213.0,88.4 215.6,86.7 218.2,86.8 220.8,88.6 223.4,92.1 226.0,97.1 228.6,101.1 231.2,100.2 233.8,96.9 236.4,94.7 239.0,94.3 241.6,95.7 244.2,99.4 246.8,106.5 249.4,120.3 252.0,125.2 254.6,111.0 257.2,105.0 259.8,102.7 262.4,103.1 265.0,105.7 267.6,110.8 270.2,117.7 272.8,118.5 275.4,113.0 278.0,108.9 280.6,107.2 283.2,107.6 285.8,110.1 288.4,114.7 291.0,120.7 293.6,123.2 296.2,119.6 298.8,116.3 301.4,115.1 304.0,116.4 306.6,120.4 309.2,128.7 311.8,151.2 314.4,141.5 317.0,128.2 319.6,123.2 322.2,122.0 324.8,123.4 327.4,127.3 330.0,133.3 332.6,136.4 335.2,132.4 337.8,128.3 340.4,126.5 343.0,127.1 345.6,130.1 348.2,135.8 350.8,143.4 353.4,144.0 356.0,138.5 358.6,135.3 361.2,135.0 363.8,137.7 366.4,144.3 369.0,159.1 371.6,162.5 374.2,147.4 376.8,141.7 379.4,140.1 382.0,141.3 384.6,145.2 387.2,150.9 389.8,153.5 392.4,149.6 395.0,146.2 397.6,145.1 400.2,146.7 402.8,151.2 405.4,159.7 408.0,168.2 410.6,161.0 413.2,155.2 415.8,153.3 418.4,154.9 421.0,160.0 423.6,170.6 426.2,175.7 428.8,164.6 431.4,159.0 434.0,157.4 436.6,158.7 439.2,162.8 441.8,168.8 444.4,170.9 447.0,166.8 449.6,163.8 452.2,163.5 454.8,166.2 457.4,172.9 460.0,187.1 462.6,187.5 465.2,175.7 467.8,171.3 470.4,171.1 473.0,174.4 475.6,181.7 478.2,188.7 480.8,182.2 483.4,176.3 486.0,174.2 488.6,175.2 491.2,179.2 493.8,185.8 496.4,189.2 499.0,184.9 501.6,181.5 504.2,181.3 506.8,184.5 509.4,192.9 512.0,218.8 514.6,202.0 517.2,190.8 519.8,187.3 522.4,188.0 525.0,192.1 527.6,199.2 530.2,200.8 532.8,194.9 535.4,191.3 538.0,191.0 540.6,193.9 543.2,200.2 545.8,208.0 548.4,205.1 551.0,199.8 553.6,198.2 556.2,200.4 558.8,207.5 561.4,220.0 564.0,219.7 566.6,207.2 569.2,203.2 571.8,203.4 574.4,207.1 577.0,213.6 579.6,215.6 582.2,210.6 584.8,207.5 587.4,207.6 590.0,211.2" style="stroke:var(--s1);stroke-width:2.2;fill:none"/><text x="70" y="240" text-anchor="middle" style="fill:var(--muted);font-size:11px">0</text><text x="200" y="240" text-anchor="middle" style="fill:var(--muted);font-size:11px">50</text><text x="330" y="240" text-anchor="middle" style="fill:var(--muted);font-size:11px">100</text><text x="460" y="240" text-anchor="middle" style="fill:var(--muted);font-size:11px">150</text><text x="590" y="240" text-anchor="middle" style="fill:var(--muted);font-size:11px">200</text><line x1="80" y1="279" x2="100" y2="279" style="stroke:var(--s2);stroke-width:2.5;fill:none"/><text x="106" y="283" style="fill:var(--ink-2);font-size:11px">SGD, lr 0.019 (largest stable)</text><line x1="280" y1="279" x2="300" y2="279" style="stroke:var(--s3);stroke-width:2.5;fill:none"/><text x="306" y="283" style="fill:var(--ink-2);font-size:11px">SGD + momentum 0.9, lr 0.015</text><line x1="480" y1="279" x2="500" y2="279" style="stroke:var(--s1);stroke-width:2.5;fill:none"/><text x="506" y="283" style="fill:var(--ink-2);font-size:11px">Adam, lr 0.3</text>
+    <text x="330" y="256" text-anchor="middle" style="fill:var(--ink-2)">optimiser step</text>
+  </g>
+</svg>
+<figcaption>Loss versus step on the badly conditioned quadratic L = ½(w₁² + 100w₂²) (log scale). SGD at its largest stable rate loses a factor of 0.981 per step; momentum and Adam settle below 10⁻³ in about a hundred steps (107 and 99 in the lab). The jaggedness is the oscillation across the steep direction.</figcaption>
+</figure>
+<p><strong>Step size and signal-to-noise.</strong> A useful reading of Adam's update: if the gradient of one parameter has mean μ and standard deviation σ (from mini-batch noise), then <code>m̂ ≈ μ</code> and <code>√v̂ ≈ √(μ² + σ²)</code>, so the step is about <code>lr · μ/√(μ² + σ²)</code>. If the gradient is consistent (σ ≪ μ) the step is ±lr; if it is mostly noise (σ ≫ μ) the step shrinks toward zero. Kingma and Ba note this gives "a form of automatic annealing": as training converges and the true gradient μ shrinks relative to noise, steps shrink on their own. They also derive that the step is bounded: |step| ≤ lr in the ordinary case, a trust region around the current weight. The consequence for tuning is that lr in Adam is a <em>distance per step per parameter</em>, not something multiplied by a gradient — which is why Adam is insensitive to the scale of the loss: multiplying the loss by 1,000 leaves Adam's trajectory unchanged, while plain SGD at the same learning rate diverges in two steps (lab).</p>
+
+<h4>5. Weight decay: L2 versus decoupled</h4>
+<p><strong>Weight decay</strong> means shrinking each weight a little every step, <code>w ← w − lr·λ·w</code>, which pulls weights toward zero and regularises the model (ml3). For plain SGD this is the same as adding the penalty <code>(λ/2)‖w‖²</code> to the loss: the penalty's gradient is <code>λw</code>, and the SGD step on it is exactly <code>−lr·λ·w</code>. Because the two are identical for SGD, libraries and papers long used the terms interchangeably. Under Adam they are not.</p>
+<p>If the L2 term is put in the loss, its gradient <code>λw</code> is added to <code>g</code> <em>before</em> Adam's machinery, so it is divided by <code>√v̂</code> along with everything else: the decay applied to a parameter is roughly <code>lr·λ·w/√v̂</code>. Loshchilov and Hutter (2017) pointed out the consequence: weights with large gradients (large √v̂) are decayed <em>less</em>, and weights with tiny gradients are decayed <em>more</em> — the reverse of what one wants, since the large-gradient weights are usually the important ones. With numbers, lr = 10⁻³, λ = 0.01 and w = 1 for two parameters, A with typical gradient size 10 and B with 0.01:</p>
+<table>
+<thead><tr><th></th><th>gradient scale</th><th>Adam + L2 shrink per step</th><th>AdamW shrink per step</th></tr></thead>
+<tbody>
+<tr><td>A</td><td>10</td><td>≈ 10⁻³ × 0.01 / 10 = 10⁻⁶</td><td>10⁻³ × 0.01 × 1 = 10⁻⁵</td></tr>
+<tr><td>B</td><td>0.01</td><td>≈ 10⁻³ × 0.01 / 0.01 = 10⁻³ (7×10⁻⁴ measured)</td><td>10⁻⁵</td></tr>
+</tbody>
+</table>
+<p>B is decayed about 700 to 1,000 times harder than A under Adam + L2, and identically under AdamW. The lab measures these numbers with simulated noisy gradients (1.0×10⁻⁶ and 7.05×10⁻⁴ against 1.0×10⁻⁵ for both). <strong>AdamW</strong> therefore applies the decay directly to the weight, outside the adaptive step: <code>w ← w − lr·(m̂/(√v̂ + ε)) − lr·λ·w</code> (in PyTorch, <code>w ← w(1 − lr·λ)</code> then the Adam update). Loshchilov and Hutter report two effects: it decouples the best weight decay from the best learning rate (the two hyperparameters can be tuned nearly independently), and it "substantially improves Adam's generalization performance", with a 15% relative improvement in test error on CIFAR-10 and ImageNet32x32 and the ability to compete with SGD with momentum on image classification. Practical rules: use AdamW, not Adam, for transformers; apply decay to weight matrices but not to biases and normalisation scales (dl4); LLM values are around 0.1 (LLaMA; Llama 3 sets the decay at each step to 0.1 times that step's learning rate, so it follows the schedule).</p>
+
+<h4>6. Adam versus SGD: what the evidence says</h4>
+<p>It is not settled that one dominates. On the side of SGD: Wilson et al. (2017) built a simple problem where SGD generalises perfectly while AdaGrad, RMSProp and Adam reach test error "arbitrarily close to half", and found in experiments that adaptive methods often reach better training loss but worse test accuracy than tuned SGD on several models. On the side of Adam: for transformers, SGD performs much worse. Zhang et al. (2024) explain this with a Hessian analysis: transformers are <em>heterogeneous</em>, meaning the curvature (Hessian spectrum) differs dramatically between parameter blocks such as embeddings, attention matrices and MLP layers, so one global learning rate cannot suit all blocks, while Adam's coordinate-wise rates can; on problems without such heterogeneity SGD matches Adam. AdamW then closed much of the generalisation gap on vision tasks. A defensible rule of thumb: <strong>transformers and NLP → AdamW; CNNs where the best final accuracy matters and you can tune a schedule → SGD with momentum is still competitive; when unsure → AdamW, which is more forgiving of learning rates and scales</strong>.</p>
+
+<h4>7. Hyperparameters in practice</h4>
+<ul>
+<li><strong>Learning rate.</strong> Sets stability and quality. Recipes lower the peak as models grow: LLaMA used 3.0×10⁻⁴ for 7B and 1.5×10⁻⁴ for 65B; Llama 3 uses 3×10⁻⁴, 1.5×10⁻⁴ and 8×10⁻⁵ for 8B, 70B and 405B. Always with warmup (ml4).</li>
+<li><strong>β₁ = 0.9.</strong> Rarely changed.</li>
+<li><strong>β₂ = 0.95 versus 0.999.</strong> β₂ sets how long v remembers. At 0.999 it averages over about 1,000 steps and reacts slowly when gradients suddenly grow (a bad batch, a shift in the data), so steps can be far too large for a while: loss spikes. At 0.95 it averages over about 20 steps and tracks recent gradient size closely. LLaMA and most LLM recipes use 0.95. PaLM used a schedule β₂ = 1 − k^(−0.8) (about 0.84 at step 10, 0.99 at step ≈ 300 and 0.999 at step ≈ 10⁴), reporting it "more stable than the standard β₂ = 0.99" because rare embedding tokens can have poorly estimated second moments over short windows.</li>
+<li><strong>ε = 10⁻⁸.</strong> It bounds the step when √v̂ is tiny: a parameter whose gradient is far smaller than ε cannot get a full-sized step. Larger values (10⁻⁶ or more) are sometimes used for stability in low precision.</li>
+<li><strong>Weight decay.</strong> 0.1 for LLM pretraining, 0.01–0.05 for fine-tuning; 0 for biases and norm parameters.</li>
+<li><strong>Gradient clipping.</strong> Global norm 1.0 in nearly every LLM recipe (dl3).</li>
+<li><strong>Batch size.</strong> A larger batch lowers gradient noise so a higher learning rate is safe. For SGD the linear scaling rule holds up to a limit (ml4); for Adam, a square-root scaling is a common starting point. Always re-tune the learning rate and warmup when the batch size changes.</li>
+</ul>
+<p>A concrete recipe (LLaMA, Touvron et al., 2023): AdamW with β₁ = 0.9, β₂ = 0.95; cosine schedule with the final learning rate 10% of the peak; weight decay 0.1; gradient clipping 1.0; 2,000 warmup steps; peak 3.0×10⁻⁴ for 7B, batches of 4M tokens. Llama 3 405B: peak 8×10⁻⁵, linear warmup over 8,000 steps, cosine decay to 8×10⁻⁷ over 1.2 million steps, and batch size raised from 4M tokens to 8M and later to 16M ("we use a lower batch size early in training to improve training stability"), with few loss spikes.</p>
+
+<h4>8. What each optimiser costs in memory</h4>
+<p>Training state per parameter in mixed precision (gpu3): 2 bytes bf16 weights, 2 bytes bf16 gradients, 4 bytes fp32 master weights, and the optimiser's own state. Adam adds two fp32 numbers, m and v: <strong>2 + 2 + 4 + 4 + 4 = 16 bytes per parameter</strong>. For a 7B model: 14 GB of weights, 14 GB of gradients, 28 GB of master weights, 28 GB for m, 28 GB for v — <strong>112 GB</strong>, before activations, which exceeds one 80 GB GPU. Options in the same accounting:</p>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Bytes of memory per parameter for mixed-precision training with different optimisers: SGD with momentum 12, Adam 16, 8-bit Adam 10, Lion or Muon 12, Adafactor about 8.5.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="10" width="12" height="12" rx="2" style="fill:var(--s1)"/><text x="38" y="21" style="fill:var(--ink-2);font-size:11px">bf16 weights</text><rect x="170" y="10" width="12" height="12" rx="2" style="fill:var(--s3)"/><text x="188" y="21" style="fill:var(--ink-2);font-size:11px">bf16 gradients</text><rect x="320" y="10" width="12" height="12" rx="2" style="fill:var(--s4)"/><text x="338" y="21" style="fill:var(--ink-2);font-size:11px">fp32 master weights</text><rect x="470" y="10" width="12" height="12" rx="2" style="fill:var(--s2)"/><text x="488" y="21" style="fill:var(--ink-2);font-size:11px">optimiser state</text>
+    <text x="162" y="51" text-anchor="end" style="fill:var(--ink)">SGD + momentum</text> <rect x="170" y="34" width="46" height="26" rx="3" style="fill:var(--s1)"/> <rect x="218" y="34" width="46" height="26" rx="3" style="fill:var(--s3)"/> <rect x="266" y="34" width="94" height="26" rx="3" style="fill:var(--s4)"/> <rect x="362" y="34" width="94" height="26" rx="3" style="fill:var(--s2)"/> <text x="464" y="52" style="fill:var(--ink);font-family:var(--mono)">12 B</text> <text x="162" y="91" text-anchor="end" style="fill:var(--ink)">Adam / AdamW</text> <rect x="170" y="74" width="46" height="26" rx="3" style="fill:var(--s1)"/> <rect x="218" y="74" width="46" height="26" rx="3" style="fill:var(--s3)"/> <rect x="266" y="74" width="94" height="26" rx="3" style="fill:var(--s4)"/> <rect x="362" y="74" width="190" height="26" rx="3" style="fill:var(--s2)"/> <text x="560" y="92" style="fill:var(--ink);font-family:var(--mono)">16 B</text> <text x="162" y="131" text-anchor="end" style="fill:var(--ink)">8-bit Adam</text> <rect x="170" y="114" width="46" height="26" rx="3" style="fill:var(--s1)"/> <rect x="218" y="114" width="46" height="26" rx="3" style="fill:var(--s3)"/> <rect x="266" y="114" width="94" height="26" rx="3" style="fill:var(--s4)"/> <rect x="362" y="114" width="46" height="26" rx="3" style="fill:var(--s2)"/> <text x="416" y="132" style="fill:var(--ink);font-family:var(--mono)">10 B</text> <text x="162" y="171" text-anchor="end" style="fill:var(--ink)">Lion / Muon*</text> <rect x="170" y="154" width="46" height="26" rx="3" style="fill:var(--s1)"/> <rect x="218" y="154" width="46" height="26" rx="3" style="fill:var(--s3)"/> <rect x="266" y="154" width="94" height="26" rx="3" style="fill:var(--s4)"/> <rect x="362" y="154" width="94" height="26" rx="3" style="fill:var(--s2)"/> <text x="464" y="172" style="fill:var(--ink);font-family:var(--mono)">12 B</text> <text x="162" y="211" text-anchor="end" style="fill:var(--ink)">Adafactor**</text> <rect x="170" y="194" width="46" height="26" rx="3" style="fill:var(--s1)"/> <rect x="218" y="194" width="46" height="26" rx="3" style="fill:var(--s3)"/> <rect x="266" y="194" width="94" height="26" rx="3" style="fill:var(--s4)"/> <rect x="362" y="194" width="10" height="26" rx="3" style="fill:var(--s2)"/> <text x="380.0" y="212" style="fill:var(--ink);font-family:var(--mono)">8.5 B</text>
+    <text x="20" y="236" style="fill:var(--muted);font-size:11px">* one momentum buffer for matrix weights; Adam still handles embeddings and norms.</text>
+    <text x="20" y="252" style="fill:var(--muted);font-size:11px">** factored second moment, no first moment: about half a byte per parameter or less.</text>
+  </g>
+</svg>
+<figcaption>Bytes of GPU memory per parameter for mixed-precision training. The optimiser state and master weights (orange and yellow) are 12 of Adam's 16 bytes; halving the moments (8-bit Adam) or dropping one of them (Lion, Muon) or factoring v (Adafactor) attacks the orange bar.</figcaption>
+</figure>
+<ul>
+<li><strong>ZeRO / FSDP</strong> (gpu9) shards the 12 optimiser-side bytes (and optionally gradients and weights) across data-parallel GPUs; Adam's update is elementwise, so each GPU updates its own slice and the result is exact.</li>
+<li><strong>8-bit optimisers</strong> (Dettmers et al., 2022) store m and v in 8 bits with block-wise dynamic quantisation, cutting the moments from 8 to 2 bytes per parameter (a 75% reduction of optimiser state) with 32-bit-quality results on tasks including 1.5B-parameter language modelling.</li>
+<li><strong>Adafactor</strong> (Shazeer &amp; Stern, 2018) replaces the full second-moment matrix of an n×m weight with row and column statistics, O(n + m) numbers instead of O(nm), and can drop the first moment; used for T5 and for PaLM.</li>
+<li><strong>Lion</strong> stores one momentum buffer; <strong>Muon</strong> stores one momentum buffer per matrix; SGD with momentum stores one.</li>
+<li><strong>LoRA</strong> (dl11) trains small adapter matrices so only they have gradients and optimiser state.</li>
+</ul>
+<p><strong>Precision, and why the master copy exists.</strong> An Adam step is of order lr — 3×10⁻⁴, say — but a bfloat16 number has 8 bits of precision, so near 1.0 the spacing between neighbouring representable values is 2⁻⁷ = 0.0078. An update smaller than half the spacing is rounded away. The lab emulates bfloat16: applying 1,000 updates of +3×10⁻⁴ to a bf16 weight of 1.0 leaves it at exactly 1.0, while an fp32 copy correctly reaches 1.3. So the optimiser keeps float32 master weights and float32 moments, updates those, and casts the result down for the forward and backward passes (gpu4). (For the same reason ε = 10⁻⁸ must not live in float16: its smallest positive number is about 6×10⁻⁸, so ε would flush to zero.) The step itself is memory-bound: for 7B parameters an unsharded update reads and writes roughly 28 bytes per parameter, 196 GB, which at H100 memory bandwidth (3.35 TB/s) is about 60 ms per step, one reason PyTorch offers fused (<code>fused=True</code>) optimiser kernels.</p>
+
+<h4>9. Using them in code</h4>
+<pre># Decay weight matrices, but not biases or normalisation scales (1-D parameters)
+decay    = [p for p in model.parameters() if p.requires_grad and p.ndim &gt;= 2]
+no_decay = [p for p in model.parameters() if p.requires_grad and p.ndim &lt; 2]
+opt = torch.optim.AdamW([{"params": decay,    "weight_decay": 0.1},
+                         {"params": no_decay, "weight_decay": 0.0}],
+                        lr=3e-4, betas=(0.9, 0.95), eps=1e-8, fused=True)
+
+def lr_at(step, warmup=2000, total=100_000, peak=3e-4, floor=0.1):
+    if step &lt; warmup: return peak * step / warmup                            # linear warmup
+    t = (step - warmup) / (total - warmup)
+    return peak * (floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * t)))  # cosine to 10%
+
+for step, batch in enumerate(loader):
+    for g in opt.param_groups: g["lr"] = lr_at(step)
+    loss = model(batch).loss; loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step(); opt.zero_grad(set_to_none=True)</pre>
+<p>Two habits: save the <em>optimiser state</em> in every checkpoint (m, v and the step counter; restarting with empty moments makes the first steps huge), and log the update-to-weight ratio <code>lr·‖update‖/‖w‖</code> per layer (about 10⁻³ is typical; dl3).</p>
+
+<h4>10. Beyond Adam: what the newer optimisers change</h4>
+<ul>
+<li><strong>LARS / LAMB</strong> (You et al.) add a layer-wise <em>trust ratio</em>, scaling each layer's update by ‖weights‖/‖update‖, so layers with small weights are not blown away by a large-batch step. LAMB trained BERT with batches of about 32,000 and reduced training time "from 3 days to just 76 minutes" on a TPU pod.</li>
+<li><strong>Lion</strong> (Chen et al., 2023) was found by program search: step along the <em>sign</em> of an interpolated momentum, so every parameter's update has the same magnitude; it stores only one moment ("more memory-efficient than Adam") and the authors report up to 2% higher ImageNet accuracy for ViT and up to 5× less pre-training compute on JFT.</li>
+<li><strong>Shampoo / SOAP</strong> keep a Kronecker-factored preconditioner per matrix (an approximation to curvature), the second-order end of the spectrum.</li>
+<li><strong>Muon</strong> orthogonalises the momentum of each 2-D weight matrix (a matrix-shaped analogue of Adam's normalisation) and uses Adam for embeddings, norms and the output head. The Moonshot report "Muon is Scalable for LLM Training" adds weight decay and a per-matrix update-scale correction, finds about 2× compute efficiency over AdamW, and trains a 16B-parameter mixture-of-experts model on 5.7 trillion tokens.</li>
+</ul>
+<p>AdamW remains the default baseline; a new optimiser has to beat a <em>tuned</em> AdamW at equal compute to justify its complexity and its extra implementation risk in distributed settings.</p>
+</section>
+
+<section data-field="deep">
+<h4>Adam as sign descent, and the geometry of its steps</h4>
+<p>When a parameter's gradient is constant, Adam's update is exactly <code>lr · sign(g)</code> (m̂ = g and √v̂ = |g|), and for noisy gradients it interpolates between sign descent and a normalised SGD step. Balles and Hennig (2018) made this explicit: the sign of the gradient carries the direction, and the variance-based scaling decides how much to trust it. This explains several practical facts. Adam's updates have nearly the same size for every parameter (an RMS of at most about lr, usually somewhat less because β₁ &lt; β₂ and ε &gt; 0), so <strong>the update RMS is a controlled quantity</strong>: a weight matrix with n parameters moves by about lr·√n per step regardless of the size of its gradient. Optimisers that change the geometry — Lion (exact sign), Muon (orthogonalised matrix step) — are best understood by what update norm they produce. The Muon report notes that AdamW keeps an update RMS of roughly a constant, while Muon's raw update RMS is 1/√max(A, B) for an A×B matrix, so they rescale it to match AdamW's: only then can the same learning rate and weight decay be reused, which they describe as making Muon work "out-of-the-box" at scale.</p>
+
+<h4>Adam as an approximation of second-order preconditioning</h4>
+<p>Newton-style methods scale the gradient by the inverse curvature. Adam's <code>1/√v</code>, with <code>v ≈ E[g²]</code>, is a diagonal approximation: E[g²] is the diagonal of the empirical Fisher information matrix, which approximates the Gauss–Newton curvature for likelihood losses. Taking the <em>square root</em> rather than the full inverse is a heuristic; practitioners find the exponent ½ works better than the exponent 1 of a true diagonal natural-gradient step, and it keeps the update norm bounded. This viewpoint explains why Adam helps with heterogeneous scales (parameters with large curvature have larger gradients and so get smaller steps) and why the more complete preconditioners (Shampoo's Kronecker factors, K-FAC) can do better at higher cost. It also explains the learning-rate scaling with width: the update per parameter is fixed at about lr, but a layer with more inputs sums more contributions, so the layer's output changes more; parameterisations such as μP scale the learning rate of each layer with width so that the optimum transfers from small to large models (ml4).</p>
+
+<h4>Convergence: what is proved and what is folklore</h4>
+<p>The original Adam paper gave a regret bound of order √T for convex problems; Reddi, Kale and Kumar (2018) found an error in that proof and constructed a simple convex problem on which Adam does not converge, because the exponential moving average <em>forgets</em> rare, large gradients and so lets the effective learning rate grow at exactly the wrong moment. Their fix, AMSGrad, takes the running <em>maximum</em> of v. In deep-learning practice the counter-example rarely bites, AMSGrad seldom beats Adam, and the more relevant failure is the interaction of a long-memory v (β₂ = 0.999) with sudden gradient growth, which produces the loss spikes that a smaller β₂ or clipping cures. The takeaway for an interview: know that Adam has no general convergence guarantee, that this is a known and studied issue, and that it rarely determines practical choices.</p>
+
+<h4>Weight decay, normalisation and the effective learning rate</h4>
+<p>In a network whose layers are followed by normalisation (dl4), the function is invariant to the scale of each weight matrix, so weight decay cannot be reducing capacity; it controls the weight norm, and through it the <em>effective</em> learning rate (step size relative to weight size, roughly lr/‖w‖²). Gradient noise pushes weight norms up, decay pulls them down, and the balance sets an equilibrium in which each step rotates the weight direction by an angle on the order of √(2·lr·λ) (results from analyses of "rotational equilibrium" for scale-invariant weights). With lr = 3×10⁻⁴ and λ = 0.1 that is about 0.008 radians per step. The practical corollary is that lr and λ should be thought of together through the product lr·λ: changing the learning rate along a schedule changes the effective decay, which is why some recipes (Llama 3) define the decay at each step as a fixed multiple of the current learning rate. It also means that AdamW's lr·λ is the natural quantity to hold constant when comparing runs of different lengths, and that decay timescales are 1/(lr·λ) steps: at lr·λ = 3×10⁻⁵, about 33,000 steps.</p>
+
+<h4>Optimiser state precision and sharding</h4>
+<p>Eight-bit optimisers (Dettmers et al., 2022) work because m and v tolerate coarse quantisation if it is done carefully: values are split into small blocks, each quantised with its own scale, and a non-linear (dynamic) 8-bit code gives resolution to both small and large magnitudes; a "stable embedding layer" (with layer norm and Xavier initialisation) removes the extreme second-moment values of rarely updated embedding rows that broke naive schemes. Sharding is even easier: because Adam's update is a purely elementwise function of (w, g, m, v), ZeRO-1 can give each data-parallel rank a slice of the state and all-gather the updated weights, with mathematically identical results (gpu9). Optimisers that need matrix-level operations, Shampoo's matrix roots or Muon's orthogonalisation (a few iterations of matrix multiplications), need the whole matrix on one device or extra communication, which is why distributed implementations of them are non-trivial engineering.</p>
+
+<h4>Schedules, EMA and schedule-free training</h4>
+<p>A cosine schedule commits to a total number of steps in advance, which is awkward for continued pretraining or scaling-law sweeps. Two alternatives are common: <em>warmup-stable-decay</em> (hold the peak learning rate, then decay quickly at the end, so any point of the stable phase can be branched into a final decay), and <em>schedule-free</em> optimisers (Defazio et al., 2024), which replace the decay with a carefully chosen averaging of iterates and need no total-steps hyperparameter. Related is keeping an <em>exponential moving average of the weights</em> and evaluating that: it smooths the noise a high learning rate leaves in the weights, giving some of the benefit of a decayed schedule at any time. All three exploit the same fact: near the end of training the noise in the iterates, not the bias, limits quality, and averaging in time or decaying the step removes it.</p>
+
+<h4>Sparse gradients and embeddings</h4>
+<p>Rare tokens produce non-zero embedding gradients only occasionally. With a dense Adam implementation, the row's m and v still decay every step even though the gradient is zero, and when a rare token finally appears its gradient is divided by a v that has shrunk toward zero: the step is huge (the large first-step effect again). Remedies are a lower β₂ in short-window runs, a larger ε, the "stable embedding" of the 8-bit paper, or sparse optimisers that update only the rows touched. PaLM's schedule β₂ = 1 − k^(−0.8) is motivated by precisely "rare embedding tokens [having] poorly estimated second moments over shorter windows".</p>
+</section>
+
+<section data-field="prod">
+<h4>The public case: Adam and AdamW</h4>
+<p>Diederik Kingma and Jimmy Ba's "Adam: A Method for Stochastic Optimization" (arXiv:1412.6980, ICLR 2015) proposed exactly the algorithm above with default settings α = 0.001, β₁ = 0.9, β₂ = 0.999 and ε = 10⁻⁸, argued that its step sizes are "approximately bounded by the stepsize hyperparameter", and showed in experiments on logistic regression, multilayer networks and convolutional networks that it matched or beat AdaGrad, RMSProp and SGD with Nesterov momentum. Section 6.4 of the paper is the empirical case for bias correction: training a variational autoencoder without the correction became unstable in the first epochs for β₂ close to 1, while with it Adam performed equal or better than RMSProp across settings. The paper's convergence proof was later shown to be flawed (Reddi et al., 2018), but the algorithm became the default optimiser of deep learning.</p>
+<p>Ilya Loshchilov and Frank Hutter's "Decoupled Weight Decay Regularization" (arXiv:1711.05101, ICLR 2019) is the second half of the story. Their abstract states the inequivalence plainly: "L2 regularization and weight decay regularization are equivalent for standard stochastic gradient descent (when rescaled by the learning rate), but ... this is not the case for adaptive gradient algorithms, such as Adam". Their experiments used a 26-layer 2×64d ResNet on CIFAR-10 and ImageNet32x32 with fixed, step-drop and cosine-annealed schedules over budgets from 100 to 1,800 epochs. Findings: Adam with decoupled weight decay achieved a 15% relative improvement in test error over Adam with L2; the optimal weight decay became nearly independent of the learning rate (so the two-dimensional search collapses), and the result competed with SGD with momentum on image classification, where Adam had usually lost. PyTorch's <code>AdamW</code> and every major LLM codebase followed.</p>
+<p>The recipes that came out of this are documented in public. LLaMA (Touvron et al., 2023): AdamW, β = (0.9, 0.95), cosine to 10%, weight decay 0.1, clipping 1.0, 2,000 warmup steps. Llama 3 (2024): AdamW with peak learning rates of 3×10⁻⁴, 1.5×10⁻⁴ and 8×10⁻⁵ for the 8B, 70B and 405B models, and for 405B a warmup of 8,000 steps, a cosine schedule decaying to 8×10⁻⁷ over 1.2 million steps, and a batch size doubled twice from 4M to 16M tokens, reporting "few loss spikes". PaLM (2022) is the notable non-AdamW example: Adafactor with a learning rate of 10⁻² for 10,000 steps and 1/√k decay after, β₁ = 0.9, β₂ = 1 − k^(−0.8), clipping 1.0 and a weight decay proportional to the square of the learning rate. Muon's public case is Moonshot's Moonlight model.</p>
+
+<h4>Production failure modes</h4>
+<p><strong>Resuming without optimiser state.</strong> Loading only the model weights from a checkpoint and starting a fresh optimiser sets m = v = 0 and, with bias correction, makes the first steps ±lr in every coordinate, at whatever learning rate the schedule is now at. The loss jumps at the resume step. Fix: checkpoint and restore the optimiser state and the step counter (distributed checkpoints shard them: gpu9), and validate that resumed loss continues the previous curve.</p>
+<p><strong>Weight decay on everything.</strong> Applying λ to biases, layer-norm scales and embeddings shrinks parameters that should not shrink (a norm scale decayed toward zero fights the normalisation). Symptom: slow degradation, norm scales trending toward zero. Fix: parameter groups as in the code above, and log per-group weight norms.</p>
+<p><strong>Learning-rate schedule bugs.</strong> Calling <code>scheduler.step()</code> once per micro-batch instead of once per optimiser step under gradient accumulation stretches the schedule by the accumulation factor; forgetting warmup after a batch-size change spikes the loss; a schedule that depends on total steps, then a run extended without adjusting it, decays too early. Log the learning rate every step.</p>
+<p><strong>Low-precision optimiser state.</strong> float16 moments with ε = 10⁻⁸ produce division by zero or garbage; bf16 master weights lose small updates (the lab). Keep master weights and moments in float32 unless using a validated 8-bit scheme.</p>
+<p><strong>Mixed loss scales and clipping order.</strong> Clip gradients after unscaling (dl3); with fp16 loss scaling, non-finite gradients must skip the optimiser step, and the moments must not be updated with infinities, or every later step is poisoned.</p>
+<p><strong>Loss spikes from a long-memory v.</strong> If spikes follow a rare large batch, check the ratio of the pre-clip gradient norm to its recent average and consider β₂ = 0.95, longer warmup, or clipping; the fix is usually cheaper than rewinding (dl3).</p>
+<h4>What to monitor</h4>
+<p>Per step: loss, learning rate, pre-clip global gradient norm. Periodically: per-layer update-to-weight ratio, the RMS of m̂/√v̂ (should be a stable fraction of 1), the second-moment statistics (very small v for embeddings is normal; v collapsing to ε everywhere is not), weight norms per group, the fraction of steps clipped, and for fp16 the loss scale and the skipped-step count. For cost planning, log optimiser-step time (the fused kernel should be a small percentage of the step) and peak memory by phase (gpu11).</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> implement SGD, momentum and Adam(W) from scratch in NumPy, reproduce the hand-computed Adam steps, compare optimisers on a badly conditioned quadratic (and see Adam's invariance to loss scale), measure how L2 and decoupled weight decay treat small- and large-gradient weights, and see why bfloat16 weights lose small updates. Python 3.12, NumPy only, runs in a few seconds.</p>
+<pre>import numpy as np
+
+# ---- optimisers as tiny classes: state + step(w, g) -&gt; new w
+class SGD:
+    def __init__(s, lr, beta=0.0): s.lr, s.beta, s.v = lr, beta, 0.0
+    def step(s, w, g): s.v = s.beta * s.v + g; return w - s.lr * s.v
+class Adam:
+    def __init__(s, lr, b1=0.9, b2=0.999, eps=1e-8, wd=0.0, decoupled=True):
+        s.lr, s.b1, s.b2, s.eps, s.wd, s.dec, s.m, s.v, s.t = lr, b1, b2, eps, wd, decoupled, 0.0, 0.0, 0
+    def step(s, w, g):
+        if s.wd and not s.dec: g = g + s.wd * w                 # L2 inside the gradient (goes through /sqrt(v))
+        s.t += 1
+        s.m = s.b1 * s.m + (1 - s.b1) * g
+        s.v = s.b2 * s.v + (1 - s.b2) * g * g
+        mh, vh = s.m / (1 - s.b1 ** s.t), s.v / (1 - s.b2 ** s.t)   # bias correction
+        w = w - s.lr * mh / (np.sqrt(vh) + s.eps)
+        if s.wd and s.dec: w = w - s.lr * s.wd * w                # AdamW: decay applied directly to the weight
+        return w
+
+# ---- 1. one Adam step by hand: gradients differ by a factor of 100,000, steps are identical
+wA = wB = 1.0; A, B = Adam(0.1), Adam(0.1)
+for t, (gA, gB) in enumerate([(100, 0.001), (100, -0.001), (100, 0.001)], 1):
+    wA, wB = A.step(wA, gA), B.step(wB, gB)
+    print(f"t={t}  A: w={wA:.4f}   B: w={wB:.4f}")
+
+# ---- 2. an ill-conditioned quadratic  L = 0.5 * (w1^2 + 100 * w2^2)
+H = np.array([1.0, 100.0])
+def run(opt_factory, scale=1.0, steps=400):
+    opts = [opt_factory(), opt_factory()]; w = np.array([5.0, 1.0]); hist = []
+    for _ in range(steps):
+        g = scale * H * w                                        # gradient of scale * L
+        w = np.array([opts[i].step(w[i], g[i]) for i in range(2)])
+        hist.append(0.5 * (H * w ** 2).sum())
+        if not np.isfinite(w).all() or hist[-1] &gt; 1e12: break
+    return np.array(hist)
+def settled(h, thr):                                             # first step after which the loss stays below thr
+    above = np.where(h &gt;= thr)[0]
+    return 1 if len(above) == 0 else (int(above[-1]) + 2 if above[-1] + 1 &lt; len(h) else None)
+print("\nsteps until the loss is below 1e-3 and stays there (None = not within 400 steps)")
+for name, f in [("SGD lr 0.019", lambda: SGD(0.019)), ("SGD+momentum lr 0.015", lambda: SGD(0.015, 0.9)),
+                ("Adam lr 0.3", lambda: Adam(0.3)), ("Adam lr 0.05", lambda: Adam(0.05))]:
+    print(f"  {name:24}", settled(run(f), 1e-3))
+print("same problem with the loss multiplied by 1000 (gradients 1000x larger):")
+for name, f in [("SGD lr 0.019", lambda: SGD(0.019)), ("Adam lr 0.3", lambda: Adam(0.3))]:
+    h = run(f, scale=1000.0)
+    print(f"  {name:24}", "diverged after %d steps" % len(h) if len(h) &lt; 400 and h[-1] &gt; 1e3 else f"steps until loss &lt; 1e-3 for good: {settled(h, 1e-3)}")
+
+# ---- 3. weight decay: L2 inside Adam vs decoupled AdamW, for a small-gradient and a large-gradient weight
+def mean_drift(sigma, wd, decoupled, n=20000, seed=0):
+    rng = np.random.default_rng(seed)                            # same gradient noise for every run
+    opt = Adam(1e-3, wd=wd, decoupled=decoupled); w0 = 1.0; total = 0.0
+    for _ in range(n):
+        total += opt.step(w0, rng.normal(0, sigma)) - w0         # weight change in one step, weight held at 1.0
+    return total / n
+print("\naverage per-step shrinkage caused by weight decay 0.01 on a weight equal to 1.0 (lr 1e-3)")
+for sigma in (10.0, 0.01):
+    base = mean_drift(sigma, 0.0, True)                          # no decay: pure gradient-noise drift
+    l2 = base - mean_drift(sigma, 0.01, False); adamw = base - mean_drift(sigma, 0.01, True)
+    print(f"  gradient scale {sigma:5}:  Adam+L2 {l2:.2e}   AdamW {adamw:.2e}")
+
+# ---- 4. why fp32 master weights: emulate bfloat16 by keeping only the top 16 bits of a float32
+def to_bf16(x): return (np.float32(x).view(np.uint32) &amp; 0xFFFF0000).view(np.float32)
+w = np.float32(1.0); step = np.float32(3e-4)
+print("\nbfloat16 weight 1.0, applying 1000 updates of +3e-4:")
+wb = w
+for _ in range(1000): wb = to_bf16(wb + step)
+print("  pure bf16:", wb, "  fp32 master copy:", np.float32(1.0) + np.float32(3e-4) * 1000)</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li><strong>Section 1</strong> prints the hand-computed table: A moves 0.1 per step (w = 0.9, 0.8, 0.7) although its gradient is 100; B, with gradient ±0.001 flipping sign, goes 0.9000, 0.9053, 0.8717. Compare with <code>torch.optim.Adam(lr=0.1)</code> if PyTorch is installed: identical.</li>
+<li><strong>Section 2</strong> reports steps until the loss on ½(w₁² + 100w₂²) drops below 10⁻³ and stays there: SGD at its largest stable rate 246 steps, momentum (0.9, lr 0.015) 107, Adam (lr 0.3) 99, Adam with a smaller learning rate 216. Multiplying the loss by 1,000 makes SGD at lr 0.019 diverge within two steps, while Adam's trajectory is unchanged (99 steps). Change the learning rates to explore each optimiser's stability limit; Adam with a constant learning rate keeps a small residual oscillation of size about lr around the minimum, which is why schedules decay it.</li>
+<li><strong>Section 3</strong> holds a weight at 1.0 and feeds it zero-mean noisy gradients of scale 10 or 0.01, with lr 10⁻³ and λ = 0.01. Under Adam+L2 the decay per step is 1.0×10⁻⁶ for the large-gradient weight and 7.05×10⁻⁴ for the small-gradient one (about 700× more); under AdamW it is 1.0×10⁻⁵ for both, exactly lr·λ·w.</li>
+<li><strong>Section 4</strong> emulates bfloat16 by keeping only the top 16 bits of a float32. 1,000 updates of +3×10⁻⁴ leave the bf16 weight at exactly 1.0 (spacing 0.0078 is more than twice the update), while the float32 master copy reaches 1.3.</li>
+</ol>
+<p><strong>Try next.</strong> Add RMSProp (no momentum, no bias correction) and compare its first step on gradient 100 with Adam's (3.2× larger with β₂ = 0.999 if you remove the correction from Adam); add Nesterov momentum; add gradient noise to the quadratic and compare how far each optimiser hovers from the minimum at a fixed learning rate.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out — weight decay</b>
+<p>Two parameters are both currently 1.0. Parameter A has consistently large gradients (√v ≈ 10); parameter B has tiny ones (√v ≈ 0.01). Weight decay λ = 0.01, learning rate η = 0.001. Compare the decay each receives under Adam with an L2 penalty versus AdamW.</p>
+<details><summary>Answer</summary>
+<p><strong>Adam + L2 in the loss.</strong> The penalty adds <code>λw</code> to the gradient, so it passes through the same division by √v as everything else. Effective shrinkage ≈ <code>η·λw/√v</code>:</p>
+<ul>
+<li>A: <code>0.001 × 0.01 × 1.0 / 10 = 1 × 10⁻⁶</code></li>
+<li>B: <code>0.001 × 0.01 × 1.0 / 0.01 = 1 × 10⁻³</code> (about 7×10⁻⁴ in a simulation, because the decay term itself contributes to √v)</li>
+</ul>
+<p>B is decayed roughly <strong>1,000 times harder than A</strong>, and A is the parameter doing the most work: the regulariser is strongest exactly where you wanted it weakest.</p>
+<p><strong>AdamW.</strong> Decay is applied straight to the weight, outside the adaptive step: <code>η·λ·w = 1 × 10⁻⁵</code> for <strong>both</strong>. Uniform, predictable, and what "weight decay" was always meant to mean. This is why AdamW is the transformer default and why λ transfers across architectures under AdamW but has to be re-tuned under Adam + L2.</p></details>
+<hr>
+<b>Size it up — optimiser memory</b>
+<p>You want to fully fine-tune a 13B-parameter model with AdamW in bf16 mixed precision on 8 × 80 GB GPUs. Compute the training state per GPU with plain data parallelism, with ZeRO-1, and with full sharding (ZeRO-3/FSDP), ignoring activations. Then say what changes if you switch to an 8-bit optimiser.</p>
+<details><summary>Answer</summary>
+<p>Per parameter: 2 (bf16 weights) + 2 (bf16 gradients) + 4 (fp32 master) + 4 (m) + 4 (v) = 16 bytes, so 13B × 16 = <strong>208 GB</strong> of state.</p>
+<ul>
+<li><strong>Plain data parallelism:</strong> every GPU holds all 208 GB. Impossible on 80 GB.</li>
+<li><strong>ZeRO-1</strong> shards the 12 optimiser-side bytes: 26 GB weights + 26 GB gradients + 156 GB/8 = 19.5 GB → <strong>71.5 GB</strong> per GPU. It fits on paper, but leaves under 9 GB for activations and buffers, so it is impractical.</li>
+<li><strong>ZeRO-3 / FSDP:</strong> everything sharded, 208/8 = <strong>26 GB</strong> per GPU, leaving room for activations (gpu9).</li>
+</ul>
+<p><strong>8-bit optimiser:</strong> m and v drop from 8 to 2 bytes per parameter, so the per-parameter total is 10 bytes and the state 130 GB; under ZeRO-1 the sharded part is 13 B × (4 + 2) bytes / 8 GPUs = 9.75 GB, so 26 + 26 + 9.75 ≈ <strong>62 GB</strong>, and under full sharding 16 GB. The master weights (4 bytes) and gradients remain, which is why 8-bit optimisers help but do not remove the need for sharding or LoRA at this scale.</p></details>
+</section>

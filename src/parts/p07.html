@@ -1,0 +1,411 @@
+
+/* ============================================================
+   DATA — system design: high level (HLD) and machine coding (LLD)
+   ============================================================ */
+function flow(stages){
+  return `<div class="flow">${stages.map((s, i) =>
+    `<div class="fnode"><span class="fn-t">${esc(s.t)}</span>${s.d ? `<span class="fn-d">${esc(s.d)}</span>` : ""}</div>` +
+    (i < stages.length - 1 ? `<div class="farrow" aria-hidden="true">→</div>` : "")).join("")}</div>`;
+}
+
+const HLD = [
+{ id:"hd1", t:"Design a multi-tenant LLM inference platform", tag:"Serving", sum:"Self-hosted models behind one API: routing, batching, autoscaling, quotas.",
+  body:`<h4>1 · Clarify the requirements</h4>
+  <ul><li><strong>Functional</strong>: one OpenAI-compatible endpoint over several open-weight models; streaming; per-tenant API keys; usage metering for billing; LoRA adapters per tenant.</li>
+  <li><strong>Non-functional</strong>: p95 time-to-first-token under 800 ms, sustained 30+ tokens/s per stream, 99.9% availability, no tenant able to starve another.</li>
+  <li><strong>Out of scope</strong> (say so): training, fine-tuning orchestration, the model registry itself.</li></ul>
+  <h4>2 · Back of the envelope</h4>
+  <p>Target 2,000 concurrent streams. An A100-80GB running a 13B model in fp16 (26 GB weights) with GQA leaves roughly 45 GB for KV cache; at ~0.5 MB per token of cache and 4k average context that is ~2 GB per sequence, so about 20–25 concurrent sequences per GPU with continuous batching. 2,000 ÷ 22 ≈ <strong>90 GPUs</strong> at peak, plus headroom and a smaller-model pool. At £2/GPU-hour that is roughly £130k/month — quote the number, then discuss how routing and quantisation reduce it.</p>
+  <h4>3 · Architecture</h4>
+  ${flow([{t:"Gateway",d:"auth · quota · rate limit"},{t:"Router",d:"model + tenant affinity"},{t:"Scheduler",d:"admission · priority queue"},{t:"Inference pool",d:"vLLM replicas per model"},{t:"Streamer",d:"SSE back to client"}])}
+  <h4>4 · The decisions that carry the interview</h4>
+  <ul>
+  <li><strong>Continuous batching</strong> in the engine, not request batching in the gateway. The scheduler admits a request into a running batch; finished sequences are evicted every step. This is the 5–20× throughput lever.</li>
+  <li><strong>PagedAttention</strong> for the KV cache so fragmentation does not cap concurrency, plus prefix sharing for common system prompts.</li>
+  <li><strong>Fairness</strong>: weighted fair queueing per tenant on <em>tokens</em>, not requests — one tenant sending 100k-token prompts must not consume the pool. Admission control rejects early with a clear 429 rather than queueing to a timeout.</li>
+  <li><strong>Autoscaling</strong> on queue depth and TTFT, not CPU. GPU cold start is minutes (model load), so keep a warm pool and scale in slowly; pre-pull images and cache weights on local NVMe.</li>
+  <li><strong>Multi-LoRA serving</strong>: one base model, adapters swapped per request (S-LoRA style) so 500 tenants share one GPU pool instead of needing 500 deployments.</li>
+  <li><strong>Routing</strong>: small model first for classified-easy traffic, with a confidence-based upgrade path.</li>
+  </ul>
+  <h4>5 · Failure and operations</h4>
+  <p>Health-check on actual generation, not process liveness — a wedged CUDA context passes a TCP check. Drain gracefully: stop admitting, finish in-flight streams, then terminate. Per-model circuit breakers with a fallback to a smaller model. Meter tokens at the streamer so a disconnected client is still billed for work done, and reconcile asynchronously.</p>
+  <h4>6 · Trade-offs to volunteer</h4>
+  <p>Larger batches raise throughput and hurt per-stream latency — expose it as a tenant-visible tier. Quantising to int4 doubles capacity for a small quality cost; run both and let the tenant choose. Self-hosting only beats an API above sustained high utilisation; say where the crossover is.</p>` },
+
+{ id:"hd2", t:"Design enterprise RAG over 50M documents", tag:"Retrieval", sum:"Ingestion, hybrid retrieval, permissions, freshness and evaluation.",
+  body:`<h4>1 · Requirements</h4>
+  <ul><li>Answer questions over SharePoint, Confluence, Jira, email and PDFs, with citations.</li>
+  <li><strong>Per-user permissions enforced at query time</strong> — this is the requirement that shapes the whole design, so surface it early.</li>
+  <li>Freshness: a new document is answerable within 5 minutes.</li>
+  <li>p95 end-to-end under 3 s; 50M documents, ~500M chunks, 5,000 daily active users.</li></ul>
+  <h4>2 · Sizing</h4>
+  <p>500M chunks × 1024-dim float32 = 2 TB of raw vectors. Quantise to int8 (500 GB) or use PQ; an HNSW graph adds roughly 30% overhead. Conclusion to state out loud: this does not fit one node, so the index is <strong>sharded</strong>, and shard-by-tenant also helps the permission story.</p>
+  <h4>3 · Pipeline</h4>
+  ${flow([{t:"Connectors",d:"CDC + backfill"},{t:"Parse",d:"layout-aware"},{t:"Chunk",d:"structure-aware"},{t:"Embed",d:"batch GPU"},{t:"Index",d:"vector + BM25"},{t:"Serve",d:"hybrid → rerank → LLM"}])}
+  <h4>4 · Ingestion detail</h4>
+  <ul>
+  <li>Change-data-capture from each source, not periodic full crawls. Keep a content hash to skip unchanged documents — the biggest cost saving in the whole pipeline.</li>
+  <li>Layout-aware parsing for PDFs (tables and headers destroyed by naive text extraction are a top cause of bad answers).</li>
+  <li>Chunk on structure — headings, sections, code blocks — target 400–700 tokens with 15% overlap; store <code>parent_id</code> so retrieval can expand to the surrounding section.</li>
+  <li>Store ACLs <em>on the chunk</em>, denormalised from the source, and re-sync on permission change events.</li>
+  </ul>
+  <h4>5 · Retrieval</h4>
+  <p>Hybrid: BM25 (exact identifiers, error codes, names) ∥ dense vectors (paraphrase), fused with reciprocal rank fusion, filtered by ACL, then a cross-encoder reranker takes 50 candidates down to 5. Optional query rewriting for follow-up turns ("what about the second one?" must be resolved before retrieval). Return chunk ids as citations and verify them post-generation.</p>
+  <h4>6 · Permissions — the part candidates miss</h4>
+  <p><strong>Pre-filter</strong> by the user's group set inside the ANN query. Post-filtering is unacceptable here: it either leaks counts or returns empty pages. Use filtered-HNSW or partition indexes by security realm. Also handle the negative case — a document a user <em>cannot</em> see must not affect their answer at all, so ACL evaluation belongs before the reranker, not after.</p>
+  <h4>7 · Evaluation and operations</h4>
+  <p>Separate retrieval metrics (recall@50, nDCG@5) from generation metrics (faithfulness, citation accuracy, answer relevance). Build a golden set of ~300 real questions with known source documents. Monitor "no relevant chunk found" rate — a rise means the index or a connector broke, and it is the earliest signal you get.</p>` },
+
+{ id:"hd3", t:"Design a real-time recommendation system", tag:"ML systems", sum:"Candidate generation, ranking, features and the feedback loop.",
+  body:`<h4>1 · Requirements</h4>
+  <p>Home feed for 100M users over a 10M-item catalogue; p99 under 150 ms; personalised; fresh items surfaced within minutes; optimise engagement subject to diversity and creator-fairness guardrails.</p>
+  <h4>2 · The standard two-stage shape</h4>
+  ${flow([{t:"Candidates",d:"10M → 1k, ~10 ms"},{t:"Ranking",d:"1k → 100, ~50 ms"},{t:"Re-rank",d:"business rules, diversity"},{t:"Serve",d:"log impressions"}])}
+  <p><strong>Candidate generation</strong> must be cheap and high-recall: several parallel sources — two-tower ANN retrieval on user/item embeddings, collaborative filtering neighbours, trending, recently viewed, followed creators — unioned and deduplicated. <strong>Ranking</strong> is an expensive model over ~1,000 items with rich cross features, predicting several targets (click, dwell, like, hide) combined by a business-weighted score.</p>
+  <h4>3 · Features and the store</h4>
+  <p>Three families: user (long-term profile, batch), item (content embeddings, stats, batch + streaming), context (time, device, session sequence, real-time). A <strong>feature store</strong> with one definition serving both the batch training path and the online path is the answer to training/serving skew — say that explicitly. Online store is Redis or DynamoDB with sub-10 ms reads; offline is a warehouse with point-in-time-correct joins.</p>
+  <h4>4 · The cold-start answers</h4>
+  <ul><li><strong>New item</strong>: content embeddings give it a position in item space from the start; add an exploration budget so it earns impressions.</li>
+  <li><strong>New user</strong>: popularity by inferred segment, then rapid session-based personalisation from the first few interactions.</li>
+  <li><strong>Exploration</strong>: Thompson sampling or epsilon-greedy on a slice of traffic — without it the logged data only reflects what the model already liked, and the system slowly eats its own tail.</li></ul>
+  <h4>5 · Training and the feedback loop</h4>
+  <p>Train on logged impressions with position bias correction (inverse propensity weighting, or a position feature that is zeroed at serving). Retrain daily; refresh embeddings hourly; near-real-time counters for trending. Watch for feedback loops and filter bubbles, and keep a diversity guardrail in re-ranking (maximal marginal relevance, or a cap per creator per page).</p>
+  <h4>6 · Trade-offs</h4>
+  <p>Precomputed feeds are fast but stale and expensive for 100M users; real-time is fresh but latency-critical. Hybrid: precompute candidates, rank at request time. Say which one you are choosing and why.</p>` },
+
+{ id:"hd4", t:"Design a fraud detection system", tag:"ML systems", sum:"Sub-100 ms decisions, extreme imbalance, adversarial drift and delayed labels.",
+  body:`<h4>1 · Requirements</h4>
+  <p>Score every transaction in under 100 ms; 50k transactions/s peak; fraud rate ~0.1%; precision matters (false declines lose customers) but a missed fraud costs 200× more; decisions must be explainable to a regulator; adversaries adapt weekly.</p>
+  <h4>2 · Architecture</h4>
+  ${flow([{t:"Txn stream",d:"Kafka"},{t:"Feature svc",d:"real-time aggregates"},{t:"Rules",d:"hard blocks"},{t:"Model",d:"GBDT + graph features"},{t:"Decision",d:"allow · challenge · block"},{t:"Review",d:"analyst queue → labels"}])}
+  <h4>3 · Features — where the signal really is</h4>
+  <ul><li><strong>Velocity aggregates</strong>: transactions per card in the last 1 min / 1 h / 24 h, distinct merchants, distinct countries. Streaming windows over Kafka with Flink; these carry most of the lift.</li>
+  <li><strong>Graph features</strong>: shared device, IP, shipping address across accounts. Fraud rings are visible as connected components long before any single transaction looks odd.</li>
+  <li><strong>Deviation</strong> from the entity's own baseline — amount z-score against this customer's history, not the global one.</li>
+  <li><strong>Entity embeddings</strong> for merchant and device.</li></ul>
+  <h4>4 · Modelling decisions</h4>
+  <p>Gradient-boosted trees as the workhorse (fast, strong on tabular, SHAP for explanations), an unsupervised anomaly model in parallel to catch novel patterns the labelled data has never seen, and a rules layer for known-bad hard blocks that must be instant and auditable. Handle imbalance with class weights and threshold tuning, not blind SMOTE, and <strong>recalibrate</strong> so the score is a usable probability for expected-loss decisions.</p>
+  <h4>5 · The three hard problems</h4>
+  <ul>
+  <li><strong>Delayed labels</strong> — a chargeback arrives 30–90 days later. Use analyst decisions as fast proxy labels, and never evaluate a model on a window whose labels have not matured.</li>
+  <li><strong>Feedback bias</strong> — you only observe outcomes for transactions you allowed. Keep a small randomised allow-through slice, or reject-inference techniques, or the model becomes blind to what it blocks.</li>
+  <li><strong>Adversarial drift</strong> — retrain weekly, monitor feature distributions daily, and treat a sudden score-distribution shift as an incident.</li>
+  </ul>
+  <h4>6 · Latency budget</h4>
+  <p>100 ms total: 20 ms feature fetch (parallel, with a timeout and a stale-value fallback), 15 ms model, 10 ms rules, rest is network and overhead. Never let a feature-store timeout fail the request — degrade to a model variant that does not need that feature.</p>` },
+
+{ id:"hd5", t:"Design an AI coding assistant (inline completion)", tag:"Applications", sum:"Sub-200 ms suggestions, context assembly from a repo, and acceptance-rate evaluation.",
+  body:`<h4>1 · Requirements</h4>
+  <p>Inline completion in the editor; p95 under 200 ms or the suggestion is useless; repository-aware; must not leak one customer's code into another's suggestions; measured by accepted-characters-retained, not by BLEU.</p>
+  <h4>2 · The latency budget is the design</h4>
+  ${flow([{t:"Editor",d:"debounce 60 ms"},{t:"Context build",d:"20 ms"},{t:"Prefill",d:"cached prefix"},{t:"Decode",d:"short, capped"},{t:"Filter",d:"dedupe · licence"}])}
+  <p>Everything follows from 200 ms: a small fast model (1–7B) rather than a frontier one; fill-in-the-middle training so the model sees the suffix too; short max output; aggressive cancellation when the user keeps typing; and client-side debouncing so you do not pay for abandoned requests.</p>
+  <h4>3 · Context assembly — the real quality lever</h4>
+  <ul><li>The current file around the cursor, split into prefix and suffix (FIM format).</li>
+  <li>Recently opened and recently edited files — a strong, cheap proxy for relevance.</li>
+  <li>Symbol definitions resolved from the language server for identifiers near the cursor — far better signal than embedding similarity for code.</li>
+  <li>Imports and type signatures; repository conventions from neighbouring files.</li>
+  <li>Budget this explicitly: maybe 4k tokens, allocated by priority, truncating the least useful first.</li></ul>
+  <h4>4 · Serving</h4>
+  <p>Prefix caching matters enormously here — consecutive keystrokes share almost the whole prompt. Speculative decoding for the tail. Cache completions keyed by a normalised context hash. Run the model close to the user (regional deployment) because 60 ms of round trip out of 200 ms is a third of the budget.</p>
+  <h4>5 · Evaluation</h4>
+  <p>Offline: exact-match and pass@k on held-out repositories, with contamination checks. Online: <strong>acceptance rate</strong>, and more importantly <em>retention</em> — how much of the accepted suggestion still exists 5 minutes later. Guardrails: suggestions per hour (fatigue), latency, and a licence/secret filter that blocks verbatim reproduction of memorised training data and anything matching a credential pattern.</p>
+  <h4>6 · Isolation</h4>
+  <p>No cross-tenant retrieval, ever. If you fine-tune per customer, adapters are per-tenant and never merged into the shared base. State this before being asked — it is the question a security-minded interviewer is waiting for.</p>` },
+
+{ id:"hd6", t:"Design a content moderation pipeline", tag:"ML systems", sum:"Multimodal, high volume, human-in-the-loop, policy that changes weekly.",
+  body:`<h4>1 · Requirements</h4>
+  <p>10M posts/day across text, image and video; block clearly-violating content in under 500 ms; route ambiguous cases to human review within minutes; policy changes weekly without retraining; every decision auditable and appealable.</p>
+  <h4>2 · Tiered architecture</h4>
+  ${flow([{t:"Hash match",d:"known-bad, ~1 ms"},{t:"Fast classifiers",d:"cheap, per modality"},{t:"LLM judge",d:"ambiguous only"},{t:"Human review",d:"priority queue"},{t:"Appeals",d:"feedback → labels"}])}
+  <p>The tiering is the answer: perceptual hashing (PDQ for images, MD5/SSDEEP for exact) catches known content almost free; small classifiers handle the bulk; only the uncertain middle reaches an expensive model, and only the genuinely contested reach a human. Quote the funnel: ~99% auto-resolved, ~1% to LLM, ~0.1% to humans.</p>
+  <h4>3 · Why an LLM in the middle</h4>
+  <p>Because policy is nuanced and changes weekly. A prompted LLM with the policy text in context can be updated the same day, where a fine-tuned classifier needs labelled data and a training run. Use the classifier scores as features in the prompt, require a structured verdict with the specific policy clause cited, and log that clause — it is what makes appeals answerable.</p>
+  <h4>4 · Human review design</h4>
+  <p>Priority by (predicted severity × reach). Route by reviewer specialisation and language. Rotate distressing content and cap exposure — a real operational requirement, and mentioning reviewer welfare distinguishes a serious answer. Measure inter-annotator agreement; if it is low, the policy is ambiguous, not the reviewers.</p>
+  <h4>5 · Feedback and drift</h4>
+  <p>Overturned decisions on appeal are the highest-value labels you will ever get — feed them back with high weight. Adversaries adapt (leetspeak, image text, cropped video), so keep a red-team set and refresh the hash database continuously. Track per-language and per-region performance separately; aggregate metrics hide catastrophic failure in low-resource languages.</p>` },
+
+{ id:"hd7", t:"Design an agent platform with tool execution", tag:"Applications", sum:"Safe execution, durable state, cost caps and observability for long-running agents.",
+  body:`<h4>1 · Requirements</h4>
+  <p>Internal teams define agents with tools; agents may run for minutes and dozens of steps; execution must be sandboxed; a run must survive a process restart; per-run cost caps; every step traceable and replayable.</p>
+  <h4>2 · Architecture</h4>
+  ${flow([{t:"Agent def",d:"tools · prompt · policy"},{t:"Orchestrator",d:"durable state machine"},{t:"LLM",d:"plan / act"},{t:"Sandbox",d:"isolated execution"},{t:"Trace store",d:"every step"}])}
+  <h4>3 · Durable execution</h4>
+  <p>Model the run as a state machine persisted after every step (Temporal, or your own event-sourced table). Each step writes an immutable event: prompt, model, tokens, tool call, tool result, cost. Restart resumes from the last event. This gives you replay for debugging, exact cost accounting and audit for free, and it is the difference between a demo and a platform.</p>
+  <h4>4 · Sandboxing</h4>
+  <p>Tools that execute code run in a per-run container or microVM (gVisor/Firecracker) with no network by default, an egress allowlist when needed, a filesystem quota, CPU/memory limits and a hard wall-clock timeout. Credentials are injected per run, scoped to that run's permissions, and never placed in the model's context — the model requests an action, the runtime holds the secret.</p>
+  <h4>5 · Bounding the loop</h4>
+  <ul><li>Max steps, max wall-clock, max tokens, max spend — all four, because agents find creative ways to exhaust exactly the one you left out.</li>
+  <li>Loop detection on repeated (tool, arguments) pairs.</li>
+  <li>Context compaction: summarise older steps, keep tool outputs in a store and pass ids rather than payloads.</li>
+  <li>Human-in-the-loop gates on irreversible actions, showing the literal action.</li></ul>
+  <h4>6 · Evaluation</h4>
+  <p>Task success rate on a fixed suite, steps-to-completion, cost per successful task, and failure taxonomy (wrong tool, bad arguments, loop, gave up, hallucinated result). Replay traces against a new prompt version before shipping it — the agent equivalent of a regression test.</p>` },
+
+{ id:"hd8", t:"Design a feature store and training platform", tag:"ML systems", sum:"One feature definition, two serving paths, and point-in-time correctness.",
+  body:`<h4>1 · The problem it solves</h4>
+  <p>Two failure modes: features computed differently in training and serving (skew), and features computed with data that would not have existed at prediction time (leakage). A feature store exists to make both structurally impossible, not to be a database.</p>
+  <h4>2 · Architecture</h4>
+  ${flow([{t:"Definitions",d:"versioned, in code"},{t:"Batch compute",d:"warehouse, daily"},{t:"Stream compute",d:"Flink, seconds"},{t:"Offline store",d:"point-in-time joins"},{t:"Online store",d:"Redis, p99 5 ms"}])}
+  <h4>3 · Point-in-time correctness</h4>
+  <p>The core mechanism. A training row for an event at time <code>t</code> must join the feature value <em>as it was at</em> <code>t</code>, not the current value. That means every feature row carries an event timestamp, and the join is an as-of join. Getting this wrong produces a model that looks superb offline and fails immediately — which is exactly the story to tell when asked about a past incident.</p>
+  <h4>4 · Other decisions</h4>
+  <ul><li><strong>One definition, two executions</strong> — the same declarative transformation compiled to a batch job and a streaming job, or a shared UDF. Never two hand-written implementations.</li>
+  <li><strong>Freshness tiers</strong> — batch (daily), near-real-time (minutes), real-time (request-time computation). Declare the tier per feature; it is a cost decision.</li>
+  <li><strong>Backfill</strong> must be first-class: a new feature is useless until it exists historically.</li>
+  <li><strong>Monitoring</strong> — null rate, distribution drift, and freshness SLA per feature, with the model's dependency graph so you know which models break when a feature goes stale.</li></ul>
+  <h4>5 · Training side</h4>
+  <p>Experiment tracking (params, metrics, git SHA, data snapshot hash), a model registry with stages (staging → production → archived), and artefacts pinned to the exact feature-definition versions. Reproducibility means: given a run id, you can rebuild the dataset and retrain to the same numbers. If you cannot, you do not have a platform.</p>` }
+];
+
+const LLD = [
+{ id:"ld1", t:"LRU cache with O(1) get and put", tag:"Data structures", sum:"Hash map plus doubly linked list — the canonical warm-up.",
+  body:`<h4>Requirements</h4><p>Fixed capacity; <code>get</code> and <code>put</code> both O(1); accessing an entry makes it most-recently used; evict the least-recently used on overflow. Ask whether it must be thread-safe — the answer changes the design.</p>
+  <h4>Design</h4><p>A hash map from key to node gives O(1) lookup. A <strong>doubly</strong> linked list gives O(1) removal from the middle (a singly linked list would need the predecessor). Sentinel head and tail nodes remove every null check.</p>
+  <pre><span class="k">class</span> Node:
+    __slots__ = (<span class="c">'k'</span>, <span class="c">'v'</span>, <span class="c">'prev'</span>, <span class="c">'next'</span>)
+
+<span class="k">class</span> LRUCache:
+    <span class="k">def</span> __init__(self, cap):
+        self.cap, self.map = cap, {}
+        self.head, self.tail = Node(), Node()   <span class="c"># sentinels</span>
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    <span class="k">def</span> _remove(self, n):
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    <span class="k">def</span> _push_front(self, n):
+        n.next, n.prev = self.head.next, self.head
+        self.head.next.prev = n
+        self.head.next = n
+
+    <span class="k">def</span> get(self, k):
+        n = self.map.get(k)
+        <span class="k">if</span> n <span class="k">is None</span>: <span class="k">return</span> -1
+        self._remove(n); self._push_front(n)
+        <span class="k">return</span> n.v
+
+    <span class="k">def</span> put(self, k, v):
+        <span class="k">if</span> k <span class="k">in</span> self.map:
+            n = self.map[k]; n.v = v
+            self._remove(n); self._push_front(n); <span class="k">return</span>
+        <span class="k">if</span> len(self.map) == self.cap:
+            lru = self.tail.prev
+            self._remove(lru); <span class="k">del</span> self.map[lru.k]
+        n = Node(); n.k, n.v = k, v
+        self.map[k] = n; self._push_front(n)</pre>
+  <h4>Extensions they will ask for</h4>
+  <ul><li><strong>Thread safety</strong>: one lock around both structures is correct but serialises everything; sharding by key hash into N independent caches gives concurrency with no cross-shard invariant.</li>
+  <li><strong>TTL</strong>: store an expiry per node, check lazily on read, and sweep in the background.</li>
+  <li><strong>LFU</strong>: frequency buckets of ordered lists plus a <code>minFreq</code> pointer — a genuinely harder design worth practising.</li>
+  <li><strong>Distributed</strong>: this is now a cache-eviction policy inside one node; the distributed question is consistent hashing and invalidation, which is a different problem.</li></ul>` },
+
+{ id:"ld2", t:"Rate limiter: token bucket and sliding window", tag:"Systems", sum:"Four algorithms, their memory cost, and the distributed version.",
+  body:`<h4>Requirements</h4><p>Limit each API key to N requests per window; low latency; correct under concurrency; works across multiple app servers. Clarify whether bursts are acceptable — that single answer picks the algorithm.</p>
+  <h4>The four algorithms</h4>
+  <ul><li><strong>Fixed window</strong> — a counter per (key, window). O(1) memory, trivially simple, but allows 2N requests across a window boundary.</li>
+  <li><strong>Sliding window log</strong> — store every timestamp. Exact, but O(N) memory per key.</li>
+  <li><strong>Sliding window counter</strong> — weight the previous window's count by the overlap fraction. O(1) memory, close to exact. The usual production choice.</li>
+  <li><strong>Token bucket</strong> — tokens refill at a fixed rate up to a capacity; each request takes one. O(1), and it <em>permits controlled bursts</em>, which is why it is right for user-facing APIs. Leaky bucket is the variant that smooths output instead.</li></ul>
+  <pre><span class="k">class</span> TokenBucket:
+    <span class="k">def</span> __init__(self, rate, cap):
+        self.rate, self.cap = rate, cap
+        self.tokens, self.ts = cap, time.monotonic()
+
+    <span class="k">def</span> allow(self, n=1):
+        now = time.monotonic()
+        self.tokens = min(self.cap, self.tokens + (now - self.ts) * self.rate)
+        self.ts = now
+        <span class="k">if</span> self.tokens &gt;= n:
+            self.tokens -= n
+            <span class="k">return</span> True
+        <span class="k">return</span> False</pre>
+  <h4>Distributed</h4>
+  <p>State must be shared, so Redis. Do the read-modify-write in a <strong>Lua script</strong> so it is atomic — a GET then SET races and lets the limit be exceeded under load. Trade-offs to volunteer: a Redis round trip per request adds latency (mitigate with a local bucket holding a leased quota), and on Redis failure you must choose fail-open (availability) or fail-closed (protection) — say which and why.</p>
+  <h4>API details</h4><p>Return <code>429</code> with <code>Retry-After</code>, and the <code>X-RateLimit-Limit/Remaining/Reset</code> headers. Rate limit on a composite key (API key, endpoint class) so an expensive endpoint gets its own budget.</p>` },
+
+{ id:"ld3", t:"An in-memory vector index with a pluggable ANN backend", tag:"AI systems", sum:"The machine-coding round an AI-engineer interview actually gives you.",
+  body:`<h4>Requirements</h4><p>Add, delete and search vectors by cosine similarity; metadata filtering; top-k; swap the index implementation without changing callers; report recall against exact search.</p>
+  <h4>Design</h4><p>Program to an interface so brute force and HNSW are interchangeable — that separation is what is being marked. Normalise on insert so cosine reduces to a dot product. Keep deletions as tombstones with periodic compaction, because graph indexes cannot cheaply remove a node.</p>
+  <pre><span class="k">class</span> VectorIndex(ABC):
+    <span class="k">def</span> add(self, id, vec, meta): ...
+    <span class="k">def</span> delete(self, id): ...
+    <span class="k">def</span> search(self, q, k, flt=None): ...
+
+<span class="k">class</span> FlatIndex(VectorIndex):
+    <span class="c"># exact; the recall baseline everything else is measured against</span>
+    <span class="k">def</span> __init__(self, dim):
+        self.dim, self.ids, self.meta = dim, [], {}
+        self.mat = np.zeros((0, dim), dtype=np.float32)
+        self.dead = set()
+
+    <span class="k">def</span> add(self, id, vec, meta=None):
+        v = np.asarray(vec, dtype=np.float32)
+        v /= (np.linalg.norm(v) + 1e-12)          <span class="c"># cosine -&gt; dot</span>
+        self.mat = np.vstack([self.mat, v])
+        self.ids.append(id); self.meta[id] = meta or {}
+
+    <span class="k">def</span> delete(self, id):
+        self.dead.add(id)                          <span class="c"># tombstone</span>
+
+    <span class="k">def</span> search(self, q, k=10, flt=None):
+        q = np.asarray(q, dtype=np.float32)
+        q /= (np.linalg.norm(q) + 1e-12)
+        scores = self.mat @ q                      <span class="c"># (n,) dot products</span>
+        order = np.argpartition(-scores, min(k * 4, len(scores) - 1))
+        out = []
+        <span class="k">for</span> i <span class="k">in</span> order:
+            id = self.ids[i]
+            <span class="k">if</span> id <span class="k">in</span> self.dead: <span class="k">continue</span>
+            <span class="k">if</span> flt <span class="k">and not</span> flt(self.meta[id]): <span class="k">continue</span>
+            out.append((id, float(scores[i])))
+        out.sort(key=<span class="k">lambda</span> t: -t[1])
+        <span class="k">return</span> out[:k]</pre>
+  <h4>What the follow-ups will be</h4>
+  <ul><li><strong>Why <code>argpartition</code> and not <code>argsort</code>?</strong> O(n) versus O(n log n); you only need the top region.</li>
+  <li><strong>Pre- vs post-filtering</strong>: filtering after ANN can return fewer than k results; over-fetching is the pragmatic fix, filtered-HNSW is the real one.</li>
+  <li><strong>Persistence</strong>: memory-map the matrix, write-ahead log for adds, snapshot plus replay on restart.</li>
+  <li><strong>Concurrency</strong>: a reader-writer lock, or copy-on-write segments (like Lucene) so readers never block.</li>
+  <li><strong>Measuring recall@k</strong> against <code>FlatIndex</code> on a sample — insist on this; it is the whole reason the interface exists.</li></ul>` },
+
+{ id:"ld4", t:"A resilient LLM client: retries, circuit breaker, fallback", tag:"AI systems", sum:"The wrapper every production AI app needs, and the failure modes it handles.",
+  body:`<h4>Requirements</h4><p>Call a provider; retry transient failures without hammering it; stop calling a dead provider; fall back to a secondary; enforce a per-request timeout and a budget; stream when asked.</p>
+  <h4>Design</h4><p>Three composable layers, each with one job: <strong>Retry</strong> (exponential backoff with jitter, only on retryable errors), <strong>CircuitBreaker</strong> (closed → open → half-open), <strong>Router</strong> (ordered providers, first healthy wins).</p>
+  <pre><span class="k">class</span> CircuitBreaker:
+    <span class="c"># closed: pass through · open: fail fast · half_open: one probe</span>
+    <span class="k">def</span> __init__(self, threshold=5, cool_s=30):
+        self.threshold, self.cool_s = threshold, cool_s
+        self.fails, self.state, self.opened_at = 0, <span class="c">'closed'</span>, 0.0
+
+    <span class="k">def</span> before(self):
+        <span class="k">if</span> self.state == <span class="c">'open'</span>:
+            <span class="k">if</span> time.monotonic() - self.opened_at &lt; self.cool_s:
+                <span class="k">raise</span> CircuitOpen()
+            self.state = <span class="c">'half_open'</span>
+
+    <span class="k">def</span> after(self, ok):
+        <span class="k">if</span> ok:
+            self.fails, self.state = 0, <span class="c">'closed'</span>
+        <span class="k">else</span>:
+            self.fails += 1
+            <span class="k">if</span> self.fails &gt;= self.threshold <span class="k">or</span> self.state == <span class="c">'half_open'</span>:
+                self.state, self.opened_at = <span class="c">'open'</span>, time.monotonic()
+
+<span class="k">def</span> call(providers, req, budget_s=20):
+    deadline = time.monotonic() + budget_s
+    <span class="k">for</span> p <span class="k">in</span> providers:
+        <span class="k">for</span> attempt <span class="k">in</span> range(3):
+            <span class="k">if</span> time.monotonic() &gt; deadline: <span class="k">raise</span> Timeout()
+            <span class="k">try</span>:
+                p.breaker.before()
+                r = p.invoke(req, timeout=deadline - time.monotonic())
+                p.breaker.after(True); <span class="k">return</span> r
+            <span class="k">except</span> (RateLimited, ServerError) <span class="k">as</span> e:
+                p.breaker.after(False)
+                time.sleep(min(2 ** attempt, 8) * (0.5 + random.random()))
+            <span class="k">except</span> (BadRequest, CircuitOpen):
+                <span class="k">break</span>                       <span class="c"># never retry these</span>
+    <span class="k">raise</span> AllProvidersFailed()</pre>
+  <h4>Details that separate a good answer</h4>
+  <ul><li><strong>Jitter is not optional</strong> — synchronised retries from many clients recreate the outage.</li>
+  <li><strong>Do not retry 400s.</strong> A malformed prompt fails identically forever; retrying burns budget and looks like an attack.</li>
+  <li><strong>Idempotency keys</strong> so a retried request that actually succeeded is not billed or executed twice.</li>
+  <li><strong>Streaming complicates fallback</strong> — once the first token is sent you cannot silently switch providers. Decide: buffer the first chunk briefly, or accept that mid-stream failures surface to the user.</li>
+  <li><strong>Emit metrics per provider</strong>: latency, error class, tokens, cost, breaker state. Without them you cannot tune any of the constants above.</li></ul>` },
+
+{ id:"ld5", t:"A token-aware document chunker", tag:"AI systems", sum:"Structure-aware splitting with overlap — deceptively fiddly.",
+  body:`<h4>Requirements</h4><p>Split a document into chunks under a token limit; never split mid-sentence when avoidable; respect structure (headings, code blocks, tables); configurable overlap; every chunk carries its heading path for context.</p>
+  <h4>Design</h4><p>Recursive splitting on a hierarchy of separators, falling through to finer ones only when a piece is still too large. Measure in <em>tokens</em> from the real tokeniser, never characters — a 500-character code block can be 300 tokens.</p>
+  <pre>SEPARATORS = [<span class="c">"\\n# "</span>, <span class="c">"\\n## "</span>, <span class="c">"\\n\\n"</span>, <span class="c">"\\n"</span>, <span class="c">". "</span>, <span class="c">" "</span>]
+
+<span class="k">def</span> split(text, max_tok, enc, depth=0):
+    <span class="k">if</span> len(enc.encode(text)) &lt;= max_tok:
+        <span class="k">return</span> [text]
+    <span class="k">if</span> depth &gt;= len(SEPARATORS):
+        <span class="c"># hard cut: no separator left</span>
+        toks = enc.encode(text)
+        <span class="k">return</span> [enc.decode(toks[i:i + max_tok])
+                <span class="k">for</span> i <span class="k">in</span> range(0, len(toks), max_tok)]
+    parts, out, buf = text.split(SEPARATORS[depth]), [], <span class="c">""</span>
+    <span class="k">for</span> p <span class="k">in</span> parts:
+        cand = (buf + SEPARATORS[depth] + p) <span class="k">if</span> buf <span class="k">else</span> p
+        <span class="k">if</span> len(enc.encode(cand)) &lt;= max_tok:
+            buf = cand
+        <span class="k">else</span>:
+            <span class="k">if</span> buf: out.append(buf)
+            buf = p <span class="k">if</span> len(enc.encode(p)) &lt;= max_tok <span class="k">else</span> <span class="c">""</span>
+            <span class="k">if not</span> buf: out += split(p, max_tok, enc, depth + 1)
+    <span class="k">if</span> buf: out.append(buf)
+    <span class="k">return</span> out</pre>
+  <h4>What makes it production-grade</h4>
+  <ul><li><strong>Overlap</strong> by re-prepending the last <code>k</code> tokens of the previous chunk — 10–20% is the usual band; more costs storage and retrieval precision.</li>
+  <li><strong>Atomic blocks</strong>: never split a fenced code block or a table row-wise. Extract them first, chunk them whole, and place them back.</li>
+  <li><strong>Heading path</strong> prepended to each chunk ("Billing &gt; Refunds &gt; Partial refunds") so an isolated chunk still says what it is about. This alone measurably improves retrieval.</li>
+  <li><strong>Stable chunk ids</strong> from a content hash, so re-ingesting an unchanged document does not churn the index.</li>
+  <li><strong>Encoder caching</strong>: <code>enc.encode</code> is called constantly in the loop above — memoise per part or the chunker becomes the bottleneck.</li></ul>` },
+
+{ id:"ld6", t:"A batching inference server queue", tag:"AI systems", sum:"Group requests into a batch under a latency SLA — concurrency done properly.",
+  body:`<h4>Requirements</h4><p>Accept concurrent single requests; group them into batches of at most <code>B</code>; never make a request wait longer than <code>T</code> ms; return each caller their own result; handle a failing batch without failing unrelated requests.</p>
+  <h4>Design</h4><p>A single-consumer queue with a dual trigger: flush when the batch is full <em>or</em> when the oldest item hits its deadline. Each request carries a future the caller awaits.</p>
+  <pre><span class="k">class</span> BatchQueue:
+    <span class="k">def</span> __init__(self, fn, max_batch=32, max_wait=0.02):
+        self.fn, self.max_batch, self.max_wait = fn, max_batch, max_wait
+        self.q = asyncio.Queue()
+        asyncio.create_task(self._loop())
+
+    <span class="k">async def</span> submit(self, item):
+        fut = asyncio.get_running_loop().create_future()
+        <span class="k">await</span> self.q.put((item, fut))
+        <span class="k">return await</span> fut
+
+    <span class="k">async def</span> _loop(self):
+        <span class="k">while</span> True:
+            item, fut = <span class="k">await</span> self.q.get()          <span class="c"># block for the first</span>
+            batch, futs = [item], [fut]
+            deadline = time.monotonic() + self.max_wait
+            <span class="k">while</span> len(batch) &lt; self.max_batch:
+                left = deadline - time.monotonic()
+                <span class="k">if</span> left &lt;= 0: <span class="k">break</span>
+                <span class="k">try</span>:
+                    i, f = <span class="k">await</span> asyncio.wait_for(self.q.get(), left)
+                <span class="k">except</span> asyncio.TimeoutError:
+                    <span class="k">break</span>
+                batch.append(i); futs.append(f)
+            <span class="k">try</span>:
+                <span class="k">for</span> f, r <span class="k">in</span> zip(futs, <span class="k">await</span> self.fn(batch)):
+                    <span class="k">if not</span> f.done(): f.set_result(r)
+            <span class="k">except</span> Exception <span class="k">as</span> e:
+                <span class="k">for</span> f <span class="k">in</span> futs:
+                    <span class="k">if not</span> f.done(): f.set_exception(e)</pre>
+  <h4>Follow-ups</h4>
+  <ul><li><strong>Why block on the first item?</strong> An empty-queue spin wastes CPU, and the latency clock should start when work exists, not before.</li>
+  <li><strong>Cancellation</strong>: if the caller goes away, mark the future cancelled and skip it at flush — otherwise you pay for abandoned work.</li>
+  <li><strong>Bucketing</strong>: for real inference, group by similar sequence length so padding does not dominate the batch cost.</li>
+  <li><strong>Backpressure</strong>: a bounded queue that rejects with 429 beats an unbounded one that turns into a latency bomb.</li>
+  <li><strong>Tuning</strong>: <code>max_wait</code> is a direct latency-versus-throughput dial; derive it from the p99 target, do not guess.</li></ul>` },
+
+{ id:"ld7", t:"Design a parking lot (the OOP classic)", tag:"OOP", sum:"Still asked — it tests class modelling, not cleverness.",
+  body:`<h4>Requirements</h4><p>Multiple floors; spot types (motorcycle, compact, large, EV with charger); park and unpark a vehicle; issue a ticket; compute a fee by duration and type; show availability per floor. Clarify: multiple entrances? Reservations? Those change the concurrency story.</p>
+  <h4>Class model</h4>
+  <pre><span class="k">class</span> VehicleType(Enum): MOTORCYCLE, COMPACT, LARGE, EV
+
+<span class="k">class</span> Vehicle:            plate, type
+<span class="k">class</span> ParkingSpot:        id, type, floor, occupied_by
+<span class="k">class</span> ParkingFloor:       spots, availability_by_type()
+<span class="k">class</span> Ticket:             id, plate, spot_id, entry_time, exit_time
+<span class="k">class</span> FeeStrategy(ABC):   compute(ticket) -&gt; Money
+<span class="k">class</span> SpotAllocator(ABC): allocate(vehicle) -&gt; ParkingSpot
+
+<span class="k">class</span> ParkingLot:
+    <span class="k">def</span> park(self, vehicle) -&gt; Ticket
+    <span class="k">def</span> unpark(self, ticket_id) -&gt; Money</pre>
+  <h4>The patterns to name, and why</h4>
+  <ul><li><strong>Strategy</strong> for fees and for allocation — pricing changes constantly and allocation policy (nearest, cheapest, EV-first) is a product decision. Both must be swappable without touching <code>ParkingLot</code>.</li>
+  <li><strong>Factory</strong> for vehicle and spot creation.</li>
+  <li><strong>Observer</strong> for the availability display board.</li>
+  <li><strong>Singleton</strong> for the lot — mention it, then note it makes testing harder and dependency injection is usually better. That caveat scores well.</li></ul>
+  <h4>Concurrency</h4>
+  <p>Two cars must not be assigned the same spot. A per-floor lock, or an atomic compare-and-set on the spot's state, with allocation and ticket creation in one transaction. Say explicitly that a naive "find free spot, then mark it" has a race between the two steps — this is the detail most candidates skip and most interviewers are waiting for.</p>
+  <h4>Extensions</h4><p>Reservations with expiry; multiple entrances needing distributed allocation; the fee strategy becoming a rules engine; the display board becoming an event stream.</p>` }
+];

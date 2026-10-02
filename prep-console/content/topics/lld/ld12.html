@@ -1,0 +1,745 @@
+<!-- topic source for lld/ld12; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld12",
+  "t": "Design an in-memory key-value store with TTL",
+  "tag": "Data structures",
+  "sum": "Build a small Redis: get, set, delete, expire, persist and ttl with absolute deadlines on an injectable clock, lazy expiry on read, and two active reclaimers (Redis-style random sampling over the keys that have a TTL, and an exact min-heap that skips stale entries), plus LRU eviction and the arithmetic that says when sampling falls behind.",
+  "prereq": [
+    [
+      "py2",
+      "dict, list and heapq (a binary heap that pops the smallest item in O(log n)); OrderedDict keeps order and can move a key to the end."
+    ],
+    [
+      "py9",
+      "Threads share memory; a check-then-act sequence on shared state needs a lock."
+    ],
+    [
+      "ld1",
+      "LRU caches: a map plus recency order, eviction from the least recently used end, and invariants checked by tests."
+    ],
+    [
+      "ld2",
+      "Inject the clock and use a monotonic one; compute time-based state lazily from timestamps instead of timers."
+    ]
+  ],
+  "myths": [
+    [
+      "A TTL means a timer per key that deletes it when it fires.",
+      "A million timers cost memory, wake-ups and locking. Real stores record an absolute deadline per key and check it when the key is read (lazy expiry), plus a background job that reclaims keys nobody reads. No per-key timers exist."
+    ],
+    [
+      "Lazy expiry is enough, since expired keys are never returned.",
+      "Reads are always correct, but a key that is never read again is never removed, so memory grows without bound while every test passes. Active expiry is a memory requirement, not a correctness one."
+    ],
+    [
+      "Random sampling removes expired keys promptly.",
+      "Sampling keeps the expired share around a target only while the sweeper's budget exceeds the expiry rate. In this lesson's simulation, 5,000 keys a second with a 3-second TTL left 77,033 dead keys in memory after 30 seconds under sampling, and none with an exact heap."
+    ],
+    [
+      "Store the TTL as seconds remaining.",
+      "Remaining time changes every instant and must be updated constantly. Store the absolute deadline (now plus TTL at the time of setting) and compute remaining time on demand. Redis stores expiry as an absolute Unix timestamp in milliseconds."
+    ],
+    [
+      "Overwriting a key keeps its TTL.",
+      "In Redis, a plain SET clears any existing TTL, and EXPIRE or PERSIST change it explicitly. Whatever rule you choose, choose it deliberately and test it, because a heap of old deadlines can otherwise delete a fresh value."
+    ],
+    [
+      "Use time.time() for deadlines.",
+      "Wall-clock time can jump backwards or forwards when the system clock is corrected, expiring everything at once or nothing for an hour. Use a monotonic clock in memory. Persisted deadlines must be wall-clock, which is why Redis warns that expiry depends on a stable system clock."
+    ]
+  ],
+  "recap": [
+    "A TTL is stored as an absolute deadline per key, computed from an injected monotonic clock, never as a timer per key.",
+    "Every read checks the deadline and deletes the key if it has passed: lazy expiry, which keeps reads correct.",
+    "Keys that are never read again need active expiry, otherwise memory leaks silently.",
+    "Redis-style active expiry samples random keys from the set of keys with a TTL, deletes the expired ones, and repeats while the sample was mostly expired; the repeat threshold sets the steady expired share.",
+    "Sampling needs O(1) random choice and removal, which a list plus an index map with swap-removal provides.",
+    "An exact alternative keeps a min-heap of deadlines and pops those that are due, skipping entries made stale by later set, expire or persist calls via a per-key generation number.",
+    "Sampling falls behind when keys expire faster than its budget can delete them; the heap deletes exactly what is due at O(log n) per key.",
+    "Optional LRU eviction bounds memory by key count; ttl returns -1 for no TTL and -2 for a missing key, following Redis.",
+    "One lock around each operation keeps the several structures consistent under threads."
+  ],
+  "glossary": [
+    [
+      "Absolute deadline",
+      "The moment a key expires, stored as a timestamp, rather than the time remaining."
+    ],
+    [
+      "Active expiry",
+      "A background process that finds and removes expired keys that nobody is reading."
+    ],
+    [
+      "CPU",
+      "Central processing unit; here, the processor time the background sweeper consumes."
+    ],
+    [
+      "Eviction",
+      "Removing live data because the store is full, as opposed to expiry, which removes data whose time is up."
+    ],
+    [
+      "Generation number",
+      "A per-key counter incremented whenever its TTL changes, used to recognise heap entries that no longer apply."
+    ],
+    [
+      "Heap (min-heap)",
+      "A tree stored in a list where the smallest item is always first; push and pop cost O(log n)."
+    ],
+    [
+      "hz (Redis)",
+      "How many times per second Redis runs its background tasks, including active expiry; 10 by default."
+    ],
+    [
+      "Indexed set",
+      "A list plus a dict from element to position, giving O(1) add, remove (by swapping with the last element) and uniform random choice."
+    ],
+    [
+      "Lazy expiry",
+      "Checking a key's deadline only when it is accessed, and deleting it then if it has passed."
+    ],
+    [
+      "LRU eviction",
+      "Removing the least recently used keys when the store is full."
+    ],
+    [
+      "Monotonic clock",
+      "A clock that only moves forward and is unaffected by changes to the system time."
+    ],
+    [
+      "Persist",
+      "Removing a key's TTL so it never expires."
+    ],
+    [
+      "Sampling",
+      "Checking a small random subset instead of everything, accepting a statistical rather than exact result."
+    ],
+    [
+      "Stale entry",
+      "A heap record for a deadline that has since been replaced or removed; it must be skipped, not acted on."
+    ],
+    [
+      "Swap-remove",
+      "Deleting from the middle of a list in O(1) by moving the last element into the hole."
+    ],
+    [
+      "Timing wheel",
+      "An array of time-slot buckets where each timer is placed in the slot for its deadline and each tick expires one slot, giving O(1) insertion and expiry at the cost of precision."
+    ],
+    [
+      "TTL",
+      "Time to live: how long a key remains valid after its expiry is set."
+    ],
+    [
+      "Volatile key",
+      "A key that has a TTL; the set of volatile keys is what active expiry samples from."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "How do you implement TTL without a timer per key?",
+      "Store an absolute deadline per key (now plus TTL when it is set) from a monotonic clock. Every read compares the clock with the deadline and treats a passed deadline as a miss, deleting the key. A background sweeper reclaims keys nobody reads. No timers are needed."
+    ],
+    [
+      "E",
+      "Why is lazy expiry alone insufficient?",
+      "Because an expired key that nobody reads is never noticed and occupies memory forever. Reads stay correct, so tests pass; memory just grows. In the solution's test, 1,000 keys with a one-second TTL were all still resident two seconds later with no sweeper."
+    ],
+    [
+      "E",
+      "What should ttl() return for a missing key and for a key without a TTL?",
+      "Follow Redis: -2 if the key does not exist (including if it has expired), -1 if it exists with no TTL, and otherwise the time remaining. Distinguishing the two negatives lets callers tell 'gone' from 'permanent'."
+    ],
+    [
+      "M",
+      "How does sampled active expiry work?",
+      "Periodically, pick a small random batch of keys from the set of keys that have a TTL, delete those whose deadline has passed, and repeat while the batch was mostly expired. Work per tick is bounded and the expired share settles near the repeat threshold: in the solution's simulation, a 25 percent threshold left at most about a third of tracked keys expired, a 5 percent threshold about a sixth."
+    ],
+    [
+      "M",
+      "Why keep a separate set of keys that have a TTL, and how do you sample it in O(1)?",
+      "So the sweeper never wastes samples on keys that cannot expire. A Python set has no O(1) random choice, so keep a list of keys plus a dict from key to its index; pick a random index, and remove by moving the last key into the removed key's slot and updating its index."
+    ],
+    [
+      "M",
+      "How does the heap-based sweeper avoid deleting a key whose TTL was extended?",
+      "Each key has a generation number that increments whenever its TTL is set, changed or removed, and each heap entry records the generation at push time. When an entry is popped, it is acted on only if its generation still matches; otherwise it is stale and skipped. Without that check, an old deadline deletes a freshly written value."
+    ],
+    [
+      "M",
+      "Should a plain set keep or clear an existing TTL?",
+      "It is a decision to make explicitly. Redis's SET clears the TTL unless told to keep it, which is what the solution does; EXPIRE and PERSIST change it explicitly. Either rule works if it is documented and tested, especially against the stale-heap-entry bug."
+    ],
+    [
+      "M",
+      "How would you add a maximum memory or key count?",
+      "Keep keys in an OrderedDict in recency order; on each set, while over the limit, evict from the least recently used end (or, like Redis's volatile policies, only among keys with a TTL, or the one closest to expiring). Eviction and expiry are different: expiry removes logically dead data, eviction removes live data to fit."
+    ],
+    [
+      "H",
+      "When does sampled expiry stop working, and what do you do?",
+      "When keys expire faster than the sampling budget can delete them, the expired share climbs toward 100 percent and memory grows anyway. At 5,000 keys per second with a 3-second TTL and about 3,200 deletions per second of budget, the solution's simulation held 77,033 dead keys after 30 seconds. Raise the budget with the volatile keyspace, or use an exact structure such as a min-heap or a timing wheel that deletes precisely what is due."
+    ],
+    [
+      "H",
+      "Compare a min-heap with a timing wheel for expiry.",
+      "A heap orders every deadline exactly: O(log n) push and pop, and stale entries to skip. A timing wheel is an array of buckets, each covering a time slice; a key goes into the bucket for its deadline, and each tick empties the current bucket, O(1) per key at the cost of granularity (a key may expire up to one slice late) and of handling deadlines beyond the wheel's span with coarser wheels. Kernels and network stacks use timing wheels for exactly this reason."
+    ],
+    [
+      "H",
+      "How does expiry work with replication?",
+      "Redis expires keys only on the primary; when a key expires there, a DEL is propagated to replicas and to the append-only file, so replicas never expire keys independently and cannot disagree. Replicas still store the deadlines, so one promoted to primary can take over expiring. Letting each replica expire on its own clock would let replicas diverge."
+    ],
+    [
+      "H",
+      "What clock should persisted deadlines use?",
+      "In memory, a monotonic clock. On disk or across restarts, monotonic time is meaningless, so persisted deadlines are absolute wall-clock timestamps; Redis stores them as Unix milliseconds and notes that time keeps flowing while the server is down, so a key can be expired by the time it is loaded, and that a stable system clock matters."
+    ],
+    [
+      "H",
+      "Make the store scale to many cores.",
+      "One lock serialises everything. Shard the keyspace into N independent stores by hash of the key, each with its own lock, structures and sweeper; operations on different shards never contend. Multi-key operations across shards then need extra care, which is why Redis Cluster requires keys in one command to share a hash slot."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "Redis: EXPIRE, and how Redis expires keys",
+      "Passive expiry on access plus active expiry that periodically tests random keys among those with an expiration; expiry propagated as DEL to replicas and the AOF; deadlines stored as absolute Unix timestamps in milliseconds; SET clears the TTL; accuracy 0 to 1 ms since 2.6.",
+      "https://redis.io/docs/latest/commands/expire/"
+    ],
+    [
+      "code",
+      "redis.conf (active-expire-effort, hz)",
+      "The active expire cycle scans the key space slowly and incrementally; at the default effort 1 it tries to keep no more than about ten percent of expired keys in memory, with effort up to 10 trading CPU and latency for memory; hz defaults to 10.",
+      "https://raw.githubusercontent.com/redis/redis/unstable/redis.conf"
+    ],
+    [
+      "docs",
+      "Redis: Keyspace notifications",
+      "Expired events are generated when the key is actually deleted, by access or by the background cycle, so there can be a significant delay after the TTL reaches zero.",
+      "https://redis.io/docs/latest/develop/pubsub/keyspace-notifications/"
+    ],
+    [
+      "docs",
+      "Redis: Key eviction",
+      "maxmemory policies (allkeys-lru, volatile-lru, volatile-ttl and others) for when memory is full, as distinct from expiry.",
+      "https://redis.io/docs/latest/develop/reference/eviction/"
+    ],
+    [
+      "docs",
+      "Python: heapq",
+      "The binary heap used for exact expiry, including the note on handling entries whose priority changed.",
+      "https://docs.python.org/3/library/heapq.html"
+    ],
+    [
+      "docs",
+      "Python: time.monotonic",
+      "A clock that cannot go backwards, for in-memory deadlines.",
+      "https://docs.python.org/3/library/time.html#time.monotonic"
+    ],
+    [
+      "paper",
+      "Varghese and Lauck: Hashed and hierarchical timing wheels",
+      "The timing-wheel data structure for very many timers with O(1) insertion and expiry.",
+      "https://www.cs.columbia.edu/~nahum/w6998/papers/sosp87-timing-wheels.pdf"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A web application keeps user sessions in memory: each login stores a session object under a random key, valid for 30 minutes. The first version stores them in a dict with an "expires at" field and checks it when a request arrives. It works, and the tests pass. Three weeks later the process is using 9 GB of memory and the operations team restarts it every night. The cause is simple: most sessions are never used again after their user closes the browser, so nobody ever reads them, so nothing ever notices they expired, so they are never deleted. Every read was correct; the memory leak was invisible to every test. The fix took an afternoon once someone understood the cause; finding the cause took three weeks of nightly restarts, because nobody was measuring how many of the stored sessions were already dead.</p>
+<p>Time-to-live, or <strong>TTL</strong>, is one of the most common features in infrastructure: sessions, caches, rate-limit counters, distributed locks, one-time codes, idempotency keys, feature-flag overrides. Redis, the most widely used in-memory store, has supported key expiry since its early days, and its documentation explains how it does it: check expiry when a key is accessed, and also, periodically, test a few random keys among those with an expiration and delete the expired ones.</p>
+<p>That explanation hides most of the engineering. How do you pick random keys from a set in constant time? How much work per second should the background process do, and what happens when keys expire faster than it can delete them? What if a key's TTL is extended after its deadline was recorded somewhere? What happens to TTLs across a restart, or on a replica? Which clock do you trust? Each is a place where an interview solution either shows judgement or quietly leaks memory or deletes live data.</p>
+<p>The lesson of the opening story is general: some bugs never produce a wrong answer, only a slowly growing cost, and they are found by measuring resources, not by checking outputs. A TTL store is the cleanest place to learn to test for them.</p>
+<p>As a machine-coding round, the TTL store is a natural follow-up to the LRU cache: the same "map plus auxiliary structure" shape, a time dimension added, and a clear distinction between correctness (reads never return expired data) and resource safety (dead data does not accumulate). It also has an honest performance analysis: random sampling, the method Redis describes, has a breaking point you can compute.</p>
+<p>This lesson follows the round: clarify the operations and semantics, name the structures, build a naive store with a timer per key and one with lazy expiry only, then the correct design in stages (absolute deadlines on an injectable clock, lazy expiry, a volatile-key set with O(1) sampling, sampled active expiry, an exact min-heap with stale-entry protection, LRU eviction, a lock), trace and test it, and cover edge cases, extensions such as replication and timing wheels, complexity, and the Redis documentation that describes the production version.</p>
+</section>
+
+<section data-field="primer">
+<h4>Deadlines, not timers</h4>
+<p>The tempting design gives every key a timer: when it fires, delete the key. With a million keys that is a million scheduled callbacks, each with memory, a place in some timer queue, and a thread or event loop waking to run it, plus a lock to delete safely. Almost nobody builds it this way. Instead, each key stores an <strong>absolute deadline</strong>: the moment it stops being valid, computed when the TTL is set as "now plus TTL". Time passing changes nothing in the store; whether a key is alive is a question asked when needed: is the current time before the deadline? Storing the deadline rather than the time remaining also matters: "remaining" changes every instant, the deadline never does. Redis stores expiry as an absolute Unix timestamp in milliseconds.</p>
+<h4>Two kinds of expiry</h4>
+<p><strong>Lazy expiry</strong> (Redis calls it passive) asks the question on every access. When a read finds a key past its deadline, it deletes the key and reports a miss. This alone makes the store correct: no expired value is ever returned. It is not enough, as the sessions story shows, because keys nobody reads are never checked. <strong>Active expiry</strong> fixes that with background work that finds and deletes expired keys on its own. It is purely about memory, and it can be approximate: if a few expired keys linger for a while, lazy expiry still guarantees nobody sees them.</p>
+<h4>The data structures</h4>
+<p>The store holds several structures that must stay consistent. The <strong>data</strong>: a dict from key to value, an OrderedDict if LRU eviction is wanted. The <strong>deadlines</strong>: a dict from key to deadline, only for keys that have a TTL. For active expiry by sampling, a <strong>volatile set</strong>: the keys with a TTL, stored so that a random one can be picked in O(1). For exact active expiry, a <strong>min-heap</strong> of (deadline, generation, key) entries so the earliest deadline is always at the top, plus a <strong>generation</strong> counter per key to recognise heap entries made obsolete by later changes.</p>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Data layout: data OrderedDict with keys a, b, c, d; deadlines dict for keys with TTL a and c; volatile list [a, c] with index map a to 0, c to 1; min-heap entries (1010, gen 1, a), (1030, gen 1, c) and a stale (1005, gen 1, c) skipped because c's generation is now 2">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="18" style="fill:var(--ink);font-weight:600">data (OrderedDict, LRU order)</text>
+<g style="font-family:var(--mono)">
+<rect x="20" y="28" width="60" height="28" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="50" y="47" text-anchor="middle" style="fill:var(--ink)">b</text>
+<rect x="80" y="28" width="60" height="28" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="110" y="47" text-anchor="middle" style="fill:var(--ink)">a</text>
+<rect x="140" y="28" width="60" height="28" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="170" y="47" text-anchor="middle" style="fill:var(--ink)">d</text>
+<rect x="200" y="28" width="60" height="28" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="230" y="47" text-anchor="middle" style="fill:var(--ink)">c</text>
+</g>
+<text x="20" y="72" style="fill:var(--muted)">LRU ← … → MRU (b and d have no TTL)</text>
+<text x="330" y="18" style="fill:var(--ink);font-weight:600">deadlines (only keys with a TTL)</text>
+<text x="330" y="40" style="fill:var(--ink-2);font-family:var(--mono)">a → 1010.0   c → 1030.0</text>
+<text x="330" y="62" style="fill:var(--ink);font-weight:600">generation</text>
+<text x="330" y="80" style="fill:var(--ink-2);font-family:var(--mono)">a → 1   c → 2   (c's TTL was reset once)</text>
+<text x="20" y="108" style="fill:var(--ink);font-weight:600">volatile set: list + index map (O(1) random pick and removal)</text>
+<g style="font-family:var(--mono)">
+<rect x="20" y="118" width="60" height="28" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="50" y="137" text-anchor="middle" style="fill:var(--ink)">a</text>
+<rect x="80" y="118" width="60" height="28" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="110" y="137" text-anchor="middle" style="fill:var(--ink)">c</text>
+<text x="160" y="137" style="fill:var(--ink-2)">pos: {a: 0, c: 1}</text>
+</g>
+<text x="330" y="108" style="fill:var(--ink);font-weight:600">min-heap of (deadline, generation, key)</text>
+<g style="font-family:var(--mono)">
+<rect x="400" y="120" width="150" height="28" rx="6" style="fill:var(--surface-2);stroke:var(--crit);stroke-dasharray:4 3"/><text x="475" y="139" text-anchor="middle" style="fill:var(--crit)">(1005, 1, c) stale</text>
+<rect x="330" y="176" width="140" height="28" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="400" y="195" text-anchor="middle" style="fill:var(--ink)">(1010, 1, a)</text>
+<rect x="490" y="176" width="140" height="28" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="560" y="195" text-anchor="middle" style="fill:var(--ink)">(1030, 2, c)</text>
+</g>
+<line x1="450" y1="150" x2="410" y2="174" style="fill:none;stroke:var(--line-2)"/><line x1="500" y1="150" x2="550" y2="174" style="fill:none;stroke:var(--line-2)"/>
+<text x="330" y="232" style="fill:var(--ink-2)">pop (1005, 1, c): c's generation is 2 → skip, do not delete</text>
+<text x="330" y="252" style="fill:var(--ink-2)">pop (1010, 1, a) at t ≥ 1010: generation matches → delete a</text>
+<text x="20" y="180" style="fill:var(--ink-2)">sampling sweeper reads</text>
+<text x="20" y="196" style="fill:var(--ink-2)">the volatile list;</text>
+<text x="20" y="212" style="fill:var(--ink-2)">heap sweeper reads the heap.</text>
+<text x="20" y="236" style="fill:var(--muted)">Every set/expire/persist/delete must</text>
+<text x="20" y="252" style="fill:var(--muted)">update all structures under one lock.</text>
+</g>
+</svg>
+<figcaption>One logical store, five physical structures. The heap may hold old entries for a key whose TTL changed; the generation number is what tells the sweeper to ignore them instead of deleting a value that is still valid.</figcaption>
+</figure>
+<h4>Where TTLs appear</h4>
+<p>Expiring data is everywhere once you look: login sessions and password-reset links, cached query results and rendered pages, rate-limiter counters that reset each window, distributed locks that must release if their holder crashes, one-time codes, idempotency keys that only need to be remembered for a day, DNS records cached for their stated lifetime, and leases in coordination services. In each, the semantics are the same (after the deadline, behave as if the data were absent) and so are the two concerns, correctness on read and reclaiming memory, which is why one well-designed store serves all of them.</p>
+<h4>The analogy, and where it breaks</h4>
+<p>Think of a fridge with use-by dates written on every item. Nobody runs a timer per yoghurt. When you take something out, you read the date and throw it away if it has passed: lazy expiry. Because some items at the back are never taken out, once a week someone checks a few items at random and throws out the expired ones, and keeps checking while they keep finding expired items: sampled active expiry. Or they keep the items sorted by date so they can throw out exactly the expired ones from the front: the heap. The analogy breaks at the scale and speed: a fridge has dozens of items checked weekly; a store has millions of keys expiring thousands of times a second, which is where the arithmetic of sampling starts to matter.</p>
+<h4>What the round expects</h4>
+<p>Get, set with optional TTL, delete, expire, persist and ttl with clear semantics; deadlines on an injected clock; lazy expiry in every access path; an active expiry method with a justification; the stale-deadline protection; LRU eviction if memory is bounded; a lock; and tests that drive a fake clock rather than sleeping.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Structures &amp; API</span></div><div class="ck"><span class="ck-m">10–14</span><span class="ck-t">Naive versions</span></div><div class="ck"><span class="ck-m">14–30</span><span class="ck-t">Lazy, sampled, heap</span></div><div class="ck"><span class="ck-m">30–38</span><span class="ck-t">Eviction, threads, tests</span></div><div class="ck"><span class="ck-m">38–45</span><span class="ck-t">Extensions</span></div></div>
+<h4>1 · Clarify the requirements</h4>
+<p>Ask which operations are needed (get, set with TTL, delete, change or remove a TTL, query remaining TTL), what a plain set does to an existing TTL, the TTL granularity (seconds or milliseconds) and accuracy needed (must a key vanish within a millisecond of its deadline, or is "never returned after it" enough), the key count and expiry rate, whether memory is bounded and what to evict, whether access is multi-threaded, and whether data must survive restarts or replicate.</p>
+<p>A typical agreed scope: string keys, any values including <code>None</code>; set with optional TTL in seconds (a plain set clears any previous TTL, as in Redis); get, delete, expire, persist and ttl with Redis's return conventions; expired keys must never be returned; memory must not grow with dead keys; optional LRU eviction by key count; thread-safe; no persistence. Invariants: every key in the deadlines map is in the data map and in the volatile set, and vice versa for the volatile set; no read returns a key whose deadline has passed.</p>
+<h4>2 · Entities and responsibilities</h4>
+<p>One class, <code>KVStore</code>, owns all structures and the lock, because they must change together. A helper class, <code>VolatileSet</code>, encapsulates the list-plus-index-map trick so the store's code reads as "add", "discard" and "sample". The clock is a function passed to the constructor, <code>time.monotonic</code> by default and a fake in tests. The sweepers are methods, called by whatever drives background work: a thread, an event loop timer, or the test.</p>
+<h4>3 · Stage one: two naive versions</h4>
+<pre>import threading
+store = {}
+def set_with_timer(k, v, ttl):
+    store[k] = v
+    threading.Timer(ttl, lambda: store.pop(k, None)).start()   # a thread per key</pre>
+<p>The timer version starts a thread per key: a hundred thousand sessions means a hundred thousand threads, which the process cannot sustain. It also has a nasty bug: if the key is set again with a new TTL before the first timer fires, the old timer deletes the new value early. The second naive version stores <code>(value, deadline)</code> and checks the deadline on every get. It is correct for reads, needs no threads, and leaks every key that is never read again, which the test <code>test_lazy_only_leaks_memory</code> shows: 1,000 keys with a one-second TTL, clock advanced two seconds, all 1,000 still resident.</p>
+<h4>4 · Stage two: deadlines and lazy expiry</h4>
+<p><code>set(k, v, ttl)</code> stores the value, moves the key to the most-recent end of the OrderedDict, and calls <code>_set_deadline</code>, which records <code>now + ttl</code> (or removes any deadline for a plain set), adds or removes the key from the volatile set, bumps the key's generation and pushes a heap entry. Every access path (get, delete, expire, persist, ttl) first calls <code>_live(k, now)</code>, which returns false for a missing key and, for a key whose deadline is at or before now, removes it from every structure, counts it as expired and returns false. The deadline is inclusive: at exactly the deadline the key is gone, which the first test checks. <code>ttl</code> returns −2 for a missing or expired key, −1 for a key with no TTL, and the seconds remaining otherwise.</p>
+<h4>5 · Stage three: O(1) sampling from the keys with a TTL</h4>
+<p>Active expiry by sampling needs to pick random keys from those that have a TTL, quickly, many times per second, while keys are being added and removed. A Python <code>set</code> has O(1) add and remove but no O(1) random choice. A list has O(1) random choice but O(n) removal from the middle. The standard trick combines them: a list of keys plus a dict from key to its index in the list. To add, append and record the index. To pick, choose a random index. To remove, look up the key's index, pop the last element of the list, put it in the removed key's slot, and update its index in the dict. Every operation is O(1). This is a reusable structure (sometimes called an indexed set) worth knowing for any problem that needs "random element of a changing set".</p>
+<h4>6 · Stage four: sampled active expiry</h4>
+<p><code>sweep_sampled(sample=20, max_rounds=16, repeat_above=0.25)</code> runs one cycle. Each round draws 20 random keys from the volatile set, deletes those whose deadline has passed, and continues to another round only if more than 25 percent of the sample was expired, up to 16 rounds. The logic is statistical: if a random sample is mostly expired, there are probably many more expired keys, so keep going; if it is mostly alive, stop and let the next cycle check again. The work per cycle is bounded, so a sweep never stalls the store.</p>
+<p>The repeat threshold sets the steady state. The solution's test loads 10,000 keys with TTLs spread over 60 seconds plus 10,000 keys without TTL, runs the sweeper ten times a second, and records the worst share of tracked keys that were expired but still resident in the first 30 seconds. With a 25 percent threshold it peaked around 32 percent; with 5 percent, around 17 percent. The persistent keys cost nothing, because they are never in the volatile set. Redis's configuration describes the same trade-off: its active expiry cycle, at the default effort level, tries to avoid having more than about ten percent of expired keys still in memory, and a higher effort setting spends more CPU to tolerate fewer.</p>
+<h4>7 · Stage five: when sampling falls behind, and the exact heap</h4>
+<p>Sampling has a ceiling. With 20 keys per round, at most 16 rounds per cycle and 10 cycles per second, it can delete at most 3,200 keys per second. If keys expire faster, no threshold helps: the expired share climbs toward 100 percent, every cycle runs all its rounds, and the backlog grows. The solution's test sets 5,000 keys per second with a 3-second TTL for 30 simulated seconds: the sampled store holds 77,033 expired keys at the end. Lazy expiry keeps reads correct, so nothing fails except memory.</p>
+<p>The exact alternative is a <strong>min-heap</strong> ordered by deadline. <code>sweep_heap</code> pops entries while the earliest deadline is at or before now, deleting each key, so it removes exactly the keys that are due, and the same test leaves zero expired keys resident. The cost is O(log n) per push and pop and memory for one entry per deadline ever set. The subtle part is <strong>stale entries</strong>. A heap cannot efficiently update or remove an arbitrary entry, so when a key's TTL is extended, cleared or the key deleted, its old entry stays in the heap. If the sweeper acted on it, it would delete a key that is still valid, the same bug as the naive timer. The fix is the generation number: every TTL change increments the key's generation, each heap entry carries the generation at the time it was pushed, and the sweeper skips any entry whose generation no longer matches. The test sets <code>x</code> with a 5-second TTL then again with 60 seconds, sets <code>y</code> with 5 seconds then plainly, sets <code>z</code> with 5 seconds, advances 6 seconds and sweeps: only <code>z</code> is removed.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Expired keys still in memory over 30 simulated seconds at 5,000 new keys per second with a 3-second TTL: lazy only grows linearly to about 135,000; sampled sweeping grows to about 77,000; heap sweeping stays at zero">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="18" style="fill:var(--ink);font-weight:600">Dead keys resident, 5,000 sets/s, 3 s TTL</text>
+<line x1="70" y1="200" x2="610" y2="200" style="fill:none;stroke:var(--line-2)"/>
+<line x1="70" y1="30" x2="70" y2="200" style="fill:none;stroke:var(--line-2)"/>
+<text x="62" y="204" text-anchor="end" style="fill:var(--muted)">0</text>
+<text x="62" y="118" text-anchor="end" style="fill:var(--muted)">70k</text>
+<text x="62" y="36" text-anchor="end" style="fill:var(--muted)">140k</text>
+<text x="70" y="220" style="fill:var(--muted)">0 s</text><text x="610" y="220" text-anchor="end" style="fill:var(--muted)">30 s</text>
+<path d="M70,200 L124,200 L610,37" style="fill:none;stroke:var(--crit);stroke-width:2"/>
+<text x="520" y="56" style="fill:var(--crit)">lazy only ≈ 135k</text>
+<path d="M70,200 L124,200 L610,106" style="fill:none;stroke:var(--s2);stroke-width:2"/>
+<text x="470" y="98" style="fill:var(--ink-2)">sampled: 77,033</text>
+<path d="M70,199 L610,199" style="fill:none;stroke:var(--good);stroke-width:2"/>
+<text x="470" y="190" style="fill:var(--good)">heap: 0</text>
+<text x="140" y="150" style="fill:var(--muted)">expiry starts at 3 s; sampling deletes</text>
+<text x="140" y="166" style="fill:var(--muted)">≤ 3,200/s, keys expire at 5,000/s</text>
+</g>
+</svg>
+<figcaption>Once the expiry rate exceeds the sampler's budget, its backlog grows at the difference, about 1,800 keys per second here. The heap deletes exactly what is due. The lazy-only line is the arithmetic upper bound (every key after the first 3 seconds is dead and resident); the sampled and heap values are from the solution's test.</figcaption>
+</figure>
+<h4>8 · Stage six: LRU eviction and the lock</h4>
+<p>Expiry removes data that is logically dead; <strong>eviction</strong> removes live data to fit a limit. With <code>max_keys</code> set, each <code>set</code> evicts from the least recently used end of the OrderedDict until the store fits, and every successful <code>get</code> moves the key to the most recent end, the same policy as the LRU cache case. The test inserts 150 keys into a store of 100 while reading <code>k0</code> after each insert: the 50 oldest unread keys are evicted and <code>k0</code> survives. Redis offers several policies here, including evicting only among keys with a TTL or evicting the key closest to expiring.</p>
+<p>All of this state is shared, and most operations touch several structures, so every public method holds one lock for its whole duration, sweepers included. The thread test runs four threads mixing sets with and without TTL, cross-thread reads and periodic heap sweeps on a store bounded at 1,000 keys, then checks the size bound and that the volatile set and deadlines map agree, a direct check of the main invariant.</p>
+<h4>Choosing an active strategy</h4>
+<table><thead><tr><th>Strategy</th><th>Cost per TTL write</th><th>Cost to reclaim</th><th>Dead keys linger?</th><th>Fits when</th></tr></thead><tbody>
+<tr><td>Lazy only</td><td>O(1)</td><td>only on access</td><td>forever if unread</td><td>never on its own</td></tr>
+<tr><td>Sampling</td><td>O(1)</td><td>bounded per cycle</td><td>a target share</td><td>expiry rate well below sweeper capacity</td></tr>
+<tr><td>Min-heap</td><td>O(log n)</td><td>O(log n) per key</td><td>no</td><td>high expiry rates, exact reclaim</td></tr>
+<tr><td>Timing wheel</td><td>O(1)</td><td>O(1) per key</td><td>up to one slot</td><td>very many timers, coarse precision is fine</td></tr>
+</tbody></table>
+<p>The interview answer is rarely one strategy alone: lazy expiry always, for correctness, plus one active strategy chosen from the expected expiry rate. Saying which numbers would make you switch (the expiry rate approaching the sampler's capacity) shows the choice is reasoned, not remembered.</p>
+<h4>9 · A trace</h4>
+<table><thead><tr><th>Time</th><th>Call</th><th>Effect</th></tr></thead><tbody>
+<tr><td>1000</td><td><code>set("x", "old", ttl=5)</code></td><td>deadline 1005, gen 1, heap (1005, 1, x), volatile {x}</td></tr>
+<tr><td>1000</td><td><code>set("x", "new", ttl=60)</code></td><td>deadline 1060, gen 2, heap gains (1060, 2, x); (1005, 1, x) is now stale</td></tr>
+<tr><td>1000</td><td><code>set("z", "v", ttl=5)</code></td><td>deadline 1005, gen 1, heap (1005, 1, z)</td></tr>
+<tr><td>1006</td><td><code>get("x")</code></td><td>deadline 1060 not passed: returns "new"</td></tr>
+<tr><td>1006</td><td><code>sweep_heap()</code></td><td>pops (1005, 1, x): gen is 2, skip; pops (1005, 1, z): gen matches, delete z; top is now 1060 &gt; 1006, stop</td></tr>
+<tr><td>1006</td><td><code>ttl("z")</code></td><td>−2: gone</td></tr>
+</tbody></table>
+<p>Without the generation check, the sweep at 1006 would have deleted <code>x</code>, although its current deadline is 54 seconds away. This single row is the most common bug in hand-written expiry heaps, and the reason the test exists.</p>
+<h4>10 · Testing a time-based store</h4>
+<p>Never sleep in these tests. The store takes a clock function; the tests pass a <code>FakeClock</code> whose <code>t</code> they move forward explicitly, so a 30-second simulation at 5,000 operations per second runs in about a second and gives the same numbers every time. Test the semantics one by one (inclusive deadline, plain set clears TTL, persist, expire, the −1 and −2 conventions, <code>None</code> as a stored value), the failure modes (lazy-only leak, stale heap entries), the steady-state behaviour of sampling under two thresholds, the throughput ceiling of sampling against the heap, eviction order, and an invariant under threads. Several of these tests assert on resource use rather than on return values, because the bugs that matter here are leaks that never produce a wrong answer.</p>
+<h4>11 · Talking through the design</h4>
+<p>"Each key stores an absolute deadline from an injected monotonic clock; no timers. Every access checks it, so reads are always correct. For memory, I track keys with a TTL in an indexed set so I can sample them in O(1), Redis-style: delete expired keys in the sample, repeat while more than a threshold were expired; the threshold sets the steady expired share. Sampling has a ceiling, about samples per round times rounds times cycles per second, so for high expiry rates I'd use a min-heap of deadlines with a generation per key, so stale entries from extended TTLs are skipped rather than deleting live data. LRU eviction via OrderedDict bounds key count. One lock around each operation keeps the structures consistent; to scale across cores I'd shard by key hash."</p>
+<h4>12 · The full solution</h4>
+<p>The file below contains the store with lazy expiry, both sweepers, LRU eviction and six tests. Python 3.12, standard library only; about three seconds, most of it the throughput simulation.</p>
+<pre>"""In-memory key-value store with TTL: lazy expiry on read, plus two active strategies
+(Redis-style random sampling over the volatile keys, and an exact min-heap with stale-entry
+skipping), optional LRU eviction, an injectable clock and one lock.
+Python 3.12, standard library only. Run: python kvstore.py"""
+from __future__ import annotations
+
+import heapq
+import random
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, Callable
+
+_MISSING = object()
+
+
+class VolatileSet:
+    """Keys that have a TTL, with O(1) add, remove and uniform random choice
+    (a list plus an index map; removal swaps the last element into the hole)."""
+
+    def __init__(self) -&gt; None:
+        self.items: list[str] = []
+        self.pos: dict[str, int] = {}
+
+    def add(self, k: str) -&gt; None:
+        if k not in self.pos:
+            self.pos[k] = len(self.items)
+            self.items.append(k)
+
+    def discard(self, k: str) -&gt; None:
+        i = self.pos.pop(k, None)
+        if i is None:
+            return
+        last = self.items.pop()
+        if i &lt; len(self.items):
+            self.items[i] = last
+            self.pos[last] = i
+
+    def sample(self, n: int, rng: random.Random) -&gt; list[str]:
+        return [self.items[rng.randrange(len(self.items))] for _ in range(min(n, len(self.items)))]
+
+    def __len__(self) -&gt; int:
+        return len(self.items)
+
+
+class KVStore:
+    def __init__(self, clock: Callable[[], float] = time.monotonic, max_keys: int | None = None,
+                 seed: int = 0) -&gt; None:
+        self.clock, self.max_keys = clock, max_keys
+        self._data: OrderedDict[str, Any] = OrderedDict()      # order = recency, for LRU
+        self._expires: dict[str, float] = {}                   # key -&gt; absolute deadline
+        self._volatile = VolatileSet()
+        self._heap: list[tuple[float, int, str]] = []          # (deadline, generation, key)
+        self._gen: dict[str, int] = {}                         # bumps on every TTL change
+        self._lock = threading.Lock()
+        self._rng = random.Random(seed)
+        self.expired = self.evicted = 0
+
+    # ---------------- internal helpers (call with the lock held) ----------------
+    def _is_expired(self, k: str, now: float) -&gt; bool:
+        d = self._expires.get(k)
+        return d is not None and d &lt;= now
+
+    def _remove(self, k: str) -&gt; None:
+        self._data.pop(k, None)
+        self._expires.pop(k, None)
+        self._volatile.discard(k)
+        self._gen[k] = self._gen.get(k, 0) + 1                 # invalidates heap entries
+
+    def _set_deadline(self, k: str, deadline: float | None) -&gt; None:
+        self._gen[k] = self._gen.get(k, 0) + 1
+        if deadline is None:
+            self._expires.pop(k, None)
+            self._volatile.discard(k)
+        else:
+            self._expires[k] = deadline
+            self._volatile.add(k)
+            heapq.heappush(self._heap, (deadline, self._gen[k], k))
+
+    def _live(self, k: str, now: float) -&gt; bool:
+        if k not in self._data:
+            return False
+        if self._is_expired(k, now):                           # lazy expiry
+            self._remove(k)
+            self.expired += 1
+            return False
+        return True
+
+    # ---------------- public API ----------------
+    def set(self, k: str, v: Any, ttl: float | None = None) -&gt; None:
+        """Like Redis SET: a plain set clears any previous TTL."""
+        if ttl is not None and ttl &lt;= 0:
+            raise ValueError("ttl must be positive")
+        with self._lock:
+            now = self.clock()
+            self._data[k] = v
+            self._data.move_to_end(k)
+            self._set_deadline(k, None if ttl is None else now + ttl)
+            if self.max_keys is not None:
+                while len(self._data) &gt; self.max_keys:
+                    victim = next(iter(self._data))            # least recently used
+                    self._remove(victim)
+                    self.evicted += 1
+
+    def get(self, k: str, default: Any = None) -&gt; Any:
+        with self._lock:
+            if not self._live(k, self.clock()):
+                return default
+            self._data.move_to_end(k)
+            return self._data[k]
+
+    def delete(self, k: str) -&gt; bool:
+        with self._lock:
+            live = self._live(k, self.clock())
+            if live:
+                self._remove(k)
+            return live
+
+    def expire(self, k: str, ttl: float) -&gt; bool:
+        with self._lock:
+            now = self.clock()
+            if not self._live(k, now):
+                return False
+            self._set_deadline(k, now + ttl)
+            return True
+
+    def persist(self, k: str) -&gt; bool:
+        with self._lock:
+            if not self._live(k, self.clock()) or k not in self._expires:
+                return False
+            self._set_deadline(k, None)
+            return True
+
+    def ttl(self, k: str) -&gt; float:
+        """Seconds left; -1 if the key has no TTL; -2 if it does not exist (Redis convention)."""
+        with self._lock:
+            now = self.clock()
+            if not self._live(k, now):
+                return -2
+            d = self._expires.get(k)
+            return -1 if d is None else d - now
+
+    def __len__(self) -&gt; int:                                  # includes not-yet-reclaimed keys
+        return len(self._data)
+
+    # ---------------- active expiry, two strategies ----------------
+    def sweep_sampled(self, sample: int = 20, max_rounds: int = 16, repeat_above: float = 0.25) -&gt; int:
+        """Redis-style: sample volatile keys, delete expired ones, repeat while many were expired."""
+        removed = 0
+        with self._lock:
+            now = self.clock()
+            for _ in range(max_rounds):
+                if not len(self._volatile):
+                    break
+                batch = set(self._volatile.sample(sample, self._rng))
+                hits = [k for k in batch if self._is_expired(k, now)]
+                for k in hits:
+                    self._remove(k)
+                removed += len(hits)
+                if len(hits) &lt;= repeat_above * len(batch):
+                    break
+        self.expired += removed
+        return removed
+
+    def sweep_heap(self, budget: int = 10_000) -&gt; int:
+        """Exact: pop deadlines that are due; skip entries made stale by a later set/expire."""
+        removed = 0
+        with self._lock:
+            now = self.clock()
+            while self._heap and self._heap[0][0] &lt;= now and budget:
+                deadline, gen, k = heapq.heappop(self._heap)
+                budget -= 1
+                if self._gen.get(k) != gen:                    # TTL changed since: ignore
+                    continue
+                self._remove(k)
+                removed += 1
+        self.expired += removed
+        return removed
+
+    def expired_resident(self) -&gt; int:
+        now = self.clock()
+        return sum(1 for k in self._expires if self._expires[k] &lt;= now)
+
+
+# ---------------------------------------------------------------- tests
+class FakeClock:
+    def __init__(self) -&gt; None:
+        self.t = 1_000.0
+
+    def __call__(self) -&gt; float:
+        return self.t
+
+
+def test_basic_ttl_semantics() -&gt; None:
+    clk = FakeClock()
+    s = KVStore(clock=clk)
+    s.set("a", 1, ttl=10)
+    s.set("b", None)                                           # None is a real value
+    assert s.get("a") == 1 and s.ttl("a") == 10 and s.ttl("b") == -1 and s.ttl("zz") == -2
+    assert s.get("b", _MISSING) is None
+    clk.t += 10
+    assert s.get("a", _MISSING) is _MISSING and s.ttl("a") == -2   # deadline is inclusive
+    s.set("c", 3, ttl=5)
+    s.set("c", 4)                                              # plain set clears the TTL
+    clk.t += 100
+    assert s.get("c") == 4
+    s.set("d", 5, ttl=5)
+    assert s.persist("d") and s.ttl("d") == -1
+    assert s.expire("d", 1) and s.ttl("d") == 1
+
+
+def test_lazy_only_leaks_memory() -&gt; None:
+    clk = FakeClock()
+    s = KVStore(clock=clk)
+    for i in range(1_000):
+        s.set(f"k{i}", i, ttl=1)
+    clk.t += 2
+    assert len(s) == 1_000 and s.expired_resident() == 1_000    # nobody read them: still resident
+
+
+def test_heap_sweep_exact_and_stale_entries_safe() -&gt; None:
+    clk = FakeClock()
+    s = KVStore(clock=clk)
+    s.set("x", "old", ttl=5)
+    s.set("x", "new", ttl=60)                                  # first heap entry is now stale
+    s.set("y", "v", ttl=5)
+    s.set("y", "kept")                                         # TTL cleared: stale entry again
+    s.set("z", "v", ttl=5)
+    clk.t += 6
+    assert s.sweep_heap() == 1                                 # only z is really due
+    assert s.get("x") == "new" and s.get("y") == "kept" and s.get("z") is None
+
+
+def test_sampled_sweep_threshold_sets_the_expired_share() -&gt; None:
+    worst = {}
+    for thr in (0.25, 0.05):
+        clk = FakeClock()
+        s = KVStore(clock=clk, seed=1)
+        for i in range(10_000):
+            s.set(f"p{i}", i)                                  # persistent keys are never sampled
+        for i in range(10_000):
+            s.set(f"v{i}", i, ttl=random.Random(i).uniform(1, 60))
+        w = 0.0
+        for tick in range(300):                                # 30 s at 10 ticks per second
+            clk.t += 0.1
+            s.sweep_sampled(repeat_above=thr, max_rounds=64)
+            if tick % 10 == 0:
+                w = max(w, s.expired_resident() / len(s._volatile))
+        worst[thr] = w
+    print(f"    worst expired share of volatile keys, by repeat threshold: "
+          + ", ".join(f"{k:.0%} -&gt; {v:.0%}" for k, v in worst.items()))
+    assert worst[0.05] &lt; worst[0.25] &lt; 0.5
+
+
+def test_sampled_cannot_keep_up_but_heap_can() -&gt; None:
+    results = {}
+    for name in ("sampled", "heap"):
+        clk = FakeClock()
+        s = KVStore(clock=clk, seed=2)
+        n = 0
+        for tick in range(300):                                # 30 simulated seconds, 10 Hz
+            for _ in range(500):                               # 5,000 new keys/s, 3 s TTL
+                s.set(f"k{n}", n, ttl=3.0)
+                n += 1
+            clk.t += 0.1
+            s.sweep_sampled() if name == "sampled" else s.sweep_heap()
+        results[name] = s.expired_resident()
+    print(f"    dead keys still in memory after 30 s at 5,000 sets/s: {results}")
+    assert results["heap"] == 0 and results["sampled"] &gt; 10_000
+
+
+def test_lru_eviction_and_threads() -&gt; None:
+    s = KVStore(max_keys=100)
+    for i in range(150):
+        s.set(f"k{i}", i)
+        s.get("k0")                                            # keep k0 hot
+    assert len(s) == 100 and s.get("k0") == 0 and s.get("k1") is None and s.evicted == 50
+
+    s2 = KVStore(max_keys=1_000)
+    def worker(w: int) -&gt; None:
+        for i in range(5_000):
+            s2.set(f"{w}:{i % 300}", i, ttl=0.05 if i % 2 else None)
+            s2.get(f"{(w + 1) % 4}:{i % 300}")
+            if i % 50 == 0:
+                s2.sweep_heap()
+    ts = [threading.Thread(target=worker, args=(w,)) for w in range(4)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert len(s2) &lt;= 1_000 and len(s2._volatile) == len(s2._expires)
+
+
+if __name__ == "__main__":
+    for t in (test_basic_ttl_semantics, test_lazy_only_leaks_memory,
+              test_heap_sweep_exact_and_stale_entries_safe, test_sampled_sweep_threshold_sets_the_expired_share,
+              test_sampled_cannot_keep_up_but_heap_can, test_lru_eviction_and_threads):
+        t()
+        print("ok ", t.__name__)</pre>
+<h4>13 · Edge cases</h4>
+<p><strong>TTL of zero or negative</strong>: rejected (Redis deletes the key immediately for non-positive EXPIRE; either is defensible if documented). <strong>Deadline exactly now</strong>: expired. <strong>Value None</strong>: a real value; misses are signalled by a private sentinel or the default argument. <strong>expire on a missing key</strong>: returns false and creates nothing. <strong>persist on a key without TTL</strong>: returns false. <strong>Heap growth</strong>: stale entries accumulate if TTLs are changed often; rebuild the heap from the deadlines map when stale entries exceed, say, half its size. <strong>Clock source</strong>: monotonic in memory; never mix clocks between setting and checking.</p>
+<h4>14 · Extensions the interviewer will ask for</h4>
+<p><strong>Persistence</strong>: write deadlines as absolute wall-clock times; on load, drop keys already past their deadline. <strong>Replication</strong>: expire only on the primary and send explicit deletes to replicas, as Redis does. <strong>Timing wheels</strong> for very high expiry rates. <strong>Memory-based limits</strong>: track approximate bytes per key and evict until under a byte budget. <strong>Pub/sub notifications</strong> when keys expire (Redis has keyspace notifications), noting they fire when the key is actually reclaimed, not at the deadline. <strong>Sharding</strong> by key hash across N stores for parallelism.</p>
+<h4>15 · Complexity</h4>
+<p>get, delete, expire, persist and ttl are O(1) average, plus O(log n) for a heap push when a TTL is set. A sampled sweep cycle is O(sample × rounds), bounded. A heap sweep is O(log n) per entry popped, stale or not. Memory is O(keys) for data, deadlines and the volatile set, plus O(TTL changes not yet popped) for the heap. In concrete terms for Python, each key costs a dict slot in data, another in deadlines and an index entry in the volatile set, plus a heap tuple per TTL change: a few hundred bytes per key, which is why production stores written in C pack expiry into a single field per key and why Redis chose a strategy that adds no per-key structure beyond the deadline itself.</p>
+</section>
+
+<section data-field="deep">
+<h4>The arithmetic of sampling</h4>
+<p>A sampler's capacity is samples per round × maximum rounds per cycle × cycles per second: 20 × 16 × 10 = 3,200 keys examined per second in the solution, and it deletes at most that many. If keys expire at rate r, the backlog of expired keys grows at r − 3,200 per second whenever r exceeds the capacity, regardless of the threshold. Below capacity, the threshold decides how many expired keys linger: the cycle stops as soon as a sample shows at most the threshold share expired, so the resident expired share hovers somewhat above the threshold. Two numbers to compute in the interview, then: the expiry rate (keys with TTL divided by average TTL, or writes per second with TTL in steady state) and the sweeper's capacity. If the first approaches the second, sampling is the wrong tool or needs a bigger budget, which is what Redis's <code>active-expire-effort</code> setting provides: higher effort, longer cycles, fewer expired keys tolerated, more CPU.</p>
+<h4>Why Redis samples instead of keeping a heap</h4>
+<p>A heap costs memory per entry and O(log n) per TTL change, and with stale entries it holds more than one entry per key. Redis keeps memory per key tiny and serves most operations in O(1), so a structure that adds a heap entry per expire and log-time work per write is a poor fit for its main use. Sampling uses only the existing table of keys with expirations, costs nothing per write, and spends a bounded, tunable amount of CPU per cycle; in exchange, expired keys linger for a while, which is harmless because reads check deadlines anyway. The redis.conf comments describe current versions as scanning the key space slowly and incrementally rather than purely at random, but the principle is the same: bounded background effort with an expired-share target. For a store whose workload is dominated by short-lived keys at very high rates, an exact structure can be the better choice, which is a good trade-off to articulate.</p>
+<h4>Timing wheels</h4>
+<p>A timing wheel, described by Varghese and Lauck in 1987, is an array of buckets like the face of a clock, each covering a fixed slice of time, say 10 milliseconds. A key with a deadline goes into the bucket for that time slot, O(1). A pointer advances one bucket per tick and everything in the current bucket is expired, O(1) per key. Deadlines beyond one revolution are handled with a counter of remaining revolutions or with hierarchical wheels (seconds, minutes, hours), where entries cascade down to finer wheels as their time approaches. The price is granularity: a key may expire up to one slice late. Operating system kernels and network stacks use timing wheels for timeouts precisely because they handle millions of timers at constant cost.</p>
+<h4>Replication and persistence</h4>
+<p>Expiry interacts with every copy of the data. If replicas expired keys on their own clocks, a key could exist on one replica and not another, so reads would depend on which replica answered. Redis avoids this by expiring only on the primary and propagating each expiry as an explicit delete to replicas and to its append-only file; replicas keep the deadlines so a promoted replica can take over expiry. Persistence forces the deadline to be wall-clock time, since monotonic time restarts with the process; Redis stores Unix milliseconds and its documentation points out that time keeps flowing while the server is down, so keys can be expired when loaded, and that the computer's clock must be stable for expiry to behave.</p>
+<h4>Estimating what you cannot see</h4>
+<p>How many expired keys are still resident? Counting them exactly means scanning every key, which is what active expiry is trying to avoid. The same sampling idea answers it approximately: check a random sample of a few hundred keys with TTLs and multiply the expired fraction by the number of such keys. The estimate's error shrinks with the square root of the sample size, so a few hundred samples give a usefully accurate figure at negligible cost. The sampling sweeper itself produces this estimate for free: the share of expired keys in its first round each cycle is an unbiased sample. Exporting it as a metric turns the silent memory leak into a visible number.</p>
+<h4>Expiry versus eviction, precisely</h4>
+<p>Expiry is semantic: the application said the data is valid for a time, and after that time it must not be served. Eviction is economic: the store is full and must discard something, possibly data the application still wants. They interact: an eviction policy that prefers keys with TTLs (Redis's volatile policies) treats TTL as a hint that data is disposable, and a policy that evicts the key closest to expiring (volatile-ttl) discards what would soon expire anyway. But a store that relies on eviction to clean up expired keys, instead of active expiry, discards live data while dead data occupies memory, the worst combination.</p>
+</section>
+
+<section data-field="prod">
+<h4>How TTL stores fail in production</h4>
+<p>The signature failure is the one in the opening story: <strong>memory growth from unreclaimed expired keys</strong>, invisible to correctness tests. It appears when active expiry is missing, too weak for the expiry rate, or starved of CPU by load. Symptoms are memory rising steadily while the number of live keys is flat. In Redis, comparing the number of keys reported with an expiry against the expected live count, and watching expired-key counters, reveals it; raising the active expiry effort or reducing the expiry rate fixes it.</p>
+<p>The second is <strong>expiry storms</strong>. If many keys are created at the same moment with the same TTL (a cache warmed at startup, sessions after a marketing email), they all expire at the same moment, and every client misses at once, stampeding the backend. Add random jitter to TTLs (for example ±10 percent) so expirations spread out. The third is <strong>clock problems</strong>: deadlines computed on one machine and checked on another with a different clock, or wall-clock jumps after time synchronisation. Keep deadlines and checks on one clock, monotonic within a process.</p>
+<p>The fourth is the <strong>extended-TTL deletion bug</strong> of hand-written heaps or timers, which deletes valid data early. It shows up as intermittent "session expired" errors for active users, and is notoriously hard to reproduce without a deterministic clock.</p>
+<h4>Expiry events</h4>
+<p>Applications sometimes want to react when a key expires: log out a user's other devices, release a reservation, start a cleanup. Redis offers keyspace notifications for expiry, and its documentation is explicit that the event is generated when the key is actually deleted, by an access or by the background cycle, not exactly at the deadline; with a slow or overloaded sweeper the event can arrive much later. Any design that triggers business actions from expiry events must either tolerate that delay or schedule the action separately with its own deadline. It is a good example of why "expired" (a fact about time) and "reclaimed" (an action by the store) must be kept apart in your head.</p>
+<h4>What to measure</h4>
+<p>Live keys, keys with TTL, expired keys reclaimed per second (by lazy access and by the sweeper separately), sweeper CPU time per cycle, estimated expired-but-resident keys (sample-based), evictions per second, and memory. A rising share of reclaims coming from lazy access rather than the sweeper means the sweeper is falling behind.</p>
+<h4>Knobs</h4>
+<p>Sweep frequency (Redis's <code>hz</code>, 10 by default), effort per cycle (sample size and rounds, Redis's <code>active-expire-effort</code> from 1 to 10), the repeat threshold, maximum memory and eviction policy, and TTL jitter in the application. Tune them from the two rates in the deep section: how fast keys expire and how fast the sweeper can reclaim.</p>
+<h4>The real case: how Redis expires keys</h4>
+<p>Redis's documentation for the EXPIRE command contains a section on how Redis expires keys, and it matches this lesson's structure closely. Keys are expired in two ways: passively, when a client tries to access a key and finds it timed out; and actively, because passive expiry is not enough for keys that will never be accessed again, so periodically Redis tests a few keys at random among the keys with an expiration and deletes those already expired. When a key expires, a DEL is synthesised in the append-only file and sent to all replicas, so expiry is centralised on the primary and replicas cannot disagree; replicas still hold the deadlines so a promoted replica can expire keys itself. Expiry information is stored as absolute Unix timestamps, in milliseconds since version 2.6, so time keeps flowing while the server is down. The documentation also states the semantics this lesson's tests check: the timeout is cleared by commands that overwrite the value, such as SET, and by PERSIST. The redis.conf file adds the tuning picture: the active expire cycle scans the key space slowly and incrementally, aims by default to avoid more than about ten percent of expired keys remaining in memory, and can be given more effort, up to 10, at the cost of CPU and latency. The interview solution is that design in miniature, plus an exact heap for the workloads where sampling's ceiling is too low.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the store, then break, measure and extend it. Python 3.12, standard library only.</p>
+<ol>
+<li>Save the full solution as <code>kvstore.py</code> and run it. Six tests print <code>ok</code>, with two printed measurements: the expired share under two sampling thresholds, and dead keys after 30 seconds at 5,000 sets per second for sampling versus the heap.</li>
+<li><strong>Break it.</strong> In <code>sweep_heap</code>, remove the generation check. The stale-entries test fails: the sweep deletes <code>x</code> and <code>y</code>, whose current TTLs are long or absent.</li>
+<li><strong>Measure it.</strong> Vary the write rate in the throughput test from 1,000 to 8,000 keys per second and plot dead keys after 30 seconds for the sampler. Find the rate where the backlog starts growing, and compare it with 20 × 16 × 10 = 3,200.</li>
+<li><strong>Measure it again.</strong> Count heap entries after a workload that extends every key's TTL ten times, and add a rebuild when stale entries exceed half the heap.</li>
+<li><strong>Extend it.</strong> Implement a single-level timing wheel with 100 buckets of 0.1 seconds as a third sweeper, and compare dead keys and work per second with the heap.</li>
+<li><strong>Extend it again.</strong> Add TTL jitter: <code>set(k, v, ttl, jitter=0.1)</code> spreads deadlines by up to 10 percent; show that a burst of keys created together no longer expires in one tick.</li>
+</ol>
+<p>Before each run, predict the dead-key count from the rates; the arithmetic in the deep section should get you within a few percent. If it does not, find out why before changing anything else, and keep the fake clock so every run is repeatable.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A store holds 10 million keys, of which 2 million have TTLs averaging 60 seconds, created steadily. Its sampler runs 10 times a second, sampling 20 keys with a TTL per round, with up to 10 rounds per cycle while more than 25 percent of a sample is expired.</p>
+<p>(a) How many keys can the sampler examine per second? (b) Does it keep up? (c) What happens to memory, and what do you change?</p>
+<details><summary>Answer</summary>
+<p><strong>(a) Sampler capacity.</strong> At most 10 cycles per second × 10 rounds × 20 keys = <strong>2,000 examinations per second</strong>, and that only when every round finds more than 25 percent expired and continues. When few keys are expired, each cycle stops after one round: 200 per second.</p>
+<p><strong>(b) Does it keep up?</strong> In steady state, keys expire at about 2,000,000 ÷ 60 ≈ <strong>33,000 per second</strong>. The sampler can delete at most 2,000 per second, even if every sampled key is expired. It falls short by more than an order of magnitude, and there is no equilibrium: the expired share climbs until nearly every sample is expired, the sampler runs all ten rounds every cycle, deletes 2,000 per second, and still falls behind by about 31,000 per second.</p>
+<p><strong>(c) Memory.</strong> Expired but resident keys accumulate at about 31,000 per second: after an hour, around 112 million dead keys, more than ten times the live keyspace, consuming memory for data that is logically gone. Reads remain correct (lazy expiry catches every expired key that is accessed), so nothing is functionally wrong; memory simply climbs until eviction starts discarding live data or the process is killed. This failure is invisible to correctness tests.</p>
+<p><strong>What to change, in order:</strong> make the sweeper's budget scale with the expiry rate rather than a constant (more rounds or a larger sample when the volatile keyspace is large, Redis's effort setting in spirit); or switch to an exact structure, a min-heap or a timing wheel, that deletes exactly what is due at O(log n) or O(1) per key, about 33,000 operations per second here, well within budget; add TTL jitter if expirations are bursty; and monitor expired-but-resident keys (estimated by sampling) as a first-class metric, alerting when the reclaim rate from lazy access exceeds the sweeper's.</p>
+</details>
+</section>

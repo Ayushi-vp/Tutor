@@ -1,0 +1,710 @@
+<!-- topic source for dl/dl4; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "dl4",
+  "t": "Normalisation: Batch, Layer, RMS",
+  "tag": "Architecture",
+  "sum": "How BatchNorm, LayerNorm and RMSNorm standardise activations over different axes, worked on a 2×3 tensor with real numbers, why CNNs use the batch axis and transformers do not, the train/eval trap, pre-norm vs post-norm, and where each shows up in modern LLMs.",
+  "prereq": [
+    [
+      "dl3",
+      "Gradients scale with the product of per-layer gains, so a layer's output scale matters; normalisation keeps that scale near 1 at every layer regardless of the weights below."
+    ],
+    [
+      "ml4",
+      "Standardising input features (zero mean, unit variance) fixes ill-conditioned loss surfaces and lets gradient descent use a larger learning rate."
+    ],
+    [
+      "dl2",
+      "ReLU and other activations are sensitive to the scale of their input: saturating ones vanish at large scale and ReLU networks need a matching initial variance."
+    ]
+  ],
+  "myths": [
+    [
+      "BatchNorm works because it removes \"internal covariate shift\".",
+      "That was the original motivation, and it is the explanation in the 2015 paper's title, but Santurkar et al. (2018) showed that adding random noise after each BatchNorm layer, which deliberately <em>reintroduces</em> covariate shift, barely hurt training. Their account is that BatchNorm makes the loss landscape smoother, so gradients are more predictive and larger learning rates are safe. The debate is not fully closed, but \"it stops the distribution shifting\" is no longer the accepted answer."
+    ],
+    [
+      "LayerNorm is just BatchNorm applied along a different axis, so they behave the same.",
+      "The axis is the whole difference in behaviour. BatchNorm's statistics depend on the other examples in the batch, so it has a training mode and an evaluation mode (running averages), degrades with tiny batches (ResNet-50 error 23.6% at batch 32 rising to 34.7% at batch 2 in Wu &amp; He's test), and is awkward with padded sequences. LayerNorm's statistics come from one example only, so it behaves identically in training and inference, at any batch size and any sequence length."
+    ],
+    [
+      "Normalising to zero mean and unit variance limits what the network can represent.",
+      "Every normalisation layer is followed by a learned scale γ and shift β per feature, so the layer can represent the identity (γ = std, β = mean) or any other scaling. Normalisation changes how the function is <em>parameterised</em> — decoupling each layer's output scale from the weights below it — without reducing what it can express."
+    ],
+    [
+      "RMSNorm is a cheap approximation that loses quality compared with LayerNorm.",
+      "RMSNorm keeps the property that seems to matter — invariance to the scale of the input — and drops the mean subtraction and the bias. Zhang &amp; Sennrich found comparable quality with 7–64% less running time depending on the model, and LLaMA, Gemma and OLMo 2 all use it. It is not an approximation in the lossy sense; it is a different, simpler layer that works as well."
+    ],
+    [
+      "Normalisation layers only matter for training, so you can ignore them at inference.",
+      "BatchNorm at inference is a different function from BatchNorm in training (it uses stored running statistics), and forgetting <code>model.eval()</code> is one of the most common reasons a model that trained well predicts badly. Even LayerNorm and RMSNorm matter at inference: their epsilon, float32 upcasting and (1 + weight) conventions have to match the checkpoint, or outputs drift."
+    ],
+    [
+      "Pre-norm and post-norm are equivalent; it is a style choice.",
+      "Xiong et al. showed that in the original post-norm transformer the expected gradients near the output layer are large at initialisation, so training needs learning-rate warmup, while pre-norm gradients are well-behaved. Pre-norm keeps a clean identity path along the residual stream, which is why most LLMs use it; the cost is that the residual stream's magnitude grows with depth, and some recent models add extra norms after the sub-layers."
+    ]
+  ],
+  "recap": [
+    "A normalisation layer subtracts a mean and divides by a standard deviation computed over some set of activations, then applies a learned per-feature scale γ and shift β; the only difference between the variants is which set of activations shares one mean and variance.",
+    "BatchNorm pools over the batch (and spatial positions) for each channel; LayerNorm pools over the features of each single example (and token); RMSNorm is LayerNorm without the mean subtraction and bias, dividing only by the root-mean-square.",
+    "On the 2×3 tensor [[2,4,6],[0,3,9]], LayerNorm turns row 1 into (−1.22, 0, 1.22) and RMSNorm into (0.46, 0.93, 1.39), while BatchNorm over a batch of two can only output ±1 in every column — an extreme illustration of why BatchNorm needs reasonable batch sizes.",
+    "BatchNorm uses batch statistics in training and stored running averages (momentum 0.1) at inference, so eval mode is mandatory, batch size 1 in training mode outputs β for every input, and domain shift or tiny fine-tuning batches corrupt the running statistics.",
+    "Normalisation makes a layer invariant to the scale of its input, so gradients no longer depend on the scale of the weights below; in the lab a 30-layer network's first-to-last gradient ratio was 0.24 for initialisations that ranged over a factor of eight, without normalisation it ranged from 10⁻⁸ to 10¹⁸.",
+    "BatchNorm let Inception match its baseline accuracy with 14× fewer steps (Ioffe &amp; Szegedy), and its benefit is best explained by a smoother loss landscape and scale invariance rather than by removing covariate shift.",
+    "Transformers use LayerNorm or RMSNorm because they are batch-independent, identical in training and inference and indifferent to padding; modern LLMs use RMSNorm in a pre-norm arrangement, with a final norm before the output head, sometimes QK-norm and extra post-sub-layer norms.",
+    "GroupNorm (groups of channels within one example) gives BatchNorm-like accuracy without a batch dependency: on ResNet-50 its error stayed at 24.0–24.2% for batch sizes 32 down to 2 while BatchNorm rose from 23.6% to 34.7%.",
+    "Practical rules: keep norm computations in float32, exclude γ and β from weight decay, match ε and the weight convention when porting checkpoints, and fold BatchNorm into the preceding convolution for inference."
+  ],
+  "glossary": [
+    [
+      "Affine parameters (γ, β)",
+      "The learned per-feature scale γ and shift β applied after normalising; they let the layer represent any scale and offset."
+    ],
+    [
+      "AP (average precision)",
+      "The standard accuracy metric for object detection: the area under a precision–recall curve, averaged over classes and overlap thresholds."
+    ],
+    [
+      "Batch normalisation (BatchNorm)",
+      "Normalises each feature using the mean and variance over the mini-batch (and spatial positions), with running averages used at inference."
+    ],
+    [
+      "BN",
+      "Short for batch normalisation."
+    ],
+    [
+      "CNN (convolutional neural network)",
+      "A network whose layers slide small shared filters over an image or sequence (dl6)."
+    ],
+    [
+      "COCO",
+      "A standard object-detection and segmentation benchmark of everyday scenes."
+    ],
+    [
+      "Covariate shift",
+      "A change in the distribution of a model's inputs; 'internal' covariate shift is the claim that the inputs to a hidden layer change as earlier layers train."
+    ],
+    [
+      "Epsilon (ε)",
+      "A small constant (about 10⁻⁵) added to the variance so the division is safe when the variance is near zero."
+    ],
+    [
+      "FLOPs",
+      "Floating-point operations: a count of how much arithmetic a computation needs (gpu3)."
+    ],
+    [
+      "Folding (fusing) BatchNorm",
+      "Merging a BatchNorm's scale and shift into the preceding convolution's weights and bias at inference so it costs nothing."
+    ],
+    [
+      "GELU",
+      "Gaussian error linear unit, a smooth ReLU-like activation (dl2)."
+    ],
+    [
+      "GPU",
+      "Graphics processing unit: the parallel processor used to train neural networks (gpu1)."
+    ],
+    [
+      "Group normalisation (GroupNorm)",
+      "Normalises over groups of channels within one example, independent of the batch."
+    ],
+    [
+      "Instance normalisation",
+      "Normalises each channel of each example over its spatial positions; used in style transfer."
+    ],
+    [
+      "L2 regularisation",
+      "A penalty on the squared size of the weights; with gradient descent it acts as weight decay (ml3)."
+    ],
+    [
+      "Layer normalisation (LayerNorm)",
+      "Normalises over the features of a single example (and token), so it does not depend on the batch."
+    ],
+    [
+      "LLM (large language model)",
+      "A very large neural network trained to predict the next token of text."
+    ],
+    [
+      "Momentum (running statistics)",
+      "The factor (typically 0.1) with which BatchNorm blends each batch's statistics into its running mean and variance."
+    ],
+    [
+      "Post-norm",
+      "Transformer arrangement where normalisation is applied after adding the residual: x = Norm(x + Sublayer(x))."
+    ],
+    [
+      "Pre-norm",
+      "Transformer arrangement where normalisation is applied to the sub-layer's input inside the residual branch: x = x + Sublayer(Norm(x))."
+    ],
+    [
+      "QK-norm",
+      "Normalising the query and key vectors before their dot product in attention, to keep attention logits from growing."
+    ],
+    [
+      "RMSNorm",
+      "Layer normalisation without mean subtraction or bias: divides by the root-mean-square of the features and multiplies by a learned scale."
+    ],
+    [
+      "RNN (recurrent neural network)",
+      "A network that processes a sequence step by step, carrying a hidden state (dl7)."
+    ],
+    [
+      "Root mean square (RMS)",
+      "The square root of the average of the squared values: √(mean(x²))."
+    ],
+    [
+      "Running mean / running variance",
+      "The exponential moving averages of batch statistics that BatchNorm stores and uses in evaluation mode."
+    ],
+    [
+      "Scale invariance",
+      "A function's output not changing when its input (or weights) are multiplied by a positive constant; normalisation layers create it."
+    ],
+    [
+      "SGD (stochastic gradient descent)",
+      "Gradient descent on the gradient of a random mini-batch (ml4)."
+    ],
+    [
+      "Standardisation",
+      "Subtracting the mean and dividing by the standard deviation so values have mean 0 and variance 1."
+    ],
+    [
+      "SyncBatchNorm",
+      "BatchNorm that computes its statistics across all GPUs in data-parallel training instead of per GPU."
+    ],
+    [
+      "Train / eval mode",
+      "PyTorch's switch (model.train(), model.eval()) that changes the behaviour of BatchNorm, dropout and similar layers."
+    ],
+    [
+      "Variance",
+      "The average squared distance of values from their mean; its square root is the standard deviation."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What does a normalisation layer do, and what is the formula?",
+      "It rescales activations to a standard range, then lets the network choose its own scale and shift: output = γ · (x − mean) / √(variance + ε) + β. The mean and variance are computed over some set of activations, and the variants differ only in which set. γ and β are learned per feature, so the layer can undo the normalisation if that is what training wants."
+    ],
+    [
+      "E",
+      "What is the difference between BatchNorm and LayerNorm?",
+      "The axis over which they compute statistics. Picture activations as a table with examples as rows and features as columns: BatchNorm takes the mean and variance of each column (across the batch, and across spatial positions in a CNN); LayerNorm takes them for each row (across the features of one example, or one token). Consequently BatchNorm depends on the other examples in the batch and behaves differently in training and inference, while LayerNorm does not."
+    ],
+    [
+      "E",
+      "Why do transformers use LayerNorm or RMSNorm rather than BatchNorm?",
+      "Sequences have variable length and are padded, so batch statistics would be polluted by padding tokens and would depend on batch composition. BatchNorm also has separate training and inference behaviour, and at inference one user's output would depend on the other requests batched with theirs unless running averages are used. LayerNorm and RMSNorm compute statistics per token from that token's features only, so they are identical in training and inference, independent of batch size and sequence length."
+    ],
+    [
+      "E",
+      "Why does BatchNorm have the learnable parameters γ and β?",
+      "Forcing every layer's output to mean 0 and variance 1 would restrict what the network can represent (for example, a sigmoid would always operate in its linear region). γ and β restore that freedom: with γ = standard deviation and β = mean, the layer reproduces the identity. The network learns whichever scale and offset the next layer wants, while the normalisation still decouples that choice from the weights below."
+    ],
+    [
+      "M",
+      "How does BatchNorm behave differently at training and inference time?",
+      "In training it normalises with the current mini-batch's mean and variance and updates running averages (running = 0.9 × running + 0.1 × batch, so momentum 0.1). At inference it uses the running mean and variance as fixed constants, making the layer a plain per-channel affine transform that no longer depends on the batch. Practical consequences: call <code>model.eval()</code> before validation, batch size 1 works in eval mode but in train mode the batch variance is 0 and every input maps to β, and stale statistics after a domain shift or tiny-batch fine-tuning silently hurt accuracy.",
+      "Follow-up: How do you fix wrong running statistics? — Re-estimate them by running forward passes over representative target data in train mode with no gradient updates (AdaBN-style recalibration), or freeze the statistics and train only γ and β."
+    ],
+    [
+      "M",
+      "What goes wrong with BatchNorm at small batch sizes, and what do you use instead?",
+      "The mean and variance are estimated from few samples, so they are noisy and the normalisation injects too much randomness; in the GroupNorm paper, ResNet-50's ImageNet error grew from 23.6% at batch size 32 to 34.7% at batch size 2. Alternatives: SyncBatchNorm (statistics over all GPUs, which costs communication), GroupNorm (24.1% at batch 2, no batch dependence), LayerNorm, or freezing BatchNorm to its pretrained statistics for fine-tuning detection and segmentation models.",
+      "Follow-up: Why does GroupNorm with one group equal LayerNorm? — Both then normalise across all channels of one example; with G = number of channels it becomes InstanceNorm."
+    ],
+    [
+      "M",
+      "What is RMSNorm and why do LLMs prefer it to LayerNorm?",
+      "RMSNorm divides by the root-mean-square of the features, x / √(mean(x²) + ε), then multiplies by a learned γ. It drops LayerNorm's mean subtraction and the bias, keeping the scale invariance that seems to be what matters. Zhang and Sennrich report comparable quality with 7–64% less running time; it has fewer parameters (γ only), one less reduction, and fuses easily. LLaMA, Gemma and OLMo 2 use it, typically computed in float32."
+    ],
+    [
+      "M",
+      "Explain pre-norm versus post-norm in a transformer and the trade-off.",
+      "Post-norm (original) computes x = Norm(x + Sublayer(x)), so the normalisation sits on the residual path; pre-norm computes x = x + Sublayer(Norm(x)), so the residual stream is an untouched identity path from input to output. Xiong et al. showed that post-norm gradients near the output are large at initialisation, so it needs learning-rate warmup and is fragile at depth, while pre-norm trains stably without warmup. The trade-off is that pre-norm's residual stream grows with depth and later layers can matter less; some recent models (Gemma 2, OLMo 2) add norms on the sub-layer outputs to regain stability without losing quality.",
+      "Follow-up: Why do pre-norm models still need a final norm? — The residual stream's scale is uncontrolled, so a last normalisation before the output head keeps the logits' scale in check."
+    ],
+    [
+      "M",
+      "How do you fold BatchNorm into a convolution for inference?",
+      "At inference BatchNorm is y = γ (z − μ)/√(σ² + ε) + β with fixed μ and σ², where z = w·x + b is the convolution output. That is another affine map, so it can be merged: w′ = w · γ/√(σ² + ε) and b′ = β + γ (b − μ)/√(σ² + ε). For example w = 2, b = 0.5, μ = 1, σ² = 4, γ = 1.5, β = 0.2 gives w′ = 1.5, b′ = −0.175. The fused layer computes the same output with no extra kernel or memory traffic."
+    ],
+    [
+      "H",
+      "Why does BatchNorm help optimisation? Is 'internal covariate shift' the reason?",
+      "The original paper attributed it to reducing internal covariate shift, but Santurkar et al. showed that injecting noise after BatchNorm layers, which reintroduces the shift, hardly hurt training, and instead showed that BatchNorm makes the loss and its gradients smoother (better Lipschitz behaviour), so gradient steps are more predictive and large learning rates are safe. A complementary account is scale invariance: the output does not depend on the scale of the layer's weights, so the gradient is orthogonal to the weights, weight norms grow, and the effective learning rate self-adjusts. The batch noise also regularises. Say that the mechanism is still debated, and name these accounts.",
+      "Follow-up: What evidence did the original paper give for the benefit? — BN-x5 (learning rate 5× higher) matched Inception's accuracy in 2.1M steps versus 31M, 14× fewer, and a sigmoid network reached 69.8% where the un-normalised one stayed at chance."
+    ],
+    [
+      "H",
+      "Derive or explain the gradient of LayerNorm and what it implies.",
+      "With x̂ = (x − μ)/σ and upstream gradient dŷ (taking γ = 1), the input gradient is dx = (1/σ) · (dŷ − mean(dŷ) − x̂ · mean(dŷ ⊙ x̂)). The two subtracted terms project out the component of the gradient along the constant vector (shift invariance) and along x̂ itself (scale invariance). For x = (2, 4, 6) and dŷ = (1, 0, 0) the gradient is (0.102, −0.204, 0.102), summing to zero; for dŷ ∝ −x̂ it is exactly zero. So the layer's output is invariant to shift and scale of the input, the gradient has no component that would change them, and the gradient magnitude scales as 1/σ, which is why gradients no longer depend on the scale of the weights beneath.",
+      "Follow-up: What changes for RMSNorm? — Only the scale-invariance term remains: dx = (1/rms) · (dŷ − x̂ · mean(dŷ ⊙ x̂)), with x̂ = x/rms; there is no shift invariance."
+    ],
+    [
+      "H",
+      "You are designing the normalisation for a 70B decoder-only LLM. What do you choose and why?",
+      "Pre-norm RMSNorm before the attention and feed-forward sub-layers, with a final RMSNorm before the output head, and no bias, as in LLaMA. Compute the norm in float32 even under bf16, with ε around 10⁻⁵ to 10⁻⁶. Consider QK-norm (RMSNorm on queries and keys, as in OLMo 2) to stop attention logits growing at high learning rates, and possibly post-sub-layer norms (Gemma 2 normalises input and output of each sub-layer) if instability appears. Exclude γ from weight decay, and treat the ε, the weight convention and the norm order as part of the checkpoint contract to avoid porting bugs.",
+      "Follow-up: Can you drop normalisation entirely? — Recent work (Dynamic Tanh, Zhu et al. 2025) replaces LayerNorm with tanh(αx) in transformers with comparable results, and NFNets removed BatchNorm in CNNs using scaled weights and adaptive clipping; but normalisation remains the standard because it is simple and robust."
+    ],
+    [
+      "H",
+      "A CNN is fine-tuned on a small dataset with batch size 4 and its validation accuracy collapses although training loss looks fine. What do you check?",
+      "Suspect BatchNorm. In train mode the layer normalises with noisy 4-sample statistics and overwrites the pretrained running statistics with them (momentum 0.1 makes them drift within tens of steps), so eval mode then uses running statistics that do not match the pretrained features. Try: freeze BatchNorm layers (put them in eval mode during training, keep γ and β trainable or frozen), lower the BatchNorm momentum, use a larger batch or gradient accumulation with SyncBatchNorm, or swap in GroupNorm and fine-tune longer. Verify by evaluating with the original pretrained statistics."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift",
+      "Ioffe & Szegedy, 2015 — this topic's public case: 14× fewer steps on Inception, sigmoid networks that train, 4.9% top-5 ImageNet error.",
+      "https://arxiv.org/abs/1502.03167"
+    ],
+    [
+      "paper",
+      "How Does Batch Normalization Help Optimization?",
+      "Santurkar et al., 2018 — demolishes the internal-covariate-shift explanation and gives the loss-smoothing one.",
+      "https://arxiv.org/abs/1805.11604"
+    ],
+    [
+      "paper",
+      "Layer Normalization",
+      "Ba, Kiros & Hinton, 2016 — the batch-independent alternative every transformer uses.",
+      "https://arxiv.org/abs/1607.06450"
+    ],
+    [
+      "paper",
+      "Root Mean Square Layer Normalization",
+      "Zhang & Sennrich, 2019 — drop the mean-centring, keep the quality, save 7–64% of the running time.",
+      "https://arxiv.org/abs/1910.07467"
+    ],
+    [
+      "paper",
+      "Group Normalization",
+      "Wu & He, 2018 — BatchNorm's failure at small batch sizes (23.6% → 34.7% error) and the batch-independent fix.",
+      "https://arxiv.org/abs/1803.08494"
+    ],
+    [
+      "paper",
+      "On Layer Normalization in the Transformer Architecture",
+      "Xiong et al., 2020 — why pre-norm trains without warmup and post-norm does not.",
+      "https://arxiv.org/abs/2002.04745"
+    ],
+    [
+      "paper",
+      "2 OLMo 2 Furious",
+      "OLMo team, 2024 — a fully documented modern recipe: RMSNorm, reordered norm after sub-layers, QK-norm and z-loss for stability.",
+      "https://arxiv.org/abs/2501.00656"
+    ],
+    [
+      "paper",
+      "Transformers without Normalization",
+      "Zhu et al., 2025 — Dynamic Tanh, tanh(αx), as a drop-in replacement for LayerNorm; a useful check on what normalisation actually does.",
+      "https://arxiv.org/abs/2503.10622"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>In 2014 Google's best image classifier, Inception, took about 31 million training steps to reach 72.2% top-1 accuracy on ImageNet. Its authors could not simply turn up the learning rate to speed things up: a five-fold increase made the model's parameters "reach machine infinity" — training exploded. They could not use sigmoid activations either; the network never got better than one-in-a-thousand chance accuracy. Everything about that network was delicate: the initial weights, the learning rate, the choice of activation. Then Sergey Ioffe and Christian Szegedy added one small operation between layers, and the same network matched its old accuracy in 2.1 million steps with a five-times-higher learning rate — fourteen times fewer steps — and even trained with sigmoids.</p>
+<p>The operation is <strong>normalisation</strong>: after a layer computes its outputs, subtract their mean and divide by their standard deviation, so the next layer always receives numbers on a standard scale, then let the network learn its preferred scale and shift. It sounds too simple to matter. But recall dl3: the gradient reaching the early layers is a product of one factor per layer, and each factor depends on the scale of that layer's weights and activations. A normalisation layer resets the scale at every depth, so the product cannot drift away from 1 however the weights below it change. That single change removed much of the fragility of deep networks, and it is now in almost every architecture you will meet.</p>
+<p>The subtlety — and the reason this is a favourite interview topic — is that there are several versions and they are not interchangeable. BatchNorm, the original, normalises across the examples in a batch; it works wonderfully for image networks but has a training mode and an evaluation mode, fails with tiny batches, and is awkward with variable-length text. Transformers use LayerNorm or, in modern large language models, RMSNorm, which normalise across the features of each example on its own. And where you put the normalisation inside a transformer block (before or after the sub-layer) decides whether a deep model trains stably. Getting these details right is what separates "I've heard of BatchNorm" from being able to debug a model that behaves differently in evaluation than in training.</p>
+<p>This lesson builds all of it from the ground up. We start from why standardising inputs helped in the first place (ml4) and extend it to hidden layers, then work every variant by hand on a 2×3 tensor with real numbers so the axis difference is unmistakable. We cover BatchNorm's running statistics and the train/eval trap, derive the gradient of a normalisation layer and what it implies, discuss why normalisation helps (with an honest account of the debate), compare LayerNorm and RMSNorm, examine GroupNorm and the small-batch failure, and place the norm inside a transformer block. The public case is the original BatchNorm paper, whose numbers we check against the source, and the lab shows a 30-layer network becoming insensitive to its initialisation.</p>
+</section>
+
+<section data-field="primer">
+<h4>Grading on a curve — two ways</h4>
+<p>Imagine a school where 200 students each take the same exam of 10 questions, and you want to put everyone's scores on a common scale. There are two natural ways to "grade on a curve". You can standardise <strong>each question</strong> across all the students: for question 3, compute the average score and the spread over the 200 students, and convert every student's score on that question to "how many spreads above or below the average". Or you can standardise <strong>each student</strong> across all their questions: for student 17, compute the average and spread over their 10 answers and convert each to a standardised score.</p>
+<p>These two are BatchNorm and LayerNorm. Picture a table of activations in which each row is one example in the batch (a student) and each column is one feature (a question). <strong>BatchNorm</strong> computes a mean and variance down each <em>column</em>, pooling over the batch. <strong>LayerNorm</strong> computes them along each <em>row</em>, pooling over the features of a single example. <strong>RMSNorm</strong> is LayerNorm that skips the subtraction of the mean and only divides by a measure of size. The analogy holds well; where it needs care is that in a real network the "questions" are learned features whose meaning changes as training proceeds, which is why the layer keeps adapting.</p>
+<figure>
+<svg viewBox="0 0 680 190" width="100%" role="img" aria-label="Four grids with examples as rows and channels as columns. BatchNorm shades one column, LayerNorm one row, InstanceNorm one cell, GroupNorm a short run of cells in one row. Shaded cells share one mean and variance.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="75.0" y="18" text-anchor="middle" style="fill:var(--ink);font-weight:600">BatchNorm</text>
+    <rect x="10" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="36" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="62" y="30" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="88" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="114" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="10" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="36" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="62" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="88" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="114" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="10" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="36" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="62" y="74" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="88" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="114" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="10" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="36" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="62" y="96" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="88" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="114" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <text x="75.0" y="134" text-anchor="middle" style="fill:var(--ink-2);font-size:12px">one channel, all examples</text>
+    <text x="240.0" y="18" text-anchor="middle" style="fill:var(--ink);font-weight:600">LayerNorm</text>
+    <rect x="175" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="201" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="227" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="253" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="279" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="175" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="201" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="227" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="253" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="279" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="175" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="201" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="227" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="253" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="279" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="175" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="201" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="227" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="253" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="279" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <text x="240.0" y="134" text-anchor="middle" style="fill:var(--ink-2);font-size:12px">one example, all channels</text>
+    <text x="405.0" y="18" text-anchor="middle" style="fill:var(--ink);font-weight:600">InstanceNorm</text>
+    <rect x="340" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="366" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="392" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="418" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="444" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="340" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="366" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="392" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="418" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="444" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="340" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="366" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="392" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="418" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="444" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="340" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="366" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="392" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="418" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="444" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <text x="405.0" y="134" text-anchor="middle" style="fill:var(--ink-2);font-size:12px">one example, one channel</text>
+    <text x="570.0" y="18" text-anchor="middle" style="fill:var(--ink);font-weight:600">GroupNorm</text>
+    <rect x="505" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="531" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="557" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="583" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="609" y="30" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="505" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="531" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="557" y="52" width="23" height="19" rx="3" style="fill:var(--accent);fill-opacity:0.85;stroke:var(--line-2)"/>
+    <rect x="583" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="609" y="52" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="505" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="531" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="557" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="583" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="609" y="74" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="505" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="531" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="557" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="583" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <rect x="609" y="96" width="23" height="19" rx="3" style="fill:var(--surface-2);fill-opacity:1;stroke:var(--line-2)"/>
+    <text x="570.0" y="134" text-anchor="middle" style="fill:var(--ink-2);font-size:12px">one example, channel group</text>
+    <text x="340" y="182" text-anchor="middle" style="fill:var(--muted);font-size:11px">rows = examples in the batch, columns = channels (features); each cell also spans all spatial positions H×W (or all tokens)</text>
+  </g>
+</svg>
+<figcaption>Rows are examples, columns are channels (features). Shaded cells are pooled to compute one mean and one variance. BatchNorm pools a column across the batch, LayerNorm a row across channels; InstanceNorm and GroupNorm are in-between choices. In an image network each cell also contains all H×W pixel positions; in a transformer each row is one token.</figcaption>
+</figure>
+
+<h4>The recipe</h4>
+<p>Every variant applies the same two steps to the numbers in one pooled set:</p>
+<pre>normalised = (x − mean) / √(variance + ε)        step 1: standardise (ε ≈ 1e-5 avoids dividing by zero)
+output     = γ × normalised + β                   step 2: learned scale γ and shift β, one pair per feature</pre>
+<p>Step 2 matters. If the layer only standardised, every layer's output would be forced to mean 0 and variance 1, which would restrict what the next layer sees. γ (gain) and β (bias) are learned like any weights, so the network can restore any scale and offset it prefers — including exactly undoing the standardisation. What normalisation adds is that the output scale is now controlled by two dedicated numbers instead of by every weight in every layer below.</p>
+<h4>A first worked example</h4>
+<p>One example's features are (2, 4, 6). <strong>LayerNorm</strong>: mean = 4; the squared deviations are 4, 0, 4, so variance = 8/3 ≈ 2.67 and standard deviation ≈ 1.63; the normalised values are (2−4)/1.63, 0, (6−4)/1.63 = <strong>(−1.22, 0, 1.22)</strong>. <strong>RMSNorm</strong> skips the mean: the root-mean-square is √((4 + 16 + 36)/3) = √18.67 ≈ 4.32, giving (2, 4, 6)/4.32 = <strong>(0.46, 0.93, 1.39)</strong>. Same idea, slightly different result: LayerNorm centres the numbers on zero, RMSNorm only rescales them.</p>
+<h4>Which to use, briefly</h4>
+<p>Convolutional networks for images: BatchNorm (or GroupNorm when batches are small). Transformers and recurrent networks: LayerNorm or RMSNorm, because they do not depend on other examples in the batch. Modern LLMs: RMSNorm, applied before each sub-layer. The rest of the lesson explains why, and the traps that come with each.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Why normalise at all</h4>
+<p>Recall from ml4 that gradient descent on a loss whose features have wildly different scales converges slowly: the loss surface is a long narrow valley, the stable learning rate is set by the steep direction, and progress along the shallow one crawls. Centring and scaling the <em>input</em> features fixes this, which is why we standardise data before training. Inside a deep network the same problem reappears at every layer: the input to layer 7 is the output of layer 6, and its scale and offset depend on layer 6's weights, which keep changing. If layer 6's outputs drift to values around 100 (or 0.001), layer 7 sees a differently scaled problem, a saturating activation may be pushed into its flat region, and ReLU units may all switch off. Initialisation (dl3) sets the scales right at step 0 but cannot keep them right afterwards. Normalisation is the mechanism that <em>maintains</em> the scale throughout training: standardise each layer's inputs inside the network, on every forward pass.</p>
+
+<h4>2. BatchNorm, step by step</h4>
+<p>Take a mini-batch of m examples and one feature (one column of the table). BatchNorm (Ioffe &amp; Szegedy, 2015) computes, for that feature:</p>
+<ol>
+<li>the batch mean <code>μ = (1/m) Σ xᵢ</code>;</li>
+<li>the batch variance <code>σ² = (1/m) Σ (xᵢ − μ)²</code>;</li>
+<li>the normalised values <code>x̂ᵢ = (xᵢ − μ)/√(σ² + ε)</code>;</li>
+<li>the output <code>yᵢ = γ x̂ᵢ + β</code>, where γ and β are learned parameters for this feature.</li>
+</ol>
+<p>In a convolutional layer the "feature" is a channel, and the statistics pool over the batch <em>and</em> all spatial positions (m × H × W values per channel), with one γ and β per channel. Worked on a single column: the four values (2, 4, 6, 8) have mean 5 and variance ((−3)² + (−1)² + 1² + 3²)/4 = 5, so σ = 2.236 and the normalised values are (−1.342, −0.447, 0.447, 1.342): mean 0, variance 1. With γ = 1 and β = 0 that is the output; with γ = 2 and β = 1 it would be (−1.68, 0.11, 1.89, 3.68).</p>
+<p><strong>The full 2×3 example.</strong> Now the smallest table that shows both axes: two examples, three features, <code>X = [[2, 4, 6], [0, 3, 9]]</code>.</p>
+<table>
+<thead><tr><th></th><th>row 1</th><th>row 2</th><th>how it is computed</th></tr></thead>
+<tbody>
+<tr><td><strong>BatchNorm</strong> (per column)</td><td>(1, 1, −1)</td><td>(−1, −1, 1)</td><td>column means (1, 3.5, 7.5), column variances (1, 0.25, 2.25)</td></tr>
+<tr><td><strong>LayerNorm</strong> (per row)</td><td>(−1.225, 0, 1.225)</td><td>(−1.069, −0.267, 1.336)</td><td>row means (4, 4), row variances (2.67, 14)</td></tr>
+<tr><td><strong>RMSNorm</strong> (per row)</td><td>(0.463, 0.926, 1.389)</td><td>(0, 0.548, 1.643)</td><td>row RMS (4.32, 5.48)</td></tr>
+</tbody>
+</table>
+<p>Look at what each does. LayerNorm's output for row 1 depends only on row 1: change the other example and nothing happens. BatchNorm's output for row 1 is (1, 1, −1) only because row 2 exists, and with a batch of just two examples every output is exactly ±1 — the layer can say only "larger or smaller than my batch-mate" for each feature, throwing away magnitude. That is an extreme case, but it explains the general behaviour: BatchNorm's output for an example depends on its batch-mates, and the estimate of the statistics gets noisier as the batch shrinks (section 8). RMSNorm preserves the sign pattern of its input (row 2 stays non-negative, since the inputs were), while LayerNorm forces zero mean. The lab prints all three so you can check them.</p>
+
+<h4>3. BatchNorm at inference: running statistics and the train/eval trap</h4>
+<p>At inference you may have one example, or a batch of unrelated requests, and you want each prediction to be deterministic and independent of the others. Batch statistics are then wrong for the job. BatchNorm therefore keeps <strong>running averages</strong> of the mean and variance during training, updated every step with a <em>momentum</em> of (by default in PyTorch) 0.1: <code>running = 0.9 × running + 0.1 × batch_statistic</code>. Starting from running mean 0 and variance 1, after one batch (2, 4, 6, 8) the running mean is 0.9 × 0 + 0.1 × 5 = 0.5 and the running variance is 0.9 × 1 + 0.1 × 6.67 = 1.57. (PyTorch stores the <em>unbiased</em> variance, dividing by m − 1 = 3, i.e. 6.67, in the running estimate, but uses the biased m-divisor for the normalisation itself.) After enough batches the running estimates converge to the population mean and variance. In evaluation mode the layer uses these stored numbers as constants, so the whole layer becomes a fixed per-channel affine map: <code>y = γ (x − running_mean) / √(running_var + ε) + β</code>.</p>
+<figure>
+<svg viewBox="0 0 640 240" width="100%" role="img" aria-label="Two lanes. Training mode: mini-batch goes into 'compute batch mean and variance', then 'normalise with batch statistics' to output, and also updates the running mean and variance with momentum 0.1. Evaluation mode: any input, even a single example, is normalised with the stored running mean and variance.">
+  <defs><marker id="dl4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px" text-anchor="middle">
+    <text x="20" y="22" text-anchor="start" style="fill:var(--ink);font-weight:600">Training mode  (model.train())</text>
+    <rect x="20" y="36" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="75" y="55" style="fill:var(--ink)">mini-batch</text><text x="75" y="71" style="fill:var(--muted)">m examples</text>
+    <rect x="170" y="36" width="140" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="240" y="55" style="fill:var(--ink)">batch mean μ_B</text><text x="240" y="71" style="fill:var(--ink)">batch variance σ²_B</text>
+    <rect x="350" y="36" width="130" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="415" y="55" style="fill:var(--ink)">y = γ·x̂ + β</text><text x="415" y="71" style="fill:var(--muted)">uses μ_B, σ²_B</text>
+    <rect x="490" y="96" width="140" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/><text x="560" y="115" style="fill:var(--ink)">running mean/var</text><text x="560" y="131" style="fill:var(--muted)">0.9·old + 0.1·batch</text>
+    <g style="stroke:var(--ink-2);fill:none"><line x1="130" y1="58" x2="168" y2="58" marker-end="url(#dl4-arrow)"/><line x1="310" y1="58" x2="348" y2="58" marker-end="url(#dl4-arrow)"/><path d="M 240 80 L 240 118 L 488 118" marker-end="url(#dl4-arrow)"/></g>
+    <text x="20" y="176" text-anchor="start" style="fill:var(--ink);font-weight:600">Evaluation mode  (model.eval())</text>
+    <rect x="20" y="190" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="75" y="209" style="fill:var(--ink)">any input</text><text x="75" y="225" style="fill:var(--muted)">even one example</text>
+    <rect x="170" y="190" width="200" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/><text x="270" y="209" style="fill:var(--ink)">y = γ·(x − running mean)</text><text x="270" y="225" style="fill:var(--ink)">/ √(running var + ε) + β</text>
+    <rect x="410" y="190" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="465" y="217" style="fill:var(--ink)">output</text>
+    <g style="stroke:var(--ink-2);fill:none"><line x1="130" y1="212" x2="168" y2="212" marker-end="url(#dl4-arrow)"/><line x1="370" y1="212" x2="408" y2="212" marker-end="url(#dl4-arrow)"/></g>
+  </g>
+</svg>
+<figcaption>The same layer is two different functions. In training the statistics come from the current batch (and update the stored averages); in evaluation they come from the stored averages, so the output no longer depends on the batch.</figcaption>
+</figure>
+<p>This design produces a set of classic bugs, each worth being able to explain:</p>
+<ul>
+<li><strong>Forgetting <code>model.eval()</code></strong> before validation or inference: BatchNorm keeps using (and updating) batch statistics, so predictions depend on batch composition and are noisier; a model that trained well appears to have poor accuracy.</li>
+<li><strong>Batch size 1 in training mode</strong>: the batch mean equals the single value, the variance is 0, so <code>x − μ = 0</code> and the output is exactly β for every input. All information is destroyed. (In eval mode, batch size 1 is perfectly fine.)</li>
+<li><strong>Domain shift</strong>: running statistics reflect the training data. If serving data looks different (new camera, different resolution), they are wrong; re-estimating them on target data (AdaBN) is a cheap fix.</li>
+<li><strong>Small-batch fine-tuning</strong>: fine-tuning a pretrained model with a batch of 2–4 makes the running statistics drift to noisy estimates within a few dozen steps (0.9ⁿ decays quickly), so evaluation, which uses them, degrades. Standard remedy: freeze BatchNorm (keep it in eval mode) during fine-tuning of detection and segmentation models.</li>
+<li><strong>Data-parallel training</strong>: each GPU sees only its own slice of the batch, so statistics are per-GPU. <strong>SyncBatchNorm</strong> computes them across all GPUs at the price of an all-reduce per layer (gpu8).</li>
+</ul>
+
+<h4>4. What normalisation does to gradients</h4>
+<p>Since normalisation is inside the network, backprop (dl1) must go through it. Write the layer for one set of activations as <code>x̂ = (x − μ)/σ</code>, <code>y = γ x̂ + β</code>. The gradient with respect to the input, for upstream gradient <code>dy</code> and taking γ = 1 for clarity, is:</p>
+<pre>dx = (1/σ) · ( dy − mean(dy) − x̂ · mean(dy ⊙ x̂) )</pre>
+<p>Read it in words. The gradient is divided by σ, so if the input is large the gradient is correspondingly small (that is the automatic scale adjustment: gradients no longer depend on how large the activations below happen to be). And two terms are <em>subtracted</em>: <code>mean(dy)</code> removes the component of the gradient along the constant direction (adding a constant to every input changes nothing, since the mean is subtracted), and <code>x̂ · mean(dy ⊙ x̂)</code> removes the component along x̂ itself (multiplying the input by a constant changes nothing, since the variance is divided out). Worked with LayerNorm on (2, 4, 6): x̂ = (−1.225, 0, 1.225), σ = 1.633. For upstream gradient dy = (1, 0, 0): mean(dy) = 0.333; mean(dy ⊙ x̂) = −1.225/3 = −0.408; then dy − 0.333 − x̂ · (−0.408) = (0.667, −0.333, −0.333) − (0.5, 0, −0.5) = (0.167, −0.333, 0.167), and dividing by σ gives <strong>(0.102, −0.204, 0.102)</strong>. Note that it sums to zero. Now try dy = −x̂ = (1.225, 0, −1.225), a gradient that would just make the input larger along its own direction: the formula returns exactly (0, 0, 0). Scaling the input has no effect on the output, so the gradient correctly has no such component. (The lab verifies both numbers with finite differences.)</p>
+<p>This has a very useful consequence for training. A normalised layer is <strong>scale-invariant</strong>: multiplying the weights of the layer below by any positive constant c does not change the output. Two things follow (deep section): the gradient with respect to those weights scales as 1/c and is orthogonal to the weights, so weights tend to grow during training and the effective learning rate (step size relative to weight size, roughly η/‖w‖²) shrinks automatically. That built-in learning-rate adjustment is one reason normalised networks tolerate large learning rates.</p>
+
+<h4>5. Why does it help? An honest account</h4>
+<p>Ioffe and Szegedy motivated BatchNorm by <em>internal covariate shift</em>: as earlier layers change, the distribution of each layer's inputs changes, so each layer has to keep re-adapting; fixing the mean and variance of each layer's inputs should remove this. This is intuitive and was the accepted story for three years. Santurkar et al. (2018) tested it. They trained networks with BatchNorm and then added random noise (with non-zero mean and non-unit variance, different at every step) <em>after</em> each BatchNorm layer, deliberately introducing severe covariate shift; training was barely worse than plain BatchNorm and far better than no BatchNorm. They concluded that "such distributional stability of layer inputs has little to do with the success of BatchNorm" and measured instead that BatchNorm "makes the optimization landscape significantly smoother": the loss and its gradient change less between nearby points, so gradients are more predictive and larger steps are safe. Three accounts are now usually given together:</p>
+<ul>
+<li><strong>Smoother loss landscape</strong> (Santurkar et al.): the loss is better behaved, allowing higher learning rates and faster convergence.</li>
+<li><strong>Scale invariance and self-tuning learning rate</strong>: weights below a normalised layer can grow without changing the function, and their gradients shrink as they do, so the relative step size adapts on its own.</li>
+<li><strong>Regularisation from batch noise</strong>: each example's normalisation depends on which other examples share its batch, which injects noise similar in spirit to dropout; Ioffe and Szegedy found that BatchNorm sometimes made dropout unnecessary.</li>
+</ul>
+<p>The honest interview answer is that the exact mechanism is still debated, that the original internal-covariate-shift explanation has been seriously challenged, and that the empirical benefits (higher learning rates, less sensitivity to initialisation, faster and more stable training) are not in doubt.</p>
+
+<h4>6. LayerNorm: the batch-independent version</h4>
+<p>Ba, Kiros and Hinton (2016) introduced <strong>LayerNorm</strong> for recurrent networks, where BatchNorm is awkward: statistics would have to be kept per time step, and sequences vary in length. LayerNorm normalises over the features of a single example, so for a transformer token vector x of width d:</p>
+<pre>μ = (1/d) Σⱼ xⱼ          σ² = (1/d) Σⱼ (xⱼ − μ)²          y = γ ⊙ (x − μ)/√(σ² + ε) + β</pre>
+<p>with γ and β vectors of length d (2d parameters). In a transformer the activations have shape (batch, tokens, d) and LayerNorm computes one mean and variance for <em>each (batch, token) pair</em>, over the d features. Nothing is shared between tokens or examples. That gives it all the properties transformers need:</p>
+<table>
+<thead><tr><th></th><th>BatchNorm</th><th>LayerNorm / RMSNorm</th></tr></thead>
+<tbody>
+<tr><td>Statistics pooled over</td><td>the batch (and space) for each channel</td><td>the features of each example (and token)</td></tr>
+<tr><td>Depends on other examples</td><td>yes</td><td>no</td></tr>
+<tr><td>Train vs eval behaviour</td><td>different (batch vs running stats)</td><td>identical</td></tr>
+<tr><td>Small batch or batch of 1</td><td>degrades; batch 1 in train mode outputs β</td><td>unaffected</td></tr>
+<tr><td>Variable-length / padded sequences</td><td>padding contaminates statistics</td><td>per token; padding irrelevant</td></tr>
+<tr><td>Cost at inference</td><td>can be folded into the previous linear layer</td><td>real work per token (a reduction and a division)</td></tr>
+<tr><td>Typical home</td><td>CNNs</td><td>transformers, RNNs</td></tr>
+</tbody>
+</table>
+<p>Geometrically, LayerNorm does two projections: it subtracts the mean (projecting the vector onto the hyperplane of zero-sum vectors), then divides by the length (projecting onto a sphere of radius √d), then applies γ and β. Every token vector entering the next layer therefore has the same norm (before γ), which is why attention and feed-forward layers downstream see a stable scale.</p>
+
+<h4>7. RMSNorm: drop the mean</h4>
+<p>Zhang and Sennrich (2019) hypothesised that of LayerNorm's two invariances, re-centring (shift invariance) and re-scaling (scale invariance), only the second matters. <strong>RMSNorm</strong> removes re-centring:</p>
+<pre>rms = √( (1/d) Σⱼ xⱼ² + ε )          y = γ ⊙ x / rms          (no mean subtraction, no bias β)</pre>
+<p>One reduction (a sum of squares) instead of two, no subtraction, and half the parameters (d instead of 2d). Their reported result: comparable quality to LayerNorm with 7–64% less running time depending on the model. On our example, row 1 becomes (0.463, 0.926, 1.389) instead of LayerNorm's (−1.225, 0, 1.225): the direction of the vector is preserved and only its length is set. RMSNorm is the norm in LLaMA (which also uses it in pre-norm position), Gemma and OLMo 2, usually computed in float32 even when the model runs in bfloat16 because the sum of squares of many values loses precision otherwise. In FLOPs the saving is negligible next to the matmuls (LLaMA-7B has only 65 RMSNorm weight vectors — 2 per layer for 32 layers plus one final — about 266,000 parameters in total, 0.004% of the model), but norm layers are memory-bandwidth-bound and run at every layer for every token, so removing a pass over the data and fusing what remains into one kernel is a measurable speed-up (gpu6).</p>
+
+<h4>8. GroupNorm and the small-batch failure</h4>
+<p>BatchNorm's Achilles heel is small batches. Object detection and segmentation models process high-resolution images and often fit only 1–2 images per GPU. With so few samples the batch mean and variance are noisy estimates, and the noise hurts. Wu and He (2018) measured it on ResNet-50 for ImageNet classification: BatchNorm's validation error was 23.6% at batch size 32 but 24.8% at 8, 27.3% at 4 and <strong>34.7% at 2</strong>. Their alternative, <strong>GroupNorm</strong>, divides the channels of a single example into G groups (G = 32 by default) and normalises over each group and all spatial positions, so it never uses other examples: its error was 24.1%, 24.2%, 24.0%, 24.2% and 24.1% at batch sizes 32, 16, 8, 4 and 2 — flat. At the regular batch size of 32 it was 0.5 points worse than BatchNorm, at batch size 2 it was 10.6 points better. With G = 1 GroupNorm is LayerNorm over channels and space (the paper measured 25.3%); with G = number of channels it is <strong>InstanceNorm</strong> (28.4% in their test), which normalises each channel of each image separately and is favoured for style transfer, where an image's contrast should not affect its style.</p>
+<figure>
+<svg viewBox="0 0 640 262" width="100%" role="img" aria-label="ImageNet validation error of ResNet-50 versus batch size per worker. BatchNorm rises from 23.6 percent at 32 to 34.7 percent at 2; GroupNorm stays between 24.0 and 24.2 percent.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="70" y1="186" x2="510" y2="186" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="190" text-anchor="end" style="fill:var(--muted);font-size:11px">24%</text><line x1="70" y1="137" x2="510" y2="137" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="141" text-anchor="end" style="fill:var(--muted);font-size:11px">28%</text><line x1="70" y1="89" x2="510" y2="89" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="93" text-anchor="end" style="fill:var(--muted);font-size:11px">32%</text><line x1="70" y1="40" x2="510" y2="40" style="stroke:var(--line-2);stroke-dasharray:2 4;fill:none"/><text x="62" y="44" text-anchor="end" style="fill:var(--muted);font-size:11px">36%</text>
+    <line x1="70" y1="40" x2="70" y2="215" style="stroke:var(--line-2);fill:none"/>
+    <polyline points="90,190.6 190,189.4 290,176.0 390,145.6 490,55.8" style="stroke:var(--s2);stroke-width:2.5;fill:none"/>
+    <polyline points="90,184.5 190,183.3 290,185.7 390,183.3 490,184.5" style="stroke:var(--s1);stroke-width:2.5;fill:none"/>
+    <circle cx="90" cy="190.6" r="4" style="fill:var(--s2)"/><text x="90" y="208" text-anchor="middle" style="fill:var(--s2);font-size:11px">23.6</text><circle cx="90" cy="184.5" r="4" style="fill:var(--s1)"/><text x="90" y="175" text-anchor="middle" style="fill:var(--s1);font-size:11px">24.1</text><circle cx="190" cy="189.4" r="4" style="fill:var(--s2)"/><text x="190" y="206" text-anchor="middle" style="fill:var(--s2);font-size:11px">23.7</text><circle cx="190" cy="183.3" r="4" style="fill:var(--s1)"/><text x="190" y="174" text-anchor="middle" style="fill:var(--s1);font-size:11px">24.2</text><circle cx="290" cy="176.0" r="4" style="fill:var(--s2)"/><text x="290" y="167" text-anchor="middle" style="fill:var(--s2);font-size:11px">24.8</text><circle cx="290" cy="185.7" r="4" style="fill:var(--s1)"/><text x="290" y="203" text-anchor="middle" style="fill:var(--s1);font-size:11px">24.0</text><circle cx="390" cy="145.6" r="4" style="fill:var(--s2)"/><text x="390" y="137" text-anchor="middle" style="fill:var(--s2);font-size:11px">27.3</text><circle cx="390" cy="183.3" r="4" style="fill:var(--s1)"/><text x="390" y="200" text-anchor="middle" style="fill:var(--s1);font-size:11px">24.2</text><circle cx="490" cy="55.8" r="4" style="fill:var(--s2)"/><text x="490" y="47" text-anchor="middle" style="fill:var(--s2);font-size:11px">34.7</text><circle cx="490" cy="184.5" r="4" style="fill:var(--s1)"/><text x="490" y="201" text-anchor="middle" style="fill:var(--s1);font-size:11px">24.1</text><text x="90" y="230" text-anchor="middle" style="fill:var(--muted);font-size:11px">32</text><text x="190" y="230" text-anchor="middle" style="fill:var(--muted);font-size:11px">16</text><text x="290" y="230" text-anchor="middle" style="fill:var(--muted);font-size:11px">8</text><text x="390" y="230" text-anchor="middle" style="fill:var(--muted);font-size:11px">4</text><text x="490" y="230" text-anchor="middle" style="fill:var(--muted);font-size:11px">2</text>
+    <text x="290" y="252" text-anchor="middle" style="fill:var(--ink-2)">batch size per GPU (samples used for each normalisation statistic)</text>
+    <text x="520" y="60" style="fill:var(--s2)">BatchNorm</text>
+    <text x="520" y="188" style="fill:var(--s1)">GroupNorm (G=32)</text>
+  </g>
+</svg>
+<figcaption>ResNet-50 on ImageNet (Wu &amp; He 2018): BatchNorm's error explodes as the batch shrinks, because its statistics become noisy estimates; GroupNorm, which uses one example only, is unaffected. Numbers are read from the paper's table.</figcaption>
+</figure>
+
+<h4>9. Where the norm goes in a transformer block</h4>
+<p>A transformer block has two sub-layers (attention, then a feed-forward network) each wrapped in a residual connection. The original 2017 transformer applied LayerNorm <em>after</em> the addition (<strong>post-norm</strong>); almost all current models apply it <em>before</em> the sub-layer, inside the branch (<strong>pre-norm</strong>).</p>
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Left, post-norm: input x goes to a sublayer, is added back to x on the skip path, then normalised. Right, pre-norm: input x is normalised, goes through the sublayer, and is added to x on the skip path; the skip path never passes through a norm.">
+  <defs><marker id="dl4-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker>
+  <marker id="dl4-arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px" text-anchor="middle">
+    <text x="230" y="18" style="fill:var(--ink);font-weight:600">Post-norm (original transformer)</text>
+    <text x="230" y="34" style="fill:var(--muted)">x ← Norm( x + Sublayer(x) )</text>
+    <text x="230" y="58" style="fill:var(--ink)">x</text>
+    <rect x="175" y="100" width="110" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="230" y="121" style="fill:var(--ink)">Sublayer</text>
+    <circle cx="230" cy="180" r="13" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="230" y="186" style="fill:var(--ink);font-size:16px">+</text>
+    <rect x="185" y="216" width="90" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/><text x="230" y="236" style="fill:var(--ink)">Norm</text>
+    <text x="230" y="272" style="fill:var(--ink)">x′</text>
+    <g style="stroke:var(--ink-2);fill:none;stroke-width:1.5"><line x1="230" y1="64" x2="230" y2="98" marker-end="url(#dl4-arr2)"/><line x1="230" y1="134" x2="230" y2="165" marker-end="url(#dl4-arr2)"/><line x1="230" y1="193" x2="230" y2="214" marker-end="url(#dl4-arr2)"/><line x1="230" y1="246" x2="230" y2="260" marker-end="url(#dl4-arr2)"/>
+      <path d="M 230 74 L 140 74 L 140 180 L 215 180" marker-end="url(#dl4-arr2)"/></g>
+    <text x="128" y="130" text-anchor="end" style="fill:var(--crit)">skip path also</text><text x="128" y="146" text-anchor="end" style="fill:var(--crit)">goes through Norm</text>
+    <text x="430" y="18" style="fill:var(--ink);font-weight:600">Pre-norm (modern LLMs)</text>
+    <text x="430" y="34" style="fill:var(--muted)">x ← x + Sublayer( Norm(x) )</text>
+    <text x="430" y="58" style="fill:var(--ink)">x</text>
+    <rect x="385" y="100" width="90" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="430" y="120" style="fill:var(--ink)">Norm</text>
+    <rect x="375" y="148" width="110" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="430" y="169" style="fill:var(--ink)">Sublayer</text>
+    <circle cx="430" cy="220" r="13" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="430" y="226" style="fill:var(--ink);font-size:16px">+</text>
+    <text x="430" y="272" style="fill:var(--ink)">x′</text>
+    <g style="stroke:var(--ink-2);fill:none;stroke-width:1.5"><line x1="430" y1="64" x2="430" y2="98" marker-end="url(#dl4-arr2)"/><line x1="430" y1="130" x2="430" y2="146" marker-end="url(#dl4-arr2)"/><line x1="430" y1="182" x2="430" y2="205" marker-end="url(#dl4-arr2)"/><line x1="430" y1="233" x2="430" y2="260" marker-end="url(#dl4-arr2)"/></g>
+    <path d="M 430 74 L 530 74 L 530 220 L 445 220" marker-end="url(#dl4-arr3)" style="stroke:var(--accent);stroke-width:2.5;fill:none"/>
+    <text x="536" y="150" text-anchor="start" style="fill:var(--accent)">clean identity</text><text x="536" y="166" text-anchor="start" style="fill:var(--accent)">path: no norm</text>
+  </g>
+</svg>
+<figcaption>In pre-norm the residual stream (blue) runs from input to output untouched, so gradients have a gain-1 path through every block (dl3). In post-norm every block's output passes through a norm, and at initialisation the gradients near the output are large, which is why post-norm needs learning-rate warmup.</figcaption>
+</figure>
+<p>Xiong et al. (2020) proved with a mean-field analysis that at initialisation, for post-norm, "the expected gradients of the parameters near the output layer are large", so a large learning rate is unstable and warmup is needed, whereas for pre-norm "the gradients are well-behaved at initialization", and they trained pre-norm transformers without the warm-up stage with comparable results. Two refinements matter in current models. First, pre-norm needs a <strong>final norm</strong> after the last block (before the output projection), because the residual stream's scale has grown through depth. Second, the extra stability of putting norms <em>after</em> sub-layers has been revived: Gemma 2 applies RMSNorm to "the input and output of each transformer sub-layer", and OLMo 2 uses "reordered norm", <code>h = x + RMSNorm(Attention(x))</code>, together with <strong>QK-norm</strong> (RMSNorm on the queries and keys before their dot product, "to avoid attention logits being too large, which can lead to training loss divergence") and a z-loss (dl3). These stabilise very long or high-learning-rate runs at little cost.</p>
+
+<h4>10. A normaliser makes the network forgiving: a measurement</h4>
+<p>Recall the dl3 experiment: a plain 30-layer ReLU network's first-layer gradient, relative to the last layer's, was 6 with the right (He) initialisation but 10⁵ with a too-large one and 3×10⁻⁴ with a too-small one. The lab of this lesson repeats it with a LayerNorm after every linear layer. Results (ratio of gradient at layer 1 to gradient at layer 30): with weights at half the He scale, 1.2×10⁻⁸ without normalisation and <strong>0.24</strong> with it; at He scale, 6.2 without and 0.24 with; at four times the He scale, 1.8×10¹⁸ without and <strong>0.24</strong> with. The same number for an initialisation range of a factor of eight — the LayerNorm has made the gradient independent of the weight scale, exactly what the scale-invariance argument of section 4 predicts. (The exact 0.24 depends on the random draw and the depth, but the independence of the initial scale is exact.) This is why normalised networks train from careless initialisations and tolerate large learning rates.</p>
+
+<h4>11. Practical rules</h4>
+<ul>
+<li><strong>ε and precision.</strong> ε ≈ 10⁻⁵ (10⁻⁶ in some models) guards the division. Compute the statistics and the division in float32 even if the rest of the model runs in bfloat16 or float16; low-precision sums of squares over thousands of features lose accuracy.</li>
+<li><strong>Weight decay.</strong> Do not apply weight decay to γ and β (and biases): decaying γ towards zero fights the normalisation. Optimiser parameter groups (dl5) handle this.</li>
+<li><strong>Initialisation.</strong> γ = 1, β = 0 at the start, so the layer initially is pure standardisation. (Gemma-style norms parameterise the scale as 1 + weight with weight initialised to 0; the checkpoint convention must be respected when porting.)</li>
+<li><strong>Fold BatchNorm for inference.</strong> Since eval-mode BatchNorm is an affine map, it merges into the preceding convolution: <code>w′ = w·γ/√(σ² + ε)</code>, <code>b′ = β + γ(b − μ)/√(σ² + ε)</code>. Worked with w = 2, b = 0.5, running mean 1, variance 4, γ = 1.5, β = 0.2: w′ = 1.5 and b′ = 0.2 + 1.5 × (0.5 − 1)/2 = −0.175, and (1.5x − 0.175) equals the unfused output for every x.</li>
+<li><strong>Train/eval discipline.</strong> Call <code>model.train()</code> and <code>model.eval()</code> deliberately; in fine-tuning with small batches keep BatchNorm layers in eval mode.</li>
+</ul>
+</section>
+
+<section data-field="deep">
+<h4>Scale invariance, weight norms and the effective learning rate</h4>
+<p>Suppose a layer's output goes through a normaliser, so the loss L is unchanged when the layer's weight vector w is multiplied by c &gt; 0: L(cw) = L(w). Differentiate with respect to c at c = 1: ∇L(w) · w = 0, so the gradient is <em>orthogonal</em> to the weights. A gradient step therefore moves the weights along a tangent and, by Pythagoras, increases the norm: ‖w − η∇L‖² = ‖w‖² + η²‖∇L‖². So weight norms grow during training with plain gradient descent. Differentiating again shows the gradient scales inversely with the weights: ∇L(cw) = ∇L(w)/c. Together: as ‖w‖ grows, the gradient shrinks like 1/‖w‖ and the change in the <em>direction</em> of w per step shrinks like η/‖w‖². This is an automatic learning-rate decay, controlled by the weight norm. It explains why BatchNorm networks tolerate a large initial learning rate (the weights grow until the effective rate is stable), why it makes a huge difference whether weight decay is used (weight decay shrinks ‖w‖ and so raises the effective rate; the balance between growth from gradients and shrinkage from decay sets an equilibrium effective learning rate), and why changing weight decay changes results in normalised networks in ways it would not in a plain one. It also warns against reading a weight-norm curve naively: a growing norm in a normalised layer is expected and does not by itself indicate instability.</p>
+
+<h4>BatchNorm leaks information between examples</h4>
+<p>Because one example's output depends on its batch-mates, BatchNorm can leak. In contrastive self-supervised learning (dl11), the positive pair sits inside the same batch as the negatives, and the batch statistics can let a model infer which examples belong together without learning good features — the "shortcut" that MoCo avoided with shuffled BatchNorm (statistics computed on a different device split for query and key encoders) and SimCLR with a global BatchNorm across devices. At serving time, using batch statistics would make one user's response depend on other users' requests batched with theirs, which is unacceptable for privacy and reproducibility, another reason transformer inference avoids it.</p>
+
+<h4>Norm layers as memory-bound kernels</h4>
+<p>A LayerNorm or RMSNorm does about 5–10 arithmetic operations per element but must read the whole activation and write it back: its arithmetic intensity is far below the GPU's ridge point (gpu2), so it is bounded by memory bandwidth, and an unfused implementation that computes the mean, the variance, the normalisation and the scale as separate kernels reads and writes the tensor several times. Production stacks fuse the whole norm into one kernel (and often fuse it with the residual add and the following quantisation), computing in float32 registers but reading and writing bfloat16. <code>torch.compile</code> generates such fusions automatically (gpu6). RMSNorm's advantage over LayerNorm is exactly here: one fewer reduction and no bias, so a leaner kernel.</p>
+
+<h4>Normalisation-free approaches</h4>
+<p>If normalisation only serves to keep scales controlled and gradients well-conditioned, similar effects may be obtained differently. NFNets (Brock et al., 2021) train large-batch ResNets <em>without</em> BatchNorm by scaling weights (scaled weight standardisation) and using adaptive gradient clipping — clipping each unit's gradient by the ratio of its norm to its weight's norm — and matched or surpassed BatchNorm models on ImageNet. Zhu et al. (2025) observed that trained LayerNorms in transformers often produce a tanh-like S-shaped input–output mapping and proposed <strong>Dynamic Tanh</strong>, <code>tanh(αx)</code> with a learnable scalar α, as a drop-in replacement; they report comparable results across vision and language models. Neither has displaced normalisation as the default, but they clarify what the layer is doing: bounding and re-scaling activations elementwise in a way that keeps optimisation well-behaved.</p>
+
+<h4>Conditioning: adaptive normalisation</h4>
+<p>The learned γ and β need not be fixed parameters; they can be <em>predicted from other data</em>. In conditional image generation (dl10), <strong>adaptive layer norm</strong> (adaLN, used in diffusion transformers) computes γ and β from the conditioning signal (the diffusion timestep, a class label), so a single network can behave differently per condition, and in style transfer AdaIN sets the per-channel statistics from a style image. This shows that after standardisation, γ and β are the natural place to inject information: the standardised activations are "content", and the affine parameters set their scale and offset.</p>
+
+<h4>Batch size, BatchNorm and the effective batch</h4>
+<p>With data parallelism, per-GPU batch size determines BatchNorm's statistics quality, so scaling out a fixed global batch over more GPUs shrinks the per-GPU batch and can degrade BatchNorm models even though the global batch is unchanged — a subtle scale-out bug. Goyal et al.'s ImageNet-in-an-hour work (ml4) kept the per-GPU batch at 32 and computed BatchNorm statistics per GPU, so that the definition of the loss did not depend on the number of GPUs. The alternatives are SyncBatchNorm (exact global statistics, one all-reduce of sums per norm layer per pass), 'ghost' batch normalisation (deliberately computing statistics over small virtual sub-batches as a regulariser) or replacing the norm with GroupNorm. The same reasoning is why gradient accumulation does not reproduce a large batch for BatchNorm networks: each micro-batch's statistics are computed alone (dl1).</p>
+
+<h4>Failure at the edge: ε, zeros and outliers</h4>
+<p>If a feature is (nearly) constant across the pooled set, its variance is close to zero and the output is dominated by ε: with ε = 10⁻⁵ and variance 10⁻⁶, the standard deviation is 0.0033 rather than 0.001, and tiny noise can be amplified by a factor of 300. In float16, x² can overflow above 256 in magnitude (256² = 65,536 &gt; 65,504) if the sum of squares is computed in half precision, another reason for float32 accumulation. In LLMs a few hidden dimensions develop very large magnitudes ("massive activations" or outlier features); RMSNorm divides everything by an RMS dominated by those dimensions, which shrinks the informative ones — an interaction that motivates some of the quantisation and architecture work around outliers (dl2, gpu4).</p>
+</section>
+
+<section data-field="prod">
+<h4>The public case: Batch Normalization on Inception</h4>
+<p>Ioffe and Szegedy's paper (arXiv:1502.03167, Google, 2015) is short and dense with checkable numbers. They took the Inception network (batch size 32, learning rate 0.0015, momentum SGD), which reached 72.2% top-1 accuracy on the ImageNet validation set after 31 × 10⁶ steps, and inserted BatchNorm before each non-linearity. Their results, from the paper's Figure 3: <strong>BN-Baseline</strong> (BatchNorm only) reached 72.2% in 13.3 million steps — less than half; <strong>BN-x5</strong> (also with a 5× higher learning rate, 0.0075, plus modifications such as removing dropout and reducing L2 weight regularisation by 5×) reached it in 2.1 million steps, the "14 times fewer steps" of the abstract, with a maximum accuracy of 73.0%; <strong>BN-x30</strong> (learning rate 0.045, thirty times the original) trained "somewhat slower initially" but reached 74.8%, the best single-network accuracy, in about 6 million steps. Applying the same 5× learning rate to the original Inception "caused the model parameters to reach machine infinity". <strong>BN-x5-Sigmoid</strong>, the same network with sigmoid non-linearities, reached 69.8%, while "without Batch Normalization, Inception with sigmoid never achieves better than 1/1000 accuracy" — chance. An ensemble of six BN-x30-based networks achieved 4.9% top-5 validation error and 4.82% test error, ahead of the previous best of 4.94% (He et al.'s PReLU ensemble, dl2) and, the authors note, better than the estimated accuracy of human raters. The lessons are the ones from this lesson: normalisation buys a much larger usable learning rate (5× to 30×), makes training insensitive to activation choice (sigmoid works), and acts as a regulariser (dropout could be reduced or removed).</p>
+<p>The counterpart case is Wu and He's Group Normalization paper (arXiv:1803.08494, Facebook AI Research, 2018), which quantified BatchNorm's weakness: ResNet-50's ImageNet error rose from 23.6% (batch 32) to 34.7% (batch 2), while GroupNorm with 32 groups was flat at 24.0–24.2%. For detection and segmentation (Mask R-CNN on COCO), where per-GPU batches are 1–2 images, they found that GroupNorm improved over the standard workaround of freezing BatchNorm into a fixed affine layer (their BN* baseline) by 1.1 box AP and 0.8 mask AP.</p>
+
+<h4>Real-world incident classes</h4>
+<p><strong>The model that is great in training and poor in production.</strong> The number-one cause is a missing <code>model.eval()</code>, or running inference under <code>model.train()</code> with a small batch. Symptoms: accuracy that changes with batch size or with the order of requests, and predictions that are not deterministic. A one-line assertion at service start-up (<code>assert not model.training</code>) prevents it; a test that feeds the same example alone and inside a batch and checks that outputs match to within numerical noise detects any remaining batch dependence.</p>
+<p><strong>Silent drift of running statistics in fine-tuning.</strong> After a few hundred steps of fine-tuning with batch size 2–4, evaluation accuracy is far worse than at start although the training loss falls. The running mean and variance have been overwritten by noisy small-batch estimates. Fix by freezing BatchNorm (eval mode for those layers), or by using GroupNorm, and always compare against the pretrained statistics.</p>
+<p><strong>Porting bugs in norm layers.</strong> The Gemma port story in dl2 is also a norm story: the community fix (Hugging Face transformers PR #29402) listed, alongside the approximate GELU, that the RMSNorm which multiplies by (1 + weight) "must be upcasted to float32 and not bfloat16 or float16 halfway", unlike LLaMA's version, which downcasts before multiplying by the weights. Differences of this kind (ε, upcasting order, weight convention, whether the mean is subtracted) produce small numerical drift that grows with depth. A layer-by-layer comparison against a reference implementation on fixed inputs finds the first layer that diverges.</p>
+<p><strong>Instability that norm placement can cure.</strong> Loss spikes in long high-learning-rate runs are often attention logits growing (dl3). OLMo 2's technical report lists RMSNorm, reordered norm (normalising sub-layer outputs), QK-norm and z-loss among the stability measures it adopted; Gemma 2 normalises the input and output of every sub-layer. If a run is spiking, adding QK-norm or output norms is a cheaper experiment than changing the optimiser.</p>
+<h4>What to monitor</h4>
+<p>For BatchNorm networks: the running mean and variance of each layer over time (a running variance collapsing towards zero or a running mean far from the training data's indicates a problem), the difference in accuracy between train and eval modes on the same held-out data, and per-GPU batch size. For LayerNorm and RMSNorm models: activation RMS at the input of each block (it should grow smoothly with depth in pre-norm models, and a sudden jump points at a layer), the γ statistics (a γ growing without bound or collapsing to zero in one layer), and gradient norms per layer (dl3). During porting or quantisation: layer-wise output error against a float32 reference.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> implement the three normalisers on the lesson's 2×3 tensor, show their different dependence on the batch, verify the LayerNorm gradient formula against finite differences, see BatchNorm's running statistics, and repeat the dl3 experiment to watch a normaliser make a 30-layer network insensitive to initialisation. NumPy only, Python 3.12, a few seconds.</p>
+<pre>import numpy as np
+EPS = 1e-5
+
+# ---- three normalisers; x has shape (batch, features)
+def batchnorm(x):  m, v = x.mean(0), x.var(0);                 return (x - m) / np.sqrt(v + EPS)
+def layernorm(x):  m, v = x.mean(1, keepdims=True), x.var(1, keepdims=True); return (x - m) / np.sqrt(v + EPS)
+def rmsnorm(x):    return x / np.sqrt((x ** 2).mean(1, keepdims=True) + EPS)
+
+X = np.array([[2., 4., 6.], [0., 3., 9.]])
+np.set_printoptions(precision=3, suppress=True)
+print("BatchNorm (per column):\n", batchnorm(X))
+print("LayerNorm (per row):\n", layernorm(X))
+print("RMSNorm (per row):\n", rmsnorm(X))
+
+# ---- batch dependence: change the OTHER example, look at example 0's output
+X2 = X.copy(); X2[1] = [100., 200., 300.]
+print("\nexample 0 after swapping its batch-mate:  BN", batchnorm(X2)[0], " LN", layernorm(X2)[0])
+
+# ---- train-mode BatchNorm with a batch of one destroys the input (mean = the value, variance = 0)
+print("BN, batch of 1:", batchnorm(np.array([[2., 4., 6.]])))
+
+# ---- LayerNorm backward by formula vs finite differences
+def ln_backward(dy, x):
+    xh, s = layernorm(x), np.sqrt(x.var(1, keepdims=True) + EPS)
+    return (dy - dy.mean(1, keepdims=True) - xh * (dy * xh).mean(1, keepdims=True)) / s
+x = np.array([[2., 4., 6.]]); dy = np.array([[1., 0., 0.]])
+num = np.zeros_like(x)
+for j in range(3):
+    e = np.zeros_like(x); e[0, j] = 1e-6
+    num[0, j] = ((layernorm(x + e) - layernorm(x - e)) * dy).sum() / 2e-6
+print("\nLN backward  formula:", ln_backward(dy, x), " finite differences:", num)
+print("gradient along the normalised direction is removed:", ln_backward(-layernorm(x), x))
+
+# ---- running statistics for BatchNorm (momentum 0.1): what eval mode would use
+batch = np.array([2., 4., 6., 8.]); rm, rv = 0.0, 1.0
+rm, rv = 0.9 * rm + 0.1 * batch.mean(), 0.9 * rv + 0.1 * batch.var(ddof=1)
+print("\nafter one batch: running mean", rm, " running var", round(rv, 3))
+
+# ---- does a normaliser rescue a badly scaled 30-layer network? (compare dl3)
+DEPTH, WIDTH = 30, 100
+def signal(std, norm, seed=0):
+    r = np.random.default_rng(seed)
+    Ws = [r.normal(0, std, (WIDTH, WIDTH)) for _ in range(DEPTH)]
+    h, cache = r.normal(size=(64, WIDTH)), []
+    for W in Ws:
+        z = h @ W
+        y = layernorm(z) if norm else z
+        a = np.maximum(y, 0)
+        cache.append((z, y)); h = a
+    d = np.ones_like(h) / h.size; out = []
+    for W, (z, y) in zip(reversed(Ws), reversed(cache)):
+        dy = d * (y &gt; 0)
+        dz = ln_backward(dy, z) if norm else dy
+        d = dz @ W.T; out.append(np.linalg.norm(d))
+    return out[-1] / out[0]                          # gradient at layer 1 relative to the top
+print("\ngradient at layer 1 / gradient at layer 30, ReLU, 30 layers")
+for label, std in [("too small (0.5x He)", 0.5 * np.sqrt(2 / WIDTH)), ("He", np.sqrt(2 / WIDTH)), ("too big (4x He)", 4 * np.sqrt(2 / WIDTH))]:
+    print(f"{label:20} no norm {signal(std, False):9.1e}   with LayerNorm {signal(std, True):9.1e}")</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li><strong>The three tables</strong> match section 2: BatchNorm gives [[1, 1, −1], [−1, −1, 1]] (a batch of two can only produce ±1); LayerNorm gives row 1 = (−1.225, 0, 1.225) and row 2 = (−1.069, −0.267, 1.336); RMSNorm gives (0.463, 0.926, 1.389) and (0, 0.548, 1.643).</li>
+<li><strong>Batch dependence.</strong> After replacing example 1 with (100, 200, 300), example 0's LayerNorm output is unchanged but its BatchNorm output flips from (1, 1, −1) to (−1, −1, −1). This is the difference in one line.</li>
+<li><strong>Batch of one.</strong> Train-mode BatchNorm returns all zeros (β) for a single example: the batch mean is the value itself and the variance is zero.</li>
+<li><strong>The gradient formula</strong> agrees with finite differences: (0.102, −0.204, 0.102), and a gradient along the normalised direction comes out as zero — scale invariance made visible.</li>
+<li><strong>Running statistics.</strong> After one batch (2, 4, 6, 8) with momentum 0.1 the running mean is 0.5 and the running variance 1.567.</li>
+<li><strong>The depth experiment</strong> prints the gradient ratio (layer 1 ÷ layer 30) for three weight scales. Without normalisation it swings from about 10⁻⁸ through 6 to about 10¹⁸; with LayerNorm it is 0.24 in all three rows. Try depth 60, or remove the ReLU, and see that the invariance to the initial weight scale persists.</li>
+</ol>
+<p><strong>Try next.</strong> Add γ and β and write their gradients (<code>dγ = Σ dy ⊙ x̂</code>, <code>dβ = Σ dy</code>); implement BatchNorm's backward and check it the same way; implement GroupNorm with a group count G and confirm that G = 1 reproduces LayerNorm over the same axes and G = features reproduces InstanceNorm.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A BatchNorm layer sees the activations <code>[2, 4, 6, 8]</code> for one feature across a batch of 4, with <code>γ = 1, β = 0</code>. Compute the output. Then say what happens at batch size 1 in training mode, and at batch size 1 in evaluation mode. Finally, apply LayerNorm to the single example <code>(2, 4, 6, 8)</code> and compare.</p>
+<details><summary>Answer</summary>
+<p>Mean = 5, variance = <code>((−3)² + (−1)² + 1² + 3²)/4 = 5</code>, so σ = 2.236 (ignoring ε).</p>
+<p>Output = <code>(x − 5)/2.236</code> → <strong>(−1.342, −0.447, 0.447, 1.342)</strong>: zero mean, unit variance, then scaled by γ and shifted by β.</p>
+<p><strong>Batch size 1, training mode:</strong> the batch mean is the single value, so <code>x − μ = 0</code> and the variance is 0. The output is <code>0/√ε = 0</code>, then <code>γ·0 + β = β</code>: every input produces the same output and the layer has destroyed all information. <strong>Batch size 1, evaluation mode:</strong> perfectly fine, because BatchNorm uses the stored running mean and variance and no longer depends on the batch.</p>
+<p><strong>LayerNorm on one example (2, 4, 6, 8):</strong> here the four numbers are four <em>features</em> of a single example. The mean is 5, the variance 5 and the result is the same (−1.342, −0.447, 0.447, 1.342), because the arithmetic is identical; what differs is which numbers are pooled. In BatchNorm these were four examples' values of <em>one</em> feature. In LayerNorm they are one example's values of four features, and LayerNorm works for any batch size, including 1, and in training and inference alike.</p>
+<p><strong>Why transformers therefore use LayerNorm or RMSNorm:</strong> statistics that come from a single token's features do not depend on the batch, behave identically in training and inference, and are unaffected by padded positions. RMSNorm goes one step further and drops the mean subtraction, which is cheaper and works as well.</p></details>
+<hr>
+<b>Choose a normaliser</b>
+<p>You are fine-tuning a Mask R-CNN detector whose backbone is a ResNet-50 with BatchNorm. Memory limits you to 2 images per GPU on 8 GPUs. What do you do with the BatchNorm layers, and what do you change if you were training the same backbone from scratch?</p>
+<details><summary>Answer</summary>
+<p><strong>Fine-tuning:</strong> two images per GPU give very noisy batch statistics, and updating the running statistics from them would drift them away from the pretrained values. The standard approach is to <em>freeze</em> BatchNorm: keep those layers in evaluation mode (running statistics fixed, so each layer is a fixed per-channel affine map) and either freeze γ and β too or train them with a small learning rate. That keeps fine-tuning consistent with the pretrained features and costs nothing at inference.</p>
+<p><strong>From scratch:</strong> options in order of preference. (1) <em>GroupNorm</em> (G = 32) in the backbone and heads, whose accuracy is independent of the per-GPU batch (Wu &amp; He: 24.1% ImageNet error at batch 2 versus 34.7% for BatchNorm). (2) <em>SyncBatchNorm</em> across the 8 GPUs, which gives statistics from 16 images at the cost of an all-reduce per layer (gpu8); better than nothing but still small. (3) Gradient accumulation does not fix BatchNorm, because each micro-batch's statistics are computed separately. Either GroupNorm or synchronised BatchNorm is a legitimate answer; say what the trade-off is (accuracy at large batches versus independence from the batch).</p></details>
+</section>

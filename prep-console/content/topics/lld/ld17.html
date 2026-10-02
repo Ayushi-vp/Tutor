@@ -1,0 +1,798 @@
+<!-- topic source for lld/ld17; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld17",
+  "t": "Implement a thread pool with graceful shutdown",
+  "tag": "Concurrency",
+  "sum": "Build the executor behind concurrent.futures: a fixed set of workers on a shared queue, futures that carry results and exceptions, workers that survive bad tasks, submit and shutdown made atomic with one lock so no accepted task is stranded, sentinels queued behind the work for a graceful stop, optional cancellation, join timeouts, and the nested-wait deadlock every pool can hit.",
+  "prereq": [
+    [
+      "ld16",
+      "A blocking queue with a lock and condition variables; waits in while loops; close and drain for shutdown."
+    ],
+    [
+      "py9",
+      "Threads, daemon versus non-daemon threads, and Thread.join with a timeout."
+    ],
+    [
+      "py7",
+      "Exceptions propagate up a thread's call stack; an uncaught one ends that thread."
+    ],
+    [
+      "swe12",
+      "Check-then-act races and how to reason about every interleaving."
+    ]
+  ],
+  "myths": [
+    [
+      "A thread pool is just threads looping over a queue.",
+      "That part is easy. The design work is in the edges: what a caller gets back (a future with the result or the exception), what happens when a task raises (the worker must survive), what happens to tasks submitted while shutting down (they must be rejected, never silently stranded), and how the pool stops (after the queued work, within a time limit)."
+    ],
+    [
+      "Checking a shutdown flag in submit is enough.",
+      "If the check and the enqueue are separate steps, shutdown can run between them: the task is accepted, then queued behind the stop signals, and never runs, so its future waits forever. The check and the enqueue must happen under the same lock that shutdown takes to set the flag."
+    ],
+    [
+      "An exception in a task is the caller's problem.",
+      "If the worker does not catch it, the exception ends the worker thread. The pool silently shrinks with every failing task until nothing runs. Workers catch every exception and store it in the task's future, where the caller receives it."
+    ],
+    [
+      "Shutdown can stop running tasks.",
+      "Python threads cannot be killed safely from outside. Shutdown stops accepting work, optionally cancels tasks that have not started, and waits for running tasks to finish. Long tasks that must stop early need cooperative cancellation: a flag or event they check."
+    ],
+    [
+      "More workers always means more throughput.",
+      "For CPU-bound Python code, the global interpreter lock lets one thread run bytecode at a time, so extra threads add switching overhead. Threads help with I/O-bound work and with C code that releases the lock. Python's default, min(32, CPU count + 4), reflects that balance."
+    ],
+    [
+      "Waiting on another task's result inside a task is fine.",
+      "With a bounded pool it can deadlock: if every worker is waiting for a task that is still queued, nothing can run it. Python's documentation gives exactly this example. Avoid blocking waits inside pool tasks, or use a separate pool for the inner work."
+    ]
+  ],
+  "recap": [
+    "A thread pool runs submitted tasks on a fixed set of long-lived worker threads that take work from a shared queue.",
+    "submit returns a future, an object that will hold the task's result or exception and lets callers wait for it with a timeout.",
+    "Workers catch every exception from a task and store it in the future, so a bad task never kills a worker.",
+    "submit checks the shutdown flag and enqueues under the same lock that shutdown uses to set the flag, so a task is either rejected or guaranteed to run.",
+    "Graceful shutdown stops accepting work, lets queued tasks finish, then stops each worker with a sentinel placed behind the remaining work.",
+    "Cancellation of pending tasks drains the queue and marks their futures cancelled; running tasks always finish.",
+    "Shutdown can wait with a timeout and report whether all workers stopped.",
+    "A task that waits for another task in the same full pool can deadlock it; the standard library documents the case.",
+    "Python's ThreadPoolExecutor uses the same design: a work queue, None as the sentinel, a shutdown lock around submit, and cancel_futures for pending work."
+  ],
+  "glossary": [
+    [
+      "Bulkhead",
+      "A separate pool of workers or connections for one dependency or class of work, so its slowness cannot exhaust resources others need."
+    ],
+    [
+      "Cancellation",
+      "Marking a task that has not started so that it will never run; its future reports that it was cancelled."
+    ],
+    [
+      "Cooperative cancellation",
+      "Stopping a running task by setting a flag or event that the task checks and responds to, since threads cannot be safely killed."
+    ],
+    [
+      "Daemon thread",
+      "A thread that does not keep the program alive; it is stopped abruptly when the main program exits."
+    ],
+    [
+      "Executor",
+      "An object that runs submitted callables, usually on a pool of threads or processes, and returns futures."
+    ],
+    [
+      "FIFO",
+      "First in, first out: the queue order in which tasks are run."
+    ],
+    [
+      "Future",
+      "An object representing a result that will be available later, with methods to wait for it, read it, or learn its exception."
+    ],
+    [
+      "GIL",
+      "Global interpreter lock: CPython's lock that lets one thread run Python bytecode at a time."
+    ],
+    [
+      "Graceful shutdown",
+      "Stopping a component by refusing new work, finishing accepted work, and then releasing resources."
+    ],
+    [
+      "Join",
+      "Waiting for a thread to finish; with a timeout, waiting at most that long."
+    ],
+    [
+      "Poison pill",
+      "A special value placed in a work queue that tells a worker to exit; also called a sentinel."
+    ],
+    [
+      "Process pool",
+      "A pool of worker processes instead of threads, used for CPU-bound Python work because each process has its own interpreter."
+    ],
+    [
+      "Sentinel",
+      "A unique marker value, here placed in the queue to signal a worker to stop."
+    ],
+    [
+      "Starvation (pool)",
+      "Tasks waiting indefinitely because every worker is occupied, for example by tasks waiting on other queued tasks."
+    ],
+    [
+      "Thread pool",
+      "A group of reusable worker threads that execute tasks from a queue, avoiding the cost of creating a thread per task."
+    ],
+    [
+      "Work stealing",
+      "A scheduling scheme where each worker has its own task deque and idle workers take tasks from the far end of busy workers' deques."
+    ],
+    [
+      "Worker",
+      "A thread in a pool that repeatedly takes a task from the queue and runs it."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why use a thread pool instead of a new thread per task?",
+      "Creating a thread costs time and memory, and an unbounded number of threads can exhaust the machine. A pool reuses a fixed set of workers, bounds concurrency, and queues excess work. It also gives one place to handle results, exceptions and shutdown."
+    ],
+    [
+      "E",
+      "What does submit return, and why not just the result?",
+      "A future: the task runs later on another thread, so the caller gets an object it can wait on, with result(timeout) returning the value or raising the task's exception. This lets the caller submit many tasks and wait for them together."
+    ],
+    [
+      "E",
+      "What happens when a task raises an exception?",
+      "The worker catches it and stores it in the task's future; result() re-raises it in the caller's thread. The worker carries on with the next task. If the worker did not catch it, the exception would end the worker thread and the pool would shrink with every failure."
+    ],
+    [
+      "M",
+      "Trace the submit-versus-shutdown race and show the fix.",
+      "Thread A calls submit, checks the flag (not shut down) and is preempted. Thread B calls shutdown: sets the flag, puts one sentinel per worker, and the workers exit. A resumes and enqueues its task behind the sentinels. No worker will ever take it, so its future waits forever. The fix is to do the check and the enqueue while holding the lock shutdown takes to set the flag; then shutdown either happens entirely before (A is rejected) or entirely after (the task is queued before the sentinels and runs).",
+      "Follow-up: how does CPython do it? — submit holds self._shutdown_lock while it checks _shutdown and puts the work item; shutdown takes the same lock to set the flag."
+    ],
+    [
+      "M",
+      "How do sentinels make shutdown graceful?",
+      "The queue is FIFO, so sentinels added at shutdown sit behind every task already queued. Workers finish all queued tasks first, then each takes one sentinel and exits. One sentinel per worker, or a single sentinel that each exiting worker puts back for the next, as CPython's executor does."
+    ],
+    [
+      "M",
+      "How do you cancel pending work on shutdown?",
+      "Under the lock, drain the queue and mark each drained task's future cancelled, then add the sentinels. Tasks already running cannot be interrupted and finish normally. Python's ThreadPoolExecutor.shutdown has a cancel_futures argument that does this."
+    ],
+    [
+      "M",
+      "Why can shutdown not stop a running task?",
+      "Python provides no safe way to kill a thread: it might hold locks or be halfway through updating shared state. A long task that should stop early must check a cancellation flag or event periodically and return. The pool can pass such a token to tasks or tasks can capture one."
+    ],
+    [
+      "M",
+      "How many workers should a pool have?",
+      "It depends on the work. I/O-bound tasks spend most of their time waiting, so many threads help, bounded by the downstream system's capacity. CPU-bound pure-Python tasks gain little from threads because of the GIL; use processes. Python's default for ThreadPoolExecutor is min(32, CPU count + 4), designed to keep at least five workers for I/O while not over-allocating on large machines."
+    ],
+    [
+      "H",
+      "How can a thread pool deadlock, and how do you prevent it?",
+      "If tasks wait for other tasks submitted to the same pool, and all workers are occupied by such waiting tasks, the tasks they wait for sit in the queue with no worker to run them. Python's documentation shows a one-worker pool where a task submits another and waits on it. Prevent it by never blocking on same-pool futures inside tasks (chain callbacks instead), by using separate pools for inner work, or by sizing pools so it cannot happen."
+    ],
+    [
+      "H",
+      "What should happen to the pool when the Python program exits?",
+      "Worker threads are non-daemon, so the interpreter waits for them; the pool must make them exit, or the program hangs at exit. CPython registers an exit hook that sets a global shutdown flag and puts a sentinel in every executor's queue, so workers finish their current task and stop. A daemon-thread pool would instead be killed mid-task, losing work."
+    ],
+    [
+      "H",
+      "Add a bounded queue to the pool. What changes?",
+      "submit now blocks or fails when the queue is full, which gives backpressure. Shutdown must still be able to add sentinels, so either reserve space for them, use a separate stop flag that workers check after a get with a timeout, or close the queue (as in the blocking-queue case) so blocked submitters wake and fail."
+    ],
+    [
+      "H",
+      "How do you test a thread pool's shutdown logic?",
+      "Make the race deterministic: inject a hook in submit between the check and the enqueue, pause the submitting thread there with an event, run shutdown, then release it. With the racy pool the accepted task's future never completes; with the locked pool shutdown waits for submit and the task runs. Add stress tests for throughput and exception handling, and join with timeouts so a hang becomes a failure."
+    ],
+    [
+      "H",
+      "How do futures notify waiters, and why notify_all?",
+      "Each future has a condition variable; result() waits on it until the state is done or cancelled, and the worker calls notify_all when it stores the outcome. notify_all because several threads may wait on the same future and all of them can proceed once it completes, unlike a queue where one item serves one consumer."
+    ]
+  ],
+  "refs": [
+    [
+      "code",
+      "CPython Lib/concurrent/futures/thread.py",
+      "ThreadPoolExecutor: submit holds _shutdown_lock while checking _shutdown and enqueueing; workers exit on None and put None back to wake others; shutdown sets the flag, drains and cancels with cancel_futures, puts None and joins; idle threads are reused before new ones start; default max_workers min(32, cpu_count + 4).",
+      "https://raw.githubusercontent.com/python/cpython/3.12/Lib/concurrent/futures/thread.py"
+    ],
+    [
+      "docs",
+      "Python: concurrent.futures",
+      "Executor.submit, shutdown(wait, cancel_futures), Future semantics, the default worker count change in 3.8 and 3.13, and the documented nested-wait deadlocks.",
+      "https://docs.python.org/3/library/concurrent.futures.html"
+    ],
+    [
+      "docs",
+      "Python: threading",
+      "Thread, join with timeout, daemon threads, and condition variables used by futures.",
+      "https://docs.python.org/3/library/threading.html"
+    ],
+    [
+      "docs",
+      "Java ExecutorService",
+      "The same lifecycle in Java: shutdown (finish queued work) versus shutdownNow (attempt to stop), and awaitTermination with a timeout.",
+      "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html"
+    ],
+    [
+      "docs",
+      "Thread pool",
+      "Overview of the pattern, sizing considerations and work queues.",
+      "https://en.wikipedia.org/wiki/Thread_pool"
+    ],
+    [
+      "docs",
+      "Futures and promises",
+      "The concept behind the future objects returned by submit.",
+      "https://en.wikipedia.org/wiki/Futures_and_promises"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A service processes uploads by handing each one to a thread pool. One day a malformed file makes the processing function raise an exception. Nothing crashes, but over the following hour throughput drops to zero. The pool's workers did not catch exceptions; each bad file killed one worker, and after eight bad files there were no workers left, while the queue kept accepting uploads that would never be processed. A week later, during a deploy, the same service occasionally hangs at shutdown: a request handler had submitted a task in the instant the pool was shutting down, the task was accepted, and the handler waited for a result that would never come.</p>
+<p>A <strong>thread pool</strong> is a small, fixed set of reusable worker threads that take tasks from a shared queue. It exists because creating a thread per task is expensive and unbounded, and because a pool is the one place where concurrency limits, results, errors and shutdown can be handled once, correctly. Python ships one as <code>concurrent.futures.ThreadPoolExecutor</code>, Java as <code>ExecutorService</code>, and nearly every server framework has one inside.</p>
+<p>As a machine-coding question, the pool tests whether you can think about a component's whole lifecycle under concurrency. Running tasks is the easy middle. The hard parts are at the edges: what a caller receives (a <strong>future</strong> that will hold either the result or the exception), what happens when a task fails (the worker must survive), what happens to work submitted while the pool is stopping (it must be rejected or guaranteed to run, never stranded), how the pool stops (after the work it accepted, within a time limit), and what can make it hang (tasks waiting on other tasks in the same pool).</p>
+<p>Each of those edges has a bad interleaving an interviewer will ask you to trace. The most instructive is the race between <code>submit</code> and <code>shutdown</code>: two threads, each doing something reasonable, combine to strand a task forever. The fix, a single lock covering both the shutdown check and the enqueue, is exactly what CPython's own executor does, and the solution in this lesson reproduces the race deterministically by pausing a thread at the critical moment.</p>
+<p>Finally, the pool is where the earlier concurrency tools come together: the blocking queue carries the tasks, condition variables power the futures, a lock makes two operations atomic, and sentinels reuse FIFO order to sequence shutdown after work. Seeing them combine is the real goal of the exercise.</p>
+<p>The lesson follows the round: clarify the requirements, name the pieces, draw them, write a naive pool and trace its failures, then build the correct pool in stages (futures with condition variables, workers that survive exceptions, submit and shutdown made atomic, sentinels behind the work, cancellation, timeouts), test the race deterministically, discuss the nested-wait deadlock and pool sizing, and compare with CPython's <code>ThreadPoolExecutor</code> source.</p>
+</section>
+
+<section data-field="primer">
+<h4>Why pools exist</h4>
+<p>Starting a thread costs time (system calls, a stack of typically several hundred kilobytes to megabytes of reserved memory) and every running thread competes for the CPU and the scheduler's attention. A program that starts a thread per request has no limit on how many it creates: under a burst of ten thousand requests it creates ten thousand threads, and everything slows down. A pool creates a fixed number of workers once and reuses them. Excess work waits in a queue, which bounds concurrency and turns overload into queueing delay instead of collapse.</p>
+<h4>The parts</h4>
+<p>A pool has four parts. A <strong>work queue</strong> holds submitted tasks in order; it is the blocking queue from the previous case. <strong>Workers</strong> are threads that loop forever: take a task, run it, record the outcome. A <strong>future</strong> is the handle returned to whoever submitted the task; it starts pending and later holds the result or the exception, and its <code>result(timeout)</code> method blocks until then. And a <strong>lifecycle</strong>: the pool is running (accepting work), then shutting down (refusing new work, finishing accepted work), then terminated (all workers exited).</p>
+<figure>
+<svg viewBox="0 0 640 240" width="100%" role="img" aria-label="Callers submit tasks and receive futures; tasks wait in a FIFO work queue; worker threads take tasks, run them and complete the futures with a result or an exception; callers wait on futures">
+<defs><marker id="ld17-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="20" y="40" width="120" height="120" rx="8" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="80" y="60" text-anchor="middle" style="fill:var(--ink);font-weight:600">callers</text>
+<text x="80" y="84" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">f = submit(fn)</text>
+<text x="80" y="104" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">...</text>
+<text x="80" y="128" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">f.result(5)</text>
+<text x="80" y="150" text-anchor="middle" style="fill:var(--muted)">wait on the future</text>
+<rect x="190" y="70" width="190" height="60" rx="8" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<text x="285" y="62" text-anchor="middle" style="fill:var(--ink);font-weight:600">work queue (FIFO)</text>
+<g style="fill:var(--s2)"><rect x="200" y="85" width="34" height="30" rx="4"/><rect x="240" y="85" width="34" height="30" rx="4"/><rect x="280" y="85" width="34" height="30" rx="4"/></g>
+<rect x="320" y="85" width="34" height="30" rx="4" style="fill:var(--crit);opacity:0.5"/><text x="337" y="105" text-anchor="middle" style="fill:var(--ink)">☠</text>
+<text x="285" y="150" text-anchor="middle" style="fill:var(--muted)">sentinels go behind the work</text>
+<rect x="440" y="30" width="180" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="530" y="55" text-anchor="middle" style="fill:var(--ink)">worker 1: run task</text>
+<rect x="440" y="80" width="180" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="530" y="105" text-anchor="middle" style="fill:var(--ink)">worker 2: run task</text>
+<rect x="440" y="130" width="180" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="530" y="155" text-anchor="middle" style="fill:var(--ink)">worker 3: waiting</text>
+<line x1="142" y1="90" x2="188" y2="96" marker-end="url(#ld17-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="382" y1="96" x2="438" y2="56" marker-end="url(#ld17-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<line x1="382" y1="100" x2="438" y2="100" marker-end="url(#ld17-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+<path d="M530,172 C530,220 80,220 80,162" marker-end="url(#ld17-arrow)" style="fill:none;stroke:var(--good)"/>
+<text x="305" y="214" text-anchor="middle" style="fill:var(--good)">future completed: result or exception (notify_all waiters)</text>
+</g>
+</svg>
+<figcaption>Callers never touch workers directly: they submit to the queue and wait on futures. Workers never return values directly: they complete futures. Stopping is done by queuing sentinels behind the remaining work.</figcaption>
+</figure>
+<h4>Futures</h4>
+<p>A <strong>future</strong> is a placeholder for a result that does not exist yet. It has a state (pending, running, done, cancelled), and once done it holds either a value or an exception. <code>result(timeout)</code> waits until it is done, then returns the value or re-raises the exception in the caller's thread, which is how an error in a worker reaches the code that cares about it. Internally a future needs exactly the tools from the blocking queue: a condition variable, a predicate ("state is done or cancelled") checked in a loop, and <code>notify_all</code> when the outcome is stored, because several threads may be waiting on the same future.</p>
+<h4>The lifecycle is a state machine</h4>
+<p>A pool's lifecycle has three states, running, shutting down and terminated, and most of its bugs are transitions that happen at the wrong moment: a submit observed in one state and executed in the next, a worker exiting before the queue is empty, a shutdown that runs twice. Writing the states down and asking, for every operation, "which states may this run in, and what makes the state change atomic with it?" is the reasoning that finds the race in this lesson before any test does.</p>
+<h4>Where pools appear</h4>
+<p>Web servers run request handlers on pools; database drivers run queries on them; asyncio offloads blocking calls to a default thread pool through <code>run_in_executor</code>; data pipelines download files on them; and AI services often use a pool to fan out calls to model APIs or vector stores. Each of them has to answer the same questions about errors, overload and shutdown, which is why getting this small component right pays off broadly.</p>
+<h4>The analogy, and where it breaks</h4>
+<p>Think of a dry cleaner. Customers hand in clothes and get a ticket (the future). Items wait on a rack (the queue) and a few staff (workers) process them in order. When an item is ready, the ticket can be redeemed; if the item was ruined, the customer learns that when they present the ticket, not before. At closing time the shop stops taking new items, finishes those on the rack, and the staff go home. The analogy breaks at closing: a real shop can tell a customer at the door "we're closed" at the same instant the shutter comes down, but in software the check "are we open?" and the act "put it on the rack" are separate steps, and closing time can fall between them.</p>
+<h4>What the round expects</h4>
+<p>A pool class with <code>submit</code> returning futures and <code>shutdown(wait, cancel_pending, timeout)</code>; workers that catch exceptions; the submit/shutdown race identified and closed; sentinels for graceful stop; and tests, including a deterministic test of the race and a demonstration of the nested-wait deadlock.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Queue, workers, futures</span></div><div class="ck"><span class="ck-m">10–16</span><span class="ck-t">Naive pool &amp; traces</span></div><div class="ck"><span class="ck-m">16–30</span><span class="ck-t">Correct pool</span></div><div class="ck"><span class="ck-m">30–38</span><span class="ck-t">Deterministic race test</span></div><div class="ck"><span class="ck-m">38–45</span><span class="ck-t">Deadlock, sizing, extensions</span></div></div>
+<h4>1 · Clarify the requirements</h4>
+<p>Ask how many workers and whether the number is fixed or grows with demand, whether the work queue is bounded, what submit returns, how task failures are reported, what shutdown means (finish queued work, or drop it), whether running tasks can be interrupted, whether shutdown should wait and for how long, whether tasks may submit other tasks, and whether the pool should be usable as a context manager.</p>
+<p>A typical agreed scope: a fixed number of workers started at construction; an unbounded FIFO work queue; submit returns a future with result(timeout) and cancel(); exceptions are delivered through the future; shutdown rejects new submissions, by default finishes queued tasks, optionally cancels tasks not yet started, and can wait with a timeout, reporting whether all workers stopped; running tasks always run to completion. Invariants: every accepted task's future eventually completes or is cancelled; the number of workers never changes until shutdown; no task starts after its future was cancelled.</p>
+<h4>2 · The pieces</h4>
+<p><code>Future</code>: a condition variable, a state, a result and an exception; <code>_start</code> moves it from pending to running (and refuses if it was cancelled), <code>_finish</code> stores the outcome and notifies all waiters, <code>cancel</code> succeeds only while pending, <code>result</code> waits with a timeout. <code>_WorkQueue</code>: an unbounded deque with a condition, from which workers take items in a while loop. <code>ThreadPool</code>: the workers, the queue, a lock and a shutdown flag. A module-level <code>_SENTINEL = object()</code> is a unique marker no task can equal.</p>
+<h4>3 · Stage one: a naive pool, two failures</h4>
+<pre>class NaivePool:
+    def __init__(self, n):
+        self.q, self.shutdown_flag = queue.Queue(), False
+        for _ in range(n):
+            threading.Thread(target=self._work, daemon=True).start()
+
+    def _work(self):
+        while True:
+            fn, fut = self.q.get()
+            fut.set_result(fn())               # an exception here ends the thread
+
+    def submit(self, fn):
+        if self.shutdown_flag:                 # check ...
+            raise RuntimeError("shut down")
+        fut = Future()
+        self.q.put((fn, fut))                  # ... then act, without a lock
+        return fut</pre>
+<p>Its first failure is the opening story's. When <code>fn()</code> raises, nothing catches it, the exception propagates out of <code>_work</code>, and the thread ends; the future is never completed, so its caller waits forever, and the pool has one worker fewer. After as many failures as workers, the queue fills with tasks nobody will run. The second failure is shutdown. The workers are daemon threads, so at program exit they are killed mid-task. There is no way to wait for queued work. And the check of <code>shutdown_flag</code> in submit is separated from the enqueue, which is the race traced below.</p>
+<h4>4 · Stage two: futures and workers that survive</h4>
+<p>The worker loop takes an item; if it is the sentinel it returns; otherwise it calls <code>fut._start()</code>, which returns false if the future was cancelled while queued, in which case the task is skipped. Then it runs the task inside <code>try</code>: on success <code>fut._finish(result=...)</code>, on any exception <code>fut._finish(exc=e)</code> and a failure counter is incremented. Catching <code>BaseException</code> rather than <code>Exception</code> also covers tasks that raise <code>SystemExit</code> or similar, which would otherwise end the worker. The worker then loops for the next task. The test submits 100 tasks that divide by zero to a four-worker pool, checks every future re-raises <code>ZeroDivisionError</code>, that all four workers are still alive, and that the pool still computes <code>sum([1, 2, 3])</code> afterwards.</p>
+<p>One small detail in the solution illustrates the whole topic: the failure counter. <code>self.task_errors += 1</code> looks atomic but is a read, an add and a write; two workers failing at the same moment can both read 7 and both write 8, losing a count. The solution wraps it in its own small lock. Shared mutable state in a concurrent component needs protection however trivial it looks.</p>
+<h4>A second trace: the worker that dies</h4>
+<p>Before the shutdown race, trace the naive worker with four workers and a burst of eight tasks, two of which raise.</p>
+<table><thead><tr><th>Time</th><th>Event</th><th>Live workers</th><th>Pending futures nobody will complete</th></tr></thead><tbody>
+<tr><td>1</td><td>W1 runs task 3, which raises; the exception leaves <code>_work</code>; W1's thread ends</td><td>3</td><td>task 3</td></tr>
+<tr><td>2</td><td>W3 runs task 6, which raises; W3 ends</td><td>2</td><td>tasks 3, 6</td></tr>
+<tr><td>3</td><td>remaining tasks run on W2 and W4, twice as slowly</td><td>2</td><td>tasks 3, 6</td></tr>
+<tr><td>4</td><td>two more bad inputs later in the day</td><td>0</td><td>every task submitted from now on</td></tr>
+</tbody></table>
+<p>Nothing logs an error unless the thread's default exception hook prints it, the pool object looks healthy, and submit keeps accepting work. The callers of tasks 3 and 6 wait forever on futures that were never completed. The fix is the try block in the worker plus storing the exception in the future: the failure is delivered to exactly the caller who needs it, and the worker continues.</p>
+<h4>5 · The bad interleaving: submit versus shutdown</h4>
+<p>Consider the racy submit, which checks the flag under the lock but enqueues after releasing it, and a pool with two workers. Thread A submits a task while thread B shuts the pool down.</p>
+<table><thead><tr><th>Step</th><th>Thread A: submit(task)</th><th>Thread B: shutdown()</th><th>Queue</th></tr></thead><tbody>
+<tr><td>1</td><td>acquires lock; <code>_shutdown</code> is false; releases lock</td><td></td><td>[]</td></tr>
+<tr><td>2</td><td>creates the future (preempted here)</td><td></td><td>[]</td></tr>
+<tr><td>3</td><td></td><td>acquires lock; sets <code>_shutdown = True</code></td><td>[]</td></tr>
+<tr><td>4</td><td></td><td>puts one sentinel per worker; releases lock</td><td>[☠, ☠]</td></tr>
+<tr><td>5</td><td></td><td>joins workers; each takes a sentinel and exits</td><td>[]</td></tr>
+<tr><td>6</td><td>resumes; puts (task, future)</td><td>returns: "all workers stopped"</td><td>[task]</td></tr>
+<tr><td>7</td><td>returns the future to its caller, who waits on it</td><td></td><td>[task] forever</td></tr>
+</tbody></table>
+<p>Every step looks reasonable in isolation. The task was accepted, the caller holds a future, the pool reports a clean shutdown, and the task will never run because no worker is left; the caller waits forever, or until its own timeout. The window between step 1 and step 6 can be microseconds, which is why this bug appears only occasionally, typically during deploys.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Thread timeline: submit checks the shutdown flag and is preempted; shutdown sets the flag, queues sentinels and the workers exit; submit then enqueues its task, which no worker will ever run">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="44" style="fill:var(--ink);font-weight:600">A submit</text><text x="20" y="104" style="fill:var(--ink);font-weight:600">B shutdown</text><text x="20" y="164" style="fill:var(--ink);font-weight:600">workers</text>
+<line x1="100" y1="40" x2="620" y2="40" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 4"/><line x1="100" y1="100" x2="620" y2="100" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 4"/><line x1="100" y1="160" x2="620" y2="160" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 4"/>
+<rect x="110" y="30" width="100" height="20" style="fill:var(--s1);opacity:0.6"/><text x="160" y="44" text-anchor="middle" style="fill:var(--ink)">check: open</text>
+<rect x="210" y="30" width="210" height="20" style="fill:none;stroke:var(--s1);stroke-dasharray:4 3"/><text x="315" y="44" text-anchor="middle" style="fill:var(--muted)">preempted, no lock held</text>
+<rect x="230" y="90" width="100" height="20" style="fill:var(--s2);opacity:0.6"/><text x="280" y="104" text-anchor="middle" style="fill:var(--ink)">flag = True</text>
+<rect x="335" y="90" width="80" height="20" style="fill:var(--s2);opacity:0.6"/><text x="375" y="104" text-anchor="middle" style="fill:var(--ink)">put ☠ ☠</text>
+<rect x="420" y="150" width="90" height="20" style="fill:var(--line-2)"/><text x="465" y="164" text-anchor="middle" style="fill:var(--ink)">take ☠, exit</text>
+<rect x="430" y="30" width="80" height="20" style="fill:var(--crit);opacity:0.6"/><text x="470" y="44" text-anchor="middle" style="fill:var(--ink)">put task</text>
+<rect x="515" y="30" width="100" height="20" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/><text x="565" y="44" text-anchor="middle" style="fill:var(--crit)">waits forever</text>
+<text x="100" y="196" style="fill:var(--ink-2)">time →  The check and the put are separated; shutdown fits entirely between them.</text>
+<text x="100" y="214" style="fill:var(--good)">Fix: hold the shutdown lock from the check through the put, so B must run wholly before or after A.</text>
+</g>
+</svg>
+<figcaption>The task was accepted and never run. Holding one lock across the check and the enqueue, the same lock shutdown takes to set the flag, makes the two operations atomic with respect to each other.</figcaption>
+</figure>
+<h4>6 · Stage three: the fix and why it works</h4>
+<p>The correct <code>submit</code> holds <code>self._lock</code> from the shutdown check through the enqueue. <code>shutdown</code> takes the same lock to set the flag and enqueue the sentinels. Now there are only two possible orders. If submit gets the lock first, it enqueues the task and releases; shutdown then sets the flag and enqueues sentinels behind the task, so a worker runs the task before taking a sentinel. If shutdown gets the lock first, it sets the flag and enqueues sentinels; submit then sees the flag and raises <code>RuntimeError</code>, so the caller knows immediately. Either way, every future handed out completes. CPython's <code>ThreadPoolExecutor.submit</code> does exactly this, holding <code>self._shutdown_lock</code> while it checks <code>self._shutdown</code>, creates the future and puts the work item in the queue.</p>
+<p>The lock is held only briefly, for a flag check and a queue append, so it does not limit throughput: workers never take it. It protects exactly the invariant that matters: "a task is enqueued only while the pool is accepting work, and sentinels are enqueued only after the last accepted task".</p>
+<h4>Why futures use notify_all</h4>
+<p>The work queue wakes one consumer per item with <code>notify()</code>, because one item can serve only one consumer. A future is different: when it completes, every thread waiting on it can proceed, since they all want the same result. So <code>_finish</code> and <code>cancel</code> call <code>notify_all()</code>. Waking only one waiter would leave the others asleep until their timeouts, a lost wakeup in a new form. The general rule: notify one when the state change can satisfy exactly one waiter, notify all when it can satisfy many or when waiters want different things.</p>
+<h4>7 · Stage four: graceful shutdown with sentinels</h4>
+<p>A <strong>sentinel</strong> (or poison pill) is a unique object placed in the queue to tell a worker to stop. Because the queue is FIFO and sentinels are added after the flag is set, they sit behind every accepted task, so workers drain the queue before stopping. The solution puts one sentinel per worker; each worker exits after taking one. CPython's executor uses a single <code>None</code> and has each exiting worker put <code>None</code> back for the next, which also handles pools whose size changes. After enqueuing sentinels, <code>shutdown(wait=True)</code> joins each worker, sharing one deadline across all joins when a timeout is given, and returns whether all workers stopped. Calling shutdown twice is harmless. The pool is also a context manager whose exit calls <code>shutdown(wait=True)</code>, so <code>with ThreadPool(8) as pool:</code> guarantees cleanup.</p>
+<figure>
+<svg viewBox="0 0 640 210" width="100%" role="img" aria-label="Pool lifecycle: RUNNING accepts submits; shutdown moves to SHUTTING_DOWN which rejects submits, optionally cancels pending tasks, queues sentinels behind remaining work; when all workers have taken a sentinel and exited the pool is TERMINATED">
+<defs><marker id="ld17-a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="20" y="40" width="150" height="56" rx="28" style="fill:var(--surface-2);stroke:var(--good);stroke-width:2"/><text x="95" y="64" text-anchor="middle" style="fill:var(--ink);font-weight:600">RUNNING</text><text x="95" y="82" text-anchor="middle" style="fill:var(--muted)">submit accepted</text>
+<rect x="245" y="40" width="170" height="56" rx="28" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:2"/><text x="330" y="64" text-anchor="middle" style="fill:var(--ink);font-weight:600">SHUTTING DOWN</text><text x="330" y="82" text-anchor="middle" style="fill:var(--muted)">submit → RuntimeError</text>
+<rect x="490" y="40" width="130" height="56" rx="28" style="fill:var(--surface-2);stroke:var(--line-2);stroke-width:2"/><text x="555" y="64" text-anchor="middle" style="fill:var(--ink);font-weight:600">TERMINATED</text><text x="555" y="82" text-anchor="middle" style="fill:var(--muted)">all workers exited</text>
+<line x1="172" y1="68" x2="243" y2="68" marker-end="url(#ld17-a3)" style="fill:none;stroke:var(--ink-2)"/><text x="207" y="60" text-anchor="middle" style="fill:var(--ink-2)">shutdown()</text>
+<line x1="417" y1="68" x2="488" y2="68" marker-end="url(#ld17-a3)" style="fill:none;stroke:var(--ink-2)"/><text x="452" y="60" text-anchor="middle" style="fill:var(--ink-2)">last ☠ taken</text>
+<text x="20" y="130" style="fill:var(--ink)">Under the lock, at the RUNNING → SHUTTING DOWN step:</text>
+<text x="20" y="150" style="fill:var(--ink-2)">1. set the flag   2. if cancel_pending: drain queue, cancel each future   3. put one ☠ per worker</text>
+<text x="20" y="176" style="fill:var(--ink)">Then, without the lock:</text>
+<text x="20" y="196" style="fill:var(--ink-2)">join each worker against one shared deadline; return True only if every worker has stopped</text>
+</g>
+</svg>
+<figcaption>Three states, one transition under the lock. Running tasks always finish; queued tasks finish unless cancelled; nothing new is accepted once the flag is set.</figcaption>
+</figure>
+<h4>8 · Stage five: cancellation and timeouts</h4>
+<p><code>shutdown(cancel_pending=True)</code> drains the queue under the lock and cancels each drained task's future before adding the sentinels, so tasks that have not started never start, and their callers get <code>CancelledError</code> from <code>result()</code> instead of waiting. A future can be cancelled only while pending: <code>_start</code> and <code>cancel</code> both take the future's lock, so a task is either cancelled before it starts or starts and cannot be cancelled, never both. The test occupies the only worker with a task blocked on an event, queues ten more, shuts down with cancellation in another thread, then releases the event: the running task completes, the ten queued ones raise <code>CancelledError</code>. Python's <code>ThreadPoolExecutor.shutdown</code> has the same option, named <code>cancel_futures</code>, added in Python 3.9.</p>
+<p>Timeouts appear in two places. <code>Future.result(timeout)</code> uses <code>wait_for</code> with a deadline and raises <code>TimeoutError</code>, which is what lets tests and careful callers avoid hanging. <code>shutdown(timeout=...)</code> bounds how long it waits for workers and reports whether they stopped, so a supervisor can decide to exit anyway, log the stuck task, or escalate.</p>
+<h4>9 · The nested-wait deadlock</h4>
+<p>Pools have a deadlock of their own that no lock ordering fixes. A task running on a worker submits another task to the same pool and waits for its result. If every worker is doing the same, all workers are blocked waiting for tasks that are sitting in the queue with no free worker to run them. Python's documentation shows the smallest case: a pool with one worker running a function that submits <code>pow(5, 2)</code> and calls <code>result()</code>; it never completes because the only worker is the one waiting. The solution's last test reproduces it with a timeout inside the outer task so the test terminates: the inner future times out, then runs after the outer task finishes. The remedies are structural: do not block on same-pool futures inside tasks; attach a callback that continues the work when the inner future completes; or run inner work on a different pool.</p>
+<h4>10 · The full solution</h4>
+<p>The file below contains the future, the work queue, the correct pool, the racy pool and six tests, including the deterministic race test. Python 3.12, standard library only; it runs in about a second.</p>
+<pre>"""A thread pool with futures and graceful shutdown: fixed workers on a shared queue, task
+exceptions captured in futures (workers never die), submit and shutdown serialised by one lock
+so no task can slip in after shutdown, sentinels ("poison pills") to stop workers after the
+queued work, optional cancellation of pending tasks, and a join timeout.
+Python 3.12, standard library only. Run: python threadpool.py"""
+from __future__ import annotations
+
+import collections
+import threading
+import time
+from typing import Any, Callable
+
+_SENTINEL = object()
+
+
+class CancelledError(Exception): ...
+
+
+class Future:
+    """A result that will exist later. One condition variable guards state and result."""
+    PENDING, RUNNING, DONE, CANCELLED = "pending", "running", "done", "cancelled"
+
+    def __init__(self) -&gt; None:
+        self._cv = threading.Condition()
+        self._state = Future.PENDING
+        self._result: Any = None
+        self._exc: BaseException | None = None
+
+    def _start(self) -&gt; bool:
+        with self._cv:
+            if self._state != Future.PENDING:
+                return False                                  # cancelled before it ran
+            self._state = Future.RUNNING
+            return True
+
+    def _finish(self, result: Any = None, exc: BaseException | None = None) -&gt; None:
+        with self._cv:
+            self._result, self._exc, self._state = result, exc, Future.DONE
+            self._cv.notify_all()                             # every waiter wants this
+
+    def cancel(self) -&gt; bool:
+        with self._cv:
+            if self._state != Future.PENDING:
+                return False                                  # too late: running or done
+            self._state = Future.CANCELLED
+            self._cv.notify_all()
+            return True
+
+    def done(self) -&gt; bool:
+        with self._cv:
+            return self._state in (Future.DONE, Future.CANCELLED)
+
+    def result(self, timeout: float | None = None) -&gt; Any:
+        with self._cv:
+            if not self._cv.wait_for(lambda: self._state in (Future.DONE, Future.CANCELLED), timeout):
+                raise TimeoutError("result not ready")
+            if self._state == Future.CANCELLED:
+                raise CancelledError()
+            if self._exc is not None:
+                raise self._exc
+            return self._result
+
+
+class _WorkQueue:
+    """Unbounded FIFO with one lock and one condition (only consumers ever wait)."""
+
+    def __init__(self) -&gt; None:
+        self._items: collections.deque = collections.deque()
+        self._cv = threading.Condition()
+
+    def put(self, item) -&gt; None:
+        with self._cv:
+            self._items.append(item)
+            self._cv.notify()
+
+    def get(self):
+        with self._cv:
+            while not self._items:
+                self._cv.wait()
+            return self._items.popleft()
+
+    def drain(self) -&gt; list:
+        with self._cv:
+            items, self._items = list(self._items), collections.deque()
+            return items
+
+
+class ThreadPool:
+    def __init__(self, workers: int, name: str = "pool",
+                 _hook: Callable[[], None] | None = None) -&gt; None:
+        if workers &lt;= 0:
+            raise ValueError("need at least one worker")
+        self._q = _WorkQueue()
+        self._lock = threading.Lock()                         # guards _shutdown AND enqueue
+        self._shutdown = False
+        self._hook = _hook or (lambda: None)                  # test hook inside submit
+        self.task_errors = 0
+        self._stats_lock = threading.Lock()                   # += is read-modify-write: lock it
+        self._threads = [threading.Thread(target=self._worker, name=f"{name}-{i}") for i in range(workers)]
+        for t in self._threads:                               # non-daemon: exit waits for them
+            t.start()
+
+    def _worker(self) -&gt; None:
+        while True:
+            item = self._q.get()
+            if item is _SENTINEL:
+                return                                        # one pill stops one worker
+            fn, args, kwargs, fut = item
+            if not fut._start():
+                continue                                      # was cancelled while queued
+            try:
+                fut._finish(result=fn(*args, **kwargs))
+            except BaseException as e:                        # a bad task must not kill the worker
+                with self._stats_lock:
+                    self.task_errors += 1
+                fut._finish(exc=e)
+
+    def submit(self, fn: Callable, *args, **kwargs) -&gt; Future:
+        with self._lock:                                      # check and enqueue as ONE step
+            if self._shutdown:
+                raise RuntimeError("cannot submit after shutdown")
+            fut = Future()
+            self._hook()                                      # (tests pause here)
+            self._q.put((fn, args, kwargs, fut))
+            return fut
+
+    def shutdown(self, wait: bool = True, cancel_pending: bool = False,
+                 timeout: float | None = None) -&gt; bool:
+        """Stop accepting work. Queued tasks still run (unless cancel_pending); then one sentinel
+        per worker, queued BEHIND the remaining work, stops the workers."""
+        with self._lock:
+            if self._shutdown:
+                return all(not t.is_alive() for t in self._threads)
+            self._shutdown = True
+            if cancel_pending:
+                for item in self._q.drain():
+                    item[3].cancel()
+            for _ in self._threads:
+                self._q.put(_SENTINEL)
+        if not wait:
+            return False
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for t in self._threads:
+            t.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        return all(not t.is_alive() for t in self._threads)
+
+    def __enter__(self) -&gt; "ThreadPool":
+        return self
+
+    def __exit__(self, *exc) -&gt; None:
+        self.shutdown(wait=True)
+
+    def alive_workers(self) -&gt; int:
+        return sum(t.is_alive() for t in self._threads)
+
+
+class RacyPool(ThreadPool):
+    """BUG: the shutdown check and the enqueue are not atomic with respect to shutdown."""
+
+    def submit(self, fn, *args, **kwargs):
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot submit after shutdown")
+        fut = Future()
+        self._hook()                                          # shutdown can run right here
+        self._q.put((fn, args, kwargs, fut))                  # ...behind the sentinels: never runs
+        return fut
+
+
+# ---------------------------------------------------------------- tests
+def test_results_and_parallelism() -&gt; None:
+    with ThreadPool(8) as pool:
+        futs = [pool.submit(pow, i, 2) for i in range(1_000)]
+        assert [f.result(timeout=5) for f in futs] == [i * i for i in range(1_000)]
+        t0 = time.perf_counter()
+        sleeps = [pool.submit(time.sleep, 0.05) for _ in range(8)]
+        for f in sleeps:
+            f.result(timeout=5)
+        assert time.perf_counter() - t0 &lt; 0.3                 # 8 x 50 ms ran concurrently
+
+
+def test_task_exceptions_do_not_kill_workers() -&gt; None:
+    pool = ThreadPool(4)
+    bad = [pool.submit(lambda: 1 / 0) for _ in range(100)]
+    for f in bad:
+        try:
+            f.result(timeout=5)
+        except ZeroDivisionError:
+            pass
+    assert pool.alive_workers() == 4 and pool.task_errors == 100
+    assert pool.submit(sum, [1, 2, 3]).result(timeout=5) == 6
+    pool.shutdown()
+
+
+def test_graceful_shutdown_runs_queued_work() -&gt; None:
+    pool = ThreadPool(2)
+    done: list[int] = []
+    lock = threading.Lock()
+
+    def job(i: int) -&gt; None:
+        time.sleep(0.01)
+        with lock:
+            done.append(i)
+    futs = [pool.submit(job, i) for i in range(40)]
+    assert pool.shutdown(wait=True, timeout=10) is True       # queued work finished first
+    assert sorted(done) == list(range(40)) and all(f.done() for f in futs)
+    try:
+        pool.submit(job, 99)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("submit after shutdown accepted")
+
+
+def test_cancel_pending_on_shutdown() -&gt; None:
+    pool = ThreadPool(1)
+    gate = threading.Event()
+    running = pool.submit(gate.wait, 5)                       # occupies the only worker
+    time.sleep(0.05)
+    queued = [pool.submit(pow, 2, i) for i in range(10)]
+    stopper = threading.Thread(target=pool.shutdown, kwargs={"cancel_pending": True})
+    stopper.start()
+    time.sleep(0.05)
+    gate.set()                                                # let the running task finish
+    stopper.join(5)
+    assert running.result(timeout=1) is True
+    for f in queued:
+        try:
+            f.result(timeout=1)
+        except CancelledError:
+            pass
+        else:
+            raise AssertionError("queued task ran despite cancel_pending")
+
+
+def test_submit_shutdown_race_is_closed_by_the_lock() -&gt; None:
+    def scenario(pool_cls) -&gt; bool:
+        reached, release = threading.Event(), threading.Event()
+        calls = {"n": 0}
+
+        def hook() -&gt; None:                                   # pause the first submit mid-way
+            calls["n"] += 1
+            if calls["n"] == 1:
+                reached.set()
+                release.wait(2)
+        pool = pool_cls(2, _hook=hook)
+        box: list[Future] = []
+        sub = threading.Thread(target=lambda: box.append(pool.submit(pow, 3, 3)))
+        sub.start()
+        reached.wait(2)                                       # submit is between check and put
+        stopper = threading.Thread(target=pool.shutdown)
+        stopper.start()
+        time.sleep(0.1)                                       # shutdown runs now if it can
+        release.set()
+        sub.join(2); stopper.join(2)
+        try:
+            return box[0].result(timeout=0.5) == 27           # did the accepted task run?
+        except TimeoutError:
+            return False
+    assert scenario(RacyPool) is False                        # accepted, then never run: hangs
+    assert scenario(ThreadPool) is True
+
+
+def test_nested_wait_deadlocks_a_full_pool() -&gt; None:
+    pool = ThreadPool(1)
+
+    def outer() -&gt; int:
+        inner = pool.submit(pow, 2, 10)
+        return inner.result(timeout=0.3)                      # the only worker is busy: us
+    f = pool.submit(outer)
+    try:
+        f.result(timeout=2)
+    except TimeoutError:
+        pass                                                  # inner timed out inside outer
+    else:
+        raise AssertionError("expected the nested wait to time out")
+    pool.shutdown(timeout=2)
+
+
+if __name__ == "__main__":
+    for t in (test_results_and_parallelism, test_task_exceptions_do_not_kill_workers,
+              test_graceful_shutdown_runs_queued_work, test_cancel_pending_on_shutdown,
+              test_submit_shutdown_race_is_closed_by_the_lock, test_nested_wait_deadlocks_a_full_pool):
+        t()
+        print("ok ", t.__name__)</pre>
+<h4>11 · Testing the race deterministically</h4>
+<p>Stress tests find races by making them likely; a deterministic test makes one certain. The pool takes a test hook that <code>submit</code> calls at the critical point. In the racy pool the hook runs after the shutdown check and before the enqueue; in the correct pool it runs at the same place, but inside the lock. The test makes the first call to the hook signal an event and then wait for a second event, so the submitting thread is frozen at the critical point. With the submit frozen, the test starts <code>shutdown</code> in another thread, gives it a moment to run, then releases the submit. With the racy pool, shutdown completes during the pause, the task is enqueued behind the sentinels, and its future times out: the bug is reproduced every time. With the correct pool, shutdown cannot take the lock while submit holds it, so it waits; when submit finishes, the sentinels go behind the task and the future returns 27. The same technique, a hook that pauses one thread at a chosen line, turns almost any race into a reliable test.</p>
+<h4>12 · Talking through the design</h4>
+<p>"Workers loop on a FIFO queue; submit returns a future with a condition variable, completed with notify_all. Workers catch every exception and store it in the future, so failures never shrink the pool. The key race is submit versus shutdown: if the flag check and the enqueue are separate, shutdown can slip between them and the task lands behind the sentinels and never runs. So submit holds the shutdown lock across check and enqueue, and shutdown takes the same lock to set the flag, optionally cancel pending tasks, and queue one sentinel per worker behind the remaining work. Then it joins workers with a deadline. Running tasks can't be killed; long tasks need a cancellation event. And tasks shouldn't block on futures from the same pool, or a full pool deadlocks, the example in Python's own docs."</p>
+<h4>13 · Edge cases</h4>
+<p><strong>Submitting from inside a task</strong>: allowed, but waiting on it risks the nested deadlock. <strong>Shutdown called from inside a task</strong> with <code>wait=True</code>: the worker would join itself; detect it or forbid it. <strong>Exceptions in done callbacks</strong>: catch and log them so they do not kill the worker that completes the future. <strong>Tasks that never return</strong>: shutdown with a timeout reports failure instead of hanging. <strong>Zero or negative worker counts</strong>: rejected. <strong>Garbage collection</strong>: if the pool object is dropped without shutdown, CPython's executor uses a weak reference callback to wake workers so they exit; a hand-written pool should at least document that shutdown is required, or provide the context manager.</p>
+<h4>14 · Extensions the interviewer will ask for</h4>
+<p><strong>Dynamic sizing</strong>: start workers lazily up to a maximum, reuse idle ones first (CPython counts idle workers with a semaphore), and retire workers idle for too long. <strong>Bounded queue</strong>: backpressure on submit, with shutdown closing the queue so blocked submitters wake. <strong>Priorities</strong>: a priority queue with sequence numbers. <strong>Done callbacks</strong>: run a function when a future completes, the basis of chaining without blocking. <strong>Cooperative cancellation</strong>: pass each task a cancellation token checked periodically. <strong>Per-task timeouts</strong>: tracked by a supervisor that cancels the token. <strong>Metrics</strong>: queue length, task latency split into queueing and running, failures.</p>
+<h4>15 · Complexity</h4>
+<p>submit is O(1): a lock, a flag check, an append and a notify. A worker iteration is O(1) plus the task. Shutdown is O(queue length) when cancelling, plus joins. Memory is O(workers + queued tasks); each thread reserves its own stack. Throughput is limited by the tasks themselves and, for CPU-bound Python code, by the GIL; the pool's own overhead is a few microseconds per task. That overhead matters only for very small tasks; if each task takes microseconds, batch several units of work into one task so the queueing and wake-up costs are paid once per batch rather than once per unit.</p>
+</section>
+
+<section data-field="deep">
+<h4>How CPython's executor stops its workers</h4>
+<p>CPython's <code>ThreadPoolExecutor</code> uses <code>None</code> as its sentinel and a chain of wake-ups. When a worker takes <code>None</code> from the queue, it checks whether the interpreter is shutting down, whether its executor has been garbage-collected (it holds only a weak reference), or whether the executor has been shut down; if any is true, it marks the executor as shutting down, puts <code>None</code> back into the queue to wake the next worker, and returns. <code>shutdown</code> therefore needs to put only one <code>None</code>, and the chain stops every worker in turn. The weak reference matters: an executor that is dropped without shutdown is collected, a callback puts <code>None</code> in its queue, and its workers exit instead of leaking. And at interpreter exit, a hook registered with the threading module sets a global flag and puts <code>None</code> into every executor's queue before non-daemon threads are joined, so programs do not hang at exit.</p>
+<h4>Sizing pools</h4>
+<p>The right size depends on what tasks spend their time doing. A task that waits on the network 90 percent of the time keeps a CPU busy only 10 percent of the time, so roughly ten such threads per core keep it busy; the classic estimate is threads ≈ cores × (1 + wait time / compute time). That estimate assumes the bottleneck is the CPU; often it is a downstream service, a database connection pool or a rate limit, and the pool should be sized to that. For pure-Python CPU-bound work, threads in the default build run one at a time under the GIL, so a process pool is the tool. Python's default for <code>ThreadPoolExecutor</code>, <code>min(32, cpu_count + 4)</code> since 3.8 (using the process's available CPU count since 3.13), keeps at least five workers for I/O and avoids creating hundreds of threads on very large machines.</p>
+<h4>Why threads cannot be killed</h4>
+<p>Forcibly stopping a thread at an arbitrary instruction could leave a lock held forever, a data structure half-updated, a file half-written. Java deprecated <code>Thread.stop</code> for exactly this reason, and Python offers no equivalent at all. Interrupting therefore has to be cooperative: the task checks a flag or an event at safe points, or uses operations with timeouts so it can notice cancellation. Java's <code>shutdownNow</code> interrupts workers, which only affects tasks that respond to interruption. A Python pool can pass a <code>threading.Event</code> to each task, set it on hard shutdown, and document that long tasks must check it.</p>
+<h4>Futures and callbacks instead of blocking</h4>
+<p>Blocking on futures inside pool tasks is the root of the nested deadlock and also wastes a worker while it waits. The alternative is continuation: attach a callback to a future that runs when it completes and submits the next step, so no worker ever waits. <code>concurrent.futures.Future.add_done_callback</code> supports this, and asyncio is built around it. The trade-off is readability: callback chains are harder to follow than straight-line code, which is the problem async/await syntax solves.</p>
+<h4>Process pools and the GIL</h4>
+<p>In CPython's default build, the global interpreter lock lets one thread execute Python bytecode at a time, so a thread pool speeds up work that waits (network, disk, sleeping) or work done in C extensions that release the lock (NumPy, compression, hashing of large buffers), but not pure-Python computation. For that, <code>ProcessPoolExecutor</code> runs tasks in separate processes, each with its own interpreter, at the cost of pickling arguments and results across process boundaries and of process start-up time. The free-threaded build introduced experimentally in Python 3.13 removes the GIL, which makes thread pools useful for CPU-bound Python too, and makes every unprotected shared counter, like the failure counter in this lesson's solution, even more likely to go wrong.</p>
+<h4>Where escaped exceptions should go</h4>
+<p>Storing an exception in a future only helps if someone eventually calls <code>result()</code>. Fire-and-forget submissions, where nobody keeps the future, swallow errors silently. Production pools therefore log exceptions from tasks whose futures are garbage-collected unobserved, or require callers to attach a done callback, and they count failures as a metric. Python's <code>threading.excepthook</code> handles exceptions that escape a thread entirely, which in a correct pool should never happen, so it is a useful alarm.</p>
+<h4>Work stealing</h4>
+<p>A single shared queue is simple and fair but becomes a point of contention with many workers and tiny tasks: every get and put takes the same lock. Work-stealing pools give each worker its own double-ended queue; a worker pushes and pops tasks it creates at one end, and idle workers steal from the other end of a busy worker's deque. Java's ForkJoinPool and many task runtimes use it. It shines for recursive, divide-and-conquer workloads where tasks spawn subtasks, and it avoids most cross-worker contention. For the interview, naming it as the scaling step beyond a shared queue, and saying why, is enough.</p>
+</section>
+
+<section data-field="prod">
+<h4>How thread pools fail in production</h4>
+<p>The failures cluster at the edges described in this lesson. Workers dying on exceptions, with throughput decaying silently, is the first; the defence is catching every exception in the worker and counting failures. Requests hanging forever on futures from a pool that was shutting down is the second, typically seen during deploys; the defence is the shutdown lock, plus timeouts on every <code>result()</code> call so that no caller waits indefinitely even if something else goes wrong. Pool starvation is the third: all workers blocked waiting on something (other tasks in the same pool, a slow downstream service, a lock) while the queue grows. It shows as queue length climbing while CPU sits idle. The defence is never blocking on same-pool work, timeouts on every external call, and separate pools (bulkheads) for different kinds of work, so a slow dependency can only exhaust its own pool.</p>
+<p>Shutdown problems are the fourth: programs that hang at exit because a worker is stuck in a task, or that lose work because daemon workers were killed. Graceful shutdown with a timeout, followed by logging which tasks were still running, gives operators both safety and visibility.</p>
+<h4>Bulkheads</h4>
+<p>A single shared pool for all work lets one slow dependency take every worker: if calls to a payment provider start taking thirty seconds, they occupy all workers and unrelated tasks queue behind them. Separate pools per dependency or per class of work, called bulkheads after a ship's watertight compartments, confine the damage: the payment pool fills up and its callers wait or fail, while everything else continues. Combined with timeouts on every external call and the circuit breakers from the resilient-client case, bulkheads are the standard defence against one slow component exhausting a service's threads.</p>
+<h4>What to measure</h4>
+<p>Queue length, the time tasks spend queued and the time they spend running (separately), active versus idle workers, task failures by type, rejected submissions, and shutdown duration. A rising queueing time with idle workers means workers are blocked; a rising queueing time with all workers busy means the pool or a downstream dependency is undersized.</p>
+<h4>Knobs</h4>
+<p>Every one of these should be configurable without a code change, because the right values depend on the deployment and change as traffic grows. Worker count, queue bound and rejection policy, per-task and per-result timeouts, shutdown timeout, and separate pools per workload. Change worker counts with load tests that include the downstream systems, since a larger pool often just moves the bottleneck to a database.</p>
+<h4>The real case: CPython's ThreadPoolExecutor</h4>
+<p>The standard library's <code>concurrent/futures/thread.py</code> is a production version of this lesson, about 250 lines long. Its <code>submit</code> acquires <code>self._shutdown_lock</code> (and a global lock used at interpreter exit) and, while holding them, raises <code>RuntimeError('cannot schedule new futures after shutdown')</code> if the executor is shut down, otherwise creates a future and a work item, puts the item in the work queue and adjusts the thread count, so the check and the enqueue are one atomic step. <code>shutdown(wait=True, *, cancel_futures=False)</code> takes the same lock, sets <code>self._shutdown</code>, optionally drains the queue cancelling each work item's future, and puts <code>None</code> in the queue to wake blocked workers, then joins the threads if <code>wait</code> is true. The worker loop runs items until it receives <code>None</code>, then exits if the interpreter, the executor or its owner is shutting down, putting <code>None</code> back first so the next worker wakes. The documentation adds the user-facing rules: submit after shutdown raises <code>RuntimeError</code>; the default worker count became <code>min(32, os.cpu_count() + 4)</code> in 3.8; and deadlocks occur when a callable associated with a future waits on the results of another future, with a one-worker example that submits <code>pow(5, 2)</code> and waits on it. Reading it after building your own is the best check that the design choices here are the ones the maintainers made.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the pool, then break, measure and extend it. Python 3.12, standard library only.</p>
+<ol>
+<li>Save the full solution as <code>threadpool.py</code> and run it. Six tests print <code>ok</code>, including the deterministic submit/shutdown race (the racy pool strands the task, the correct one runs it) and the nested-wait deadlock.</li>
+<li><strong>Break it.</strong> Remove the <code>try/except</code> in <code>_worker</code> so a task's exception escapes. Run the exception test: workers die, futures never complete, and the alive-worker count drops.</li>
+<li><strong>Break it again.</strong> Move the hook call and <code>self._q.put(...)</code> in the correct <code>submit</code> outside the <code>with self._lock:</code> block. The race test now fails for the "correct" pool too, every time, because the pause lands between the check and the enqueue.</li>
+<li><strong>Measure it.</strong> Time 10,000 tiny tasks (<code>pow(2, 10)</code>) on 1, 4 and 16 workers, then 200 tasks that sleep 10 ms. Explain why threads help the second workload and not the first.</li>
+<li><strong>Extend it.</strong> Add <code>add_done_callback</code> to <code>Future</code> (run immediately if already done; catch exceptions in callbacks) and rewrite the nested-wait task to use a callback instead of blocking.</li>
+<li><strong>Extend it again.</strong> Add cooperative cancellation: pass a <code>threading.Event</code> to tasks that ask for one, set it on <code>shutdown(force=True)</code>, and write a long task that checks it every 10 ms.</li>
+</ol>
+<p>For every change, run the whole suite several times; the stress-style tests can pass by luck once, and a timing-dependent bug that appears one run in ten is still a bug. Keep the deterministic race test as a regression test: it fails instantly if anyone ever moves the enqueue outside the lock again.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A teammate's pool shuts down like this:</p>
+<pre>def submit(self, fn):
+    if self.closed:
+        raise RuntimeError("closed")
+    fut = Future()
+    self.q.put((fn, fut))
+    return fut
+
+def shutdown(self):
+    self.closed = True
+    for _ in self.workers:
+        self.q.put(None)
+    for w in self.workers:
+        w.join()
+
+def _worker(self):
+    while True:
+        item = self.q.get()
+        if item is None:
+            return
+        fn, fut = item
+        fut.set_result(fn())</pre>
+<p>(a) List the bugs. (b) Trace an interleaving that strands a task. (c) Write the fix and explain why each part works.</p>
+<details><summary>Answer</summary>
+<p><strong>(a) Bugs.</strong> (1) submit's check of <code>closed</code> and its <code>put</code> are not atomic with respect to shutdown. (2) shutdown sets <code>closed</code> without a lock, so even the flag write is unsynchronised with submit's read in languages with weaker memory guarantees, and nothing stops two shutdowns running at once. (3) The worker does not catch exceptions: a failing <code>fn()</code> ends the worker thread and leaves its future pending forever. (4) <code>join()</code> has no timeout, so one stuck task hangs shutdown indefinitely. (5) There is no way to cancel queued tasks if a fast shutdown is needed.</p>
+<p><strong>(b) Stranding a task.</strong> Thread A runs submit: reads <code>closed == False</code>, creates the future, and is preempted before <code>put</code>. Thread B runs shutdown: sets <code>closed = True</code>, puts one <code>None</code> per worker, and joins; each worker takes a <code>None</code> and exits; shutdown returns. A resumes and puts <code>(fn, fut)</code>. The queue now holds a task with no workers left, and A's caller waits on <code>fut</code> forever. The same pattern happens if B runs between A's check and A's put at any point.</p>
+<p><strong>(c) The fix.</strong></p>
+<pre>def submit(self, fn):
+    with self.lock:                          # check and enqueue as one step
+        if self.closed:
+            raise RuntimeError("closed")
+        fut = Future()
+        self.q.put((fn, fut))
+        return fut
+
+def shutdown(self, timeout=None, cancel_pending=False):
+    with self.lock:
+        if self.closed:
+            return
+        self.closed = True
+        if cancel_pending:
+            for fn, fut in drain(self.q):
+                fut.cancel()
+        for _ in self.workers:
+            self.q.put(None)                 # behind every accepted task
+    deadline = None if timeout is None else time.monotonic() + timeout
+    for w in self.workers:
+        w.join(None if deadline is None else max(0, deadline - time.monotonic()))
+
+def _worker(self):
+    while True:
+        item = self.q.get()
+        if item is None:
+            return
+        fn, fut = item
+        try:
+            fut.set_result(fn())
+        except BaseException as e:           # the worker survives
+            fut.set_exception(e)</pre>
+<p><strong>Why it works.</strong> The shared lock makes submit and the flag change mutually exclusive, so shutdown happens either wholly before a submit (which then raises) or wholly after (and its sentinels queue behind that submit's task, which a worker runs first). Sentinels added under the lock after the flag is set are guaranteed to follow every accepted task in FIFO order. Catching exceptions keeps every worker alive and completes every future. A shared deadline bounds shutdown. And the early return makes shutdown idempotent. This is the same structure as CPython's <code>ThreadPoolExecutor</code>, whose submit holds <code>_shutdown_lock</code> across the check and the enqueue.</p>
+</details>
+</section>

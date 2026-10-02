@@ -1,0 +1,765 @@
+<!-- topic source for lld/ld18; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld18",
+  "t": "Implement a connection pool",
+  "tag": "Concurrency",
+  "sum": "Reuse expensive connections safely: a bounded pool with overflow, slots reserved under the lock but connections opened outside it, acquire with a timeout on a condition variable, validation on checkout (recycle by age, pre-ping), reset on return, discarding broken and overflow connections while waking waiters, double-release and leak detection, and FIFO versus LIFO reuse, with SQLAlchemy's QueuePool as the production reference.",
+  "prereq": [
+    [
+      "ld16",
+      "Condition variables: wait in a loop on a predicate, notify when the state changes, and never sleep holding work others need."
+    ],
+    [
+      "ld17",
+      "A shared resource handed out and returned across threads, with lifecycle rules and a lock that makes check-and-act atomic."
+    ],
+    [
+      "py7",
+      "Context managers and try/finally guarantee cleanup even when the body raises."
+    ],
+    [
+      "net4",
+      "Opening a TCP connection costs a handshake round trip, TLS adds more, and servers limit how many connections they accept."
+    ]
+  ],
+  "myths": [
+    [
+      "A pool is a list of connections with a lock around it.",
+      "The list is the easy part. The design work is in bounding the total including connections being opened, opening them without holding the lock, waiting with a timeout, validating stale connections, resetting state on return, discarding broken ones without losing wakeups, and catching leaks and double returns."
+    ],
+    [
+      "Check the count, then open a connection, then increment the count.",
+      "Between the check and the increment, other threads pass the same check. In this lesson's test, a racy pool with a limit of 5 handed out 20 connections to 20 simultaneous callers. Reserve the slot by incrementing under the lock first, open the connection outside the lock, and give the slot back if opening fails."
+    ],
+    [
+      "Hold the lock while opening the connection to keep it simple.",
+      "Opening a database connection takes milliseconds to seconds; holding the pool's lock that long blocks every thread that wants to return or reuse a connection. Reserve under the lock, then do the slow I/O without it."
+    ],
+    [
+      "A connection that worked when it was returned still works when it is reused.",
+      "Servers close idle connections (MySQL's default idle timeout is eight hours), restart, or fail over, and firewalls drop silent connections. Validate on checkout with a cheap ping, or recycle connections older than the server's timeout; SQLAlchemy calls these pessimistic and optimistic disconnect handling."
+    ],
+    [
+      "Returning a connection just puts it back in the list.",
+      "The previous user may have left a transaction open, holding row locks and uncommitted changes, or changed session settings. The pool must reset it, typically with a rollback, before anyone else gets it. SQLAlchemy's pool rolls back on return by default."
+    ],
+    [
+      "Bigger pools are always better.",
+      "Every connection costs memory and processes on the database, which has its own limit, and many application instances each with a large pool can exceed it. Beyond the point where the database is busy, more concurrent queries only add contention. Size pools from the database's capacity divided among instances."
+    ]
+  ],
+  "recap": [
+    "A connection pool keeps open connections to a server and lends them to threads, because opening a connection is slow and servers limit how many they accept.",
+    "The pool counts every connection it is responsible for: idle, checked out, and being opened; the count never exceeds size plus overflow.",
+    "acquire takes an idle connection if one exists; otherwise it reserves a slot under the lock if under the limit; otherwise it waits on a condition variable until a deadline and raises a timeout.",
+    "New connections are opened outside the lock; if opening fails, the reserved slot is released and a waiter is notified.",
+    "On checkout, connections older than the recycle age or failing a cheap ping are discarded and replaced transparently.",
+    "On return, open transactions are rolled back; broken connections and connections above the base size are closed; every change in capacity notifies a waiter.",
+    "The pool tracks checked-out connections, rejects double returns, and can report connections held too long (leaks); a context manager guarantees return even when the caller raises.",
+    "FIFO reuse spreads use across all connections; LIFO reuse keeps a few busy and lets spares idle out, which suits servers that close idle connections.",
+    "SQLAlchemy's QueuePool implements this design with pool_size 5, max_overflow 10, pool_timeout 30 seconds, optional pool_recycle and pool_pre_ping, and rollback on return."
+  ],
+  "glossary": [
+    [
+      "Checkout / checkin",
+      "Taking a connection from the pool for use, and returning it afterwards."
+    ],
+    [
+      "Connection leak",
+      "A connection taken from the pool and never returned, usually because an error path skipped the return."
+    ],
+    [
+      "Connection pool",
+      "A set of open connections to a server that are reused by many requests instead of opening a new connection each time."
+    ],
+    [
+      "Double release",
+      "Returning the same connection to the pool twice, which can hand one connection to two users at once."
+    ],
+    [
+      "Failover",
+      "Switching to a standby server when the primary fails; existing connections to the old primary become dead."
+    ],
+    [
+      "Idle timeout",
+      "The time after which a server closes a connection that has had no activity."
+    ],
+    [
+      "LIFO / FIFO reuse",
+      "Handing out the most recently returned connection (last in, first out) versus the one idle longest (first in, first out)."
+    ],
+    [
+      "Max overflow",
+      "Extra connections a pool may open beyond its base size during bursts, closed again when returned."
+    ],
+    [
+      "Pessimistic validation",
+      "Checking a connection with a cheap query or ping every time it is checked out."
+    ],
+    [
+      "Optimistic validation",
+      "Assuming connections are fine but replacing them after a fixed age (recycle) or when an error reveals they are dead."
+    ],
+    [
+      "Pool timeout",
+      "How long acquire waits for a connection before giving up with an error."
+    ],
+    [
+      "Pre-ping",
+      "A lightweight test, such as SELECT 1, run on a connection at checkout to confirm it is alive."
+    ],
+    [
+      "Recycle",
+      "Closing and replacing connections older than a set age, before the server or network would drop them."
+    ],
+    [
+      "Reservation",
+      "Incrementing the pool's count under the lock before opening a connection, so concurrent callers cannot exceed the limit."
+    ],
+    [
+      "Reset on return",
+      "Rolling back any open transaction and restoring session state when a connection is returned."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why pool connections at all?",
+      "Opening a database connection costs network round trips, authentication and often TLS, from milliseconds to hundreds of milliseconds, and servers limit concurrent connections. Reusing a small set of open connections removes that cost from every request and caps the load the application puts on the server."
+    ],
+    [
+      "E",
+      "What should acquire do when every connection is in use?",
+      "If the total is below size plus overflow, open a new one; otherwise wait on a condition variable for a connection to be returned or a slot to free up, up to a timeout, then raise an error. Waiting forever turns a database slowdown into hung requests; failing after a bounded wait lets callers report an error."
+    ],
+    [
+      "E",
+      "Why must a returned connection be reset?",
+      "The previous user may have left a transaction open, holding locks and uncommitted changes, or changed session settings. The next user would inherit them. A rollback on return clears transactional state; SQLAlchemy's pool does it by default."
+    ],
+    [
+      "M",
+      "Trace the over-creation race and its fix.",
+      "Twenty threads find no idle connection; each checks 'total < 5' under the lock and sees 0, releases the lock, and opens a connection, which takes 10 ms; each then increments the total. All twenty pass the check before any increment, so twenty connections are opened. The fix is to increment the total under the lock as part of the check (a reservation), then open outside the lock, and decrement and notify if opening fails. In this lesson's test the racy pool handed out 20 connections against a limit of 5; the fixed pool never exceeded 5."
+    ],
+    [
+      "M",
+      "Why not hold the lock while opening a connection?",
+      "Opening is slow I/O. While it runs, no other thread could return or take a connection, so one slow connect stalls the whole pool. Reservation gives the same correctness (the slot is counted) without holding the lock during I/O."
+    ],
+    [
+      "M",
+      "How does the pool deal with connections the server has closed?",
+      "Validate on checkout: discard connections older than the recycle age, and optionally ping each one (a cheap query such as SELECT 1); a dead one is closed, its slot released, and the loop tries again. That is SQLAlchemy's pool_recycle and pool_pre_ping. Without it, the first request after a database restart fails on a dead connection."
+    ],
+    [
+      "M",
+      "What is max_overflow, and why close overflow connections on return?",
+      "The pool keeps a base number of connections open; during bursts it may open up to max_overflow more. Closing those when they are returned brings the pool back to its base size after the burst, so idle connections do not accumulate on the server. SQLAlchemy's defaults are pool_size 5 and max_overflow 10."
+    ],
+    [
+      "M",
+      "How do you prevent and detect connection leaks?",
+      "Prevent them with a context manager so the connection is returned in a finally block even if the request handler raises. Detect them by recording when each connection was checked out and reporting those held longer than a threshold, with the stack trace of the checkout if possible."
+    ],
+    [
+      "H",
+      "A waiter times out even though a connection was freed. What went wrong?",
+      "Probably a lost wakeup: the code path that discarded a broken connection, or released a reservation after a failed connect, decremented the count without notifying the condition. The waiter, sleeping until notified or timed out, never re-checked. Every change in capacity must notify; in the solution, all of them go through one helper that does."
+    ],
+    [
+      "H",
+      "Why might you choose LIFO reuse?",
+      "With FIFO, connections are used round robin, so all of them stay active even under light load, and the server's idle timeout never prunes them. With LIFO, the most recently returned connection is reused first, so a few connections do the work and the rest sit idle long enough for server-side timeouts to close them, which pairs with pre-ping to replace them on demand. SQLAlchemy exposes this as pool_use_lifo."
+    ],
+    [
+      "H",
+      "Twenty application instances each have a pool of 10 plus 10 overflow. What can go wrong?",
+      "Under load they can open 400 connections, which may exceed the database's max_connections or its memory, causing 'too many connections' errors or slow queries everywhere. Size per-instance pools from the database's capacity divided by the number of instances, consider a server-side pooler such as PgBouncer, and remember autoscaling multiplies pools."
+    ],
+    [
+      "H",
+      "What happens to a pool when a process forks?",
+      "The child inherits the parent's open sockets. If both use the same connection, their messages interleave on one socket and the protocol breaks. SQLAlchemy's documentation stresses that pooled connections must not be shared with a forked process: dispose of the pool in the child, or create pools after forking."
+    ],
+    [
+      "H",
+      "How would you make the pool fair under contention?",
+      "With one condition variable, notify wakes the longest waiter, but a thread arriving just then can take the freed connection first. For strict fairness, keep a FIFO of per-waiter events and hand a returned connection directly to the first waiter. It reduces throughput slightly and prevents a waiter from timing out while newcomers are served."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "SQLAlchemy: Connection Pooling",
+      "QueuePool tuning (pool_size, max_overflow, pool_recycle, pool_timeout), no pre-created connections, reset on return with rollback, pessimistic disconnect handling with pool_pre_ping (SELECT 1), optimistic handling with pool_recycle, FIFO versus LIFO with pool_use_lifo, and why pooled connections must not be shared across os.fork().",
+      "https://docs.sqlalchemy.org/en/20/core/pooling.html"
+    ],
+    [
+      "docs",
+      "SQLAlchemy: create_engine parameters",
+      "Defaults: pool_size=5, max_overflow=10, pool_timeout=30, pool_recycle=-1 (with the note that MySQL disconnects idle connections after eight hours by default), pool_use_lifo=False.",
+      "https://docs.sqlalchemy.org/en/20/core/engines.html"
+    ],
+    [
+      "docs",
+      "HikariCP wiki: About Pool Sizing",
+      "The (core_count x 2) + effective_spindle_count starting point for active database connections, and why small pools often outperform large ones; the companion Down the Rabbit Hole page describes HikariCP's ConcurrentBag with direct hand-off.",
+      "https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing"
+    ],
+    [
+      "docs",
+      "PgBouncer",
+      "A server-side connection pooler for PostgreSQL, used when many application pools would exceed the database's connection limit.",
+      "https://www.pgbouncer.org/"
+    ],
+    [
+      "docs",
+      "Python: threading (Condition)",
+      "Condition variables with wait timeouts, used for acquire with a deadline.",
+      "https://docs.python.org/3/library/threading.html#condition-objects"
+    ],
+    [
+      "docs",
+      "Python: contextlib.contextmanager",
+      "Generator-based context managers that run cleanup in a finally block.",
+      "https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A web service connects to its database for every request. At low traffic nobody notices that each request spends 30 milliseconds opening a connection before running a 2-millisecond query. During a launch, traffic grows twentyfold; the database spends more time accepting and authenticating connections than answering queries, hits its connection limit, and starts refusing new ones. The service falls over, and the database graphs show it nearly idle in terms of actual queries.</p>
+<p>A <strong>connection pool</strong> fixes this by keeping a small number of connections open and lending them out: a request borrows one, runs its queries, and returns it for the next request. Every serious database client has one: SQLAlchemy's <code>QueuePool</code> in Python, HikariCP in Java, the pools inside most drivers, and server-side poolers such as PgBouncer when there are too many application processes.</p>
+<p>The pool is a perfect machine-coding question for concurrency because it is a shared, scarce resource with a messy lifecycle. Connections are expensive to create, so creating them must not happen under the pool's lock. They are limited, so the pool must never create more than its bound, even when twenty threads ask at the same instant. They go stale, because servers close idle connections, restart and fail over, so they must be checked before reuse. They carry state, so a returned connection must be reset before someone else gets it. And callers make mistakes: they forget to return connections on error paths, or return one twice.</p>
+<p>Each of those has a bad interleaving worth tracing. The most instructive is the over-creation race: check that there is room, then open a connection, then count it. In this lesson's test a pool written that way, with a limit of 5, handed out 20 connections to 20 simultaneous callers. The fix, reserving the slot under the lock before opening the connection outside it, is the central idea of the lesson, and it generalises to any "check capacity, then do slow work" situation.</p>
+<p>The lesson follows the round: clarify the requirements, name the states a connection can be in, draw the pool, write a naive version and trace its failures, then build the correct pool in stages (reservation, waiting with a timeout, validation on checkout, reset on return, discarding and overflow, leak and double-release detection, FIFO versus LIFO), test it against a fake database server under contention and across a simulated restart, and compare each decision with SQLAlchemy's documented pool.</p>
+</section>
+
+<section data-field="primer">
+<h4>Why connections are expensive</h4>
+<p>A database connection is a TCP connection plus a protocol session. Opening one costs a network round trip for the TCP handshake, often more for TLS encryption, then authentication and session setup on the server, which may start a process or allocate memory per connection. That can take from a few milliseconds on a local network to hundreds over long distances, often far more than the query itself. Servers also cap concurrent connections (PostgreSQL's default <code>max_connections</code> is 100), because each one costs memory. Reusing connections removes the setup cost from every request and keeps the number the server sees small and stable.</p>
+<h4>The life of a pooled connection</h4>
+<p>A connection in a pool is always in one of a few states. <strong>Being opened</strong>: a slot is reserved and the handshake is in progress. <strong>Idle</strong>: open and waiting in the pool. <strong>Checked out</strong>: lent to a caller. <strong>Discarded</strong>: closed and removed, because it was broken, too old, or an extra overflow connection that is no longer needed. The pool's job is to move connections between these states safely and to keep one number honest: the total it is responsible for, which must never exceed its limit.</p>
+<figure>
+<svg viewBox="0 0 640 240" width="100%" role="img" aria-label="Connection lifecycle: a reserved slot becomes an open connection, which is checked out; on return it is reset and goes idle, or is closed if broken or overflow; on checkout from idle it is validated and discarded if too old or failing a ping">
+<defs><marker id="ld18-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="20" y="90" width="120" height="50" rx="25" style="fill:var(--surface-2);stroke:var(--line-2);stroke-width:2"/><text x="80" y="112" text-anchor="middle" style="fill:var(--ink);font-weight:600">OPENING</text><text x="80" y="128" text-anchor="middle" style="fill:var(--muted)">slot reserved</text>
+<rect x="250" y="20" width="140" height="50" rx="25" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:2"/><text x="320" y="42" text-anchor="middle" style="fill:var(--ink);font-weight:600">CHECKED OUT</text><text x="320" y="58" text-anchor="middle" style="fill:var(--muted)">lent to a caller</text>
+<rect x="250" y="160" width="140" height="50" rx="25" style="fill:var(--surface-2);stroke:var(--good);stroke-width:2"/><text x="320" y="182" text-anchor="middle" style="fill:var(--ink);font-weight:600">IDLE</text><text x="320" y="198" text-anchor="middle" style="fill:var(--muted)">in the pool</text>
+<rect x="490" y="90" width="130" height="50" rx="25" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="555" y="112" text-anchor="middle" style="fill:var(--ink);font-weight:600">DISCARDED</text><text x="555" y="128" text-anchor="middle" style="fill:var(--muted)">closed, slot freed</text>
+<path d="M140,104 C190,70 210,52 248,46" marker-end="url(#ld18-arrow)" style="fill:none;stroke:var(--ink-2)"/><text x="160" y="66" style="fill:var(--ink-2)">connected</text>
+<path d="M300,72 L300,158" marker-end="url(#ld18-arrow)" style="fill:none;stroke:var(--ink-2)"/><text x="230" y="118" style="fill:var(--ink-2)">release: reset</text>
+<path d="M340,158 L340,72" marker-end="url(#ld18-arrow)" style="fill:none;stroke:var(--ink-2)"/><text x="348" y="118" style="fill:var(--ink-2)">acquire: valid</text>
+<path d="M392,40 C450,45 480,70 520,88" marker-end="url(#ld18-arrow)" style="fill:none;stroke:var(--crit)"/><text x="420" y="34" style="fill:var(--crit)">broken / overflow</text>
+<path d="M392,190 C450,185 480,160 520,142" marker-end="url(#ld18-arrow)" style="fill:none;stroke:var(--crit)"/><text x="420" y="212" style="fill:var(--crit)">too old / failed ping</text>
+<path d="M140,130 C200,230 450,240 520,140" marker-end="url(#ld18-arrow)" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/><text x="300" y="234" style="fill:var(--crit)">connect failed: un-reserve</text>
+<text x="20" y="20" style="fill:var(--muted)">total = opening + checked out + idle ≤ size + overflow</text>
+</g>
+</svg>
+<figcaption>Every arrow into DISCARDED frees a slot and must wake a waiter. The count includes connections still being opened, which is what stops twenty simultaneous callers from all opening one.</figcaption>
+</figure>
+<h4>Waiting for a connection</h4>
+<p>When every connection is in use and the pool is at its limit, a caller must wait. Waiting uses a condition variable, exactly as in the blocking-queue case: hold the pool's lock, and while there is no idle connection and no free slot, wait; when a connection is returned or a slot frees up, notify. Unlike a queue, the wait needs a deadline: a caller should get an error after, say, 30 seconds rather than hang forever when the database is overloaded. SQLAlchemy calls this <code>pool_timeout</code> and defaults it to 30 seconds.</p>
+<h4>The analogy, and where it breaks</h4>
+<p>Think of a library with five copies of a popular textbook. Students borrow a copy, use it and return it; the librarian keeps a count of copies on loan. If all five are out, students queue. The librarian may order up to ten extra copies during exam week, and sends those extras back when they are returned. Before lending a copy, the librarian checks it is not falling apart; when a copy comes back, they remove any notes left in it. The analogy breaks at ordering: a librarian who has decided to order a copy writes it in the ledger first, but software that checks "fewer than five?" and then spends ten milliseconds opening a connection before writing anything down lets twenty requests each decide to order one.</p>
+<h4>What the round expects</h4>
+<p>A pool with <code>acquire(timeout)</code>, <code>release(conn)</code> and a context manager; a bound with optional overflow; reservation under the lock and connection opening outside it; validation on checkout; reset on return; discarding broken connections while waking waiters; and tests under contention, including one showing the over-creation race.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">States &amp; counts</span></div><div class="ck"><span class="ck-m">10–16</span><span class="ck-t">Naive pool &amp; traces</span></div><div class="ck"><span class="ck-m">16–30</span><span class="ck-t">Correct pool</span></div><div class="ck"><span class="ck-m">30–38</span><span class="ck-t">Stress &amp; restart tests</span></div><div class="ck"><span class="ck-m">38–45</span><span class="ck-t">Sizing, extensions</span></div></div>
+<h4>1 · Clarify the requirements</h4>
+<p>Ask what is being pooled (database connections, HTTP clients, model-server sessions), how expensive creating one is, how many the server allows, the base size and whether bursts may exceed it, how long callers may wait, whether connections go stale (server idle timeouts, restarts, failover), what state connections carry between uses (transactions, session settings), whether connections should be created up front or lazily, and how callers will use the pool (threads, async tasks, forked processes).</p>
+<p>A typical agreed scope: a thread-safe pool of database connections; base size and maximum overflow; lazy creation; acquire with a timeout that raises; validation on checkout by age and by ping; rollback on return; broken and overflow connections closed on return; a context manager; detection of double returns and long-held connections. Invariants: the total of opening, checked-out and idle connections never exceeds size plus overflow; a connection is never checked out by two callers at once; every capacity change wakes a waiter if one exists.</p>
+<h4>2 · The pieces</h4>
+<p>The pool's state is a deque of idle connections, a dict of checked-out connection ids with the time each was taken, and an integer <code>_total</code> counting every connection the pool is responsible for, including those being opened. One condition variable (with its lock) guards all of it. The solution adds a <code>FakeServer</code> that counts open connections, records the peak, can enforce a connection limit, takes a configurable time to connect, and can "restart", which makes every existing connection dead, so the tests can check bounds and recovery without a real database.</p>
+<h4>3 · Stage one: a naive pool and the over-creation race</h4>
+<pre>def acquire(self):
+    with self.lock:
+        if self.idle:
+            return self.idle.pop()
+        room = self.total &lt; self.limit         # check
+    if not room:
+        raise PoolTimeout("full")
+    conn = self.connect()                     # slow: 10 ms, no lock held
+    with self.lock:
+        self.total += 1                       # act, too late
+    return conn</pre>
+<p>The author carefully kept the slow <code>connect()</code> outside the lock, which is right, but split the check from the increment, which is wrong. Here is the interleaving with a limit of 5 and twenty threads arriving together:</p>
+<table><thead><tr><th>Step</th><th>Thread 1</th><th>Threads 2–20</th><th>total</th></tr></thead><tbody>
+<tr><td>1</td><td>lock; no idle; 0 &lt; 5: room; unlock</td><td></td><td>0</td></tr>
+<tr><td>2</td><td>connect() begins (10 ms)</td><td>each: lock; no idle; 0 &lt; 5: room; unlock</td><td>0</td></tr>
+<tr><td>3</td><td>still connecting</td><td>each: connect() begins</td><td>0</td></tr>
+<tr><td>4</td><td>lock; total += 1</td><td>each in turn: lock; total += 1</td><td>1 … 20</td></tr>
+</tbody></table>
+<p>Every thread checked the count while it was still 0, because no thread had incremented it yet: the increment only happens after the slow connect. Twenty connections are opened against a limit of 5. In the solution's test, with a 10-millisecond connect delay, the racy pool handed out exactly that: 20 connections, and the fake server's peak was 20. Against a real database with a limit, the excess connections fail with "too many connections"; against one without, the application quietly uses four times the connections it was configured for.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Timeline: threads T1 to T4 each check total=0 under the lock and see room, then each spends 10 ms connecting without the lock, then each increments total; four connections exceed a limit of 2. With reservation, T1 and T2 increment during the check and T3 and T4 wait">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="18" style="fill:var(--ink);font-weight:600">Racy: check, connect, then count (limit 2)</text>
+<g>
+<text x="20" y="44" style="fill:var(--ink)">T1</text><text x="20" y="66" style="fill:var(--ink)">T2</text><text x="20" y="88" style="fill:var(--ink)">T3</text><text x="20" y="110" style="fill:var(--ink)">T4</text>
+<rect x="60" y="34" width="30" height="14" style="fill:var(--s1)"/><rect x="90" y="34" width="200" height="14" style="fill:var(--s2);opacity:0.5"/><rect x="290" y="34" width="30" height="14" style="fill:var(--crit);opacity:0.7"/>
+<rect x="92" y="56" width="30" height="14" style="fill:var(--s1)"/><rect x="122" y="56" width="200" height="14" style="fill:var(--s2);opacity:0.5"/><rect x="322" y="56" width="30" height="14" style="fill:var(--crit);opacity:0.7"/>
+<rect x="124" y="78" width="30" height="14" style="fill:var(--s1)"/><rect x="154" y="78" width="200" height="14" style="fill:var(--s2);opacity:0.5"/><rect x="354" y="78" width="30" height="14" style="fill:var(--crit);opacity:0.7"/>
+<rect x="156" y="100" width="30" height="14" style="fill:var(--s1)"/><rect x="186" y="100" width="200" height="14" style="fill:var(--s2);opacity:0.5"/><rect x="386" y="100" width="30" height="14" style="fill:var(--crit);opacity:0.7"/>
+<text x="430" y="62" style="fill:var(--ink-2)">blue: check sees total = 0</text><text x="430" y="80" style="fill:var(--ink-2)">wide: connect, no lock</text><text x="430" y="98" style="fill:var(--crit)">red: total += 1 → 4 &gt; 2</text>
+</g>
+<text x="20" y="144" style="fill:var(--ink);font-weight:600">Reserved: check and count together, then connect</text>
+<text x="20" y="166" style="fill:var(--ink)">T1</text><text x="20" y="186" style="fill:var(--ink)">T2</text><text x="20" y="206" style="fill:var(--ink)">T3</text>
+<rect x="60" y="156" width="30" height="14" style="fill:var(--good)"/><rect x="90" y="156" width="200" height="14" style="fill:var(--s2);opacity:0.5"/>
+<rect x="92" y="176" width="30" height="14" style="fill:var(--good)"/><rect x="122" y="176" width="200" height="14" style="fill:var(--s2);opacity:0.5"/>
+<rect x="124" y="196" width="30" height="14" style="fill:var(--s1)"/><rect x="154" y="196" width="170" height="14" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/><text x="240" y="207" text-anchor="middle" style="fill:var(--muted)">waits (total = 2)</text>
+<text x="430" y="186" style="fill:var(--good)">green: total += 1 inside the check</text>
+</g>
+</svg>
+<figcaption>The racy version's counter lags behind the decisions made from it by the length of a connect. Reserving the slot inside the same critical section as the check makes the count include connections still being opened.</figcaption>
+</figure>
+<h4>4 · Stage two: reservation, and why it works</h4>
+<p>The correct <code>acquire</code> makes the decision and the count one step: under the lock, if no idle connection exists and <code>_total</code> is below the limit, it increments <code>_total</code> immediately and records that it must create a connection. Only then does it release the lock and open the connection. The count now includes connections being opened, so a second thread arriving one microsecond later sees 1, not 0, and the twenty-first thread sees 20... except it cannot, because the fifth reservation brought the total to the limit and every later thread waits. If opening fails (the server is down or rejects the connection), the reservation is given back: <code>_total</code> is decremented and a waiter notified, so a failure does not permanently shrink the pool. The solution's contention test drives 20 threads through 100 queries each against a pool of 5 with a 2-millisecond connect delay: the server's peak was 5 and the pool created exactly 5 connections.</p>
+<p>Why not simply hold the lock during <code>connect()</code>? It would also be correct, but every other thread, including those returning connections, would be blocked for the duration of a connect. One slow connection attempt (a database failing over, a DNS lookup timing out) would freeze the entire pool. Reservation keeps the critical section to a few instructions.</p>
+<h4>5 · Stage three: waiting with a deadline</h4>
+<p>When there is no idle connection and no free slot, <code>acquire</code> waits on the condition variable in a loop, recomputing the time left until a single deadline computed at the start. If the wait times out and the condition still does not hold, it raises <code>PoolTimeout</code>. The loop matters for the reasons from the blocking-queue case: a woken thread must re-check, because another thread may have taken the connection first. The test holds both connections of a size-2 pool and checks that a third acquire with a 0.1-second timeout raises after about 0.1 seconds.</p>
+<h4>6 · Stage four: validation on checkout</h4>
+<p>An idle connection may be dead: the server restarted, failed over to a standby, or closed it after an idle timeout (MySQL's default is eight hours, as SQLAlchemy's documentation notes), or a firewall silently dropped it. Using it fails the caller's first query. The pool validates connections when it hands them out, outside the lock since validation can do I/O. Two checks are standard. <strong>Recycle by age</strong>: a connection older than the configured age is closed and replaced, which SQLAlchemy calls <code>pool_recycle</code> and describes as the optimistic approach. <strong>Pre-ping</strong>: a cheap round trip (a driver ping, or <code>SELECT 1</code>) on every checkout, SQLAlchemy's <code>pool_pre_ping</code>, the pessimistic approach. A connection that fails either check is discarded (closed, slot released, a waiter notified) and the loop tries again, creating a fresh connection if needed, so the caller never sees the dead one. The restart test checks out a connection, returns it, restarts the fake server, and checks that the next checkout returns a different, working connection, with one discard recorded.</p>
+<h4>7 · Stage five: return, reset, discard and overflow</h4>
+<p><code>release</code> first removes the connection from the checked-out set under the lock; if it was not there, this is a double release (or a connection from another pool) and it raises, because otherwise the same connection could end up in the idle deque twice and be handed to two callers at once. Then, outside the lock, it resets the connection: if a transaction is open, it rolls back, releasing locks and discarding uncommitted changes. If the reset fails because the connection is dead, the connection is discarded. Otherwise, under the lock: if the total exceeds the base size, this is an overflow connection that was opened during a burst, so it is closed; else it goes back to the idle deque and one waiter is notified.</p>
+<p>Every path that frees capacity notifies a waiter, and in the solution all discard paths go through one helper, <code>_forget</code>, so none can forget. That matters: here is the lost-wakeup trace that results if the discard path only decrements the count.</p>
+<table><thead><tr><th>Step</th><th>Thread A (holds the only connection)</th><th>Thread B (waiting)</th><th>total</th></tr></thead><tbody>
+<tr><td>1</td><td></td><td>acquire: no idle, total = 1 = limit; waits (timeout 2 s)</td><td>1</td></tr>
+<tr><td>2</td><td>begins a transaction; the database restarts</td><td>asleep</td><td>1</td></tr>
+<tr><td>3</td><td>release: rollback fails, connection dead</td><td>asleep</td><td>1</td></tr>
+<tr><td>4</td><td>discard: close; total -= 1; <em>no notify</em></td><td>asleep</td><td>0</td></tr>
+<tr><td>5</td><td></td><td>still asleep: nothing woke it</td><td>0</td></tr>
+<tr><td>6</td><td></td><td>2 s later: timeout, PoolTimeout, although the pool had room</td><td>0</td></tr>
+</tbody></table>
+<p>The solution's test reproduces this situation (a waiter, a transaction, a restart, a release that must discard) and asserts that the waiter receives a fresh, live connection well within its timeout.</p>
+<h4>8 · Stage six: leaks, double release and the context manager</h4>
+<p>The commonest real bug is a connection that is never returned: a request handler raises between acquire and release. After as many such errors as the pool's size, every acquire times out. The defence is structural: callers use <code>with pool.connection() as c:</code>, whose finally block returns the connection whatever happens; the test raises inside the block and checks the connection came back. Detection complements it: the pool records when each connection was checked out, and <code>leaks(older_than)</code> lists those held too long, which a monitoring thread can log with the checkout's stack trace. Double release is rejected using the same checked-out map.</p>
+<h4>9 · Stage seven: FIFO or LIFO</h4>
+<p>Which idle connection should the pool hand out? FIFO (the one idle longest) spreads use across all connections in rotation, so all of them stay warm. LIFO (the one returned most recently) keeps reusing a few, leaving the rest idle; under light load the spares sit long enough for the server's idle timeout to close them, and pre-ping replaces them when traffic returns. SQLAlchemy's documentation describes exactly this trade-off for its <code>pool_use_lifo</code> flag. The test fills a pool of four, then runs twelve sequential checkouts: FIFO touches all four connections, LIFO only one.</p>
+<figure>
+<svg viewBox="0 0 640 200" width="100%" role="img" aria-label="Pool layout: one condition variable guards an idle deque, a checked-out map and the total; FIFO takes from the left of the idle deque and LIFO from the right; returned connections are appended on the right">
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="20" y="20" width="600" height="160" rx="10" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<text x="320" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">one condition variable (and its lock) guards everything below</text>
+<text x="40" y="70" style="fill:var(--ink)">idle deque</text>
+<g style="font-family:var(--mono)">
+<rect x="130" y="56" width="50" height="24" rx="4" style="fill:var(--s2);opacity:0.5"/><text x="155" y="73" text-anchor="middle" style="fill:var(--ink)">c3</text>
+<rect x="185" y="56" width="50" height="24" rx="4" style="fill:var(--s2);opacity:0.5"/><text x="210" y="73" text-anchor="middle" style="fill:var(--ink)">c7</text>
+<rect x="240" y="56" width="50" height="24" rx="4" style="fill:var(--s2);opacity:0.5"/><text x="265" y="73" text-anchor="middle" style="fill:var(--ink)">c1</text>
+</g>
+<text x="130" y="98" style="fill:var(--ink-2)">← FIFO takes here (idle longest)</text>
+<text x="300" y="73" style="fill:var(--ink-2)">LIFO takes here; returns append here →</text>
+<text x="40" y="128" style="fill:var(--ink)">checked out</text>
+<text x="130" y="128" style="fill:var(--ink-2);font-family:var(--mono)">{c2: since 10:00:01.2, c5: since 10:00:01.9}</text>
+<text x="40" y="160" style="fill:var(--ink)">total</text>
+<text x="130" y="160" style="fill:var(--ink-2);font-family:var(--mono)">6 = 3 idle + 2 out + 1 being opened   (limit 5 + overflow 2)</text>
+</g>
+</svg>
+<figcaption>Three structures and one number, all under one lock. The checked-out map is what makes double-release detection and leak reports possible; the total is what makes the bound hold while connections are still being opened.</figcaption>
+</figure>
+<h4>10 · The full solution</h4>
+<p>The file below contains the fake server, the pool, the racy pool and seven tests. Python 3.12, standard library only; it runs in a couple of seconds.</p>
+<pre>"""Connection pool: bounded size plus overflow, reserve-then-create outside the lock,
+acquire with timeout on a condition variable, validation on checkout (recycle by age,
+pre-ping), reset on return, broken and overflow connections discarded, double-release
+detection, a context manager against leaks, and FIFO or LIFO reuse.
+Python 3.12, standard library only (a fake database stands in for the server).
+Run: python connpool.py"""
+from __future__ import annotations
+
+import collections
+import contextlib
+import itertools
+import threading
+import time
+from typing import Callable, Iterator
+
+
+# ------------------------------------------------------------------ a fake database server
+class TooManyConnections(Exception): ...
+class Disconnected(Exception): ...
+
+
+class FakeServer:
+    def __init__(self, max_connections: int = 100, connect_delay: float = 0.0) -&gt; None:
+        self.max_connections, self.connect_delay = max_connections, connect_delay
+        self.open = 0
+        self.peak = 0
+        self.generation = 0                                   # bumps on restart
+        self._lock = threading.Lock()
+        self._ids = itertools.count(1)
+
+    def connect(self) -&gt; "FakeConnection":
+        time.sleep(self.connect_delay)                        # handshakes take time
+        with self._lock:
+            if self.open &gt;= self.max_connections:
+                raise TooManyConnections(f"server limit {self.max_connections}")
+            self.open += 1
+            self.peak = max(self.peak, self.open)
+            return FakeConnection(self, next(self._ids), self.generation)
+
+    def restart(self) -&gt; None:
+        with self._lock:
+            self.generation += 1                              # every existing socket is now dead
+            self.open = 0
+
+
+class FakeConnection:
+    def __init__(self, server: FakeServer, cid: int, generation: int) -&gt; None:
+        self.server, self.id, self.gen = server, cid, generation
+        self.created = time.monotonic()
+        self.in_transaction = False
+        self.closed = False
+
+    def _check(self) -&gt; None:
+        if self.closed or self.gen != self.server.generation:
+            raise Disconnected(f"connection {self.id} is dead")
+
+    def execute(self, sql: str) -&gt; str:
+        self._check()
+        if sql.upper().startswith("BEGIN"):
+            self.in_transaction = True
+        return f"ok:{sql}"
+
+    def ping(self) -&gt; bool:
+        try:
+            self._check()
+            return True
+        except Disconnected:
+            return False
+
+    def rollback(self) -&gt; None:
+        self._check()
+        self.in_transaction = False
+
+    def close(self) -&gt; None:
+        if not self.closed:
+            self.closed = True
+            if self.gen == self.server.generation:
+                with self.server._lock:
+                    self.server.open -= 1
+
+
+# ------------------------------------------------------------------ the pool
+class PoolTimeout(Exception): ...
+
+
+class ConnectionPool:
+    def __init__(self, connect: Callable[[], FakeConnection], size: int = 5, max_overflow: int = 0,
+                 timeout: float = 30.0, recycle: float | None = None, pre_ping: bool = True,
+                 lifo: bool = False) -&gt; None:
+        self._connect, self.size, self.max_overflow = connect, size, max_overflow
+        self.timeout, self.recycle, self.pre_ping, self.lifo = timeout, recycle, pre_ping, lifo
+        self._idle: collections.deque[FakeConnection] = collections.deque()
+        self._out: dict[int, float] = {}                      # checked-out id -&gt; since
+        self._total = 0                                        # idle + out + being created
+        self._cv = threading.Condition()
+        self.created = self.discarded = 0
+
+    @property
+    def limit(self) -&gt; int:
+        return self.size + self.max_overflow
+
+    def _valid(self, c: FakeConnection) -&gt; bool:
+        if self.recycle is not None and time.monotonic() - c.created &gt; self.recycle:
+            return False
+        return c.ping() if self.pre_ping else True
+
+    def _forget(self, c: FakeConnection | None) -&gt; None:
+        """Give a slot back (call WITHOUT the lock held: close may do I/O)."""
+        if c is not None:
+            c.close()
+        with self._cv:
+            self._total -= 1
+            self.discarded += c is not None
+            self._cv.notify()                                 # capacity changed: wake a waiter
+
+    def acquire(self, timeout: float | None = None) -&gt; FakeConnection:
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        while True:
+            with self._cv:
+                while not self._idle and self._total &gt;= self.limit:
+                    left = deadline - time.monotonic()
+                    if left &lt;= 0 or not self._cv.wait(left):
+                        if not self._idle and self._total &gt;= self.limit:
+                            raise PoolTimeout(f"no connection within the timeout ({self.limit} in use)")
+                if self._idle:
+                    c = self._idle.pop() if self.lifo else self._idle.popleft()
+                    create = False
+                else:
+                    self._total += 1                          # RESERVE the slot under the lock
+                    c, create = None, True
+            if create:                                        # slow I/O outside the lock
+                try:
+                    c = self._connect()
+                except BaseException:
+                    self._forget(None)                        # un-reserve, wake a waiter
+                    raise
+                with self._cv:
+                    self.created += 1
+            elif not self._valid(c):                          # stale: replace transparently
+                self._forget(c)
+                continue
+            with self._cv:
+                self._out[c.id] = time.monotonic()
+            return c
+
+    def release(self, c: FakeConnection) -&gt; None:
+        with self._cv:
+            if self._out.pop(c.id, None) is None:
+                raise RuntimeError(f"connection {c.id} released twice or not from this pool")
+        try:
+            if c.in_transaction:
+                c.rollback()                                  # reset: never hand over open state
+        except Disconnected:
+            self._forget(c)
+            return
+        with self._cv:
+            if self._total &gt; self.size:                       # an overflow connection: shrink
+                overflow = True
+            else:
+                self._idle.append(c)
+                self._cv.notify()
+                return
+        if overflow:
+            self._forget(c)
+
+    @contextlib.contextmanager
+    def connection(self, timeout: float | None = None) -&gt; Iterator[FakeConnection]:
+        c = self.acquire(timeout)
+        try:
+            yield c
+        finally:
+            self.release(c)                                   # even if the body raised
+
+    def leaks(self, older_than: float) -&gt; list[int]:
+        now = time.monotonic()
+        with self._cv:
+            return [cid for cid, since in self._out.items() if now - since &gt; older_than]
+
+    def dispose(self) -&gt; None:
+        with self._cv:
+            idle, self._idle = list(self._idle), collections.deque()
+        for c in idle:
+            self._forget(c)
+
+
+class RacyPool(ConnectionPool):
+    """BUG: checks the count, then creates, then increments; two threads both pass the check."""
+
+    def acquire(self, timeout=None):
+        with self._cv:
+            if self._idle:
+                c = self._idle.popleft()
+                self._out[c.id] = time.monotonic()
+                return c
+            room = self._total &lt; self.limit                   # check ...
+        if not room:
+            raise PoolTimeout("full")
+        c = self._connect()                                   # ... act, unprotected
+        with self._cv:
+            self._total += 1
+            self._out[c.id] = time.monotonic()
+        return c
+
+
+# ---------------------------------------------------------------- tests
+def hammer(pool: ConnectionPool, threads: int = 20, ops: int = 100) -&gt; list[str]:
+    errors: list[str] = []
+    start = threading.Barrier(threads)
+
+    def worker() -&gt; None:
+        start.wait()
+        for _ in range(ops):
+            try:
+                with pool.connection(timeout=5) as c:
+                    c.execute("SELECT 1")
+            except Exception as e:
+                errors.append(type(e).__name__)
+    ts = [threading.Thread(target=worker) for _ in range(threads)]
+    for t in ts: t.start()
+    for t in ts: t.join(30)
+    return errors
+
+
+def test_bounded_under_contention() -&gt; None:
+    server = FakeServer(max_connections=1_000, connect_delay=0.002)
+    pool = ConnectionPool(server.connect, size=5, max_overflow=0)
+    assert hammer(pool) == []
+    assert server.peak &lt;= 5 and pool.created &lt;= 5
+    print(f"    20 threads x 100 queries through 5 connections: peak {server.peak}, created {pool.created}")
+
+
+def test_racy_creation_overshoots() -&gt; None:
+    server = FakeServer(max_connections=1_000, connect_delay=0.01)
+    pool = RacyPool(server.connect, size=5, max_overflow=0)
+    got, start = [], threading.Barrier(20)
+
+    def grab() -&gt; None:
+        start.wait()
+        try:
+            got.append(pool.acquire())
+        except PoolTimeout:
+            pass
+    ts = [threading.Thread(target=grab) for _ in range(20)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    print(f"    racy pool, limit 5: {len(got)} connections handed out, server peak {server.peak}")
+    assert len(got) &gt; 5
+
+
+def test_restart_is_survived_with_pre_ping() -&gt; None:
+    server = FakeServer()
+    pool = ConnectionPool(server.connect, size=3)
+    with pool.connection() as c:
+        first = c.id
+    server.restart()                                          # the idle connection is now dead
+    with pool.connection() as c:
+        assert c.execute("SELECT 1") == "ok:SELECT 1" and c.id != first
+    assert pool.discarded == 1
+
+
+def test_recycle_and_overflow_and_reset() -&gt; None:
+    server = FakeServer()
+    pool = ConnectionPool(server.connect, size=1, max_overflow=2, recycle=0.05)
+    a, b, c = pool.acquire(), pool.acquire(), pool.acquire()  # 1 pooled + 2 overflow
+    a.execute("BEGIN")
+    for x in (a, b, c):
+        pool.release(x)
+    assert len(pool._idle) == 1 and server.open == 1          # overflow closed on return
+    assert not pool._idle[0].in_transaction                   # rolled back on return
+    time.sleep(0.06)
+    d = pool.acquire()                                        # too old: recycled
+    assert d.id not in (a.id, b.id, c.id)
+    pool.release(d)
+
+
+def test_timeout_leak_and_double_release() -&gt; None:
+    server = FakeServer()
+    pool = ConnectionPool(server.connect, size=2)
+    leaked = pool.acquire()
+    held = pool.acquire()
+    t0 = time.monotonic()
+    try:
+        pool.acquire(timeout=0.1)
+    except PoolTimeout:
+        assert time.monotonic() - t0 &gt;= 0.09
+    time.sleep(0.02)
+    assert set(pool.leaks(older_than=0.01)) == {leaked.id, held.id}
+    pool.release(held)
+    try:
+        pool.release(held)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("double release accepted")
+    try:
+        with pool.connection() as c:
+            raise ValueError("bug in the request handler")
+    except ValueError:
+        pass
+    assert len(pool._idle) == 1                               # returned despite the exception
+
+
+def test_waiter_wakes_when_a_broken_connection_is_discarded() -&gt; None:
+    server = FakeServer()
+    pool = ConnectionPool(server.connect, size=1)
+    c = pool.acquire()
+    got = []
+    t = threading.Thread(target=lambda: got.append(pool.acquire(timeout=2)))
+    t.start()
+    time.sleep(0.05)
+    c.execute("BEGIN")
+    server.restart()                                          # rollback on return will fail
+    pool.release(c)                                           # discarded: must still wake the waiter
+    t.join(1)
+    assert got and got[0].ping()
+
+
+def test_lifo_keeps_spares_idle() -&gt; None:
+    server = FakeServer()
+    for lifo in (False, True):
+        pool = ConnectionPool(server.connect, size=4, lifo=lifo)
+        conns = [pool.acquire() for _ in range(4)]
+        for c in conns:
+            pool.release(c)
+        used = set()
+        for _ in range(12):                                   # light, sequential load
+            with pool.connection() as c:
+                used.add(c.id)
+        assert len(used) == (1 if lifo else 4)
+        pool.dispose()
+
+
+if __name__ == "__main__":
+    for t in (test_bounded_under_contention, test_racy_creation_overshoots, test_restart_is_survived_with_pre_ping,
+              test_recycle_and_overflow_and_reset, test_timeout_leak_and_double_release,
+              test_waiter_wakes_when_a_broken_connection_is_discarded, test_lifo_keeps_spares_idle):
+        t()
+        print("ok ", t.__name__)</pre>
+<h4>11 · Testing a pool</h4>
+<p>Three kinds of test cover it. A contention test drives many threads through the pool simultaneously, released together by a barrier, and checks the bound from the server's point of view (peak open connections), not just the pool's own counters. A demonstration test runs the racy pool through the same burst to prove the test can detect over-creation; with a 10-millisecond connect delay it saw all 20 threads get a connection against a limit of 5. Scenario tests then pin each lifecycle rule: dead connections replaced after a restart, overflow connections closed on return, transactions rolled back, recycling by age, timeouts, leak reports, double-release rejection, the context manager returning connections on exceptions, a waiter woken when a broken connection is discarded, and LIFO's reuse pattern. The fake server is what makes all of this fast and deterministic: no database, and a restart is one method call.</p>
+<h4>12 · Talking through the design</h4>
+<p>"The pool tracks a total that includes connections being opened, so under the lock acquire either takes an idle connection or reserves a slot by incrementing the total, then opens the connection outside the lock; on failure it un-reserves and notifies. Without reservation, twenty simultaneous callers all see room and open twenty connections against a limit of five; I've reproduced that. If there's no idle connection and no room, it waits on the condition with a deadline and raises a timeout. On checkout it validates: recycle by age and pre-ping, discarding dead ones transparently. On return it rejects double releases, rolls back open transactions, closes broken and overflow connections, and every capacity change notifies, or a waiter can sleep through a freed slot. Callers use a context manager so errors can't leak connections. SQLAlchemy's QueuePool makes the same choices: pool_size 5, max_overflow 10, pool_timeout 30, pre-ping and recycle, rollback on return, LIFO optional."</p>
+<h4>13 · Edge cases</h4>
+<p><strong>Size zero</strong>: SQLAlchemy treats pool_size 0 as no limit; decide and document. <strong>Connect hangs</strong>: give the connect call its own timeout, or a reserved slot is held indefinitely. <strong>Server rejects connections</strong> (limit reached): the reservation is released and the error propagates; consider backing off. <strong>Pool disposed while connections are out</strong>: close idle ones now and checked-out ones when returned. <strong>Connection used after release</strong>: the caller still holds a reference; wrapping connections in a proxy that refuses use after release catches it. <strong>Threads and asyncio mixed</strong>: use an async pool for coroutines; a thread pool's blocking waits would stall the event loop. <strong>Forking</strong>: never share pooled connections with a child process.</p>
+<h4>14 · Extensions the interviewer will ask for</h4>
+<p><strong>Minimum idle and pre-warming</strong>: keep a few connections open ahead of demand to avoid cold-start latency. <strong>Background health checks</strong> that ping idle connections periodically instead of at every checkout. <strong>Fair queuing</strong> for waiters. <strong>Per-tenant or per-endpoint pools</strong> as bulkheads. <strong>Metrics</strong>: in use, idle, waiting, wait time, creation rate, discard reasons. <strong>Async pools</strong> for asyncio drivers. <strong>Server-side pooling</strong> with PgBouncer when hundreds of application processes would otherwise each hold their own pool.</p>
+<h4>15 · Complexity</h4>
+<p>acquire and release are O(1) apart from waiting and I/O: deque and dict operations under a short critical section. Validation costs one round trip per checkout with pre-ping, or nothing with recycling alone. Memory is O(size + overflow) connections, each costing memory on both client and server. Throughput is bounded by the number of connections times the queries per second each can serve; the lock is never held during I/O, so it is not the bottleneck.</p>
+</section>
+
+<section data-field="deep">
+<h4>Reservation as a general pattern</h4>
+<p>"Check that there is capacity, then do slow work, then record it" appears far beyond connection pools: allocating seats, rate-limit tokens, disk quota, GPU memory for a batch, worker slots in a scheduler. The race is always the same, decisions made from a counter that has not yet been updated, and the fix is always the same: update the counter as part of the check, under the lock (or with an atomic compare-and-set), do the slow work afterwards, and roll the reservation back if the work fails. Databases use the same idea when they insert a placeholder row with a unique constraint before doing expensive work. Recognising "this is a reservation problem" is worth saying explicitly in an interview.</p>
+<h4>Pessimistic versus optimistic validation</h4>
+<p>Pre-ping on every checkout costs one round trip per request but guarantees the connection was alive a moment ago. Recycling by age costs nothing per request but only protects against staleness that correlates with age, such as server idle timeouts; it does nothing for a database that restarted five seconds ago. Many deployments combine them, or use pre-ping only after a connection has been idle for some seconds, which is what HikariCP's keepalive and validation settings approximate. And neither eliminates errors entirely: a connection can die between the ping and the query, so applications still need retry logic for idempotent operations.</p>
+<h4>Sizing the pool</h4>
+<p>A database can do only so much concurrent work: roughly its CPU cores times a small factor, plus some allowance for queries waiting on disk. Beyond that, more concurrent queries add lock contention and context switching without adding throughput, and latency rises for everyone. HikariCP's pool-sizing guide gives a widely used starting point, active connections ≈ (core count × 2) + effective spindle count, and notes that the result is often surprisingly small. The application's pool should be sized so that the sum across all instances stays near that number; requests beyond it should queue in the application (in the pool's wait queue), where they cost little, rather than in the database, where they cost a lot. Autoscaling multiplies pools, which is why server-side poolers exist.</p>
+<h4>Fairness and the waiter queue</h4>
+<p>With one condition variable, <code>notify</code> wakes the longest waiter, but a thread that arrives at that moment can take the returned connection first, and the woken waiter goes back to sleep. Under sustained overload, an unlucky waiter can be overtaken repeatedly and time out while newer requests succeed. Strictly fair pools keep a FIFO of waiters, each with its own event, and hand a returned connection directly to the head waiter, bypassing the idle deque. HikariCP's design notes list direct hand-off among the optimisations of its connection bag. Fairness costs a little throughput and makes tail latency predictable.</p>
+<h4>Pools across processes and forks</h4>
+<p>A connection is a socket, and sockets survive <code>fork()</code>: the child process inherits copies of the parent's file descriptors. If both processes then use the same pooled connection, their protocol messages interleave on one socket, and the database sees garbage or answers the wrong process. SQLAlchemy's documentation calls it critical that pooled connections are not shared with a forked process and recommends disposing of the pool in the child, or creating engines after forking. Pre-fork servers (Gunicorn with preload, multiprocessing workers) are where this bites.</p>
+</section>
+
+<section data-field="prod">
+<h4>How pools fail in production</h4>
+<p>Pool exhaustion is the classic outage: every connection checked out, every new request waiting, timeouts everywhere. Its causes are leaks (an error path that skips the return), slow queries holding connections for seconds, and transactions left open while the application does something slow, such as calling an external API inside a database transaction. The symptoms are rising wait times and timeouts in the application while the database itself shows few active queries, the tell-tale sign that connections are held but idle. Leak detection with checkout stack traces, statement timeouts on the database, and never doing network calls inside transactions are the standard remedies.</p>
+<p>Stale connections are the second: after a database failover or restart, the first request on each pooled connection fails. Pre-ping removes the errors at the cost of a round trip; recycling below the server's idle timeout prevents most idle disconnections. Over-subscription is the third: many instances times large pools exceeding the database's limit, often triggered by autoscaling during a traffic spike, exactly when the database can least afford extra connections.</p>
+<h4>What to measure</h4>
+<p>Connections in use, idle and being opened; threads waiting and their wait time (the most direct sign of an undersized pool or a slow database); connection creation and discard rates with reasons (age, failed ping, broken, overflow); checkout duration distribution (long tails mean slow queries or leaks); and on the database side, active versus idle-in-transaction sessions.</p>
+<h4>Knobs</h4>
+<p>Base size, overflow, acquire timeout, recycle age (below the server's and any firewall's idle timeouts), pre-ping on or off, FIFO or LIFO, and a statement timeout on the server. Tune size from the database's capacity divided by instances, and acquire timeout from the request's own deadline: there is no point waiting 30 seconds for a connection inside a request that times out after 10.</p>
+<h4>The real case: SQLAlchemy's QueuePool</h4>
+<p>SQLAlchemy's pooling documentation describes the production version of this design. Its <code>QueuePool</code> is tuned with four main parameters passed to <code>create_engine</code>: <code>pool_size</code> (default 5, the number of connections kept open), <code>max_overflow</code> (default 10, connections allowed beyond the pool size), <code>pool_timeout</code> (default 30 seconds to wait before giving up on getting a connection) and <code>pool_recycle</code> (default −1, no recycling; the documentation notes that MySQL disconnects connections idle for eight hours by default). No pool pre-creates connections; they are opened on first use. On return, the pool's reset-on-return behaviour calls <code>rollback()</code> so that transactional state, including row and table locks, is removed before reuse. For disconnects it describes two approaches: pessimistic, with <code>pool_pre_ping</code> testing each connection at checkout with a driver ping or <code>SELECT 1</code>; and optimistic, with <code>pool_recycle</code> replacing connections after a set age and invalidation when an error reveals a dead connection. A <code>pool_use_lifo</code> flag switches reuse from FIFO, which cycles through every connection, to LIFO, which lets surplus connections idle so server-side timeouts can close them, recommended together with pre-ping. And the documentation is emphatic that pooled connections must not be shared with a forked process. Each of those features corresponds to a stage in this lesson's pool, which is why reading the SQLAlchemy page after building one is the best way to check the design.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the pool against the fake server, then break, measure and extend it. Python 3.12, standard library only.</p>
+<ol>
+<li>Save the full solution as <code>connpool.py</code> and run it. Seven tests print <code>ok</code>; note the contention test's peak of 5 and the racy pool's 20 connections against a limit of 5.</li>
+<li><strong>Break it.</strong> In <code>acquire</code>, move <code>self._total += 1</code> from the reservation branch to after <code>self._connect()</code>. Run the contention test with <code>connect_delay=0.01</code>: the server's peak climbs above 5.</li>
+<li><strong>Break it again.</strong> Remove the <code>notify()</code> from <code>_forget</code>. Run the broken-connection test: the waiter times out after two seconds despite the free slot.</li>
+<li><strong>Measure it.</strong> With 50 threads and 2 ms queries, vary the pool size from 1 to 20 and plot throughput and average wait time. Then set the fake server to slow down as more connections are open (add a delay proportional to <code>open</code>) and find the size beyond which throughput falls.</li>
+<li><strong>Extend it.</strong> Add a minimum-idle setting with a background thread that keeps at least N idle connections open and pings idle ones every few seconds.</li>
+<li><strong>Extend it again.</strong> Make the pool fair: keep a FIFO of waiter events and hand returned connections directly to the first waiter.</li>
+</ol>
+<p>Judge each change by the server's peak, the absence of timeouts under the stress test, and the scenario tests.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A service runs 8 instances, each with a pool of size 10 and max_overflow 10, against a PostgreSQL server with max_connections 100. Each request runs queries for 20 ms in total, and each instance handles up to 400 requests per second at peak. A deploy adds a call to a payment API, taking 300 ms, inside the database transaction.</p>
+<p>(a) Before the deploy, how many connections does each instance need at peak, and is the server's limit safe? (b) After the deploy? (c) What do you change?</p>
+<details><summary>Answer</summary>
+<p><strong>(a) Before.</strong> By Little's law, connections in use ≈ arrival rate × time each request holds a connection: 400 per second × 0.02 s = <strong>8 connections per instance</strong>, within the base size of 10. Across 8 instances: 64 at peak, under the server's 100. In the worst case, if every instance used its overflow, 8 × 20 = 160 would exceed the limit, so the configuration is only safe because traffic stays below overflow levels.</p>
+<p><strong>(b) After.</strong> Each request now holds its connection for 20 + 300 = 320 ms, because the payment call happens inside the transaction. Needed per instance: 400 × 0.32 = <strong>128 connections</strong>. The pool provides at most 20, so 108 requests' worth of demand queue in the pool, waits rise until they hit the pool timeout, and requests fail. The instances try to open their overflow connections, 160 in total, beyond the server's 100, so some opens fail with "too many connections". On the database, the sessions are mostly "idle in transaction", holding locks while waiting for the payment API, which can block other queries. Database CPU looks low, which misleads anyone looking only at it.</p>
+<p><strong>(c) The fix.</strong> Move the payment call outside the transaction: commit, call the API, then record the result in a new short transaction (with an idempotency key for the payment). Connection hold time returns to about 20 ms and demand to about 8 per instance. Then make the configuration safe even at overflow: size the pools so that instances × (size + overflow) stays below the server's limit with headroom for administration, for example size 8 and overflow 2 (80 total), or put PgBouncer in front of the database. Add a statement timeout and an idle-in-transaction timeout on the server, alert on pool wait time, and set the pool timeout shorter than the request deadline so failing requests release capacity quickly.</p>
+</details>
+</section>

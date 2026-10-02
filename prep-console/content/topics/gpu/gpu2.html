@@ -1,0 +1,495 @@
+<!-- topic source for gpu/gpu2; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "gpu2",
+  "t": "The roofline model and arithmetic intensity",
+  "tag": "Performance model",
+  "sum": "FLOPs per byte decides whether an operation is limited by compute or by memory. How to count both, draw the roofline, place every part of a transformer on it, and choose the optimisation that actually moves you up.",
+  "viz": "gpuRoofline",
+  "prereq": [
+    [
+      "gpu1",
+      "A GPU has a peak arithmetic rate (about 989 dense BF16 TFLOP/s on an H100) and a memory bandwidth from HBM (3.35 TB/s); their ratio, the ridge point, is about 295 FLOP per byte."
+    ],
+    [
+      "lm5",
+      "During generation, a model stores the key and value vectors of every previous token (the KV cache) so each new token only computes its own; grouped-query attention (GQA) lets several query heads share one key/value head to shrink that cache."
+    ]
+  ],
+  "myths": [
+    [
+      "If a kernel is slow, it needs more FLOPs per second — a better GPU or a better kernel.",
+      "Only if it is compute-bound. A kernel below the ridge point is limited by bytes per second, and a GPU with twice the FLOPs but the same bandwidth will not speed it up at all. The first question is always where the operation sits on the roofline; that tells you whether to reduce bytes, increase reuse, or speed up arithmetic."
+    ],
+    [
+      "Quantising a model always makes it faster.",
+      "Weight quantisation reduces bytes, which speeds up memory-bound work such as small-batch decoding. For compute-bound work such as large-batch prefill, fewer bytes change nothing unless the arithmetic also moves to a faster format. And if dequantisation is a separate, unfused kernel, the extra memory traffic can make it slower: PyTorch's gpt-fast found int8 weights without a fused kernel were slower than FP16."
+    ],
+    [
+      "Arithmetic intensity is a fixed property of an algorithm.",
+      "It depends on the shapes (a matmul's intensity grows with batch size), the number format (bytes per element), and the implementation (a fused kernel that keeps intermediates on chip moves fewer bytes than a chain of separate kernels). Changing any of these moves the operation along the x-axis; that is the whole point of most optimisations."
+    ],
+    [
+      "The roofline tells you how fast your code runs.",
+      "It gives an upper bound — the best possible time given FLOPs and bytes. Real kernels land below it because of launch overhead, too little parallelism to fill the SMs, imperfect shapes, cache misses and clocks that drop under power limits. Its value is in telling you which ceiling you are closest to and how far away you are."
+    ],
+    [
+      "Bigger batches always improve throughput.",
+      "Throughput rises almost linearly with batch size only while an operation is memory-bound: the weight reads are shared by more sequences for free. Once past the ridge point it becomes compute-bound and throughput stops growing, while latency per step keeps rising. In LLM serving, the KV cache also grows with the batch and adds bytes that batching does not amortise, so the gains flatten earlier."
+    ]
+  ],
+  "recap": [
+    "Arithmetic intensity is FLOPs performed divided by bytes moved to and from memory; it is a property of an operation's shapes, number format and implementation.",
+    "The roofline says attainable FLOP/s = min(peak FLOP/s, intensity × bandwidth): a sloped memory-bound region, then a flat compute-bound region, meeting at the ridge point (peak ÷ bandwidth, about 295 FLOP/byte for an H100 in BF16).",
+    "Element-wise operations, normalisations and softmax have intensity around 1 FLOP/byte and are always memory-bound; the cure is fusion so intermediates never travel to HBM.",
+    "A matmul of B rows through a d × f weight matrix has intensity close to B when B is small, so batching raises intensity almost linearly until the ridge point, around B ≈ 300 in BF16 on an H100.",
+    "Below the ridge, extra batch is nearly free: time per step stays flat while tokens per step grow, which is why LLM servers batch many sequences together.",
+    "Decode attention has intensity equal to the GQA group size (often 8) whatever the batch, because each sequence reads its own KV cache; long contexts therefore keep decoding memory-bound.",
+    "Below the ridge, go faster by moving fewer bytes (fuse, quantise weights and KV cache, reuse on-chip) or raising intensity (batch); above it, use faster arithmetic (FP8, FP4) or fewer FLOPs.",
+    "The roofline is an upper bound: good GEMMs reach 70-80% of peak and good memory-bound kernels 80-90% of bandwidth; far below both means overhead, too little parallelism or bad shapes.",
+    "For inference, model bandwidth utilisation (MBU) — bytes that must be read per step times steps per second, divided by peak bandwidth — is the memory-bound counterpart of MFU."
+  ],
+  "glossary": [
+    [
+      "Arithmetic intensity",
+      "FLOPs performed divided by bytes moved to or from a given level of memory (usually HBM). Measured in FLOP/byte."
+    ],
+    [
+      "Attainable performance",
+      "The highest FLOP/s an operation can reach on given hardware according to the roofline: the lower of peak compute and intensity × bandwidth."
+    ],
+    [
+      "Batch size",
+      "The number of independent inputs (sequences, images) processed together in one step; in a matmul it is the number of rows multiplied by the weight matrix."
+    ],
+    [
+      "Compute-bound",
+      "Limited by arithmetic throughput: the operation's intensity is above the ridge point, so faster arithmetic helps and more bandwidth does not."
+    ],
+    [
+      "Decode",
+      "The token-by-token generation phase of an LLM, in which each step processes one new token per sequence."
+    ],
+    [
+      "Fusion (kernel fusion)",
+      "Combining several operations into one GPU kernel so intermediate results stay in registers or shared memory instead of being written to and re-read from HBM."
+    ],
+    [
+      "GEMM",
+      "General matrix multiply: the standard name for a matrix-matrix multiplication kernel, C = αAB + βC."
+    ],
+    [
+      "GEMV",
+      "General matrix-vector multiply: a matrix times a single vector, the shape of batch-1 decoding. Intensity about 1 FLOP/byte in BF16."
+    ],
+    [
+      "GQA group size",
+      "In grouped-query attention, the number of query heads sharing one key/value head (for example 64 query heads and 8 KV heads gives 8). Sets decode attention's intensity."
+    ],
+    [
+      "Hierarchical roofline",
+      "A roofline drawn for each memory level (HBM, L2, shared memory), each with its own bandwidth slope, to see which level limits a kernel."
+    ],
+    [
+      "KV cache",
+      "The stored key and value vectors of all previous tokens of each sequence, read in full at every decode step."
+    ],
+    [
+      "MBU (model bandwidth utilisation)",
+      "Bytes a model must read per step × steps per second, divided by peak memory bandwidth. The memory-bound counterpart of MFU."
+    ],
+    [
+      "Memory-bound",
+      "Limited by bandwidth: the operation's intensity is below the ridge point, so moving fewer bytes helps and faster arithmetic does not."
+    ],
+    [
+      "MFU (model FLOPs utilisation)",
+      "FLOPs the model needs per second divided by peak FLOP/s; the standard efficiency measure for compute-bound work such as training."
+    ],
+    [
+      "Overhead-bound",
+      "Limited by fixed costs outside the arithmetic and memory traffic — kernel launches, Python, synchronisation — so the operation sits below the roofline entirely."
+    ],
+    [
+      "Prefill",
+      "The phase of LLM inference that processes the whole prompt at once, many tokens per matmul, before generation starts. Usually compute-bound."
+    ],
+    [
+      "Ridge point",
+      "Peak FLOP/s divided by bandwidth: the intensity at which the sloped and flat parts of the roofline meet."
+    ],
+    [
+      "Roofline model",
+      "A performance model that bounds attainable FLOP/s by min(peak compute, intensity × bandwidth), usually drawn on log-log axes."
+    ],
+    [
+      "Weight-only quantisation",
+      "Storing weights in fewer bits (int8, int4, FP4) and converting them to BF16 inside the kernel before the maths; cuts bytes read without changing the arithmetic format."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What is arithmetic intensity and what is the ridge point?",
+      "Arithmetic intensity is the FLOPs an operation performs per byte it moves to or from memory. The ridge point is peak FLOP/s divided by memory bandwidth — about 989 × 10^12 / 3.35 × 10^12 ≈ 295 FLOP/byte for an H100 in BF16. Operations with lower intensity are memory-bound; higher, compute-bound."
+    ],
+    [
+      "E",
+      "Write down the roofline equation and explain its two parts.",
+      "Attainable FLOP/s = min(peak FLOP/s, intensity × bandwidth). The second term is how fast memory can deliver the data the operation needs, converted into FLOPs; if it is smaller than peak, memory is the limit. On a log-log plot it is a rising diagonal line that meets the flat line of peak compute at the ridge point."
+    ],
+    [
+      "E",
+      "What is the arithmetic intensity of adding two BF16 vectors, and what does that imply?",
+      "One FLOP per element, and 6 bytes per element (read two 2-byte inputs, write one output), so about 0.17 FLOP/byte — nearly 2,000 times below the H100 ridge. It is completely memory-bound: its speed is set by bandwidth, and the only real optimisation is to avoid doing it as a separate pass, by fusing it into a neighbouring kernel."
+    ],
+    [
+      "M",
+      "Derive the arithmetic intensity of a matmul of a B × d activation by a d × f weight matrix in BF16.",
+      "FLOPs are 2·B·d·f. Bytes are 2·(B·d + d·f + B·f) for reading both inputs and writing the output. When B is much smaller than d and f, the weight term dominates and intensity ≈ 2·B·d·f / 2·d·f = B. So intensity is roughly the batch size until B approaches the matrix dimensions, and on an H100 the matmul becomes compute-bound at around B ≈ 300.",
+      "Follow-up: And with int4 weights? — Weight bytes fall to 0.5 per element, so intensity ≈ 4B and the matmul turns compute-bound around B ≈ 75; below that it runs up to 4× faster than BF16."
+    ],
+    [
+      "M",
+      "Why does batching make LLM decoding more efficient, and when does it stop helping?",
+      "At batch 1 each weight is read from HBM to do 2 FLOPs, so intensity is about 1 FLOP/byte and the tensor cores idle. With B sequences, each weight read serves B tokens, so intensity and throughput rise roughly linearly with B while the step time barely changes. It stops helping when the weight matmuls reach the ridge point, or earlier when KV-cache reads — which batching does not share — dominate the bytes, or when KV memory runs out.",
+      "Follow-up: What's the latency cost? — Step time stays nearly flat while memory-bound, so latency per token barely changes; past the ridge, step time grows with B and every user's tokens slow down."
+    ],
+    [
+      "M",
+      "Why does decode attention stay memory-bound even with large batches?",
+      "Each sequence attends over its own KV cache, so batching does not share those reads. Per KV head, reading K and V costs 4·L·d_head bytes in BF16 and each of the g query heads sharing it does 4·L·d_head FLOPs, giving intensity ≈ g, the GQA group size — often 8. That is far below the ridge whatever the batch size, so with long contexts attention becomes the bandwidth bottleneck.",
+      "Follow-up: What reduces it? — Fewer bytes: KV-cache quantisation to FP8, fewer KV heads (GQA, or compressed latent attention as in DeepSeek's MLA), sliding-window layers, and higher-bandwidth GPUs."
+    ],
+    [
+      "M",
+      "What is MBU and how would you compute it for a served model?",
+      "Model bandwidth utilisation is the bytes that must be read per decode step times steps per second, divided by peak bandwidth. PyTorch's gpt-fast example: a 7B model in FP16 is 14 GB; at 107 tokens per second on an A100 that is about 1.5 TB/s against about 2 TB/s peak — roughly 72% MBU, close to what a plain memory copy achieves. At that point the only big wins left change the bytes (quantisation) or the number of steps (speculative decoding).",
+      "Follow-up: Why not MFU for decoding? — At batch 1, MFU is below 1% by construction; it measures the wrong resource. MBU says how close you are to the real ceiling."
+    ],
+    [
+      "M",
+      "LayerNorm takes 8% of your training step. How do you decide whether it's worth optimising, and how?",
+      "Compute its roofline time: it reads and writes the activation tensor with a handful of FLOPs per element, so its minimum time is bytes divided by bandwidth. If the profiled kernel is already near that — say 85% of peak bandwidth — a better standalone kernel can't help. The fix is to stop moving the bytes separately: fuse the norm with the preceding residual add or the following matmul's input read, via torch.compile, a Triton kernel or a library fused op."
+    ],
+    [
+      "H",
+      "How do 4-bit weight quantisation and FP8 compute each move you on the roofline?",
+      "Weight-only 4-bit quantisation cuts bytes per weight by 4×, moving the operation right (intensity × 4) without changing the roof, so memory-bound decode speeds up almost proportionally while compute-bound prefill doesn't. FP8 compute doubles the tensor-core roof and the ridge point: compute-bound prefill and training get faster, while memory-bound decode only benefits if its bytes also shrink — which FP8 weights do by 2×.",
+      "Follow-up: Which would you pick for a chatbot with short prompts and long answers? — Decode dominates and is memory-bound, so weight (and KV) quantisation gives the larger gain; FP8 compute matters more for long-prompt, prefill-heavy workloads."
+    ],
+    [
+      "H",
+      "Your transformer training step is 1.8× slower than the sum of its matmuls' roofline times. What is in the gap, and how do you attribute it?",
+      "Real steps are a sequence of kernels, so total time is the sum of each kernel's time, not a single roofline. The gap usually holds memory-bound kernels (norms, activations, softmax, dropout, optimiser update), matmuls running below their roofline because of shapes or waves, communication not overlapped with compute, and idle gaps from CPU overhead. Profile, group kernels by type, compute each group's roofline time from FLOPs and bytes, and compare: the biggest difference between measured and bound is the best target.",
+      "Follow-up: How much can fusion recover? — Typically most of the element-wise time: FlashAttention and fused norm/activation kernels routinely cut non-matmul time by half or more in transformer training."
+    ],
+    [
+      "H",
+      "Explain the hierarchical roofline and how it explains FlashAttention's speed-up.",
+      "Each memory level has its own bandwidth, so a kernel has a separate intensity and roof for HBM, L2 and shared memory. Standard attention writes the N × N score matrix to HBM and reads it back, so its HBM intensity is low. FlashAttention computes the same result in tiles held in shared memory and registers, never materialising the matrix, which cuts HBM bytes by a large factor. FLOPs are unchanged (even slightly higher from recomputation), but HBM intensity rises enough to become compute-bound."
+    ],
+    [
+      "H",
+      "How does the roofline idea extend to multi-GPU communication?",
+      "Replace HBM bandwidth with link bandwidth and bytes read with bytes sent: the intensity is FLOPs of local computation per byte communicated. With tensor parallelism, each layer does roughly 2·B·d²·(constant)/TP FLOPs per GPU but must all-reduce activations of about B·d elements, so intensity per NVLink byte grows with d/TP. When it falls below the link's ridge point (peak FLOP/s ÷ link bandwidth — for an H100 over NVLink at 450 GB/s each way, about 2,200 FLOP/byte), communication dominates; that's why tensor parallelism stays inside NVLink domains and data parallelism goes over the slower network.",
+      "Follow-up: Can communication hide behind compute? — Yes, if they overlap; then the step time is the max of the two rather than the sum, which is why frameworks launch collectives on separate streams."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Roofline: An Insightful Visual Performance Model for Multicore Architectures",
+      "Williams, Waterman and Patterson (2009) — the original roofline paper.",
+      "https://people.eecs.berkeley.edu/~kubitron/cs252/handouts/papers/RooflineVyNoYellow.pdf"
+    ],
+    [
+      "book",
+      "How to Scale Your Model: All About Rooflines",
+      "The roofline chapter of Google DeepMind's scaling book, applied to matmuls and communication with worked problems.",
+      "https://jax-ml.github.io/scaling-book/roofline/"
+    ],
+    [
+      "post",
+      "Accelerating Generative AI with PyTorch II: GPT, Fast",
+      "A step-by-step decode optimisation of Llama-7B on an A100 reasoned entirely with overhead, bandwidth and MBU.",
+      "https://pytorch.org/blog/accelerating-generative-ai-2/"
+    ],
+    [
+      "docs",
+      "NVIDIA: GPU Performance Background",
+      "Arithmetic intensity, math- versus memory-bound operations and how tensor dimensions affect them.",
+      "https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html"
+    ],
+    [
+      "post",
+      "Making Deep Learning Go Brrrr From First Principles",
+      "Horace He — the compute/bandwidth/overhead framing with worked examples.",
+      "https://horace.io/brrr_intro.html"
+    ],
+    [
+      "post",
+      "LLM Inference Performance Engineering: Best Practices",
+      "Databricks' guide to serving metrics, including MBU measured across batch sizes and tensor-parallel degrees.",
+      "https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices"
+    ],
+    [
+      "docs",
+      "Nsight Compute Profiling Guide",
+      "NVIDIA's profiler documentation, including the roofline chart and speed-of-light sections that place a kernel against its ceilings.",
+      "https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>An inference team serves a 70-billion-parameter model on H100s. Latency is too high, so they propose three fixes: upgrade to B200s, which have more than twice the FLOPs; rewrite the attention kernel; or quantise the weights to 4 bits. Each costs weeks. Someone else asks a better question first: <em>what is this workload actually waiting for?</em> For a chatbot generating answers one token at a time, it turns out to be waiting for memory — reading 140 GB of weights for every token — while the arithmetic units sit more than 99% idle. That single observation ranks the options immediately. Quantising the weights cuts the bytes by four and should help a lot. The B200 helps, but because its memory is 2.4× faster, not because of its FLOPs. Rewriting attention helps only if attention is where the bytes are.</p>
+<p>Now flip the workload: the same team fine-tunes the model on long documents. Here thousands of tokens pass through each weight matrix at once, the arithmetic units are the bottleneck, and 4-bit weights do almost nothing for speed, while FP8 arithmetic nearly doubles it. Same model, same hardware, opposite advice. Engineers who don't know which situation they are in waste months optimising the wrong thing.</p>
+<p>The <strong>roofline model</strong> is the tool that tells you which situation you're in. It needs only two numbers about an operation — how many floating-point operations it does and how many bytes it moves — and two numbers about the chip — peak FLOP/s and memory bandwidth. From them it gives an upper bound on speed, names the bottleneck, and shows which optimisations can possibly help. It is the single most useful model in ML performance work and the one interviewers lean on most: "why is decoding memory-bound?", "why does batching help?", "why did quantisation make it faster but not twice as fast?".</p>
+<p>This lesson teaches you to count FLOPs and bytes for real operations, to draw and read the roofline, to derive why a matmul's intensity is roughly its batch size and why decode attention's is the GQA group size, and to place every piece of a transformer on the chart. We then walk through a real, public optimisation — PyTorch's gpt-fast, which took Llama-7B decoding on an A100 from 25 to over 200 tokens per second — explaining each step with the roofline, and finish with the limits of the model and how it is used in production.</p>
+</section>
+
+<section data-field="primer">
+<h4>The loading dock and the assembly line</h4>
+<p>Picture a factory with a loading dock and an assembly line. Crates of parts arrive at the dock at a fixed rate — say 100 crates an hour. The assembly line can do a fixed amount of work per hour. Whether the factory is limited by the dock or the line depends on one thing: <em>how much work each crate enables</em>. If each crate holds one bolt that takes a second to fit, the line sits idle waiting for crates; the dock is the bottleneck. If each crate holds a kit that takes an hour to assemble, crates pile up; the line is the bottleneck. Between the two there is a break-even amount of work per crate at which both are exactly busy.</p>
+<p>A GPU is that factory. The loading dock is <strong>memory bandwidth</strong> — how many bytes per second HBM can deliver to the SMs (3.35 TB/s on an H100). The assembly line is <strong>peak compute</strong> — how many floating-point operations per second the tensor cores can do (about 989 trillion in BF16, dense). "Work per crate" is <strong>arithmetic intensity</strong>:</p>
+<pre>arithmetic intensity = FLOPs performed / bytes moved to and from memory</pre>
+<p>The break-even point is the <strong>ridge point</strong>: peak FLOP/s ÷ bandwidth = 989 × 10<sup>12</sup> / 3.35 × 10<sup>12</sup> ≈ <strong>295 FLOP/byte</strong> for an H100. An operation doing fewer than 295 FLOPs per byte it moves will leave tensor cores idle waiting for data — it is <strong>memory-bound</strong>. One doing more will leave memory idle waiting for arithmetic — it is <strong>compute-bound</strong>.</p>
+<p>Where the analogy breaks: a real factory's crates can be reused only once, but a GPU can keep data on chip and reuse it many times — which is exactly how good kernels raise their intensity. Intensity is not fixed by the problem; it depends on how cleverly the work is organised.</p>
+<h4>The roofline picture</h4>
+<p>The whole model is one line of algebra:</p>
+<pre>attainable FLOP/s = min( peak FLOP/s,  intensity × bandwidth )</pre>
+<p>Plotted with intensity on the horizontal axis and FLOP/s on the vertical, both on logarithmic scales, it looks like a roof: a rising slope on the left, where speed is intensity × bandwidth, and a flat top on the right, where speed is peak compute. The two meet at the ridge point.</p>
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Log-log roofline for an H100: a sloped memory roof rising to the BF16 ridge point at 295 FLOP per byte, a lower flat FP32 roof at 67 TFLOP/s, and operations placed on it from LayerNorm at 2 FLOP per byte to prefill matmuls at 2,700">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="70" y1="250" x2="615" y2="250" style="stroke:var(--line-2);fill:none"/>
+    <line x1="70" y1="250" x2="70" y2="30" style="stroke:var(--line-2);fill:none"/>
+    <g style="fill:var(--muted);font-size:11px">
+      <text x="70" y="266" text-anchor="middle">0.1</text><text x="178" y="266" text-anchor="middle">1</text><text x="286" y="266" text-anchor="middle">10</text><text x="394" y="266" text-anchor="middle">100</text><text x="502" y="266" text-anchor="middle">1,000</text><text x="610" y="266" text-anchor="middle">10,000</text>
+      <text x="62" y="254" text-anchor="end">1</text><text x="62" y="191" text-anchor="end">10</text><text x="62" y="128" text-anchor="end">100</text><text x="62" y="65" text-anchor="end">1,000</text>
+    </g>
+    <text x="340" y="288" text-anchor="middle" style="fill:var(--ink-2)">arithmetic intensity (FLOP per byte of HBM traffic, log scale)</text>
+    <text x="16" y="140" text-anchor="middle" transform="rotate(-90 16 140)" style="fill:var(--ink-2)">TFLOP/s (log)</text>
+    <line x1="121" y1="250" x2="445" y2="62" style="stroke:var(--accent);stroke-width:2.5;fill:none"/>
+    <line x1="445" y1="62" x2="610" y2="62" style="stroke:var(--accent);stroke-width:2.5;fill:none"/>
+    <line x1="318" y1="135" x2="610" y2="135" style="stroke:var(--s3);stroke-width:1.5;stroke-dasharray:5 4;fill:none"/>
+    <text x="608" y="128" text-anchor="end" style="fill:var(--ink-2);font-size:11px">FP32 CUDA-core roof, 67 TF</text>
+    <text x="608" y="55" text-anchor="end" style="fill:var(--ink);font-size:11px">BF16 tensor-core roof, 989 TF</text>
+    <line x1="445" y1="62" x2="445" y2="250" style="stroke:var(--line-2);stroke-dasharray:3 3;fill:none"/>
+    <text x="449" y="244" style="fill:var(--ink-2);font-size:11px">ridge 295</text>
+    <text x="200" y="130" transform="rotate(-30 200 130)" style="fill:var(--ink-2);font-size:11px">memory roof: 3.35 TB/s × intensity</text>
+    <g style="font-size:11px">
+      <circle cx="210" cy="198" r="5" style="fill:var(--crit)"/><text x="218" y="212" style="fill:var(--ink)">LayerNorm ~2</text>
+      <circle cx="178" cy="217" r="5" style="fill:var(--crit)"/><text x="120" y="236" style="fill:var(--ink)">decode B=1 ~1</text>
+      <circle cx="275" cy="160" r="5" style="fill:var(--s5)"/><text x="283" y="170" style="fill:var(--ink)">decode attention ~8</text>
+      <circle cx="372" cy="104" r="5" style="fill:var(--s2)"/><text x="380" y="114" style="fill:var(--ink)">decode B=64</text>
+      <circle cx="549" cy="62" r="5" style="fill:var(--good)"/><text x="549" y="84" text-anchor="middle" style="fill:var(--ink)">prefill / training</text>
+    </g>
+  </g>
+</svg>
+<figcaption>Every operation sits on or below the roof at its own intensity. The slope is the memory limit, the flat top the compute limit. Note that non-matmul work runs on CUDA cores and has a lower flat roof (dashed), and that everything left of the ridge ignores most of the chip's 989 TFLOP/s.</figcaption>
+</figure>
+<p>Reading the chart gives you the whole method. Find the operation's intensity on the x-axis; go up to the roof; that height is the best FLOP/s it can reach. If you are on the slope, making arithmetic faster does nothing — you need to move right (more FLOPs per byte) or raise the slope (more bandwidth). If you are on the flat top, moving right does nothing — you need a higher roof (faster arithmetic, such as FP8) or less work. The rest of this lesson is about computing intensities correctly and knowing which moves are available.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Counting FLOPs</h4>
+<p>A <strong>FLOP</strong> is one floating-point addition or multiplication. Counting them for ML operations needs only a few rules.</p>
+<p><strong>Matrix multiplication.</strong> Multiplying an m × k matrix by a k × n matrix produces m × n outputs, each a dot product of length k: k multiplies and k − 1 adds, which we round to 2k. Total: <strong>2·m·k·n FLOPs</strong>. This rule is the workhorse; learn it cold. A [1, 8,192] × [8,192, 8,192] matrix-vector product is 2 × 8,192<sup>2</sup> ≈ 134 million FLOPs; an [8,192, 8,192] × [8,192, 8,192] matmul is 2 × 8,192<sup>3</sup> ≈ 1.1 trillion.</p>
+<p><strong>Element-wise operations</strong> — add, multiply, GELU, dropout — do a small constant number of FLOPs per element: one for an add, perhaps 10-20 for a GELU using a tanh approximation. <strong>Reductions and normalisations</strong> such as softmax and LayerNorm do a handful per element too: softmax computes a maximum, subtracts it, exponentiates, sums and divides, around 5 per element. Precision here is rarely important, because these operations are almost never limited by FLOPs — as we'll see, the bytes decide their speed.</p>
+<p>Two cautions. Some sources count a multiply-add as one operation ("MACs"); in this track one multiply-add is 2 FLOPs, matching how NVIDIA quotes peak TFLOP/s. And the FLOPs that matter for the roofline are those executed on the unit you're comparing against: matmuls run on tensor cores, everything else on the CUDA cores, which on an H100 have a roof about 15 times lower (67 TFLOP/s in FP32).</p>
+
+<h4>2. Counting bytes</h4>
+<p>For the roofline we count the <strong>minimum traffic to HBM</strong>: every input read once, every output written once. That is what an ideal kernel achieves, because it keeps anything it reuses on chip. Real kernels can move more (if tiles don't fit on chip and data is re-read) or occasionally less (if a small operand stays in the 50 MB L2 cache between kernels), but the minimum is the right starting point.</p>
+<p>Bytes depend on the number format: 4 bytes per element for FP32, 2 for BF16 or FP16, 1 for FP8 or int8, half a byte for 4-bit formats. For a BF16 matmul of m × k by k × n, the minimum traffic is 2·(m·k + k·n + m·n) bytes — read both inputs, write the output.</p>
+
+<h4>3. Intensities of common operations</h4>
+<p>Put the two counts together. All examples are BF16 unless stated.</p>
+<table><thead><tr><th>Operation</th><th>FLOPs</th><th>Bytes</th><th>Intensity (FLOP/byte)</th></tr></thead><tbody>
+<tr><td>Add two vectors of n elements</td><td>n</td><td>6n (read 2, write 1)</td><td>0.17</td></tr>
+<tr><td>GELU on n elements (~14 FLOPs each)</td><td>14n</td><td>4n</td><td>~3.5</td></tr>
+<tr><td>LayerNorm on n elements (~8 FLOPs each)</td><td>8n</td><td>4n</td><td>~2</td></tr>
+<tr><td>Softmax on n elements (~5 FLOPs each)</td><td>5n</td><td>4n</td><td>~1.25</td></tr>
+<tr><td>Matrix-vector: [1, d] × [d, d]</td><td>2d²</td><td>≈2d²</td><td>≈1</td></tr>
+<tr><td>Square matmul: [n, n] × [n, n]</td><td>2n³</td><td>6n²</td><td>n/3 (2,731 at n = 8,192)</td></tr>
+</tbody></table>
+<p>The pattern is stark. Everything that is not a matrix multiplication sits between 0.1 and 5 FLOP/byte — two or three orders of magnitude below the H100's ridge at 295. A matrix-vector product is no better. Only matrix-matrix products with large dimensions reach the compute-bound region, and they do so because each loaded element takes part in many multiplications: in an n × n matmul, each input element is used n times.</p>
+<p>A worked check: a GELU on a [8,192, 8,192] BF16 tensor (67 million elements) moves 4 × 67 M = 268 MB. At 3.35 TB/s that takes at least 80 µs. Its 940 million FLOPs would take 14 µs even on the FP32 lanes. So its roofline time is 80 µs, and a well-written GELU kernel runs in perhaps 90 µs. No kernel trick can do much better — except not reading and writing the tensor at all, by computing GELU inside the matmul that produced it. That is <strong>kernel fusion</strong>, and it is the entire reason compilers like <code>torch.compile</code> and tools like Triton exist (gpu6).</p>
+
+<h4>4. The roofline, precisely</h4>
+<p>With intensity I, peak compute P and bandwidth W, the best achievable rate is min(P, I × W), and the best achievable time for an operation with F FLOPs and Q bytes is:</p>
+<pre>time ≥ max( F / P ,  Q / W )</pre>
+<p>These are the same statement: whichever resource takes longer sets the time. The ridge point I* = P / W is where F/P = Q/W. Notice two things about the H100 numbers. First, the memory slope is so shallow relative to the roof that an operation at intensity 10 reaches only 33.5 TFLOP/s — 3% of peak. Second, there is not just one roof. Each precision and unit has its own: FP32 on CUDA cores 67 TFLOP/s, TF32 on tensor cores about 494, BF16 about 989, FP8 about 1,979. The ridge point moves with the roof: for FP8 compute, it is 1,979 / 3.35 ≈ 590 FLOP/byte. Using a faster format raises the ceiling but also means you need more reuse to reach it.</p>
+<p>The same arithmetic applies to every GPU. The ridge point was about 153 on the A100, is about 295 on the H100, about 206 on the H200 (same compute, 4.8 TB/s), and about 281 on the B200 (2.25 PFLOP/s, 8 TB/s). A lower ridge point means more operations are compute-bound — the H200 is the "memory-bound workloads" edition of the H100.</p>
+
+<h4>5. Batch size and the matmul: the free-lunch zone</h4>
+<p>The most important derivation in LLM performance: a batch of B token vectors, each of width d, multiplied by a d × f weight matrix. FLOPs are 2·B·d·f. Bytes are 2·B·d (activations in) + 2·d·f (weights) + 2·B·f (activations out). When B is much smaller than d and f — as in decoding, where B is the number of sequences, maybe 1 to 256, and d and f are several thousand — the weight term dominates the bytes:</p>
+<pre>intensity = 2·B·d·f / (2·B·d + 2·d·f + 2·B·f)  ≈  2·B·d·f / 2·d·f  =  B</pre>
+<p><strong>Intensity is roughly the batch size.</strong> One sequence reads each 2-byte weight to do 2 FLOPs: 1 FLOP/byte. Sixty-four sequences read each weight once and use it 64 times: 64 FLOP/byte. The weight read is shared by the whole batch; the activations are tiny by comparison. On an H100, the weight matmuls cross the ridge at roughly B ≈ 300.</p>
+<p>Concretely, take the MLP up-projection of a 70B-class model: d = 8,192, f = 28,672, weights 470 MB in BF16. From the roofline:</p>
+<table><thead><tr><th>Batch B</th><th>Intensity</th><th>Attainable</th><th>Time per step</th><th>Time per token</th></tr></thead><tbody>
+<tr><td>1</td><td>1.0</td><td>3 TFLOP/s</td><td>140 µs</td><td>140 µs</td></tr>
+<tr><td>8</td><td>8</td><td>27 TFLOP/s</td><td>140 µs</td><td>17.5 µs</td></tr>
+<tr><td>64</td><td>63</td><td>212 TFLOP/s</td><td>142 µs</td><td>2.2 µs</td></tr>
+<tr><td>256</td><td>246</td><td>824 TFLOP/s</td><td>146 µs</td><td>0.57 µs</td></tr>
+<tr><td>1,024</td><td>882</td><td>989 TFLOP/s (compute-bound)</td><td>486 µs</td><td>0.47 µs</td></tr>
+</tbody></table>
+<p>From batch 1 to 256 the step time barely moves — 140 µs to 146 µs — because it is set by reading 470 MB of weights, and the extra arithmetic is hidden inside that time. Throughput rises 256-fold for nothing. This is the <strong>free-lunch zone</strong>, and it is why every LLM server batches requests together (continuous batching, lm13). Past the ridge the lunch ends: at B = 1,024 the step takes 3.3 times longer, and cost per token only falls from 0.57 to 0.47 µs.</p>
+<figure>
+<svg viewBox="0 0 640 290" width="100%" role="img" aria-label="Time per token versus batch size on log-log axes for a 70B-class MLP matmul on an H100: BF16 weights fall from 140 microseconds at batch 1 to a floor of 0.47 at batch 1,024; int4 weights start 4 times lower but reach the same floor earlier">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="80" y1="250" x2="610" y2="250" style="stroke:var(--line-2);fill:none"/>
+    <line x1="80" y1="250" x2="80" y2="40" style="stroke:var(--line-2);fill:none"/>
+    <g style="fill:var(--muted);font-size:11px">
+      <text x="80" y="266" text-anchor="middle">1</text><text x="210" y="266" text-anchor="middle">8</text><text x="340" y="266" text-anchor="middle">64</text><text x="427" y="266" text-anchor="middle">256</text><text x="513" y="266" text-anchor="middle">1,024</text><text x="600" y="266" text-anchor="middle">4,096</text>
+      <text x="72" y="254" text-anchor="end">0.1</text><text x="72" y="204" text-anchor="end">1</text><text x="72" y="154" text-anchor="end">10</text><text x="72" y="104" text-anchor="end">100</text><text x="72" y="54" text-anchor="end">1,000</text>
+    </g>
+    <text x="345" y="286" text-anchor="middle" style="fill:var(--ink-2)">batch size B (log scale)</text>
+    <text x="18" y="150" text-anchor="middle" transform="rotate(-90 18 150)" style="fill:var(--ink-2)">µs per token (log)</text>
+    <polyline points="80,93 210,138 340,183 427,212 513,216 600,216" style="stroke:var(--accent);stroke-width:2.5;fill:none"/>
+    <polyline points="80,123 210,168 340,212 427,216 513,216 600,216" style="stroke:var(--s2);stroke-width:2.5;stroke-dasharray:6 4;fill:none"/>
+    <line x1="455" y1="40" x2="455" y2="250" style="stroke:var(--line-2);stroke-dasharray:3 3;fill:none"/>
+    <text x="459" y="56" style="fill:var(--ink-2);font-size:11px">BF16 ridge ≈ B 300</text>
+    <text x="120" y="86" style="fill:var(--ink);font-size:11px">BF16 weights</text>
+    <text x="120" y="140" style="fill:var(--ink);font-size:11px">int4 weights (4× fewer bytes)</text>
+    <text x="520" y="206" style="fill:var(--ink-2);font-size:11px">compute floor</text>
+    <text x="200" y="236" style="fill:var(--muted);font-size:11px">memory-bound: step time flat, cost per token ∝ 1/B</text>
+  </g>
+</svg>
+<figcaption>While memory-bound, doubling the batch halves the cost per token for free. Quantised weights shift the whole left part down by 4× but hit the same compute floor sooner — they help small batches most and large batches not at all.</figcaption>
+</figure>
+<p>The same formula explains why <strong>prefill and training are compute-bound</strong>: a prompt of 2,000 tokens through the same matrix is B = 2,000 rows, intensity around 1,500, well above the ridge. "Prefill of 300 tokens" and "decode batch of 300 sequences" have identical intensity for the weight matmuls — both are 300 rows through the weights.</p>
+
+<h4>6. Decode attention: the part batching can't fix</h4>
+<p>Attention during decoding is different, because its "weights" are the <strong>KV cache</strong> (lm5): the key and value vectors of every earlier token in <em>this</em> sequence. Nothing is shared between sequences, so batching doesn't amortise anything.</p>
+<p>Count one KV head over a context of L tokens with head dimension d<sub>h</sub>, in BF16. Reading K and V costs 2 × L × d<sub>h</sub> × 2 bytes = 4·L·d<sub>h</sub> bytes. With <strong>grouped-query attention</strong> (GQA), g query heads share that KV head — Llama 3 70B has 64 query heads and 8 KV heads, so g = 8. Each query head computes its scores against all L keys (2·L·d<sub>h</sub> FLOPs) and a weighted sum of all L values (another 2·L·d<sub>h</sub>): 4·L·d<sub>h</sub> FLOPs per query head, 4·g·L·d<sub>h</sub> for the group. Intensity = 4·g·L·d<sub>h</sub> / 4·L·d<sub>h</sub> = <strong>g</strong>. With g = 8, decode attention runs at 8 FLOP/byte — permanently memory-bound, whatever the batch size and context length.</p>
+<p>And the bytes are large. Llama 3 70B has 80 layers, 8 KV heads and d<sub>h</sub> = 128, so each token's cache is 2 (K and V) × 80 × 8 × 128 × 2 bytes ≈ 0.33 MB. A sequence with 8,000 tokens of context carries 2.6 GB of cache, all read at every decode step. A batch of 64 such sequences reads about 170 GB of KV per step — more than the 140 GB of weights. At long context, attention, not the weight matmuls, dominates decode time.</p>
+
+<h4>7. A full decode step, end to end</h4>
+<p>Put the pieces together for a realistic serving setup: a 70B model in BF16 on eight H100s using tensor parallelism (each GPU holds an eighth of every weight matrix — dl9 and gpu10 cover this), 32 concurrent sequences with 4,096 tokens of context each.</p>
+<ul>
+<li><strong>Weight bytes per GPU per step:</strong> 140 GB / 8 = 17.5 GB.</li>
+<li><strong>KV bytes per GPU per step:</strong> 32 × 4,096 tokens × 0.33 MB = 43 GB across the system, 5.4 GB per GPU.</li>
+<li><strong>Memory time:</strong> (17.5 + 5.4) GB / 3.35 TB/s ≈ <strong>6.8 ms</strong>.</li>
+<li><strong>FLOPs per GPU:</strong> weights 2 × 70 × 10<sup>9</sup> × 32 / 8 ≈ 0.56 TFLOP; attention 4 × 8 query heads per KV head × 4,096 × 128 × 80 layers × 8 KV heads × 32 sequences / 8 GPUs ≈ 0.04 TFLOP. At 989 TFLOP/s: <strong>about 0.6 ms</strong>.</li>
+</ul>
+<p>The step is memory-bound by more than 10×: the roofline minimum is about 6.8 ms per step, so at best 32 / 0.0068 ≈ 4,700 tokens per second across the server, or about 147 tokens per second per user, before communication and overhead (which gpu10 adds). The breakdown also tells you what to do next: weights are three-quarters of the bytes, so FP8 or 4-bit weights are the biggest lever; KV is the rest and grows with batch and context, so KV quantisation matters more as traffic grows; faster FLOPs are irrelevant here.</p>
+
+<h4>8. The moves: how each optimisation shifts you on the chart</h4>
+<p>Every performance technique in this track is one of a few moves on the roofline.</p>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Roofline with arrows showing four moves: batching and fusion and weight quantisation move an operation right along the memory slope; a faster number format raises the flat roof; more bandwidth steepens the slope">
+  <defs><marker id="gpu2-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="60" y1="240" x2="620" y2="240" style="stroke:var(--line-2);fill:none"/>
+    <line x1="60" y1="240" x2="60" y2="20" style="stroke:var(--line-2);fill:none"/>
+    <text x="340" y="262" text-anchor="middle" style="fill:var(--ink-2)">intensity (log) →</text>
+    <line x1="80" y1="230" x2="400" y2="90" style="stroke:var(--accent);stroke-width:2.5;fill:none"/>
+    <line x1="400" y1="90" x2="610" y2="90" style="stroke:var(--accent);stroke-width:2.5;fill:none"/>
+    <line x1="430" y1="45" x2="610" y2="45" style="stroke:var(--good);stroke-width:2;stroke-dasharray:6 4;fill:none"/>
+    <text x="610" y="38" text-anchor="end" style="fill:var(--ink);font-size:11px">FP8 / FP4 raises the roof</text>
+    <line x1="520" y1="85" x2="520" y2="52" marker-end="url(#gpu2-arrow)" style="stroke:var(--good);stroke-width:1.5;fill:none"/>
+    <line x1="80" y1="215" x2="340" y2="60" style="stroke:var(--s3);stroke-width:1.5;stroke-dasharray:4 4;fill:none"/>
+    <text x="150" y="130" style="fill:var(--ink-2);font-size:11px">more bandwidth (H200, B200):</text>
+    <text x="150" y="145" style="fill:var(--ink-2);font-size:11px">steeper slope</text>
+    <circle cx="150" cy="199" r="6" style="fill:var(--crit)"/>
+    <line x1="160" y1="196" x2="300" y2="136" marker-end="url(#gpu2-arrow)" style="stroke:var(--ink-2);stroke-width:1.5;fill:none"/>
+    <circle cx="310" cy="129" r="6" style="fill:var(--s2)"/>
+    <text x="215" y="205" style="fill:var(--ink);font-size:11px">batching, fusion, weight</text>
+    <text x="215" y="220" style="fill:var(--ink);font-size:11px">quantisation, on-chip reuse: move right</text>
+    <text x="410" y="120" style="fill:var(--ink-2);font-size:11px">right of the ridge, moving</text>
+    <text x="410" y="135" style="fill:var(--ink-2);font-size:11px">further right gains nothing</text>
+  </g>
+</svg>
+<figcaption>Below the ridge, the useful moves are "go right" (fewer bytes per FLOP) or "steeper slope" (more bandwidth). Above it, only "higher roof" (faster arithmetic) or fewer FLOPs help. Picking the move that matches your position is the whole skill.</figcaption>
+</figure>
+<ul>
+<li><strong>Batching</strong> raises intensity for anything with shared weights (move right).</li>
+<li><strong>Fusion</strong> removes intermediate reads and writes: a fused matmul + bias + GELU does the same FLOPs but skips 2 passes over the activation (move right).</li>
+<li><strong>On-chip reuse / tiling</strong> — FlashAttention, tiled matmuls — keeps data in shared memory so each HBM byte serves more FLOPs (move right).</li>
+<li><strong>Weight or KV quantisation</strong> halves or quarters the bytes (move right) without changing the arithmetic format.</li>
+<li><strong>Lower-precision arithmetic</strong> (FP8, FP4) raises the roof and the ridge; it helps only operations already near or above the ridge.</li>
+<li><strong>More bandwidth</strong> (H200, B200, Rubin) steepens the slope, speeding every memory-bound operation proportionally.</li>
+</ul>
+
+<h4>9. A real case: gpt-fast, step by step</h4>
+<p>In late 2023 the PyTorch team published "GPT, Fast": a from-scratch Llama-7B decoder in under 1,000 lines of plain PyTorch, benchmarked at batch size 1 on an A100-80GB (power-limited to 330 W). Every step is a roofline argument.</p>
+<p><strong>Start: 25.5 tokens/s.</strong> The first version was <em>overhead-bound</em>: the trace showed the GPU idle between hundreds of tiny kernel launches while single-threaded Python decided what to do next. It sat far below the roofline entirely.</p>
+<p><strong>torch.compile with CUDA graphs and a static KV cache: 107 tokens/s.</strong> Compiling the decode step into one captured graph removed the launch gaps (gpu6). Now check against the roofline: 7 billion parameters × 2 bytes = 14 GB read per token; 14 GB × 107 tokens/s ≈ 1.5 TB/s, against the A100's roughly 2 TB/s. The team called this <strong>model bandwidth utilisation</strong> (MBU) of about 72% — close to what even a plain memory copy achieves. The conclusion: at batch 1 there is at most 10-20% left from better kernels. To go faster, change the bytes.</p>
+<p><strong>int8 weight-only quantisation: 157 tokens/s.</strong> Weights stored in 8 bits, converted to BF16 inside the fused kernel: half the bytes, about 50% faster. A revealing detail: without torch.compile, the int8 version was <em>slower</em> than FP16, because the dequantisation ran as a separate kernel that wrote the BF16 weights back to memory — adding bytes instead of removing them.</p>
+<p><strong>int4 with GPTQ: 202 tokens/s.</strong> A quarter of the bytes, with per-32-element scale factors and GPTQ — a method that uses sample data to choose rounded weights that minimise the layer's output error (lm12) — to protect accuracy, and hand-written fused int4 kernels.</p>
+<p><strong>Speculative decoding: up to 244.7 tokens/s combined.</strong> This one changes the problem: a small draft model proposes several tokens and the large model checks them all in one pass, which is a batch of several rows through the weights — more FLOPs per weight read (move right). The gains depended on how often the draft was right: about 2× for CodeLlama-34B with a 7B draft on code, 1.3× for Llama-7B with TinyLlama.</p>
+<p><strong>Tensor parallelism:</strong> splitting each matrix across GPUs adds their bandwidths together, which is why Llama-70B reached 80 tokens/s on several GPUs. From 25 to over 240 tokens/s — nearly 10× — with no new hardware, each step chosen by asking which ceiling was nearest.</p>
+</section>
+
+<section data-field="deep">
+<h4>Realistic ceilings and the "speed of light"</h4>
+<p>The datasheet roofs are theoretical. A well-tuned large BF16 GEMM on an H100 typically sustains around 70-80% of the dense peak, because clocks fall under the 700 W power limit and pipelines have start-up and tail costs. Memory-bound kernels top out at roughly 80-90% of HBM bandwidth; gpt-fast noted that "even just copying memory struggles to break 85%". Performance engineers therefore draw an <em>empirical</em> roofline from measured peak GEMM and memory-copy throughput, and judge a kernel against that. NVIDIA's Nsight Compute presents this as "speed of light" percentages — how close a kernel is to the compute and memory ceilings — and can draw the roofline chart with the kernel plotted on it. A kernel at 20% of both ceilings has a problem the roofline can't see: latency, launch overhead or too little parallelism.</p>
+<h4>Hierarchical rooflines</h4>
+<p>Every memory level has its own bandwidth: HBM at 3.35 TB/s, L2 several times higher, shared memory tens of TB/s summed across SMs. A kernel therefore has a separate intensity for each level — FLOPs per byte of HBM traffic, per byte of L2 traffic, per byte of shared-memory traffic — and a separate slope. A tiled matmul may be far above the ridge relative to HBM yet close to the shared-memory limit, which is why kernel authors care about bank conflicts and register reuse. FlashAttention (gpu7) is the canonical example: standard attention writes the N × N score matrix to HBM and reads it back several times, which puts it on the HBM slope. FlashAttention computes the same result tile by tile in shared memory, never storing the matrix, cutting HBM traffic by a large factor. The FLOPs even rise slightly (it recomputes some values), but HBM intensity rises far more, and the kernel moves up to the compute roof.</p>
+<h4>The sum of rooflines is not a roofline</h4>
+<p>A transformer layer is a sequence of kernels. Unless operations overlap, the step's time is the <em>sum</em> of each kernel's max(F/P, Q/W), not the max of the summed FLOPs and bytes. This is why adding a memory-bound LayerNorm to a compute-bound matmul costs the LayerNorm's full memory time even though "the step is compute-bound overall". It is also why fusion is so effective: fusing a memory-bound operation into a compute-bound one lets its bytes hide under the matmul's arithmetic, turning a sum into a max.</p>
+<h4>Caches can put you above the HBM roof</h4>
+<p>The HBM slope assumes every byte comes from HBM. If a small tensor — a bias, a small weight matrix, a KV block used by many query tiles — is still in the 50 MB L2 cache from a previous kernel, the effective bandwidth is higher and the measured point lands above the HBM line. That is fine, not a measurement error; it means the relevant roof is L2. Conversely, a kernel with poor locality that re-reads the same data from HBM moves more than the minimum and lands below the ideal.</p>
+<h4>Latency- and overhead-bound regions below the roof</h4>
+<p>The roofline assumes enough parallel work to keep the machine busy. A matmul with B = 1 and a small d may launch only a few dozen thread blocks for 132 SMs; it is neither bandwidth- nor compute-bound but <em>parallelism-bound</em>. Kernels lasting a few microseconds are dominated by launch overhead. Both sit well below the roof, and the fixes — CUDA graphs, fusing many tiny ops, split-K matmuls that spread one small matmul over more SMs — are different from the roofline moves. Always compare measured time with the roofline bound: a large gap means you are in one of these regimes.</p>
+<h4>Rooflines for communication</h4>
+<p>The same idea governs multi-GPU work (gpu8). Replace HBM bandwidth with link bandwidth and bytes read with bytes sent: the "communication intensity" is FLOPs of local work per byte communicated, and the ridge is peak FLOP/s divided by link bandwidth — for an H100 sending over NVLink at 450 GB/s in each direction (NVIDIA's 900 GB/s figure counts both directions) about 2,200 FLOP/byte, and over a 400 Gb/s (50 GB/s) InfiniBand link about 20,000. With tensor parallelism across T GPUs, each layer's matmuls give each GPU roughly 2·B·d·f/T FLOPs, while the all-reduce of the output sends on the order of B·d elements; intensity scales like f/T. That is why tensor parallelism stays within a server's NVLink domain and why data parallelism, which communicates once per step, can span the slower network.</p>
+<h4>Energy has a roofline too</h4>
+<p>Moving a byte from HBM costs far more energy than a multiply-add on data already in registers — an order of magnitude or more. So memory-bound workloads are not only slow but energy-inefficient, and techniques that cut bytes (fusion, quantisation, on-chip reuse) also cut power. At data-centre scale, where power is the binding constraint on how many GPUs can be installed, this is increasingly the argument that decides architecture choices.</p>
+</section>
+
+<section data-field="prod">
+<h4>How teams use the roofline day to day</h4>
+<p>The roofline is used less as a chart and more as a habit: before optimising anything, compute its bound. A typical workflow in an inference team: profile a decode step, list the kernels with their times, compute each kernel's minimum bytes and FLOPs, and compare measured time with max(F/P, Q/W). Kernels far below their bound are candidates for better implementation; kernels at their bound are candidates only for fewer bytes (fusion, quantisation) or removal. The model-level summaries are <strong>MFU</strong> for compute-bound work (training, prefill) and <strong>MBU</strong> for memory-bound work (decode). Databricks' inference guide, for example, reports MBU for Llama-2-70B across batch sizes and tensor-parallel degrees and shows it falling as more GPUs are added — a sign that communication and overhead, not bandwidth, start to dominate.</p>
+<h4>Choosing the serving batch size</h4>
+<p>Serving frameworks such as vLLM expose a maximum number of concurrent sequences (for vLLM, <code>max_num_seqs</code>) and a token budget per step. The roofline tells you where to set them. While the weight matmuls are memory-bound, raising concurrency adds throughput almost for free, limited by KV-cache memory and by the growing KV bytes per step. Past the ridge, extra concurrency adds latency with little throughput. The right setting is where throughput is still rising but per-token latency (inter-token latency, ITL) still meets its target. Prefill complicates this: a long prompt entering the batch is compute-bound and can stall everyone's decoding for tens of milliseconds, which is why servers split long prefills into chunks mixed with decode steps (chunked prefill, lm13).</p>
+<h4>Characteristic surprises the roofline explains</h4>
+<p><strong>"We upgraded A100 → H100 and decode got only 1.6× faster, not 3×."</strong> Decode is memory-bound; bandwidth rose from 2.0 to 3.35 TB/s, a ratio of 1.64. The 3× FLOPs increase is irrelevant to it. Training throughput, which is compute-bound, did improve by around 2-3×.</p>
+<p><strong>"We quantised to int4 and prefill got no faster — or slower."</strong> Prefill is compute-bound, and weight-only int4 still computes in BF16 after dequantising; the extra dequantisation work can even slow it. Only decode, which is memory-bound, benefits. If prefill speed matters, you need FP8 or FP4 <em>arithmetic</em>, which raises the roof.</p>
+<p><strong>"Throughput stopped scaling with batch size at 64, not 300."</strong> KV-cache reads grow with batch × context and are never shared. At long contexts they overtake the weight bytes, and the combined intensity stops rising. The fix is on the KV side: FP8 KV cache, prefix sharing, or a model with fewer KV heads.</p>
+<p><strong>"The kernel is at 30% of peak bandwidth and 2% of peak FLOPs."</strong> It is below both roofs, so it is overhead- or parallelism-bound. Look at the grid size (does it fill all SMs?), the kernel duration (a few microseconds?) and the timeline gaps. This is where CUDA graphs and fusion earn their keep.</p>
+<h4>Tools</h4>
+<p>Nsight Compute reports a kernel's achieved FLOP/s and bandwidth, its speed-of-light percentages and a roofline chart. The PyTorch profiler shows per-kernel times you can compare with hand-computed bounds, and <code>torch.utils.flop_counter.FlopCounterMode</code> counts FLOPs for a model's forward and backward passes. For planning, a spreadsheet or a 20-line script with FLOPs, bytes, peak and bandwidth — like the lab below — answers most questions before any code is written.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> reproduce the free-lunch zone and the effect of weight quantisation from nothing but the roofline formula. Pure Python 3.12, no GPU needed (this machine has none).</p>
+<ol>
+<li>Save and run as <code>roofline.py</code>:</li>
+</ol>
+<pre>PEAK, BW = 989e12, 3.35e12            # H100 SXM: dense BF16 FLOP/s, HBM bytes/s
+RIDGE = PEAK / BW
+
+def matmul(m, k, n, bytes_per=2, weight_bytes=None):
+    """[m,k] x [k,n]: FLOPs and minimum HBM bytes."""
+    wb = bytes_per if weight_bytes is None else weight_bytes
+    flops = 2 * m * k * n
+    nbytes = m * k * bytes_per + k * n * wb + m * n * bytes_per
+    return flops, nbytes
+
+print(f"ridge point: {RIDGE:.0f} FLOP/byte")
+d, f = 8192, 28672                     # 70B-class hidden size and MLP width
+for B in [1, 8, 64, 256, 1024, 4096]:
+    for label, wb in [("bf16 weights", 2), ("int4 weights", 0.5)]:
+        fl, by = matmul(B, d, f, weight_bytes=wb)
+        ai = fl / by
+        t = max(fl / PEAK, by / BW) * 1e6
+        print(f"B={B:5d} {label}: intensity {ai:7.1f}  "
+              f"{min(PEAK, ai * BW) / 1e12:5.0f} TFLOP/s  {t:8.1f} us  "
+              f"{'compute' if ai &gt; RIDGE else 'memory'}-bound")</pre>
+<p><strong>What to look for.</strong> With BF16 weights the step time stays near 140 µs from B = 1 to B = 256 while intensity climbs from 1 to 246: that is the free-lunch zone. At B = 1,024 it crosses the ridge and time grows with B. With int4 weights the small-batch time drops to about 35 µs (4× fewer bytes), but from B = 256 onwards both formats take the same time — quantising weights does nothing once compute-bound.</p>
+<p><strong>Try:</strong> change <code>PEAK, BW</code> to the H200 (989e12, 4.8e12) and see only the memory-bound rows speed up; then to a B200 (2.25e15, 8e12) and find the new crossover batch.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>For a 70B model decoding on H100s with BF16 weights, at what batch size do the weight matmuls become compute-bound? What changes with 4-bit weights (BF16 compute), and why does long context spoil the picture?</p>
+<details><summary>Answer</summary>
+<p><strong>BF16 weights</strong>: intensity ≈ B FLOP/byte (2 FLOPs per 2-byte weight per sequence). The H100 ridge is about 295, so the weight matmuls become compute-bound at around <strong>B ≈ 300</strong> sequences. Below that, adding sequences costs almost no extra time per step.</p>
+<p><strong>4-bit weights</strong>: 0.5 bytes per weight, so intensity ≈ 2·B / 0.5 = 4B. Compute-bound at <strong>B ≈ 75</strong>. Below that, decode runs up to 4× faster than BF16 at the same batch because it reads a quarter of the bytes — the main reason weight-only quantisation is standard for serving. Above it, both formats are equally fast, because the maths is still done in BF16.</p>
+<p><strong>Long context</strong>: each sequence also reads its own KV cache every step, at intensity ≈ the GQA group size (8 for Llama 3 70B) no matter the batch. At about 0.33 MB per token, an 8,000-token sequence carries 2.6 GB of cache; a batch of 64 reads about 170 GB of KV per step — more than the 140 GB of weights. The combined intensity stops rising with batch, and decode stays memory-bound regardless. The levers become KV-cache quantisation (FP8 halves it), fewer or compressed KV heads (GQA, MLA), sliding-window attention in some layers, prefix sharing between requests, and higher-bandwidth GPUs.</p>
+</details>
+</section>

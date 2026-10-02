@@ -1,0 +1,403 @@
+<!-- topic source for infra/in4; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "in4",
+  "t": "Design a notification service (push, email, SMS)",
+  "tag": "Messaging",
+  "sum": "One pipeline from business events to phones and inboxes: an idempotent send API, a rules layer for preferences, quiet hours and frequency caps, fan-out to large audiences, per-channel and per-priority queues, provider rate limits, retries with backoff and dead-letter queues, deduplication at three layers, token hygiene, and Uber's real-time push platform.",
+  "prereq": [
+    ["sc10", "Queues decouple producers from consumers and absorb bursts; workers pull at their own pace."],
+    ["sc11", "Idempotency keys make retries safe: the same request twice has the effect of one."],
+    ["sc12", "Retries with exponential backoff and jitter, rate limiting and load shedding protect dependencies from overload."],
+    ["in1", "A partitioned log delivers at-least-once, so consumers see some events twice and must deduplicate."],
+    ["net11", "Servers push to clients over long-lived connections (Server-Sent Events, WebSockets, gRPC streams); mobile operating systems also offer their own push channels."]
+  ],
+  "myths": [
+    ["Exactly-once delivery to a phone is achievable if you are careful.", "The last hop is a provider (APNs, FCM, an SMS carrier) whose acknowledgement can be lost after it has delivered. You must retry, so you will sometimes send twice. What you can achieve is exactly-once effect as seen by the user: dedupe in your pipeline, and give each notification a collapse ID so a repeat replaces the banner instead of adding a second one."],
+    ["A delivered notification was seen.", "APNs and FCM accept a message and deliver it when they can; a phone that is off, in airplane mode or has disabled notifications won't show it, and the providers don't tell you whether the user saw it. 'Sent', 'delivered to provider', 'opened' and 'acted on' are different metrics, and only the app or an email pixel/click tells you about the last two."],
+    ["One queue for all notifications is fine if it's fast enough.", "Throughput hides head-of-line blocking. A 28-million-message campaign at 15,000 per second takes half an hour to drain, and a password reset queued behind it waits that long while every metric looks healthy. Transactional and bulk traffic need separate queues and separate capacity."],
+    ["If the provider returns an error, retry it.", "Only transient errors (timeouts, 429, 503) should be retried, with backoff and jitter. Permanent errors — an unregistered device token (APNs 410, FCM UNREGISTERED), a hard email bounce, an invalid phone number — must never be retried; the address should be marked dead. Retrying them wastes capacity and, for email, damages your sender reputation."],
+    ["Check the user's preferences when the event happens.", "Check them at send time. A message may sit in a queue for minutes or be scheduled for tomorrow 9 a.m.; a user who unsubscribed in the meantime must not get it. Preferences, quiet hours and frequency caps are evaluated as late as possible."],
+    ["Email deliverability is the provider's problem.", "Mailbox providers judge the sending domain. Since February 2024, Gmail requires bulk senders (over 5,000 messages a day to Gmail) to authenticate with SPF, DKIM and DMARC, support one-click unsubscribe, and keep reported spam below 0.3%. A marketing campaign that triggers complaints can push password-reset emails into spam, which is why bulk and transactional email often use separate domains or subdomains."]
+  ],
+  "recap": [
+    "A notification service turns business events into messages on push, email, SMS and in-app channels, so product teams emit events and don't each integrate with providers.",
+    "The send API is idempotent: every request carries a key, and a deduplication store keyed by (event, user, channel) stops the same notification from being sent twice by our own pipeline.",
+    "A rules layer decides whether, where and when to send: user preferences, quiet hours, frequency caps, channel choice and fallback, evaluated at send time rather than when the event arrived.",
+    "Large audiences are expanded in batches by a fan-out stage, so one campaign becomes millions of per-user tasks without blocking anything else.",
+    "Each channel has its own queues and workers, split by priority, so a bulk campaign cannot delay a password reset (head-of-line blocking).",
+    "Workers respect provider rate limits with token buckets, retry transient errors with exponential backoff and jitter, never retry permanent errors, and send exhausted messages to a dead-letter queue.",
+    "Duplicates are unavoidable at the provider boundary, so collapse IDs (APNs apns-collapse-id, FCM collapse_key) make a repeat replace the earlier banner.",
+    "Dead device tokens (APNs 410, FCM UNREGISTERED) are pruned immediately and stale ones expire, keeping sends cheap and delivery metrics honest.",
+    "Email deliverability depends on SPF, DKIM, DMARC, one-click unsubscribe and low complaint rates; SMS is expensive, so it is reserved for messages where reachability matters.",
+    "Uber's RAMEN platform pushes in-app messages over persistent streams with sequence numbers, priorities and at-least-once delivery, and has run over 1.5 million concurrent connections and 250,000 messages per second."
+  ],
+  "glossary": [
+    ["APNs", "Apple Push Notification service: the only way to send push notifications to Apple devices; your server sends HTTP/2 requests to it with a device token."],
+    ["Backoff", "Waiting longer between successive retries, usually doubling each time, so a struggling dependency is not hammered."],
+    ["Bounce", "An email that could not be delivered; a hard bounce is permanent (no such mailbox), a soft bounce temporary (mailbox full)."],
+    ["Collapse ID", "An identifier on a push notification that makes a newer notification with the same ID replace an older one on the device."],
+    ["Dead-letter queue (DLQ)", "A queue where messages go after they have failed too many times, for inspection and replay instead of endless retries."],
+    ["Deduplication store", "A fast key-value store recording which (event, user, channel) combinations were already sent, with a time-to-live."],
+    ["Device token", "An address issued by APNs or FCM that identifies one app installation on one device."],
+    ["DKIM", "DomainKeys Identified Mail: a cryptographic signature on an email that proves it came from the claimed domain and wasn't altered."],
+    ["DMARC", "A DNS policy telling mailbox providers what to do with email that fails SPF or DKIM alignment for a domain."],
+    ["Fan-out", "Expanding one notification request for an audience into one task per recipient."],
+    ["FCM", "Firebase Cloud Messaging: Google's push service for Android, and also usable for iOS and web."],
+    ["Frequency cap", "A limit on how many notifications of a kind a user may receive per period."],
+    ["Head-of-line blocking", "An urgent item waiting behind many non-urgent items in the same queue."],
+    ["Idempotency key", "A unique ID sent with a request so that repeats of the same request are recognised and applied once."],
+    ["Jitter", "Randomness added to retry delays so many clients don't retry at the same instant."],
+    ["Quiet hours", "A per-user window, in their time zone, when non-urgent notifications are held."],
+    ["Rate limit", "A cap on how fast you may send, imposed by a provider or by yourself."],
+    ["SPF", "Sender Policy Framework: a DNS record listing which servers may send email for a domain."],
+    ["Template", "A message layout with placeholders, rendered per user and locale into the final text."],
+    ["Token bucket", "A rate limiter that adds tokens at a fixed rate up to a maximum; each send spends one token, allowing short bursts but a bounded average."],
+    ["Transactional notification", "A message triggered by the user's own action or account, such as a password reset or a receipt, as opposed to marketing."],
+    ["TTL (notification)", "How long a provider should keep trying to deliver a notification before discarding it."]
+  ],
+  "qa": [
+    ["E", "Why should producers emit events rather than send notifications themselves?", "So the decision about whether to notify, on which channel and with what content lives in one rules layer instead of in every service. A product change becomes a rule change, not a deploy of the orders service, and preferences, quiet hours and caps are applied consistently.", "Follow-up: What does the event contain? — The facts (order shipped, ID, user, time), not the message text; templates render the text later per locale."],
+    ["E", "Why a separate queue per channel?", "Channels have very different throughput, latency, cost and failure modes, and are bounded by provider quotas you don't control. A stuck SMS provider must not block push, and each channel needs its own rate limiter and retry policy.", "Follow-up: And per priority? — Yes, within each channel: transactional and bulk lanes, with workers serving the transactional lane first."],
+    ["E", "Which provider errors do you retry?", "Transient ones — timeouts, 429 Too Many Requests, 5xx — with exponential backoff and jitter, up to a limit, then the dead-letter queue. Permanent ones — unregistered or expired token (APNs 410), hard bounce, invalid number — are never retried; mark the address dead.", "Follow-up: How long do you keep retrying? — Until the notification's usefulness expires: seconds for a 2FA code, hours for a receipt; set the provider TTL to match."],
+    ["M", "When should user preferences be checked?", "At dispatch time, not at event time. A user who unsubscribes while a batch is queued, or before a scheduled send, must not receive it, and preferences read minutes earlier are already stale.", "Follow-up: What about quiet hours? — Also at dispatch: if it's 2 a.m. in the user's time zone and the message isn't urgent, reschedule it rather than drop it."],
+    ["M", "How do you make sure a user doesn't get the same notification twice?", "Layers: an idempotency key on the send API; a dedup store keyed by (event ID, user, channel) with a TTL checked before sending, because upstream events arrive at least once; and a collapse ID on the push so a provider-level retry replaces the banner. True exactly-once to the device is impossible because the provider's acknowledgement can be lost after delivery.", "Follow-up: Where does the dedup store live? — A replicated in-memory store such as Redis with a TTL of a day or so, written atomically with SET NX before sending."],
+    ["M", "A campaign targets 40 million users. How does fan-out work?", "The campaign request names a segment, not users. A fan-out stage pages through the segment in batches (say 1,000 users), applies preferences and caps, and enqueues per-user tasks into the bulk lane at a controlled rate, checkpointing progress so a crash resumes rather than restarts. Delivery is spread over time and per-time-zone if required.", "Follow-up: Why not enqueue 40 million tasks at once? — It floods the queues, competes with transactional traffic and makes cancelling a bad campaign impossible; a paced fan-out can be paused."],
+    ["M", "How do you handle provider rate limits?", "A token bucket per provider account (and per SMS sender number) in the channel workers, shared across workers through a central counter or by assigning each worker a slice of the limit. On 429 responses, back off and shrink the rate. Reserve part of the budget for transactional traffic.", "Follow-up: The SMS provider allows 100 messages per second per short code; you need 2,000/s for a 2FA spike. — Use several sender numbers or a higher-throughput sender type, and prioritise 2FA over everything else on SMS."],
+    ["M", "How do you track whether notifications were delivered?", "Record each state change with the notification ID: accepted by API, sent to provider, provider accepted, delivered (SMS delivery receipts, email provider webhooks), bounced, opened, clicked. Push providers mostly confirm acceptance, not display, so opens come from the app reporting back.", "Follow-up: How would you alert? — On provider error rate, queue age per lane (oldest message waiting), dead-letter rate, and drops in delivered-to-sent ratio per channel."],
+    ["H", "A marketing blast queues 28 million pushes. What happens to a password reset sent a minute later?", "If they share a queue, it waits behind them — at 15,000/s, about half an hour — while throughput, error rate and queue drain all look normal. Fix with separate transactional and bulk lanes, transactional served first with reserved provider capacity, and the campaign paced below full capacity.", "Follow-up: Which metric would have caught it? — Age of the oldest message per lane, and end-to-end latency for transactional notifications, alerted separately."],
+    ["H", "Email deliverability suddenly drops, including password resets. What do you check?", "Spam complaint rate and bounce rate on the sending domain (Postmaster Tools), whether a recent campaign hit a bad list, SPF/DKIM/DMARC alignment after any DNS or provider change, and whether transactional mail shares a domain and IP with marketing. Separate transactional mail onto its own subdomain and IPs and suppress hard-bouncing addresses.", "Follow-up: What thresholds does Gmail publish? — Keep reported spam below 0.10% and never reach 0.30%."],
+    ["H", "Design the notification for 'your long-running AI agent task finished' (tasks take 2-40 minutes).", "The agent service emits a task-completed event with task ID and user ID; the notification service dedupes by task ID, checks whether the user is currently in the app (send an in-app event over the open connection) or not (send a push with a collapse ID equal to the task ID, and an email only if the task produced a report and the user opted in). Respect quiet hours unless the user asked to be woken. Include no sensitive output in the push text, just a deep link.", "Follow-up: The agent retries and emits the event three times. — The dedup store keyed by task ID absorbs it; the collapse ID covers anything that slips through."],
+    ["H", "How would you design per-user frequency caps across channels?", "Keep counters per (user, category, window) in a fast store with TTL equal to the window, incremented atomically at dispatch; the rules layer checks them before sending and either drops, delays or downgrades to a cheaper channel. Transactional messages bypass caps. Use a sliding window or a few fixed buckets to avoid bursts at window edges.", "Follow-up: What if two workers check and send at once? — Use an atomic increment-and-check (or a short Lua script) so the check and the count are one step."],
+    ["H", "Why not just poll from the app instead of building push?", "Polling is simple but wasteful: Uber found that at one point 80% of requests to its API gateway were polling calls. It burns battery and data, adds latency equal to the polling interval, and makes server load proportional to users rather than to events. Push over a persistent stream sends only when there is something new; OS push services cover the app when it's in the background.", "Follow-up: When is polling fine? — Low user counts, slow-changing data, or as a fallback when the stream is down."]
+  ],
+  "refs": [
+    ["post", "Uber's Real-Time Push Platform", "Uber Engineering, 2020: the RAMEN protocol (sequence numbers, priorities, at-least-once), Fireball, Streamgate and the scale numbers in this lesson.", "https://www.uber.com/blog/real-time-push-platform/"],
+    ["docs", "Sending notification requests to APNs", "Apple's request headers (apns-collapse-id, apns-priority, apns-expiration) and the 4 KB payload limit.", "https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns"],
+    ["docs", "Handling notification responses from APNs", "Status codes your push worker must handle, including 410 for tokens that are no longer active.", "https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns"],
+    ["docs", "FCM: best practices for registration token management", "Stale and expired tokens, UNREGISTERED errors and the one-month staleness heuristic.", "https://firebase.google.com/docs/cloud-messaging/manage-tokens"],
+    ["docs", "Email sender guidelines (Gmail)", "The February 2024 requirements: SPF, DKIM, DMARC, one-click unsubscribe and spam-rate thresholds.", "https://support.google.com/a/answer/81126"],
+    ["post", "Timeouts, retries, and backoff with jitter", "Amazon Builders' Library on why retries need backoff, jitter and limits.", "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"],
+    ["docs", "Amazon SQS dead-letter queues", "The DLQ pattern with redrive: how failed messages are parked, inspected and replayed.", "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Every product grows notifications the same way. The orders team adds an email when a package ships. The security team adds an SMS code at login. The growth team adds a push notification for abandoned carts. The AI team adds a push when a long-running agent task finishes. Each team integrates directly with Apple's push service, an email provider and an SMS provider, each writes its own retry loop, and each decides on its own whether the user wanted to hear about this.</p>
+<p>Then the complaints arrive. A user gets the same "your order shipped" email three times because the orders service retried after a timeout. Another gets a marketing push at 3 a.m. Someone who unsubscribed from marketing last week still gets campaigns, because the growth service caches preferences. On Black Friday a 40-million-user campaign floods the shared push queue, and password resets take half an hour to arrive, so users lock themselves out and call support. An engineer accidentally routes a campaign to SMS instead of push, and the bill is a six-figure surprise. Email from the domain starts landing in spam because a marketing list had too many dead addresses, and now the password resets land in spam too.</p>
+<p>None of these is a hard algorithmic problem. They are the problems of a <strong>pipeline that must be fast for urgent messages, polite for bulk ones, never duplicate, never send what the user declined, and stay within limits set by outside providers it doesn't control</strong>. That is why "design a notification service" is a standard interview question: it tests whether you can design fan-out, prioritisation, retries and deduplication under real-world constraints.</p>
+<p>This lesson builds the service in interview order: requirements, estimates done by hand, API, data model and architecture, then deep dives into fan-out, priority and rate limits, retries and dead-letter queues, deduplication, and the channel-specific details (device tokens, email authentication, SMS cost). It ends with failure modes, Uber's public write-up of its real-time push platform, and a lab that reproduces head-of-line blocking and duplicate sends.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a post office with a sorting room</h4>
+<p>Think of the notification service as a post office. Businesses (the other services) don't hand-deliver letters; they drop off <em>requests</em> — "tell customer 42 their parcel shipped". At the counter, a clerk stamps each request with a reference number and refuses exact duplicates ("we already have this one"). In the sorting room, a supervisor checks the customer's instructions: they asked for no mail on weekends, they prefer email to text messages, they've already had three promotional letters this week. The letter is written from a standard template in the customer's language. Then it goes into the right outgoing bin: one bin per delivery method, and within each, an express shelf and a bulk shelf. Couriers take from the express shelf first. Each courier company has a contract limiting how many letters per minute they'll accept; if a courier says "come back later", the letter goes back in the bin with a later pickup time; if they say "no such address", the address is crossed out of the customer's file. Letters that keep failing go to a dead-letter office for a human to look at.</p>
+<p>Every part of the real design is in that story: the idempotent intake, the rules engine, templates, per-channel queues with priority lanes, rate limits, retries with backoff, permanent-error handling and the dead-letter queue. Where the analogy breaks: the couriers (Apple's push service, Google's FCM, email and SMS providers) sometimes deliver a letter and then fail to tell you, so you resend it — and the customer gets two. Much of the design is about making that harmless.</p>
+
+<h4>The channels, and what makes each different</h4>
+<p><strong>Mobile push</strong> goes through the operating system vendor: <strong>APNs</strong> (Apple Push Notification service) for iPhones and <strong>FCM</strong> (Firebase Cloud Messaging) for Android. Your server sends an HTTPS request containing a <strong>device token</strong> — an address for one app on one device — and a small payload (Apple allows 4 KB). Push is free per message and fast, but delivery is best-effort: the vendor stores it briefly if the phone is offline. <strong>In-app</strong> messages travel over your own connection while the app is open (a WebSocket or streaming connection) and can carry richer, more frequent updates. <strong>Email</strong> goes through an email service provider; it is cheap, slow-ish (seconds to minutes), and its success depends on the sender's reputation. <strong>SMS</strong> goes through an SMS aggregator to mobile carriers; it reaches almost any phone, but costs real money per message and has strict throughput limits per sending number.</p>
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Notification pipeline: services send events to an idempotent API, a rules and fan-out stage, per-channel priority queues, rate-limited workers and external providers, with a dead-letter queue and status store">
+  <defs><marker id="in4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="120" width="88" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="54" y="141" text-anchor="middle" style="fill:var(--ink)">Services</text>
+    <text x="54" y="158" text-anchor="middle" style="fill:var(--muted)">emit events</text>
+    <rect x="118" y="120" width="92" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="164" y="141" text-anchor="middle" style="fill:var(--ink)">Send API</text>
+    <text x="164" y="158" text-anchor="middle" style="fill:var(--muted)">idempotency</text>
+    <rect x="230" y="105" width="104" height="80" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="282" y="126" text-anchor="middle" style="fill:var(--ink)">Rules + fan-out</text>
+    <text x="282" y="144" text-anchor="middle" style="fill:var(--muted)">prefs, caps,</text>
+    <text x="282" y="160" text-anchor="middle" style="fill:var(--muted)">quiet hours,</text>
+    <text x="282" y="176" text-anchor="middle" style="fill:var(--muted)">template, dedup</text>
+    <g>
+      <rect x="356" y="40" width="96" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/>
+      <text x="404" y="57" text-anchor="middle" style="fill:var(--ink)">push</text>
+      <text x="404" y="72" text-anchor="middle" style="fill:var(--muted)">urgent | bulk</text>
+      <rect x="356" y="95" width="96" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/>
+      <text x="404" y="112" text-anchor="middle" style="fill:var(--ink)">email</text>
+      <text x="404" y="127" text-anchor="middle" style="fill:var(--muted)">urgent | bulk</text>
+      <rect x="356" y="150" width="96" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+      <text x="404" y="167" text-anchor="middle" style="fill:var(--ink)">SMS</text>
+      <text x="404" y="182" text-anchor="middle" style="fill:var(--muted)">urgent | bulk</text>
+      <rect x="356" y="205" width="96" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--s4)"/>
+      <text x="404" y="222" text-anchor="middle" style="fill:var(--ink)">in-app</text>
+      <text x="404" y="237" text-anchor="middle" style="fill:var(--muted)">stream / inbox</text>
+    </g>
+    <rect x="472" y="40" width="70" height="205" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="507" y="130" text-anchor="middle" style="fill:var(--ink)">Workers</text>
+    <text x="507" y="148" text-anchor="middle" style="fill:var(--muted)">rate limit</text>
+    <text x="507" y="164" text-anchor="middle" style="fill:var(--muted)">retry</text>
+    <rect x="562" y="40" width="70" height="150" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="597" y="70" text-anchor="middle" style="fill:var(--ink)">APNs</text>
+    <text x="597" y="92" text-anchor="middle" style="fill:var(--ink)">FCM</text>
+    <text x="597" y="114" text-anchor="middle" style="fill:var(--ink)">Email ESP</text>
+    <text x="597" y="136" text-anchor="middle" style="fill:var(--ink)">SMS</text>
+    <text x="597" y="170" text-anchor="middle" style="fill:var(--muted)">providers</text>
+    <rect x="472" y="262" width="160" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="552" y="282" text-anchor="middle" style="fill:var(--ink)">Dead-letter queue</text>
+    <rect x="230" y="232" width="104" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="282" y="252" text-anchor="middle" style="fill:var(--ink)">Status store</text>
+    <text x="282" y="268" text-anchor="middle" style="fill:var(--muted)">+ receipts</text>
+    <line x1="98" y1="145" x2="116" y2="145" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="210" y1="145" x2="228" y2="145" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="334" y1="130" x2="354" y2="62" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="334" y1="140" x2="354" y2="115" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="334" y1="155" x2="354" y2="170" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="334" y1="165" x2="354" y2="222" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="452" y1="140" x2="470" y2="140" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="542" y1="115" x2="560" y2="115" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <line x1="507" y1="245" x2="507" y2="260" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--crit)"/>
+    <line x1="560" y1="180" x2="336" y2="252" marker-end="url(#in4-arrow)" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <text x="440" y="285" text-anchor="middle" style="fill:var(--muted)">receipts</text>
+  </g>
+</svg>
+<figcaption>The pipeline: one idempotent entry point, one rules layer that decides whether and how to send, separate queues per channel with urgent and bulk lanes, and rate-limited workers that talk to the providers. Failures that exhaust retries go to a dead-letter queue; receipts flow back into a status store.</figcaption>
+</figure>
+<p>A reader who stops here has the right picture: <strong>events in, decisions in the middle, per-channel delivery out, and every stage built to be retried safely</strong>. The deep dives below explain what each stage must do so that retries, bursts and provider failures don't turn into spam, duplicates or silence.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–18</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">18–26</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">26–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> Other services request notifications to a user or an audience (a segment of users) with a template name and data. Channels: iOS and Android push, email, SMS, and in-app (live stream plus an inbox the user can scroll). Users set preferences per category and channel, quiet hours and a time zone. Support scheduled sends ("tomorrow at 9 a.m. local time") and campaigns to tens of millions of users. Track status: sent, delivered, bounced, opened, clicked.</p>
+<p><strong>Non-functional.</strong> Transactional notifications (password reset, 2FA code, payment receipt) arrive within seconds, every time, regardless of what bulk traffic is doing. No duplicates visible to users, and never a message a user declined. Bulk campaigns finish within an agreed window (an hour, say) without starving transactional traffic. Survive provider outages without losing messages. Stay within provider rate limits and a cost budget. Scale to hundreds of millions of users.</p>
+<p><strong>Clarifying questions.</strong> "What are the priority classes, and what latency does each need?" A 2FA code is useless after five minutes; a weekly digest can wait hours. "Who owns content — the calling service or the notification service?" (Templates should live here, so text and localisation are consistent.) "Is there a cost ceiling for SMS?" "Do we need an in-app inbox, or only push?" And for the AI-product flavour: "Are there notifications triggered by model output, which need content checks before sending?"</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Scenario: a consumer AI assistant app with <strong>100 million registered users</strong>, <strong>30 million daily active users</strong>, about <strong>1.5 devices per user</strong>.</p>
+<p><strong>Daily volume.</strong> Suppose each daily active user triggers about 5 notifications a day across channels (task finished, replies, reminders, digests): 30M × 5 = <strong>150 million notifications/day</strong>. Average rate: 150 × 10<sup>6</sup> ÷ 86,400 ≈ <strong>1,740/s</strong>. Traffic follows waking hours, so peak is perhaps 3× average: about <strong>5,200/s</strong> of organic traffic.</p>
+<p><strong>Campaign peak.</strong> A campaign to 40 million users, to be delivered within 30 minutes: 40 × 10<sup>6</sup> ÷ 1,800 s ≈ <strong>22,000/s</strong>. Campaigns, not organic traffic, set the bulk lane's capacity — and they must not touch the transactional lane's.</p>
+<p><strong>Channel mix and cost.</strong> Say 80% push, 17% email, 2% in-app-only and 1% SMS (mostly 2FA). SMS: 1% of 150M = 1.5 million messages/day. If an SMS costs around $0.01 (prices vary widely by country), that is $15,000 a day, about $5.5 million a year — while push, 120 million a day, costs nothing per message. SMS is 1% of messages and nearly all of the per-message cost, which is why every SMS route needs a spend guard.</p>
+<p><strong>Storage.</strong> Device tokens: 100M users × 1.5 devices × ~200 bytes (token, platform, app version, last seen) = 30 GB — small enough for one replicated database, cached. Notification log: 150M/day × ~500 bytes (IDs, channel, template, status timestamps) = 75 GB/day; 90 days of retention = <strong>6.75 TB</strong>, which belongs in a write-optimised store partitioned by user and time (such as a wide-column store from in2). Dedup keys: 150M/day × ~100 bytes with a 24-hour TTL ≈ 15 GB in memory. Preferences: 100M × ~1 KB = 100 GB, read on every send, so cached.</p>
+<p><strong>Provider throughput.</strong> Push providers accept very high rates over HTTP/2 connections (many requests multiplexed on each), so push workers scale horizontally; at 22,000/s with, say, 50 ms per request and 100 concurrent streams per connection, each connection handles 2,000/s, so about 11 connections, plus headroom. SMS is the opposite: throughput is set per sending number by the carrier and provider (a dedicated short code is commonly in the range of 100 messages per second), so a 2FA spike of 2,000/s needs many numbers or a higher-throughput route — a constraint you can't fix by adding workers.</p>
+
+<h4>3 · API</h4>
+<pre>POST /v1/notifications
+{
+  "idempotency_key": "order-8812-shipped",   # caller-chosen, unique per intent
+  "user_id": "u_42",                          # or "audience": {"segment_id": "s_77"}
+  "category": "order_updates",                # maps to preferences and priority
+  "template": "order_shipped",
+  "data": {"order_id": "8812", "eta": "2026-10-04"},
+  "channels": ["push", "email"],              # optional override; else rules decide
+  "send_at": null,                            # or a time, optionally "user_local"
+  "ttl_s": 86400                              # useless after this
+}
+-&gt; 202 Accepted {"notification_id": "n_9f3..."}
+
+GET  /v1/notifications/{id}          -&gt; status per channel
+PUT  /v1/users/{id}/preferences      -&gt; categories x channels, quiet hours, time zone
+POST /v1/devices                     -&gt; register / refresh a device token
+POST /v1/campaigns/{id}/pause        -&gt; stop a bulk send in flight</pre>
+<p>The response is <strong>202 Accepted</strong>, not 200: the service has durably accepted the request, not delivered it. The <code>idempotency_key</code> makes the call safe to retry; a repeat with the same key returns the same <code>notification_id</code> and does nothing else. The caller sends a <em>category</em> and data, not the final text; templates and the rules layer turn those into messages, which keeps tone, localisation and legal footers consistent.</p>
+
+<h4>4 · Data model</h4>
+<ul>
+<li><strong>devices</strong>(user_id, device_id, platform, token, app_version, locale, last_seen, status) — status becomes <code>dead</code> on a permanent provider error.</li>
+<li><strong>preferences</strong>(user_id, category, channel, enabled), plus (user_id, time_zone, quiet_start, quiet_end).</li>
+<li><strong>templates</strong>(name, version, channel, locale, subject, body) — versioned, so a message can be traced to the exact text sent.</li>
+<li><strong>notifications</strong>(notification_id, idempotency_key UNIQUE, user_id or audience, category, template, data, priority, send_at, created_at).</li>
+<li><strong>deliveries</strong>(notification_id, user_id, channel, device_id, attempt, state, provider_message_id, updated_at) — partitioned by user and day; this is the 75 GB/day table.</li>
+<li><strong>dedup</strong> in memory: key <code>(event_id, user_id, channel)</code> → sent-at, TTL 24 hours.</li>
+<li><strong>counters</strong> in memory: <code>(user_id, category, window)</code> → count, for frequency caps.</li>
+</ul>
+
+<h4>5 · High-level architecture</h4>
+<p>A request walks through six stages. <strong>(1) The send API</strong> validates the request, checks the idempotency key against the <code>notifications</code> table (a unique constraint makes this atomic), stores the request, and publishes it to an intake topic in a durable log (Kafka from in1, or a managed queue) — then returns 202. <strong>(2) The scheduler</strong> holds requests with a future <code>send_at</code> and releases them on time; time-zone-aware sends are bucketed by zone. <strong>(3) The fan-out stage</strong> expands audience requests into per-user tasks in batches. <strong>(4) The rules engine</strong>, per user, loads preferences, quiet hours and caps, picks channels and fallbacks, renders the template in the user's locale, checks the dedup store, and enqueues one task per channel and device into the right priority lane. <strong>(5) Channel workers</strong> pull from their lanes, take a token from the provider's rate limiter, call the provider, and handle the response: success, retry later, or mark dead. <strong>(6) Receipt handlers</strong> consume provider webhooks (email bounces and complaints, SMS delivery receipts) and app callbacks (opened, clicked) into the status store and back into the device and suppression lists.</p>
+<p>Notice where state lives. The durable log between stages means any stage can crash and resume. Every stage is idempotent, so redelivery from the log is harmless. And the decisions that depend on fresh user state (preferences, quiet hours, caps) happen in stage 4, as late as possible.</p>
+
+<h4>6 · Deep dive: fan-out to large audiences</h4>
+<p>There are two kinds of fan-out. <strong>Per-event fan-out</strong>: one event, a handful of recipients, multiple channels and devices — "your friend replied" goes to one user's three devices plus an email. <strong>Audience fan-out</strong>: one campaign, millions of recipients. The second needs care.</p>
+<p>The campaign request names a segment. The fan-out worker pages through the segment's user IDs in batches of, say, 1,000, and for each batch publishes per-user tasks to the bulk lane, recording a checkpoint ("campaign c_77 has fanned out through user offset 3,450,000"). If the worker crashes, it resumes from the checkpoint; because downstream stages dedupe by (campaign, user, channel), re-publishing part of a batch is harmless. The fan-out rate is a dial: to deliver 40 million in 30 minutes, release about 22,000 tasks per second; to protect providers, release fewer. Because fan-out is paced rather than dumped, a campaign can be <strong>paused or cancelled</strong> mid-flight — essential when someone notices a typo in the subject line after the first million.</p>
+<p>Time-zone-aware campaigns ("9 a.m. local") split the segment by time zone and schedule each bucket separately, which also spreads load across 24 hours. And for very large broadcast messages with identical content (a breaking-news alert), push providers offer <strong>topics</strong>: devices subscribe to a topic and you send once; the provider fans out. That is cheap but gives up per-user personalisation, preferences and caps on your side.</p>
+
+<h4>7 · Deep dive: priority lanes and rate limits</h4>
+<p>Without priority, a queue is first-in, first-out, and an urgent message waits behind everything queued before it. The lab measures this: a 280,000-message campaign queued at time zero drains at 1,500/s; a password reset arriving 60 seconds later waits <strong>127 seconds</strong> behind it in a shared queue and <strong>0 seconds</strong> with a separate transactional lane. Scale that to 28 million messages at 15,000/s and the wait is half an hour.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Shared FIFO queue makes a password reset wait behind a campaign; separate lanes let it go first">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="24" style="fill:var(--ink);font-weight:600">One shared queue</text>
+    <rect x="20" y="36" width="520" height="30" style="fill:var(--s2);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="280" y="56" text-anchor="middle" style="fill:var(--ink)">campaign: 280,000 bulk pushes (≈187 s at 1,500/s)</text>
+    <rect x="540" y="36" width="60" height="30" style="fill:var(--crit);opacity:0.5"/>
+    <text x="570" y="56" text-anchor="middle" style="fill:var(--ink)">reset</text>
+    <text x="320" y="88" text-anchor="middle" style="fill:var(--crit)">reset arrives at 60 s, waits 127 s — throughput looks perfect</text>
+    <text x="20" y="128" style="fill:var(--ink);font-weight:600">Priority lanes</text>
+    <rect x="20" y="140" width="60" height="30" style="fill:var(--good);opacity:0.5"/>
+    <text x="50" y="160" text-anchor="middle" style="fill:var(--ink)">reset</text>
+    <text x="90" y="160" style="fill:var(--ink-2)">urgent lane: served first, reserved capacity</text>
+    <rect x="20" y="180" width="520" height="30" style="fill:var(--s2);opacity:0.3;stroke:var(--line-2)"/>
+    <text x="280" y="200" text-anchor="middle" style="fill:var(--ink)">bulk lane: campaign, paced below full capacity</text>
+    <text x="580" y="160" text-anchor="middle" style="fill:var(--good)">0 s wait</text>
+  </g>
+</svg>
+<figcaption>Head-of-line blocking is invisible in throughput graphs: the shared queue is busy and draining at full speed while the one message that matters waits. Separate lanes, served urgent-first, fix it.</figcaption>
+</figure>
+<p>Implement priority as <strong>separate queues per channel per priority</strong>, not a priority field in one queue (most brokers can't reorder efficiently, and a single queue still shares consumer capacity). Workers poll the urgent lane first and the bulk lane only when the urgent lane is empty, or capacity is split — for example 30% of workers reserved for urgent. Uber's push platform used the same idea at the connection level, sorting messages into high, medium and low priority and writing pending messages to the socket "in descending order of priority".</p>
+<p><strong>Rate limits</strong> come from providers (an SMS route's messages per second, an email provider's sending quota, APNs and FCM throttling misbehaving senders) and from you (don't let a campaign hit the email provider at a rate that looks like spam). A <strong>token bucket</strong> is the usual tool: tokens are added at the permitted rate, say 100 per second, up to a bucket size that allows short bursts; each send takes a token, and a worker with no token waits. With many workers, the bucket must be shared — a counter in a fast store, or each worker given a fixed share of the limit. When a provider answers 429 (too many requests), slow down: the provider's view of the limit wins. Reserve part of every limit for the urgent lane, so a bulk SMS burst can never consume the 2FA budget.</p>
+<p>Fairness between tenants matters too if the service is shared by many internal teams or external customers: one team's runaway campaign should be capped per tenant, so it doesn't fill the bulk lane for everyone.</p>
+
+<h4>8 · Deep dive: retries, backoff and dead letters</h4>
+<p>Providers fail in two ways, and the response must differ. <strong>Transient</strong> failures — timeouts, connection resets, 429, 500, 503 — may succeed later, so retry. <strong>Permanent</strong> failures will never succeed: APNs returns HTTP 410 when "the device token is no longer active for the topic", FCM returns <code>UNREGISTERED</code> (HTTP 404), email providers report hard bounces (no such mailbox), SMS providers report invalid numbers. Never retry those; mark the token or address dead so it isn't used again.</p>
+<p>Transient retries use <strong>exponential backoff with jitter</strong>: wait about 0.5 s, then 1, 2, 4, 8 s, capped at a minute, each multiplied by a random factor between 0.5 and 1.5. Exponential growth stops a struggling provider from being hammered; jitter stops thousands of workers that failed at the same moment from retrying at the same moment. Implement delays without blocking a worker: put the message on a <strong>retry queue</strong> with a "not before" time (a delay queue, or tiered retry topics such as retry-5s, retry-1m, retry-10m), and let workers pick it up when due.</p>
+<p>Retries stop at a limit — a number of attempts or, better, the notification's own TTL. A 2FA code that is five minutes old is worse than useless, because the user has already requested another; a receipt can be retried for hours. After the limit, the message goes to a <strong>dead-letter queue (DLQ)</strong> with its error history. The DLQ is not a bin: alert on its growth, inspect it, fix the cause, and replay. Set the provider-side TTL to match (APNs <code>apns-expiration</code>, FCM's message lifespan, which defaults to four weeks and can be at most 28 days), so a phone that comes online tomorrow doesn't show yesterday's 2FA code.</p>
+
+<h4>9 · Deep dive: deduplication at three layers</h4>
+<p>Duplicates come from everywhere: a calling service retries after a timeout; the event log delivers an event twice (at-least-once, from in1); a worker crashes after sending but before recording success; a provider delivers a push but the response is lost, so the worker retries. Each needs a layer.</p>
+<ol>
+<li><strong>At the API: the idempotency key.</strong> A unique constraint on <code>idempotency_key</code> means a retried request returns the original <code>notification_id</code>. This covers callers' retries.</li>
+<li><strong>In the pipeline: the dedup store.</strong> Before a worker sends, it atomically sets <code>(event_id, user_id, channel)</code> in an in-memory store only if absent (Redis <code>SET key value NX EX 86400</code>). If the key already existed, skip. This covers redelivered events and crashed-and-restarted workers. It must be set <em>before</em> the provider call; that means a crash between setting the key and sending could drop a message, so record a "sending" state and let a sweeper retry stuck ones, or accept the rare loss for low-value categories and the rare duplicate for high-value ones — choose per category.</li>
+<li><strong>At the device: the collapse ID.</strong> When a provider call times out, you don't know whether it delivered, and you must retry. Give every push a collapse ID derived from the notification ID (APNs <code>apns-collapse-id</code>, up to 64 bytes; FCM <code>collapse_key</code>, with at most four distinct collapse keys stored per device at a time). A repeat then <em>replaces</em> the earlier banner instead of adding a second. In-app messages carry the notification ID and the app ignores IDs it has already shown.</li>
+</ol>
+<p>The lab shows the layers adding up: with neither layer, 10,000 notifications produced 537 duplicate banners (200 from redelivered events, the rest from lost provider responses); the dedup store removed the event duplicates, leaving 308; collapse IDs made the remaining repeats invisible. That is the honest version of "exactly once": at-least-once delivery plus idempotent effect at every layer you control.</p>
+
+<h4>10 · Deep dive: channel details that bite</h4>
+<p><strong>Device-token hygiene.</strong> Tokens change when apps are reinstalled or restored, and die when apps are uninstalled. Register on every app start (it's cheap) and update <code>last_seen</code>; delete tokens on permanent errors immediately; treat tokens not refreshed for a while as stale — FCM's guidance considers a registration stale if the app hasn't connected for a month, and expires Android registrations inactive for 270 days. Sending to dead tokens wastes capacity and makes delivery-rate metrics drop "dramatically (but not actually valid)", in Firebase's words.</p>
+<p><strong>Email deliverability.</strong> Mailbox providers decide inbox or spam based on the sending domain's reputation. Since 1 February 2024, Gmail requires senders of more than 5,000 messages a day to Gmail to authenticate with <strong>SPF</strong> (which servers may send for the domain) and <strong>DKIM</strong> (a signature proving the message came from the domain), publish a <strong>DMARC</strong> policy, support one-click unsubscribe (the RFC 8058 header) for marketing mail, and keep reported spam below 0.3% — Google advises staying below 0.10%. Hard bounces must be suppressed; repeatedly mailing dead addresses looks like spam. Send transactional and marketing mail from different subdomains (and often different IP addresses) so a bad campaign can't drag password resets into spam folders.</p>
+<p><strong>SMS.</strong> Expensive, rate-limited per sending number, and regulated (consent and opt-out keywords like STOP are legally required in many countries). Use it for what only it can do: reaching a phone that has no app or no data connection, for 2FA and critical alerts. Prefer push and fall back to SMS only after push fails or for users without an active token. Put a spend cap in the rules layer with an alert, so a routing bug can't send 40 million SMS.</p>
+<p><strong>In-app.</strong> When the app is open, a live connection is faster and richer than OS push, and it doesn't depend on the user's notification settings. When it's closed, OS push is the only way to wake it. Many systems send in-app first, and push only if the app isn't connected — which requires a presence signal (is this user connected right now?) in the rules layer.</p>
+
+<h4>11 · Failure modes and trade-offs</h4>
+<p><strong>A provider outage</strong> (APNs degraded, email provider down): urgent-lane retries back off; messages wait in queues; when the notification's TTL passes, they go to the DLQ rather than arriving uselessly late. For email and SMS, a second provider behind a circuit breaker lets you fail over. <strong>A slow dependency in the rules layer</strong> (the preference store): cache preferences with short TTLs and decide what to do on a cache miss — for transactional messages send anyway; for marketing, skip. <strong>A runaway producer</strong> sending the same event in a loop: per-user frequency caps and per-producer quotas contain it. <strong>A bad campaign</strong> (wrong segment, broken template): pacing plus a pause switch limits the blast radius; a template preview and a small canary send catch most errors.</p>
+<p><strong>The trade-offs to state in the close:</strong> at-least-once delivery plus layered dedup instead of an impossible exactly-once; urgent latency bought with reserved, sometimes idle, capacity; late evaluation of preferences at the cost of a lookup per message; and paced bulk sends that finish later but keep providers, reputation and the transactional lane healthy.</p>
+</section>
+
+<section data-field="deep">
+<h4>Where to put the dedup check relative to the send</h4>
+<p>"Check-then-send" has a window: two workers holding redelivered copies of the same event can both check, both see "not sent", and both send. The fix is an atomic claim — <code>SET key NX</code> succeeds for exactly one of them. But claiming before sending creates the opposite risk: the claimant crashes after claiming and before sending, and the message is never sent. The robust pattern is a small state machine per (event, user, channel): <em>claimed</em> with a lease expiry, then <em>sent</em> with the provider's message ID. A sweeper finds claims whose lease expired without reaching <em>sent</em> and retries them. That brings back the possibility of a duplicate (the crashed worker may have sent before dying), which the collapse ID absorbs. Choosing which way to fail per category — prefer a duplicate for a security alert, prefer a miss for a promotional nudge — is the senior detail.</p>
+
+<h4>The send-time decision is a small, latency-critical service</h4>
+<p>The rules engine reads preferences, quiet hours, caps, presence and the user's devices for every single recipient, so at 22,000 sends per second it performs on the order of 100,000 lookups per second. It needs a cache in front of every store (in3), atomic counter updates for caps, and a defined behaviour when a dependency is slow: fail open (send) or fail closed (skip) per category. It is also where product rules accumulate — "don't send a re-engagement push to someone who opened the app in the last hour", "bundle more than three replies into one digest" — so keep the rules declarative and versioned, and log every decision with the reason, because "why did I get this?" and "why didn't I get that?" are the most common support questions.</p>
+
+<h4>Aggregation and digests</h4>
+<p>Sending one push per like on a viral post annoys the user and wastes capacity. Aggregation holds notifications of a kind for a short window (say 10 minutes) per user and sends one summary ("Ana and 23 others liked your post"). Implement it as a per-user buffer keyed by (user, category) with a timer: the first event starts the window; later events update a count and a sample of actors; when the window closes, one message is rendered. With collapse IDs per (user, category), the device can also replace a stale summary with an updated one. Digests are the same idea on a schedule (daily email). They trade immediacy for relevance, which is usually the right trade for social and marketing categories and never for security ones.</p>
+
+<h4>Ordering is usually per user, and usually not needed</h4>
+<p>Notifications rarely need global order, but per-user order sometimes matters ("order shipped" shouldn't arrive after "order delivered"). Partitioning the intake and channel queues by user ID gives per-user order through the pipeline, but retries break it: a failed first message retried later arrives after the second. Rather than enforcing order in transport, put the state in the content: include a sequence number or timestamp, use the same collapse ID for status updates of one order so the latest replaces earlier ones, and let the app show the newest state. Uber's RAMEN protocol takes the transport route for in-app streams — the client reconnects with "the largest sequence number it has seen", and the server resends from there — which works because one server owns each user's stream.</p>
+
+<h4>Scheduling millions of future sends</h4>
+<p>"Send at 9 a.m. local time" for 40 million users, or "remind me tomorrow", means storing many future events and releasing each on time. Polling a database for <code>WHERE send_at &lt;= now()</code> every second works at small scale but becomes an expensive scan. The usual design buckets scheduled items by minute: the scheduler writes each item under a key like <code>2026-10-03T09:00</code> (partitioned further by a hash so no bucket is huge), and a ticker reads one bucket each minute, publishing its items to the intake topic. Releasing a bucket must be idempotent — the same dedup keys protect against a ticker that crashes mid-bucket and replays it — and late, because preferences and quiet hours are still checked at send time. Time zones turn one campaign into up to about 38 buckets (the number of distinct UTC offsets in use), which conveniently spreads the load. This is the job-scheduler problem from in5 in miniature.</p>
+
+<h4>Multiple regions</h4>
+<p>Users are global and providers are reachable from anywhere, so the pipeline can run in several regions, each handling users homed there. The awkward parts are state that must be global: the idempotency key (a retried API call may land in another region), the dedup store and frequency caps. Either route every request for a user to their home region, keeping these stores regional, or accept a small chance of a duplicate during a region failover and rely on collapse IDs. Routing by home region is simpler and is what most systems do.</p>
+
+<h4>Content that comes from a model</h4>
+<p>AI products increasingly generate notification text: summaries of a task's output, personalised nudges. That adds two concerns. Safety: generated text can contain sensitive data from the conversation or simply be wrong, and a lock-screen banner is visible to anyone near the phone, so push text should be generic ("Your report is ready") with details behind authentication, and generated content should pass the same checks as other model output. Cost and latency: generating per-recipient text for a 40-million-user campaign is a large batch inference job, so generate per segment or per template variant ahead of time, cache the results, and keep the send pipeline free of model calls on its hot path.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: Uber's real-time push platform (RAMEN)</h4>
+<p>Uber's 2020 engineering post describes how it moved its apps from polling to server push. The motivation is a number every interviewer likes: "at some point, 80% of requests made to the backend API gateway were polling calls". Polling kept apps responsive but wasted server capacity and battery, and bugs in polling frequency caused load spikes.</p>
+<p>The platform splits the problem the way this lesson does. <strong>Fireball</strong> decides "when to push": it listens to events across the system — a driver accepting an offer, a trip state change, a timer, a geographic boundary crossing — and, based largely on configuration, decides which push messages to send to which users; "very often, a single trigger would warrant sending multiple message payloads to multiple users". The <strong>API gateway</strong> decides "what to push", generating the payload with the user's locale, OS and app version so it's correct for that device. And <strong>RAMEN</strong> (Realtime Asynchronous MEssaging Network) delivers it.</p>
+<p>RAMEN's protocol is a compact lesson in at-least-once delivery. The first version ran over Server-Sent Events: the client opens <code>/ramen/receive?seq=0</code>, the server streams pending messages "in descending order of priority" with increasing sequence numbers, and the client reconnects with the largest sequence number it has seen, which tells the server what to resend and acts as an acknowledgement so older messages can be flushed. The server sends a one-byte heartbeat every 4 seconds; a client that sees nothing for 7 seconds assumes the connection is broken and reconnects. Messages are categorised as high, medium or low priority, held in memory and backed by a database, and retried until a TTL expires. The system "provides an 'at-least-once' guarantee for delivery".</p>
+<p>The scale numbers trace the growth. The first generation, in Node.js with users sharded by UUID using Uber's Ringpop library and Redis for persistence, peaked at over 70,000 push messages per second across up to 600,000 concurrent streaming connections. The rebuilt backend — Streamgate on Netty, Apache Helix and ZooKeeper for sharding, Cassandra for durable cross-region storage with Redis as "a capacity cache" to avoid thundering herds during deploys or failovers — reached 99.99% server-side reliability and has operated "with more than 1.5M concurrent connections" pushing "over 250,000 messages per second". A later protocol moved to bidirectional gRPC streams so acknowledgements travel instantly on the reverse channel instead of on reconnection.</p>
+<p>Three lessons carry over. Separate the decision (whether, when, to whom) from the payload (what) and from delivery (how). Use sequence numbers and acknowledgements to make delivery resumable and duplicates detectable. And priorities belong at every queue, including the last one — the socket to the phone.</p>
+
+<h4>What goes wrong, and what to watch</h4>
+<p><strong>Silent head-of-line blocking</strong> — watch the age of the oldest message per lane and the end-to-end latency of transactional notifications, not queue throughput. <strong>Token rot</strong> — a slow decline in delivery rate as dead tokens accumulate; watch permanent-error rates per platform and prune. <strong>Reputation collapse for email</strong> — watch bounce and complaint rates per sending domain; a sudden rise after a campaign is the early warning. <strong>Retry storms</strong> after a provider recovers — thousands of delayed retries land at once; jitter and per-provider rate limits contain them. <strong>Duplicate bursts</strong> after a consumer-group rebalance or deploy — watch dedup-store hit rate; a spike means upstream is redelivering. <strong>Cost runaways on SMS</strong> — watch spend per hour against a hard cap.</p>
+<p><strong>Metrics:</strong> accepted, sent, provider-accepted, delivered, bounced, opened and clicked per channel and category; latency percentiles from accept to provider-accept per lane; queue depth and oldest-message age per lane; retry and DLQ rates by error code; dedup hits; suppressed-by-preference and suppressed-by-cap counts (which explain "missing" messages); and SMS spend.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> reproduce head-of-line blocking and fix it with priority lanes, then count duplicate notifications from at-least-once upstream delivery and lost provider responses, and remove them with a dedup store and collapse IDs. Python 3.12, standard library only, under a second.</p>
+<pre>"""Notification dispatch: head-of-line blocking vs priority queues, and
+retries with backoff, a dedup store and collapse ids so retries are not shown twice.
+Python 3.12 stdlib only."""
+import random
+from collections import deque
+
+# 1. A campaign of 280,000 pushes is queued at t=0; workers send 1,500/s.
+#    A password reset arrives at t=60 s. How long does it wait?
+RATE, CAMPAIGN, RESET_AT = 1_500, 280_000, 60
+def reset_wait(priority_queues):
+    marketing, transactional = deque(range(CAMPAIGN)), deque()
+    for t in range(10_000):
+        if t == RESET_AT: transactional.append("reset")
+        budget = RATE
+        if priority_queues:                       # transactional always first
+            while budget and transactional:
+                transactional.popleft(); budget -= 1
+                return t - RESET_AT
+        while budget and marketing:               # shared FIFO: reset sits behind
+            marketing.popleft(); budget -= 1
+        if not priority_queues and t &gt;= RESET_AT and not marketing:
+            return t - RESET_AT + 1               # reset goes out right after
+print("reset wait, one shared queue:", reset_wait(False), "s")
+print("reset wait, priority queues: ", reset_wait(True), "s")
+
+# 2. Duplicates come from two places: upstream events delivered twice
+#    (at-least-once, 2%) and provider calls whose response is lost (3%), which
+#    we must retry. The provider fails 10% of calls transiently and 1% of
+#    tokens are dead.
+rng = random.Random(3)
+def provider_send(token):
+    if token % 100 == 0: return "UNREGISTERED"     # permanent: prune the token
+    if rng.random() &lt; 0.10: return "UNAVAILABLE"    # transient: retry later
+    return "TIMEOUT" if rng.random() &lt; 0.03 else "OK"   # TIMEOUT: it WAS delivered
+
+def run(use_dedup_store, use_collapse_id):
+    sent, done, dead = [], set(), set()
+    events = [(i, i) for i in range(10_000)]        # (event_id, user token)
+    events += rng.sample(events, 200)               # 2% redelivered upstream
+    for event_id, token in events:
+        if use_dedup_store and event_id in done: continue
+        attempt = 1
+        while attempt &lt;= 6:
+            r = provider_send(token)
+            if r in ("OK", "TIMEOUT"):
+                sent.append(event_id)               # the phone received it
+            if r == "OK": break
+            if r == "UNREGISTERED": dead.add(token); break
+            backoff = min(60, 0.5 * 2 ** attempt) * rng.uniform(0.5, 1.5)
+            attempt += 1                            # (would sleep `backoff` s)
+        done.add(event_id)
+    # with a collapse id, a repeat replaces the earlier banner instead of adding one
+    shown = len(set(sent)) if use_collapse_id else len(sent)
+    return shown, len(set(sent)), len(dead)
+
+for store, collapse in [(False, False), (True, False), (True, True)]:
+    shown, unique, dead = run(store, collapse)
+    print(f"dedup store={store!s:5} collapse id={collapse!s:5}: banners shown {shown}, "
+          f"unique {unique}, duplicates {shown - unique}, tokens pruned {dead}")</pre>
+<p><strong>Run it:</strong> save as <code>notify_lab.py</code> and run <code>python notify_lab.py</code>.</p>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li>The reset waits <strong>127 s</strong> in one shared queue: 280,000 − 60 × 1,500 = 190,000 messages ahead of it at 1,500/s. With a separate urgent lane it waits 0 s.</li>
+<li>With no protection, 10,000 notifications produce 537 duplicate banners: the 200 redelivered events (minus those to dead tokens) plus provider timeouts that were retried after the message had actually been delivered.</li>
+<li>The dedup store removes the duplicates caused by redelivered events, but about 300 remain: they come from the provider boundary, which your store can't see past.</li>
+<li>Collapse IDs make those remaining repeats replace the earlier banner, so the user sees each notification once. 100 tokens (1%) are pruned on their first permanent error and never retried.</li>
+</ol>
+<p><strong>Try next:</strong> make the urgent lane share capacity 30/70 with the bulk lane instead of strict priority and measure the reset's wait; add a token bucket that allows 100 SMS per second and see how long a 2,000-code burst takes to drain.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+    <p>A marketing campaign fires a broadcast to 40M users at 10:00. The channel mix is 70% push, 25% email, 5% SMS. Push workers sustain 15,000/s, email 8,000/s, SMS 500/s (carrier limit). SMS costs £0.028 each. Transactional traffic runs at 2,000/s continuously through the same queues.</p>
+    <p>(a) How long does the campaign take per channel? (b) What happens to a password reset sent at 10:01? (c) What does the SMS portion cost, and what would you change?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Drain times.</strong> Push: 28M ÷ 15,000/s ≈ <strong>31 minutes</strong>. Email: 10M ÷ 8,000/s ≈ <strong>21 minutes</strong>. SMS: 2M ÷ 500/s = 4,000 s ≈ <strong>67 minutes</strong>. Transactional traffic also uses part of that capacity, so in practice each is a little longer. SMS is 5% of the campaign and takes more than twice as long as push, because the carrier limit is an external constraint you can't scale around by adding workers.</p>
+    <p><strong>(b) The password reset at 10:01 — the important part.</strong> If transactional and marketing share a queue, the reset is behind roughly 27 million queued push messages. At 15,000/s it waits <strong>about 30 minutes</strong>. The user requested a reset, received nothing, requested again, received nothing, and has filed a support ticket before the first message arrives. The system is not down, no error was logged, and every metric looks healthy — throughput is at capacity and the queue is draining normally.</p>
+    <p>This is head-of-line blocking, the most common real failure in notification systems. The fixes:</p>
+    <ul>
+    <li><strong>Separate priority lanes per channel</strong> — a transactional push queue and a marketing push queue, with workers serving transactional first and draining marketing with spare capacity. A password reset then waits milliseconds regardless of what marketing is doing.</li>
+    <li><strong>Separate provider connections or accounts,</strong> so transactional throughput is not consumed by the campaign and — for email — so marketing complaint rates can't damage the reputation password resets depend on.</li>
+    <li><strong>Pace the campaign</strong> to leave deliberate headroom, e.g. cap marketing at 12,000/s of the 15,000/s push capacity. The campaign takes 39 minutes instead of 31, which nobody notices, and transactional latency is protected.</li>
+    </ul>
+    <p><strong>(c) SMS cost.</strong> 2M × £0.028 = <strong>£56,000 for one campaign</strong>, against push, which is free, and email at a fraction of a penny. SMS is 5% of the messages and essentially all of the cost.</p>
+    <p>What to change, in order:</p>
+    <ul>
+    <li><strong>Don't use SMS for marketing</strong> unless the user explicitly chose it and the message justifies the cost. Reserve SMS for transactional cases where reachability matters — two-factor codes, delivery arrival, fraud alerts.</li>
+    <li><strong>Channel selection by value, with fallback.</strong> Send push first; fall back to SMS only for users with no active push token <em>and</em> only for high-value notifications. That might cut SMS volume by 90%.</li>
+    <li><strong>Put a spend cap in the rules engine</strong> with a hard stop and an alert. A bug that routes all 40M messages to SMS is a <strong>£1.12M</strong> incident; at 500/s it would take 80,000 s, about 22 hours, to drain — the carrier limit is your only accidental protection. Make it a deliberate control.</li>
+    </ul>
+    <p><strong>The lesson:</strong> the two things that actually hurt you here — head-of-line blocking of critical messages, and per-message cost on one channel — are both invisible in a throughput-oriented capacity plan. Priority separation and a spend cap are cheap to build beforehand and impossible to add during the incident.</p></details>
+
+<b>Diagnose it</b>
+    <p>After a Kafka consumer-group rebalance during a deploy, about 2% of users report receiving the same "your task finished" push twice, each as a separate banner. Your pipeline has an idempotency key on the API and a dedup store in the push worker. What happened and what do you fix?</p>
+    <details><summary>Answer</summary>
+    <p>The rebalance moved partitions between consumers; the new owners started from the last committed offsets, so events processed but not yet committed were redelivered (at-least-once). The dedup store should have caught those — so check how the key is built and when it's written. Likely causes: the dedup key includes something that differs between deliveries (a worker-generated UUID or a timestamp instead of the event's own ID); the key is written <em>after</em> the provider call, so two workers handling the overlapping copies both passed the check; or the dedup TTL is shorter than the redelivery window. Separate banners also mean pushes were sent without a stable collapse ID. Fix: key the dedup store on (event_id, user_id, channel), claim it atomically with SET NX before sending, and set apns-collapse-id / collapse_key to a value derived from the event ID so any duplicate that still slips through replaces the first banner.</p></details>
+</section>

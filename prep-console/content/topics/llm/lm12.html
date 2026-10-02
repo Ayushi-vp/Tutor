@@ -1,0 +1,339 @@
+<!-- topic source for llm/lm12; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "lm12",
+  "t": "Quantisation and the memory arithmetic",
+  "tag": "Inference",
+  "sum": "How storing weights, activations and the KV cache in 8 or 4 bits shrinks memory and speeds up decoding: absmax and group quantisation worked by hand, why outlier features break naive int8, how LLM.int8(), GPTQ and AWQ keep accuracy, and the memory sums every interviewer asks for.",
+  "viz": "quant",
+  "prereq": [
+    ["gpu4", "Number formats trade bits for range and precision: bf16 and fp16 use 2 bytes, int8 and FP8 1 byte, 4-bit formats half a byte, and low-bit formats need scaling factors per tensor or per block."],
+    ["gpu10", "Decoding one token per step is memory-bound: each step reads every weight (and the KV cache) from GPU memory, so time per token is roughly bytes read ÷ memory bandwidth."],
+    ["lm5", "The KV cache stores keys and values of past tokens; at long context or high batch it can exceed the weights in memory."],
+    ["lm3", "Almost all of a transformer's parameters are in large linear layers (attention projections and MLPs); Llama 2 7B has 6.74B parameters, 13.5 GB in bf16."],
+    ["lm11", "QLoRA stores a frozen base model in 4-bit NF4 during fine-tuning and computes in bf16, dequantising blocks on the fly."]
+  ],
+  "myths": [
+    ["Quantisation always costs a lot of accuracy.", "With good methods, 8-bit weights are typically indistinguishable from 16-bit, and 4-bit weights lose little on large models: LLM.int8() ran models up to 175B parameters in 8-bit 'without performance degradation', and GPTQ quantised 175B models to 3-4 bits 'with negligible accuracy degradation'. Losses grow at 3 bits and below, on small models, and on sensitive tasks such as long reasoning, so it must be measured, but 'quantised means much worse' is outdated."],
+    ["Quantising to 4 bits makes the model 4 times faster.", "Speed-ups come from moving fewer bytes, so they appear where inference is memory-bound: small-batch decoding. There, 4-bit weights can make each step up to about 3-4 times faster (GPTQ reported about 3.25× on an A100). Prefill and large-batch decoding are compute-bound, and if the hardware computes in 16-bit after dequantising, 4-bit weights barely speed them up and can slow them down."],
+    ["You can quantise activations just like weights.", "Activations in large models contain outlier features up to 20 times larger than other dimensions, concentrated in a few channels; a single int8 scale for a row then wastes almost all its levels on the outliers. Dettmers et al. found these outliers appear systematically from about 6.7B parameters and break regular 8-bit quantisation; methods keep outlier columns in 16-bit (LLM.int8()), move the difficulty into the weights (SmoothQuant) or use FP8, which has more range."],
+    ["Bits per weight equals file size.", "Low-bit formats store a scaling factor (and sometimes a zero point) per group of weights. A 16-bit scale per 128 weights adds 0.125 bits per weight; per 32 weights, 0.5 bits. A '4-bit' model with group size 32 is closer to 4.5 bits per weight, and embedding or output layers are often left in higher precision."],
+    ["Quantisation is only about weights.", "For serving, the KV cache can be as large as the weights (lm5), and quantising it to 8 bits halves it, doubling the batch or context that fits. Weight-only quantisation (W4A16) helps memory and small-batch speed; weight-and-activation quantisation (W8A8, FP8) also speeds up compute-bound phases on hardware with fast low-precision units."],
+    ["A quantised model behaves the same everywhere if its benchmark score is close.", "Averages hide failures: quantisation can disproportionately hurt rare languages, long-context retrieval, arithmetic, code or particular prompts. Evaluate on your own tasks, compare outputs on a sample, and check perplexity on your domain, not just a headline benchmark."]
+  ],
+  "recap": [
+    "Quantisation stores numbers with fewer bits, a low-precision integer code times a scale, cutting memory and the bytes moved per decode step.",
+    "Absmax int8 by hand: for x = [0.5, −1.2, 3.0, 0.1] the scale is 3.0/127 = 0.0236, the codes are [21, −51, 127, 4] and the reconstruction [0.496, −1.205, 3.0, 0.094]; int4 (levels −7 to 7) gives codes [1, −3, 7, 0] and much larger errors.",
+    "One outlier forces a large shared scale and wastes precision for everything else, so modern methods use per-channel or per-group scales (for example one 16-bit scale per 128 weights, 0.125 extra bits per weight).",
+    "Weight memory is parameters × bytes: Llama 2 7B is 13.5 GB in bf16, 6.7 GB in int8 and about 3.5 GB in int4 with group-128 scales; a 70B model is about 141, 71 and 36 GB.",
+    "Because small-batch decoding is memory-bound, smaller weights mean faster tokens: reading 141 GB at 3.35 TB/s takes about 42 ms, 36 GB about 11 ms.",
+    "LLM.int8() found systematic outlier features (up to 20× larger) emerging around 6.7B parameters in all layers and 75% of sequence positions, and kept those dimensions in 16-bit while over 99.9% of values were multiplied in 8-bit, with no degradation up to 175B.",
+    "GPTQ quantises weights one column at a time and uses second-order (Hessian) information from calibration data to push each column's rounding error onto columns not yet quantised; it compressed 175B models to 3-4 bits in about four GPU hours.",
+    "AWQ observes that about 1% of weight channels are salient, identifies them by activation magnitude, and scales them up before quantisation (folding the inverse scale into the input) to protect them without mixed precision.",
+    "In the lab, int4 group-128 round-to-nearest gives 11.7% relative output error on a layer with correlated, outlier-bearing inputs, AWQ-style scaling 9.8% and GPTQ-style error compensation 3.8%; int8 with outlier columns kept in 16-bit cuts activation-quantisation error from 3.4% to 0.8%.",
+    "Choose by goal: weight-only 4-bit for fitting large models and fast single-user decoding, 8-bit or FP8 weights and activations for high-throughput serving on supporting hardware, an 8-bit KV cache for more concurrency, and always re-evaluate on your own tasks."
+  ],
+  "glossary": [
+    ["Absmax quantisation", "Symmetric quantisation whose scale maps the largest absolute value in a group to the largest integer code (127 for int8)."],
+    ["Calibration data", "A small sample of representative inputs used to measure activation statistics or Hessians when choosing quantisation parameters."],
+    ["Dequantise", "Convert integer codes back to real numbers by multiplying by the scale (and adding any zero point)."],
+    ["FP8", "8-bit floating-point formats (E4M3, E5M2) with an exponent, giving more range than int8; supported natively by recent GPUs (gpu4)."],
+    ["GGUF", "The file format used by llama.cpp for quantised models, with several block-wise quantisation types."],
+    ["GPTQ", "A post-training weight quantisation method that quantises columns sequentially and compensates rounding errors using second-order information from calibration data."],
+    ["Group size", "The number of consecutive weights sharing one scale, such as 32, 64 or 128; smaller groups are more accurate but add more scale overhead."],
+    ["Hessian (here)", "The matrix XᵀX of input statistics for a layer, which tells how much output error a weight change in each direction causes."],
+    ["Mixed-precision decomposition", "LLM.int8()'s method of computing outlier feature dimensions in 16-bit and the rest in int8, then summing."],
+    ["NF4", "4-bit NormalFloat: a 4-bit format with levels at normal-distribution quantiles, used by QLoRA."],
+    ["OBQ", "Optimal brain quantiser: the column-by-column, Hessian-based method GPTQ builds on."],
+    ["Outlier feature", "A hidden-state dimension whose values are far larger than others across many tokens and layers in large transformers."],
+    ["Per-channel quantisation", "Using one scale per output row (or input column) of a weight matrix instead of one for the whole tensor."],
+    ["Post-training quantisation (PTQ)", "Quantising a trained model without further training, sometimes using calibration data."],
+    ["Quantisation-aware training (QAT)", "Training or fine-tuning with simulated quantisation in the forward pass so the model learns to tolerate it."],
+    ["Round-to-nearest (RTN)", "The simplest quantisation: divide by the scale and round each value independently."],
+    ["Salient weights", "The small fraction of weights whose quantisation error most affects outputs, typically those multiplied by large activations."],
+    ["Scale", "The real-valued step between adjacent integer codes in a quantised group."],
+    ["SmoothQuant", "A method that divides activations by per-channel factors and multiplies the matching weights by them, moving outlier difficulty from activations into weights so both can be int8."],
+    ["W4A16 / W8A8", "Notation for weight and activation bit widths: 4-bit weights with 16-bit activations, or 8-bit both."],
+    ["Zero point", "An offset used in asymmetric quantisation so the integer range covers [min, max] rather than a range symmetric about zero."]
+  ],
+  "qa": [
+    ["E", "How much memory does a 70B model need in bf16, int8 and int4?", "Parameters × bytes: about 70.6B × 2 = 141 GB in bf16, 71 GB in int8, and about 35 GB in int4 plus a few percent for scales (about 36 GB with one 16-bit scale per 128 weights). Add the KV cache and activations at serving time. So 70B fits on two 80 GB GPUs in bf16, one in int8 with little room for cache, and comfortably on one in int4."],
+    ["E", "Quantise [0.5, −1.2, 3.0, 0.1] to int8 with absmax.", "The largest magnitude is 3.0, so the scale is 3.0/127 = 0.0236. Divide and round: codes 21, −51, 127, 4. Multiply back: 0.496, −1.205, 3.0, 0.094, errors of a few thousandths. In int4 (codes −7 to 7) the scale is 3.0/7 = 0.429, codes 1, −3, 7, 0, reconstruction 0.429, −1.286, 3.0, 0: the small values lose most of their precision."],
+    ["E", "Why does quantisation speed up generation?", "Decoding a token at small batch reads every weight from GPU memory once and does little arithmetic per byte, so its time is set by bytes ÷ bandwidth. Halving or quartering the bytes per weight cuts that time nearly proportionally, as long as dequantisation is fused into the matrix-multiply kernel. At large batch or in prefill the work is compute-bound, and weight-only quantisation helps much less."],
+    ["M", "Why do outliers matter so much, and what does LLM.int8() do about them?", "With absmax scaling, the largest value in a group sets the step size for everyone. In large transformers a few hidden dimensions carry values up to 20× larger than the rest, consistently across tokens, so a per-token int8 scale leaves the normal values with only a handful of usable levels. Dettmers et al. found these outliers emerge systematically around 6.7B parameters. LLM.int8() detects feature dimensions with magnitude above a threshold (6.0), computes those columns in 16-bit and everything else in int8 (over 99.9% of values), and adds the two results, preserving accuracy up to 175B.", "Follow-up: What is the cost? — The mixed-precision split adds overhead, so LLM.int8() saves memory but is not faster than 16-bit in its original implementation."],
+    ["M", "Per-tensor, per-channel or per-group scales?", "A single scale per tensor is cheapest but lets any outlier ruin everything. Per-channel scales (one per output row) adapt to each row's range at negligible cost and are standard for int8 weights. For 4-bit, per-group scales over 32-128 consecutive weights are needed for accuracy; their cost is overhead (a 16-bit scale per 128 weights adds 0.125 bits per weight) and slightly more complex kernels."],
+    ["M", "Explain GPTQ at a high level.", "It quantises a layer's weights one input column at a time. After rounding a column, it computes the resulting output error and updates the not-yet-quantised columns to compensate, using the inverse of the Hessian XᵀX built from calibration inputs, which says how weight changes in each direction affect outputs. Errors that the remaining columns can absorb are cancelled instead of accumulating. With efficient batching and a Cholesky formulation it quantised 175B models to 3-4 bits in about four GPU hours.", "Follow-up: Why does correlation between inputs matter? — The compensation works by shifting error into directions the inputs make interchangeable; with correlated inputs there is a lot of such room, which is why GPTQ beats round-to-nearest by 3× in the lab's correlated layer."],
+    ["M", "How does AWQ differ from GPTQ?", "AWQ (activation-aware weight quantisation) does not reconstruct weights. It notes that about 1% of weight channels matter most, those multiplied by large activations, and protects them by scaling those input channels of the weight up by a factor s before quantisation and dividing the corresponding activations by s, which is mathematically equivalent in full precision but gives salient weights relatively more quantisation levels. The scales come from activation statistics, with no backpropagation, so it generalises well and is simple to run."],
+    ["M", "Should you quantise the KV cache?", "Often yes, to 8 bits (int8 or FP8): it halves cache memory, which directly increases the batch size or context length a GPU can serve (lm5), and decode steps read fewer bytes. Accuracy impact is usually small at 8 bits but should be checked on long-context tasks. 4-bit caches save more but are riskier and need careful per-channel or per-group scaling of keys."],
+    ["M", "What is the difference between weight-only and weight-and-activation quantisation?", "Weight-only (W4A16, W8A16) stores weights in low precision and dequantises them to 16-bit inside the matrix multiply; it saves memory and speeds up memory-bound decoding. Weight-and-activation (W8A8, FP8) quantises both operands, so the multiply itself runs on low-precision tensor cores at higher throughput, which also speeds up compute-bound prefill and large batches, but requires handling activation outliers and hardware support."],
+    ["H", "A 4-bit model scores within 1 point of the 16-bit model on a benchmark but users complain. What might be happening?", "Averages hide localised damage. Quantisation can hurt particular abilities more: long-context retrieval, arithmetic, code, low-resource languages, or rare tokens, and long generations accumulate small errors. The benchmark may also not resemble the product's traffic. Compare 16-bit and 4-bit outputs on a sample of real prompts, measure perplexity on your domain, run task-specific evaluations, and consider a less aggressive scheme (8-bit, smaller groups, GPTQ or AWQ instead of round-to-nearest, keeping sensitive layers in higher precision)."],
+    ["H", "Estimate decode speed for Llama 2 70B in bf16 versus int4 on H100s at batch 1.", "Each token reads all weights: 141 GB in bf16, about 36 GB in int4. At 3.35 TB/s per H100, bf16 needs two GPUs (141 GB does not fit in 80 GB) and with tensor parallelism reads 70.5 GB per GPU per token, about 21 ms plus communication; int4 fits on one GPU and reads 36 GB, about 11 ms. Real systems reach perhaps 60-80% of peak bandwidth, so roughly 30 ms versus 15 ms per token, about 30-35 versus 65 tokens per second.", "Follow-up: What changes at batch 64? — Weight reads are shared across the batch, so compute and KV-cache reads dominate; int4 weights help much less, and W8A8 or FP8 compute becomes the more useful lever."],
+    ["H", "How would you choose a quantisation scheme for a production service?", "Start from the bottleneck. If the model does not fit or single-user latency matters, weight-only int4 (GPTQ or AWQ, group 128) or int8. If throughput at high batch matters and the GPUs support it, FP8 or W8A8 for weights and activations, plus an 8-bit KV cache for concurrency. Then evaluate against the 16-bit model on task metrics and real-traffic samples, benchmark tokens per second and latency at the target batch with the real serving engine (kernel support decides actual speed), and keep the option to leave sensitive layers in higher precision."],
+    ["H", "Why does quantisation hurt small models more than large ones, yet outliers appear only in large models?", "Small models have less redundancy, so the noise quantisation adds to each weight is a larger fraction of what each weight contributes, and errors are less likely to average out; their 4-bit losses are typically larger. Large models are more robust to weight noise, but from around 6.7B parameters develop the systematic activation outliers that break naive activation quantisation. So for weights, bigger models quantise more easily; for activations, bigger models need outlier handling."]
+  ],
+  "refs": [
+    ["paper", "LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale", "Dettmers et al., 2022. The public case: emergent outlier features and mixed-precision decomposition up to 175B.", "https://arxiv.org/abs/2208.07339"],
+    ["paper", "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers", "Frantar et al., 2022. Second-order, column-by-column weight quantisation; 175B in about four GPU hours.", "https://arxiv.org/abs/2210.17323"],
+    ["paper", "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration", "Lin et al., 2023. Protect the ~1% salient channels by scaling, chosen from activation statistics.", "https://arxiv.org/abs/2306.00978"],
+    ["paper", "SmoothQuant", "Xiao et al., 2022. Moving activation outliers into weights so W8A8 works.", "https://arxiv.org/abs/2211.10438"],
+    ["docs", "Quantization overview", "Hugging Face Transformers. Supported methods side by side.", "https://huggingface.co/docs/transformers/main/en/quantization/overview"],
+    ["code", "llama.cpp", "The GGUF block-quantisation reference implementation for running quantised models locally.", "https://github.com/ggml-org/llama.cpp"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team wants to run a 70-billion-parameter open model for an internal assistant. In the bf16 format it was released in, its weights take 141 GB, more than the largest single GPU in their cloud account. Two GPUs would do, but they would also need room for the KV cache (lm5), the bill doubles, and each generated token still takes about 40 ms because every step must read all 141 GB of weights from memory. Someone suggests "just quantise it to 4 bits". Suddenly the model is 36 GB, fits on one GPU with room for a large cache, and generates tokens roughly three times faster. Is that too good to be true? What did they give up?</p>
+<p><strong>Quantisation</strong>, storing numbers with fewer bits, is the single most important lever for the cost of serving LLMs and for running them on modest hardware, from laptops to phones. It is also full of traps. Naively rounding the weights of a large model to 8 bits works; doing the same to its activations destroys it, because of a few huge "outlier" values that appear in models above a certain size. Rounding to 4 bits works only with care. Speed-ups appear in some regimes and vanish in others. And the accuracy cost, usually small, can be concentrated in exactly the abilities your product needs.</p>
+<p>For an AI engineer the questions are concrete and frequent: how much memory does this model need in each format; will it fit; how fast will it decode; which method should we use; how do we check we did not break it? Interviewers love the memory arithmetic because it is quick to compute and reveals immediately whether a candidate understands where inference cost comes from.</p>
+<p>This lesson builds quantisation from scratch: integer codes and scales worked by hand at 8 and 4 bits, why one outlier ruins a shared scale and how per-channel and per-group scales fix it, the memory and speed arithmetic for 7B and 70B models, then the three landmark methods: LLM.int8()'s outlier decomposition, GPTQ's error compensation and AWQ's salient-channel scaling. It covers activation and KV-cache quantisation, formats such as FP8 and NF4, and how to evaluate a quantised model. The lab implements all of it in NumPy on a layer with realistic outliers.</p>
+</section>
+
+<section data-field="primer">
+<h4>Fewer bits per number</h4>
+<p>A model's weights are usually stored as 16-bit floating-point numbers (bf16, 2 bytes each). Quantisation replaces each weight with a small integer code, 8 bits (256 possible values) or 4 bits (16 values), plus a shared <strong>scale</strong>: the real-valued size of one step between codes. To use a weight, multiply its code by the scale. The model now needs a half or a quarter of the memory, and every time it reads its weights, which it does once per generated token, it moves a half or a quarter of the bytes.</p>
+<h4>An analogy: measuring with a coarser ruler</h4>
+<p>Imagine recording the heights of everyone in a building with a ruler marked only every 10 cm instead of every millimetre. Each height is now one of a few dozen marks, so the list is much shorter to write down, and for most purposes (who is taller than whom, roughly how tall) it is still useful. The ruler's range must cover the tallest person; if one visitor is 5 metres tall, you would need a ruler 5 metres long with the same number of marks, so marks would be 50 cm apart and everyone else's height would round to the same two or three marks. That is the outlier problem in one picture, and much of modern quantisation is about rulers per group of people (per-group scales), measuring the giants separately (mixed precision), or bending the ruler (non-uniform formats). The analogy breaks in that a model's errors compound: a slightly wrong weight feeds into the next layer, and a few hundred layers of small errors can add up, which is why careful methods matter more at 4 bits than at 8.</p>
+<h4>Two moments when quantisation happens</h4>
+<p>Quantisation can be done after training or during it. <strong>Post-training quantisation</strong> takes a finished model and converts it, sometimes using a few hundred example inputs ("calibration data") to choose scales well; it takes minutes to hours and is how almost every quantised model you download was made. <strong>Quantisation-aware training</strong> simulates low precision while training or fine-tuning so the model adapts to it; it costs training compute but works at lower bit widths. This lesson focuses on post-training methods, because that is what engineers deploying existing models use. There is also a choice about <em>what</em> to quantise: the weights only, the activations flowing between layers as well, or the KV cache. Each has a different payoff and a different difficulty, and section 3 of the body compares them.</p>
+<h4>The numbers that matter</h4>
+<table>
+<thead><tr><th>Format</th><th>Bytes per weight</th><th>Llama 2 7B</th><th>70B model</th></tr></thead>
+<tbody>
+<tr><td>fp32</td><td>4</td><td>27 GB</td><td>282 GB</td></tr>
+<tr><td>bf16 / fp16</td><td>2</td><td>13.5 GB</td><td>141 GB</td></tr>
+<tr><td>int8 / FP8</td><td>1</td><td>6.7 GB</td><td>71 GB</td></tr>
+<tr><td>int4, group-128 scales</td><td>≈ 0.52</td><td>3.5 GB</td><td>36 GB</td></tr>
+</tbody>
+</table>
+<p>And because generating a token at small batch means reading every weight once (gpu10), the time per token falls roughly in proportion: on an H100 with 3.35 TB/s of memory bandwidth, reading 141 GB takes about 42 ms, 36 GB about 11 ms. That is the whole attraction.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Two number lines with 15 int4 levels: with ordinary values the levels are finely spaced; with one outlier at 60 the scale stretches and almost all normal values round to zero">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">int4: 15 levels spread over ±(largest value)</text>
+    <text x="20" y="62" style="fill:var(--ink-2)">values ±3</text>
+    <line x1="120" y1="60" x2="600" y2="60" style="stroke:var(--line-2);fill:none"/>
+    <g style="stroke:var(--accent)">
+      <line x1="120" y1="52" x2="120" y2="68"/><line x1="154" y1="52" x2="154" y2="68"/><line x1="189" y1="52" x2="189" y2="68"/><line x1="223" y1="52" x2="223" y2="68"/><line x1="257" y1="52" x2="257" y2="68"/><line x1="291" y1="52" x2="291" y2="68"/><line x1="326" y1="52" x2="326" y2="68"/><line x1="360" y1="52" x2="360" y2="68"/><line x1="394" y1="52" x2="394" y2="68"/><line x1="429" y1="52" x2="429" y2="68"/><line x1="463" y1="52" x2="463" y2="68"/><line x1="497" y1="52" x2="497" y2="68"/><line x1="531" y1="52" x2="531" y2="68"/><line x1="566" y1="52" x2="566" y2="68"/><line x1="600" y1="52" x2="600" y2="68"/>
+    </g>
+    <g style="fill:var(--s1)"><circle cx="303" cy="60" r="4"/><circle cx="345" cy="60" r="4"/><circle cx="380" cy="60" r="4"/><circle cx="410" cy="60" r="4"/><circle cx="265" cy="60" r="4"/><circle cx="440" cy="60" r="4"/></g>
+    <text x="120" y="88" style="fill:var(--muted)">−3</text><text x="355" y="88" style="fill:var(--muted)">0</text><text x="590" y="88" style="fill:var(--muted)">3</text>
+    <text x="20" y="152" style="fill:var(--ink-2)">one value = 60</text>
+    <line x1="120" y1="150" x2="600" y2="150" style="stroke:var(--line-2);fill:none"/>
+    <g style="stroke:var(--accent)">
+      <line x1="120" y1="142" x2="120" y2="158"/><line x1="154" y1="142" x2="154" y2="158"/><line x1="189" y1="142" x2="189" y2="158"/><line x1="223" y1="142" x2="223" y2="158"/><line x1="257" y1="142" x2="257" y2="158"/><line x1="291" y1="142" x2="291" y2="158"/><line x1="326" y1="142" x2="326" y2="158"/><line x1="360" y1="142" x2="360" y2="158"/><line x1="394" y1="142" x2="394" y2="158"/><line x1="429" y1="142" x2="429" y2="158"/><line x1="463" y1="142" x2="463" y2="158"/><line x1="497" y1="142" x2="497" y2="158"/><line x1="531" y1="142" x2="531" y2="158"/><line x1="566" y1="142" x2="566" y2="158"/><line x1="600" y1="142" x2="600" y2="158"/>
+    </g>
+    <g style="fill:var(--s1)"><circle cx="355" cy="150" r="4"/><circle cx="358" cy="150" r="4"/><circle cx="362" cy="150" r="4"/><circle cx="365" cy="150" r="4"/><circle cx="352" cy="150" r="4"/></g>
+    <circle cx="600" cy="150" r="5" style="fill:var(--crit)"/>
+    <text x="120" y="178" style="fill:var(--muted)">−60</text><text x="355" y="178" style="fill:var(--muted)">0</text><text x="585" y="178" style="fill:var(--muted)">60</text>
+    <text x="20" y="206" style="fill:var(--ink-2)">Step size jumps from 0.43 to 8.6: every normal value now rounds to 0.</text>
+  </g>
+</svg>
+<figcaption>Why outliers hurt. Top: values within ±3 spread across the 15 levels. Bottom: one value of 60 in the same group stretches the scale twenty-fold, so all the ordinary values (dots near zero) collapse onto the zero level. Per-group scales and outlier handling exist to prevent this.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<h4>1. Integer codes and scales</h4>
+<p>The simplest scheme is <strong>symmetric absmax quantisation</strong>. For b bits, the integer codes run from −(2^(b−1) − 1) to 2^(b−1) − 1: −127 to 127 for int8, −7 to 7 for int4 (one code is left unused to keep the range symmetric). Choose the scale so that the largest absolute value in the group maps to the largest code: s = max|x| / (2^(b−1) − 1). Quantise by q = round(x / s) and dequantise by x̂ = q · s.</p>
+<p><strong>Worked, int8:</strong> x = [0.5, −1.2, 3.0, 0.1]. The largest magnitude is 3.0, so s = 3.0/127 = 0.02362. Divide and round: 0.5/0.02362 = 21.2 → 21; −1.2/0.02362 = −50.8 → −51; 3.0 → 127; 0.1/0.02362 = 4.2 → 4. Codes [21, −51, 127, 4]. Dequantise: [0.496, −1.205, 3.000, 0.094]. Errors of 0.004 to 0.006, about 0.2% of the range: invisible in practice. <strong>Worked, int4:</strong> s = 3.0/7 = 0.4286; codes round([1.17, −2.80, 7, 0.23]) = [1, −3, 7, 0]; dequantised [0.429, −1.286, 3.0, 0]. Errors up to 0.1, and the 0.1 has vanished entirely. With only 15 levels, each step is a large fraction of the range, so how the levels are placed and how the scale is chosen matter much more.</p>
+<p><strong>Asymmetric</strong> quantisation adds a <strong>zero point</strong> so the codes cover [min, max] rather than a symmetric range, useful for values that are mostly positive (such as outputs of a ReLU). Weights of LLMs are roughly symmetric around zero, so symmetric schemes are common for weights.</p>
+<h4>2. Granularity: one scale for how many numbers?</h4>
+<p>A scale is shared by a group of numbers, and the choice of group is the main accuracy lever. <strong>Per-tensor</strong>: one scale for a whole weight matrix; cheapest, but the single largest value anywhere sets the step for everyone. <strong>Per-channel</strong>: one scale per output row; rows differ in range, and adapting to each costs almost nothing (4,096 scales for a 4,096 × 4,096 matrix). Standard for int8 weights. <strong>Per-group</strong>: one scale per block of consecutive weights within a row, typically 32, 64 or 128; needed for good 4-bit accuracy. The cost is overhead: a 16-bit scale per 128 weights adds 16/128 = 0.125 bits per weight; per 32 weights, 0.5 bits. A "4-bit" model with group size 128 actually stores about 4.125 bits per weight, or about 0.52 bytes.</p>
+<p>The lab measures the effect on a vector of 256 normal values with one outlier of 60. int8 with one scale for all 256: RMS error 0.135. int8 with groups of 32: 0.047. int4 with one scale: 1.01, which is as large as the values themselves, so the vector is destroyed; int4 with groups of 32: 0.30. The outlier only damages the 31 values that share its group.</p>
+<h4>3. What gets quantised: weights, activations, KV cache</h4>
+<p>Three kinds of numbers can be stored in low precision, with different consequences. <strong>Weights</strong> are fixed after training, so they can be quantised once, offline, with as much care (and calibration data) as you like. <strong>Activations</strong>, the inputs to each matrix multiplication, change with every input, so they must be quantised on the fly with cheap rules, and they contain the outliers discussed below. The <strong>KV cache</strong> (lm5) stores keys and values for every past token; quantising it to 8 bits halves the memory that limits batch size and context length. Notation: W4A16 means 4-bit weights, 16-bit activations (weight-only quantisation); W8A8 means both in 8 bits.</p>
+<p>Weight-only quantisation saves memory and speeds up memory-bound decoding: the kernel reads 4-bit weights, dequantises them in fast on-chip memory, and multiplies in 16-bit. Weight-and-activation quantisation lets the multiplication itself run on low-precision tensor cores, which doubles or quadruples peak throughput on GPUs that support it (gpu4), helping compute-bound prefill and large batches.</p>
+<h4>4. The memory arithmetic, in full</h4>
+<p>Serving memory = weights + KV cache + activations and overhead. For Llama 2 70B (about 70.6B parameters, 80 layers, 8 KV heads, head dimension 128):</p>
+<pre>weights   bf16: 70.6e9 × 2      = 141 GB
+          int8: 70.6e9 × 1      =  71 GB
+          int4, g=128: × 0.516  =  36 GB
+KV cache  bf16: 2 × 80 × 8 × 128 × 2 bytes = 320 KiB per token
+          8-bit: 160 KiB per token
+          32 sequences × 4,096 tokens: 40 GiB (bf16) or 20 GiB (8-bit)</pre>
+<p>On one 80 GB GPU, bf16 does not fit at all; int8 fits with only a few GB left for cache; int4 leaves about 35-40 GB for cache and activations, enough for dozens of concurrent 4K-token sequences with an 8-bit cache. This arithmetic, done before choosing hardware, prevents most capacity surprises.</p>
+<h4>5. The speed arithmetic</h4>
+<p>At batch size 1, each decode step reads every weight once and performs about 2 FLOPs per weight, far below what a GPU can do per byte (gpu2), so time per token ≈ bytes of weights ÷ memory bandwidth. On an H100 (3.35 TB/s): 70B in int4, 36 GB → about 11 ms per token at peak bandwidth; in bf16 across two GPUs with tensor parallelism, 70.5 GB per GPU → about 21 ms plus communication. Real kernels reach perhaps 60-80% of peak bandwidth. GPTQ's authors measured end-to-end speed-ups of about 3.25× on A100 GPUs and 4.5× on A6000 GPUs over fp16 for their 3-4-bit 175B models, the memory-bound regime at work. As the batch grows, weight reads are shared across sequences and the step becomes compute- or KV-bound, so weight-only quantisation's speed advantage shrinks; then W8A8 or FP8 compute and an 8-bit KV cache are the levers.</p>
+<h4>6. Outlier features</h4>
+<p>Dettmers et al. studied the hidden states of transformers as they scaled and found something surprising: a few feature dimensions carry values up to 20 times larger than the rest, and they are systematic, the same dimensions across tokens. In smaller models they appear in some layers; in their analysis, outliers first appear in about 25% of layers and then spread, and at around 6.7B parameters a "phase shift" occurs: all layers and about 75% of sequence positions are affected. They are highly concentrated: at the 6.7B scale, about 150,000 outlier values occur per sequence but in only 6 feature dimensions across the entire transformer. And they matter: setting those dimensions to zero reduced the top-1 attention softmax probability mass by more than 20% and degraded validation perplexity by 600-1000%, although they are about 0.1% of all input features, while removing the same number of random features had little effect. Their consequence for quantisation is the ruler problem: quantise an activation row with one absmax scale and the outlier dimensions stretch it, leaving the other values with a handful of usable levels. Regular 8-bit methods that worked on small models failed on larger ones exactly at this scale.</p>
+<h4>7. LLM.int8(): compute the outliers separately</h4>
+<p>LLM.int8() handles this with a <strong>mixed-precision decomposition</strong>. For a matrix multiplication XWᵀ, it finds the input feature dimensions where any activation exceeds a threshold (6.0 in the paper), and splits the computation: those few columns of X (and the matching columns of W) are multiplied in 16-bit; everything else is quantised to int8 with per-row (vector-wise) scales for activations and per-column scales for weights, multiplied in int8 and dequantised; the two partial results are added. More than 99.9% of values go through the 8-bit path. The result preserved full 16-bit accuracy for models up to 175B parameters, which could then be loaded from 16-bit checkpoints, converted and used immediately on half the memory. In the lab, a layer with 6 outlier input channels out of 512: quantising activations to int8 per token gives 3.4% relative output error; keeping the outlier columns (1.2% of channels) in 16-bit cuts it to 0.8%.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="LLM.int8 decomposition: activation matrix X has a few outlier columns; they and matching weight rows go through a 16-bit multiply, the rest through int8; results are summed">
+  <defs><marker id="lm12-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="40" width="160" height="110" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <rect x="60" y="40" width="10" height="110" style="fill:var(--crit);fill-opacity:0.5;stroke:none"/>
+    <rect x="130" y="40" width="10" height="110" style="fill:var(--crit);fill-opacity:0.5;stroke:none"/>
+    <text x="100" y="30" text-anchor="middle" style="fill:var(--ink);font-weight:600">activations X</text>
+    <text x="100" y="168" text-anchor="middle" style="fill:var(--crit)">outlier columns (|x| > 6)</text>
+    <rect x="260" y="30" width="170" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="345" y="50" text-anchor="middle" style="fill:var(--ink)">16-bit matmul</text>
+    <text x="345" y="66" text-anchor="middle" style="fill:var(--ink-2)">outlier columns only (&lt;0.1%)</text>
+    <rect x="260" y="110" width="170" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="345" y="130" text-anchor="middle" style="fill:var(--ink)">int8 matmul</text>
+    <text x="345" y="146" text-anchor="middle" style="fill:var(--ink-2)">everything else (&gt;99.9%)</text>
+    <path d="M180,70 L220,70 L220,52 L258,52" marker-end="url(#lm12-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <path d="M180,120 L220,120 L220,132 L258,132" marker-end="url(#lm12-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <circle cx="490" cy="92" r="14" style="fill:var(--surface-2);stroke:var(--ink-2)"/><text x="490" y="97" text-anchor="middle" style="fill:var(--ink)">+</text>
+    <path d="M430,52 L490,52 L490,76" marker-end="url(#lm12-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <path d="M430,132 L490,132 L490,108" marker-end="url(#lm12-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="504" y1="92" x2="560" y2="92" marker-end="url(#lm12-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="590" y="96" text-anchor="middle" style="fill:var(--ink)">XWᵀ</text>
+    <text x="20" y="205" style="fill:var(--muted)">Lab: per-token int8 activations 3.4% error → 0.8% with the 6 outlier columns kept in 16-bit.</text>
+  </g>
+</svg>
+<figcaption>LLM.int8() isolates the few systematic outlier feature dimensions into a small 16-bit multiplication and quantises everything else, so the outliers no longer stretch the int8 scales of the normal values.</figcaption>
+</figure>
+<h4>8. GPTQ: compensate rounding errors</h4>
+<p>Rounding each weight to its nearest code independently (round-to-nearest, RTN) ignores that errors in different weights can cancel or compound. GPTQ (Frantar et al., 2022) quantises a layer's weight matrix one input column at a time. After rounding column i, it computes the error that rounding introduced and adjusts all not-yet-quantised columns to compensate, so that the layer's output on calibration inputs changes as little as possible. How much to adjust each remaining column comes from the inverse of the <strong>Hessian</strong> H = XᵀX of the layer's calibration inputs: if input features i and j are correlated, an error in weight i can be partly absorbed by changing weight j. The algorithm processes columns in order, uses a Cholesky factorisation of H⁻¹ for numerical stability, and batches updates for speed. It quantised 175B-parameter models to 3-4 bits per weight in about four GPU hours with negligible accuracy loss, more than doubling the compression of earlier one-shot methods, and made it possible to run a 175B model on a single GPU for generation.</p>
+<p>The lab implements a compact version of the update. On a 512 × 512 layer whose inputs are correlated (as real activations are) and have outlier channels, int4 RTN with groups of 128 gives 11.7% relative output error; GPTQ-style compensation gives 3.8%, three times lower, using only 1,024 calibration vectors. The improvement depends on correlation: with independent inputs there is little room to shift error and GPTQ approaches RTN.</p>
+<h4>9. AWQ: protect the salient channels</h4>
+<p>AWQ (activation-aware weight quantisation, Lin et al., 2023) starts from an observation: not all weights matter equally, and protecting only about 1% of salient weight channels greatly reduces quantisation error. Which channels are salient is decided by the <em>activations</em>, not the weights: an input channel that regularly carries large values amplifies any error in the weights that multiply it. Keeping those channels in 16-bit would need awkward mixed-precision kernels, so AWQ instead multiplies the salient input channels of W by a factor s > 1 before quantising (so their weights use more of the integer range and get relatively finer steps) and divides the corresponding activations by s at run time, which can be folded into the previous layer. In full precision this is an identity; under quantisation it shifts precision towards the weights that matter. Scales are chosen from activation statistics on a small calibration set, with no backpropagation or reconstruction, which makes AWQ fast and robust to the choice of calibration data. In the lab, a simple version (s proportional to the square root of mean activation magnitude) reduces int4 error from 11.7% to 9.8%; the real method searches the scaling exponent per layer. The AWQ authors' TinyChat inference framework reported more than 3× speed-up over a 16-bit Hugging Face implementation on desktop and mobile GPUs.</p>
+<h4>10. SmoothQuant and W8A8</h4>
+<p>To quantise activations as well as weights to 8 bits without LLM.int8()'s mixed precision, SmoothQuant (Xiao et al., 2022) applies the same mathematical trick in the opposite direction: divide each activation channel by a factor and multiply the matching weight rows by it, choosing factors that "smooth" the activation outliers by moving part of their magnitude into the weights, which are easier to quantise. Both can then be int8, and the matrix multiplication runs on int8 tensor cores. This W8A8 path, and its floating-point cousin FP8, is the common choice for high-throughput serving on hardware with fast 8-bit units.</p>
+<h4>11. Formats beyond integers</h4>
+<p>Integers space their levels evenly. Weights are roughly normally distributed, with most values near zero, so evenly spaced levels waste resolution in the tails. <strong>NF4</strong> (used by QLoRA, lm11) places its 16 levels at quantiles of a normal distribution, so each level is used about equally often. <strong>FP8</strong> formats (E4M3 and E5M2, gpu4) give each number its own exponent, providing far more range than int8 at the same byte, which tolerates outliers better; recent GPUs compute in FP8 natively, making it attractive for activations and KV caches. 4-bit floating-point formats with small per-block scales (for example the microscaling formats on the newest GPUs) extend the same idea. Local-inference tools such as llama.cpp's GGUF format use a family of block-wise schemes ("k-quants") that mix bit widths across layers. The principle is constant: spend bits where the values and the errors matter.</p>
+<h4>12. A worked comparison on one layer</h4>
+<p>The lab's layer shows how much the method matters at 4 bits. The same 512 × 512 weight matrix, the same group size of 128, the same calibration inputs: round-to-nearest leaves 11.7% relative error in the layer's output; AWQ-style scaling, which only changes which weights get finer steps, cuts it to 9.8%; GPTQ-style compensation, which uses the input correlations to cancel errors, cuts it to 3.8%. For comparison, int8 per-channel weights give 0.75%. Errors at this level in a single layer compound through dozens of layers, which is why naive 4-bit models are noticeably worse while GPTQ and AWQ models are close to the original. The ordering in a real model depends on its activations, and the published methods are more refined than the lab's versions, but the lesson holds: at 8 bits, almost any sensible method works; at 4 bits, the method is a large part of the quality.</p>
+<h4>13. Evaluating a quantised model</h4>
+<p>Quantisation is lossy, so it must be evaluated, and the headline benchmark is not enough. Measure <strong>perplexity</strong> on held-out text from your domain (a sensitive, cheap signal: increases of a few percent are typical at 4 bits for large models). Run <strong>task evaluations</strong> that matter for the product: accuracy, long-context retrieval, code, maths, multilingual inputs, and compare <strong>outputs</strong> of the 16-bit and quantised models on a sample of real prompts. Check <strong>speed</strong> with the actual serving engine and batch sizes, because speed depends on kernel support for the exact format. If a scheme hurts a capability, options include a larger group size or smaller one, a better method (GPTQ or AWQ instead of RTN), 8 bits instead of 4, keeping sensitive layers (often the first and last, embeddings and LM head) in higher precision, or quantisation-aware fine-tuning.</p>
+<h4>14. Choosing a scheme</h4>
+<table>
+<thead><tr><th>Goal</th><th>Typical choice</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Fit a big model on fewer or smaller GPUs</td><td>W4A16 (GPTQ/AWQ, g=128)</td><td>4× smaller weights, little loss on large models</td></tr>
+<tr><td>Fast single-user generation, local devices</td><td>W4A16 or GGUF 4-5 bit</td><td>decode is memory-bound; fewer bytes per token</td></tr>
+<tr><td>High-throughput serving at large batch</td><td>FP8 or W8A8 (SmoothQuant), 8-bit KV</td><td>low-precision compute plus more room for cache</td></tr>
+<tr><td>Long contexts or many users</td><td>8-bit KV cache</td><td>halves the memory that limits concurrency</td></tr>
+<tr><td>Fine-tuning on limited memory</td><td>QLoRA (NF4 base)</td><td>frozen base in 4 bits, adapters in 16 bits</td></tr>
+</tbody>
+</table>
+</section>
+
+<section data-field="deep">
+<h4>Why weights tolerate quantisation</h4>
+<p>Quantisation adds a small, roughly random error ε to each weight. A layer's output y = Wx then changes by εx, a sum of many independent small terms, whose size grows only with the square root of the number of terms while the signal grows linearly with it. Large layers therefore average quantisation noise away relative to their outputs, and large models have more redundancy (many weights and many paths can carry the same information). That is why 8-bit weights are nearly lossless and 4-bit weights are acceptable for large models, while small models, with less redundancy, lose more. The averaging argument fails for systematic errors, such as those caused by outliers or by consistently biased rounding, which is what careful methods target.</p>
+<h4>The GPTQ update, derived in one line</h4>
+<p>For a single output row w and calibration inputs X, the output error from changing w by δ is ‖Xδ‖² = δᵀHδ with H = XᵀX. If column q is forced to its quantised value (changing it by e_q), the optimal adjustment of the remaining weights to minimise δᵀHδ is δ = −e_q · H⁻¹[:, q] / H⁻¹[q, q], the classic optimal-brain-surgeon result. Applying it column by column, with H⁻¹ updated as columns are fixed, is OBQ; GPTQ's contributions were to quantise columns in a fixed order for all rows at once (so H⁻¹ is shared across rows), process them in blocks for GPU efficiency, and use a Cholesky decomposition of H⁻¹ for numerical stability. The lab's loop is exactly this with the Cholesky factor U: e = (w_i − q_i)/U[i,i], then w[:, i:] −= e·U[i, i:].</p>
+<h4>Where outliers come from</h4>
+<p>Why would a trained network concentrate huge values in a few dimensions? One account connects outliers to attention sinks and "no-op" behaviour (lm2): to let an attention head do nothing, the model routes large values through specific dimensions so that softmax puts weight on a sink token, and normalisation layers (lm3) with learned per-dimension scales amplify them. Whatever the cause, they are consistent across inputs, which is what makes them detectable from calibration data and handleable by per-channel methods. Training-side remedies (modified attention or normalisation, or rotating the hidden space with an orthogonal matrix before quantisation, which spreads outliers across all dimensions) are active research and some are used in practice.</p>
+<h4>Kernels decide the real speed</h4>
+<p>A quantised model is only fast if a kernel exists that reads the packed low-bit format, dequantises it in registers or shared memory, and feeds tensor cores without extra trips to main memory (gpu6 explains fusion). Without such kernels, a framework may dequantise whole matrices to 16-bit in memory before multiplying, which costs more bandwidth than it saves. Speed also depends on batch size: weight-only kernels shine at batch 1-16 and can lose to plain 16-bit at large batches, where dequantisation overhead lands on a compute-bound path. Always benchmark the exact format, engine and batch size you will deploy.</p>
+<h4>Rotation tricks</h4>
+<p>Outliers are a property of the basis: they live in a handful of coordinates. Multiplying the hidden states by a random orthogonal matrix (and the adjacent weights by its transpose, so the network computes the same function) spreads each outlier's energy across all dimensions, leaving a distribution with no extreme coordinates, which quantises well with simple per-token scales. Recent methods apply fixed Hadamard rotations or learned rotations at points where they can be folded into existing weights, making 4-bit weights and activations (W4A4) and 4-bit KV caches more accurate. The idea is the same as SmoothQuant's and AWQ's: transform the problem so that the numbers to be quantised are well-behaved, using operations that cancel exactly in full precision.</p>
+<h4>Quantisation-aware training and low-bit frontiers</h4>
+<p>Post-training methods hit diminishing returns below about 4 bits. Quantisation-aware training simulates quantisation in the forward pass during training or fine-tuning (using a straight-through gradient estimator for the rounding step) so the model learns weights that survive it; it recovers much of the loss at 2-3 bits but costs training compute. Research models trained natively with ternary weights (−1, 0, 1) suggest that very low precision is possible when designed in from the start. For engineers deploying existing models, the practical frontier remains 4-bit weights with good post-training methods, 8-bit or FP8 activations and caches, and 16-bit where sensitivity demands it.</p>
+</section>
+
+<section data-field="prod">
+<h4>The public case: LLM.int8() (Dettmers et al., 2022), then GPTQ and AWQ</h4>
+<p>In 2022 the largest open models, such as OPT-175B and BLOOM-176B, needed about 350 GB in 16-bit, a multi-GPU server just to load. Existing 8-bit methods worked on small models but failed on large ones, and nobody knew why. Dettmers, Lewis, Belkada and Zettlemoyer traced the failure to emergent outlier features: dimensions with magnitudes up to 20× larger than others, which first appear in about 25% of transformer layers and, around 6.7B parameters, undergo a phase shift to affect all layers and 75% of sequence positions. Regular quantisation, they showed, fails exactly where these appear. Their LLM.int8() method uses vector-wise quantisation plus a mixed-precision decomposition that multiplies the outlier dimensions (magnitude above 6.0) in 16-bit while more than 99.9% of values are multiplied in 8-bit. A 175B model could be loaded from a 16/32-bit checkpoint, converted to int8 and used immediately without performance degradation, halving memory and making OPT-175B and BLOOM usable on a single server with consumer GPUs. The method shipped in the open-source bitsandbytes library and became the standard 8-bit loader.</p>
+<p>GPTQ (Frantar, Ashkboos, Hoefler and Alistarh) went further on weights: one-shot quantisation using approximate second-order information, quantising 175B models to 3 or 4 bits per weight in about four GPU hours with negligible accuracy degradation, enabling generation with a 175B model on a single GPU and inference speed-ups of about 3.25× on A100 and 4.5× on A6000 GPUs over FP16. AWQ (Lin et al.) showed that protecting about 1% of salient weight channels, chosen by activation magnitude and protected by scaling rather than mixed precision, gives strong 4-bit quality without backpropagation, and its TinyChat framework reported more than 3× speed-up over a 16-bit implementation and deployment of Llama 2 70B on mobile GPUs. Together these three papers are why "download a 4-bit version" is now a routine step.</p>
+<h4>Failure modes in production</h4>
+<p><strong>No speed-up, or a slow-down.</strong> A quantised model running without fused kernels, or at large batch with weight-only quantisation. Benchmark with the deployment engine at realistic batch sizes before switching.</p>
+<p><strong>Localised quality loss.</strong> Perplexity barely moves but a specific capability (code, maths, a language, long context) degrades. Evaluate on task suites that cover your traffic and compare outputs side by side.</p>
+<p><strong>Calibration mismatch.</strong> GPTQ calibrated on generic English text applied to a code or multilingual workload performs worse than expected. Calibrate on representative data.</p>
+<p><strong>Format and engine mismatch.</strong> A checkpoint quantised for one library loads but runs dequantised in another, or a scale convention differs. Use formats your serving engine supports natively.</p>
+<p><strong>KV-cache quantisation surprises.</strong> 8-bit caches are usually safe, but some models' keys have outlier channels that need per-channel scales; check long-context tasks after enabling.</p>
+<h4>A typical rollout</h4>
+<p>A sensible sequence for a team moving a 70B model to 4-bit: produce GPTQ and AWQ variants with calibration data drawn from production prompts; compare perplexity on a domain sample and the task evaluation suite against the bf16 model; run a side-by-side human or judge comparison on a few hundred real prompts; benchmark throughput and latency with the production engine at expected batch sizes; then canary the quantised model on a small share of traffic, watching user feedback and task metrics before switching fully. Keeping the bf16 model available for rollback is cheap insurance.</p>
+<h4>What to monitor</h4>
+<p>Tokens per second and latency per token at production batch sizes, GPU memory headroom for KV cache, perplexity on a fixed domain sample, task metrics against the 16-bit reference, and output-diff rates on a canary set of prompts when changing quantisation settings.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> quantise by hand at 8 and 4 bits, see an outlier ruin a shared scale, then quantise a realistic layer (correlated inputs with six outlier channels) with round-to-nearest, AWQ-style scaling and a GPTQ-style column-by-column update, and reproduce LLM.int8()'s mixed-precision trick. NumPy only, a few seconds.</p>
+<pre>import numpy as np
+np.set_printoptions(precision=3, suppress=True)
+rng = np.random.default_rng(0)
+
+def quant(x, bits, axis=None):
+    """Symmetric absmax quantisation; returns the de-quantised values (what the matmul effectively uses)."""
+    qmax = 2 ** (bits - 1) - 1
+    s = np.abs(x).max(axis=axis, keepdims=axis is not None) / qmax
+    s = np.where(s == 0, 1, s)
+    return np.clip(np.round(x / s), -qmax, qmax) * s
+
+# ---- 1. by hand
+x = np.array([0.5, -1.2, 3.0, 0.1])
+for bits in (8, 4):
+    qmax = 2 ** (bits - 1) - 1; s = 3.0 / qmax
+    print(f"int{bits}: scale {s:.4f}, codes {np.round(x / s).astype(int)}, back {quant(x, bits)}, error {quant(x, bits) - x}")
+
+# ---- 2. one outlier ruins a shared scale; smaller groups contain the damage
+v = rng.normal(0, 1, 256); v[17] = 60.0                                  # one outlier, like LLM.int8()'s features
+err = lambda a, b: np.sqrt(np.mean((a - b) ** 2))
+print(f"\nint8 RMS error, one scale for 256 values: {err(quant(v, 8), v):.4f}")
+print(f"int8 RMS error, groups of 32:             {err(quant(v.reshape(-1, 32), 8, axis=1).ravel(), v):.4f}")
+print(f"int4 RMS error, one scale / groups of 32: {err(quant(v, 4), v):.4f} / {err(quant(v.reshape(-1, 32), 4, axis=1).ravel(), v):.4f}")
+
+# ---- 3. a layer: activations with a few outlier channels, weights normal
+n_in, n_out, n_tok = 512, 512, 1024
+W = rng.normal(0, n_in ** -0.5, (n_out, n_in))
+X = rng.normal(size=(n_tok, 64)) @ rng.normal(0, 0.125, (64, n_in)) + 0.3 * rng.normal(size=(n_tok, n_in))   # correlated features, like real activations
+outl = rng.choice(n_in, 6, replace=False); X[:, outl] *= 20
+Y = X @ W.T
+rel = lambda Yq: np.linalg.norm(Yq - Y) / np.linalg.norm(Y)
+def group_quant(W, bits, g=128):                                         # per output row, groups of g inputs
+    return quant(W.reshape(n_out, -1, g), bits, axis=2).reshape(n_out, n_in)
+print("\nrelative output error of the layer (weights quantised, activations exact):")
+print(f"  int8 per output channel        {rel(X @ quant(W, 8, axis=1).T):.4f}")
+print(f"  int4 round-to-nearest, g=128   {rel(X @ group_quant(W, 4).T):.4f}")
+
+# AWQ-style: scale up weight columns that meet large activations, quantise, fold the inverse scale into x
+a = np.abs(X).mean(0); s = (a / a.mean()) ** 0.5
+print(f"  int4 AWQ-style scaling, g=128  {rel((X / s) @ group_quant(W * s, 4).T):.4f}")
+
+# GPTQ-style: quantise one input column at a time, push its error onto the not-yet-quantised columns
+def gptq(W, X, bits, g=128):
+    W = W.copy(); Q = np.zeros_like(W)
+    H = X.T @ X / len(X); H += 0.01 * np.mean(np.diag(H)) * np.eye(n_in)
+    U = np.linalg.cholesky(np.linalg.inv(H)).T                            # upper Cholesky factor of H^-1
+    qmax = 2 ** (bits - 1) - 1
+    for i in range(n_in):
+        if i % g == 0:                                                    # group scale from the (updated) weights
+            scale = np.abs(W[:, i:i + g]).max(1) / qmax
+        q = np.clip(np.round(W[:, i] / scale), -qmax, qmax) * scale
+        e = (W[:, i] - q) / U[i, i]
+        W[:, i:] -= np.outer(e, U[i, i:]); Q[:, i] = q
+    return Q
+print(f"  int4 GPTQ-style, g=128         {rel(X @ gptq(W, X, 4).T):.4f}")
+
+# ---- 4. LLM.int8(): quantising activations too; keep outlier feature columns in 16-bit
+Xq_naive = quant(X, 8, axis=1)                                           # per-token int8
+big = np.abs(X).max(0) &gt; 6.0
+X_mixed = np.where(big, X, quant(np.where(big, 0, X), 8, axis=1))
+Wq = quant(W, 8, axis=1)
+print(f"\nint8 weights and activations, per-token scales: {rel(Xq_naive @ Wq.T):.4f}")
+print(f"same, outlier columns kept in 16-bit ({big.sum()} of {n_in} = {big.mean():.1%}): {rel(X_mixed @ Wq.T):.4f}")
+
+# ---- 5. memory
+for name, P in [("7B", 6.74e9), ("70B", 70.6e9)]:
+    row = ", ".join(f"{fmt} {P * b / 1e9:6.1f} GB" for fmt, b in [("bf16", 2), ("int8", 1), ("int4+g128 scales", 0.5 + 2 / 128)])
+    print(f"{name:4s}: {row}")</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li><strong>Section 1:</strong> int8 codes [21, −51, 127, 4] with errors under 0.01; int4 codes [1, −3, 7, 0] with errors up to 0.1.</li>
+<li><strong>Section 2:</strong> one outlier of 60 among 256 values: int8 RMS error 0.135 with one scale, 0.047 with groups of 32; int4 1.01 (destroyed) versus 0.30.</li>
+<li><strong>Section 3:</strong> relative output error of a 512 × 512 layer: int8 per channel 0.0075; int4 round-to-nearest 0.117; AWQ-style 0.098; GPTQ-style 0.038.</li>
+<li><strong>Section 4:</strong> int8 weights and activations 0.034, falling to 0.008 when the 6 outlier columns (1.2%) stay in 16-bit.</li>
+<li><strong>Section 5:</strong> 13.5 / 6.7 / 3.5 GB for 7B and 141 / 71 / 36 GB for 70B in bf16 / int8 / int4 with group-128 scales.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Estimate — does it fit, and how fast?</b>
+<p>You must serve a 34B model (48 layers, 8 KV heads, head dimension 128) on one 48 GB GPU with 0.96 TB/s of memory bandwidth, for up to 8 concurrent users with 4,096-token contexts. Which weight and cache formats work, and what time per token should you expect?</p>
+<details><summary>Answer</summary>
+<p><strong>Weights:</strong> bf16 68 GB (no), int8 34 GB, int4 (g=128) about 17.6 GB.</p>
+<p><strong>KV cache:</strong> 2 × 48 × 8 × 128 × 2 bytes = 192 KiB per token in bf16; 8 users × 4,096 tokens = 32,768 tokens → 6 GiB in bf16, 3 GiB in 8-bit.</p>
+<p><strong>Fit:</strong> int8 weights (34 GB) + bf16 cache (6.4 GB) + a few GB overhead ≈ 42-44 GB: tight but possible; int4 weights + 8-bit cache ≈ 21 GB leaves ample headroom (room for more users or longer context).</p>
+<p><strong>Speed at small batch:</strong> each step reads weights plus caches. int8: (34 + 6.4) GB / 0.96 TB/s ≈ 42 ms at peak, perhaps 55-65 ms in practice, about 16-18 tokens per second per user. int4 + 8-bit cache: (17.6 + 3.2) / 0.96 ≈ 22 ms, perhaps 30 ms in practice, about 33 tokens per second. Choose int4 (GPTQ or AWQ) if evaluation on your tasks shows acceptable quality; otherwise int8 with the tighter memory budget.</p></details>
+<hr>
+<b>Diagnose — the 8-bit model that falls apart</b>
+<p>A colleague quantises both weights and activations of a 13B model to int8 with one scale per tensor. Small models quantised the same way were fine; this one produces gibberish. Why, and what are the fixes?</p>
+<details><summary>Answer</summary>
+<p>Emergent outlier features: models above roughly 6.7B parameters have a few activation dimensions with values up to 20× larger than the rest, in all layers. A per-tensor (or even per-token) int8 scale is stretched by them, leaving ordinary activations with a handful of levels, so outputs degrade catastrophically. Fixes: keep weight quantisation per channel and quantise activations with outlier handling, either LLM.int8()'s mixed-precision decomposition (outlier columns in 16-bit), SmoothQuant (migrate the outliers into the weights, then W8A8), or FP8 activations, whose exponent gives the range; or use weight-only int8/int4 and keep activations in 16-bit.</p></details>
+</section>

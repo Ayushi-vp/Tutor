@@ -1,0 +1,486 @@
+
+/* ============================================================
+   DATA — classic product system design, written as 60-minute walkthroughs.
+   These are the "design X" cases every loop still asks, whatever the
+   job title. Same field shape as HLD: primer / body / deep / drill / refs.
+   ============================================================ */
+function clock(steps){
+  return `<div class="clock">${steps.map(s =>
+    `<div class="ck"><span class="ck-m">${esc(s[1])}</span><span class="ck-t">${esc(s[0])}</span></div>`).join("")}</div>`;
+}
+
+const CLASSICS = [
+
+{ id:"cd1", t:"Design a URL shortener (TinyURL, Bitly)", tag:"Warm-up", sum:"The simplest case that still touches ID generation, caching, sharding and read-heavy scale.",
+  primer:`<h4>Start here — why this easy question is asked so often</h4>
+  <p>A URL shortener turns <code>https://example.com/a/very/long/path?with=params</code> into <code>bit.ly/3xK9pQa</code>, and redirects anyone who visits the short link back to the original. That is the whole product. It is asked constantly because it is the smallest problem that still forces you to talk about <strong>unique ID generation, read-heavy caching, database sharding and cache invalidation</strong> — and because the naive answer is wrong in an interesting way.</p>
+  <h4>The naive answer and why it fails</h4>
+  <p>"Hash the long URL with MD5 and take the first 7 characters." Two problems. First, <strong>collisions</strong>: different URLs can produce the same prefix, so you silently send users to the wrong place — and you must check for a collision on every write, which is an extra read. Second, <strong>it is not idempotent in the way people assume</strong>: the same URL always maps to the same short code, which sounds good until a customer wants their own custom alias or per-campaign analytics on the same destination.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Base62</strong> — encoding a number using <code>[0-9a-zA-Z]</code>, 62 characters. Seven base62 characters give 62<sup>7</sup> ≈ 3.5 trillion codes, which is the arithmetic you will be asked to do out loud.</li>
+  <li><strong>Read-heavy</strong> — this system has roughly 100 reads per write. Almost every design decision follows from that ratio, so establish it early and keep referring back to it.</li>
+  <li><strong>301 vs 302</strong> — a permanent redirect is cached by the browser (fast, but you never see the second click) while a temporary one is not (slower, but you keep your analytics). This is a real product trade-off, not trivia.</li>
+  <li><strong>Cache-aside</strong> — read from the cache; on a miss read the database and populate the cache. The default pattern, and the right one here.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>This is <strong>a distributed hash table with a business model attached</strong>. The core operation is a single key lookup, so the interesting engineering is not the lookup at all — it is generating keys without coordination, keeping the hot ones in memory, and deciding what happens when the database and the cache disagree.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["API & data","12–20"],["Architecture","20–30"],["Deep dive","30–46"],["Scale & failure","46–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <p>State what you are building and get agreement before you draw anything.</p>
+  <ul><li><strong>In scope:</strong> create a short link from a long URL; redirect on visit; optional custom alias; optional expiry; click analytics.</li>
+  <li><strong>Out of scope</strong> (say it explicitly, it buys you time): user accounts, billing, spam and malware scanning, link preview generation.</li>
+  <li><strong>Non-functional:</strong> redirect p99 under 50 ms globally; links must never break; 99.99% availability on the read path. Shortening can be slower — nobody notices 200 ms once.</li>
+  <li><strong>The question that shapes the design:</strong> "are short codes permanent?" If yes, you can never reuse a code and the ID space must be sized for all time.</li></ul>
+
+  <h4>2 · Numbers that matter — 5–12 min</h4>
+  <p>Assume 100M new links per month and a 100:1 read ratio.</p>
+  <ul><li>Writes: 100M ÷ 2.6M seconds ≈ <strong>40 writes/s</strong>, peak maybe 200/s. That is nothing — a single Postgres handles it.</li>
+  <li>Reads: <strong>4,000/s</strong> average, perhaps 20,000/s at peak. This is the number that matters.</li>
+  <li>Storage: 100M links/month × 5 years = 6B rows. At ~500 bytes each (long URL, code, owner, timestamps) that is <strong>~3 TB</strong>. Large but not exotic — one machine cannot hold it in RAM, several can hold it on disk.</li>
+  <li>ID space: 6B links needs 62<sup>6</sup> ≈ 57B, so <strong>7 characters</strong> gives comfortable headroom at 3.5 trillion.</li>
+  <li>Cache: the click distribution is extremely skewed — roughly 20% of links get 80% of traffic, and most links are dead within a week. Caching 20M hot links × 500 B ≈ <strong>10 GB</strong>, which fits easily in one Redis. Say this: <em>the entire working set fits in memory, so the database is almost never on the read path.</em></li></ul>
+
+  <h4>3 · API and data model — 12–20 min</h4>
+  <pre>POST /v1/links   {url, alias?, expires_at?}  -&gt; {code, short_url}
+GET  /{code}                                 -&gt; 302 Location: &lt;long_url&gt;
+GET  /v1/links/{code}/stats                  -&gt; {clicks, by_day, by_country}</pre>
+  <p>One table, keyed by the short code, because the only hot query is "code → URL":</p>
+  <pre>links(code PK, long_url, owner_id, created_at, expires_at, is_custom)</pre>
+  <p>Clicks go to a <em>separate</em> append-only store, never a counter column on this row — a counter update per click would turn a read-only path into a write-heavy one and put a hot row lock on your most popular links. Say that out loud; it is the first real design decision.</p>
+
+  <h4>4 · High-level architecture — 20–30 min</h4>
+  ${flow([{t:"CDN / edge",d:"cache 302s"},{t:"API",d:"stateless, autoscaled"},{t:"Redis",d:"code → url, LRU"},{t:"Database",d:"sharded by code"},{t:"Kafka → analytics",d:"async clicks"}])}
+  <p>The read path is: edge cache → Redis → database. The write path is: generate code → insert → warm the cache. Clicks are fired onto a queue and never block the redirect.</p>
+
+  <h4>5 · The deep dive — 30–46 min: generating the code</h4>
+  <p>This is what the interview is actually about. Walk the options and pick one.</p>
+  <ul>
+  <li><strong>Hash and truncate.</strong> Simple, but needs a collision check on every write (an extra read, and a retry loop) and leaks nothing useful. Workable, not great.</li>
+  <li><strong>Auto-increment then base62.</strong> Guarantees uniqueness with no check. But a single sequence is a global coordination point, and worse, the codes are <em>sequential and guessable</em> — anyone can enumerate every link in the system, which is a genuine privacy failure for links people assume are unlisted.</li>
+  <li><strong>Counter ranges per server (the answer to give).</strong> A coordination service (ZooKeeper, etcd, or just a row in Postgres) hands each API instance a block of one million IDs. The instance serves them locally with zero coordination and asks for another block when it runs low. Throughput is effectively unbounded, and if an instance dies you lose an unused block — which is free, because the ID space is 3.5 trillion.</li>
+  <li><strong>Make them unguessable.</strong> Do not emit the raw counter. Either pass it through a keyed pseudorandom permutation (a bijection, so it stays collision-free) before base62 encoding, or append a few random characters. Volunteering the enumeration problem before being asked is one of the strongest moves available in this question.</li>
+  </ul>
+  <p><strong>Custom aliases</strong> live in the same key space and must be checked for conflict — insert with a uniqueness constraint and let the database reject duplicates rather than doing read-then-write, which races.</p>
+
+  <h4>6 · Scale and failure — 46–56 min</h4>
+  <ul>
+  <li><strong>Sharding:</strong> by code hash, which spreads load evenly and matches the only query pattern. Do not shard by user — one large customer would hotspot a shard.</li>
+  <li><strong>Cache stampede:</strong> when a link goes viral and the cache entry expires, thousands of requests hit one database row simultaneously. Fix with a short lock or single-flight so one request refills while the rest wait briefly.</li>
+  <li><strong>Redis down:</strong> the database must survive full read traffic. 20,000 reads/s against a sharded key-value lookup is achievable, but say that you would shed load or serve stale rather than cascade.</li>
+  <li><strong>Deletion and expiry:</strong> lazy on read plus a background sweep. Crucially, an expired link must also be purged from the CDN and Redis, or it keeps redirecting for hours after deletion — this is the compliance-relevant failure.</li>
+  <li><strong>Geography:</strong> reads are served from regional replicas and the edge; writes go to one primary region. A newly created link may take a second to be readable elsewhere, which is acceptable — say so explicitly rather than pretending it is synchronous.</li>
+  </ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Summarise in three sentences: counter ranges give coordination-free unique codes; the working set fits in memory so the database is off the hot path; analytics are asynchronous so a click never slows a redirect. Then name one thing you would do differently at ten times the scale — typically moving the redirect entirely into the CDN with an edge key-value store, so most requests never reach your origin at all.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>301 versus 302 is a revenue decision.</strong> A 301 permanent redirect is cached by browsers and intermediaries, so subsequent clicks never reach you — cheap, fast, and you lose the analytics that are the entire paid product. Use 302 with explicit no-cache headers, and accept the cost. If you are asked to reduce cost, the answer is edge caching under <em>your</em> control, not handing caching to the browser.</li>
+  <li><strong>The enumeration attack deserves airtime.</strong> Sequential base62 codes mean an attacker can walk the whole corpus in hours, and people shorten links to private documents constantly. The fix is a format-preserving permutation of the counter, which keeps the guarantee of no collisions while destroying the ordering. This is a security argument that most candidates miss entirely and it costs one sentence.</li>
+  <li><strong>Analytics is the actually-hard subsystem</strong> and interviewers often pivot to it. Clicks arrive at 20,000/s, must be deduplicated (bots and prefetchers click links nobody saw), enriched with geo and referrer, and aggregated per link per day. That is a stream-processing problem: Kafka for durability, a windowed aggregation into a columnar store, and a separate raw log for later reprocessing. Do not put a counter in the links table — say why.</li>
+  <li><strong>Where a bloom filter genuinely helps.</strong> Custom aliases need a uniqueness check on write, and most checks are misses. A bloom filter in front rejects almost all "is this alias taken?" queries without touching the database, with the correct semantics: false positives are fine here (you fall through to a real check) and false negatives are impossible.</li>
+  <li><strong>Know the "why not just DynamoDB" answer.</strong> A managed key-value store with global tables solves the reads, the sharding and the replication, and for this workload it is genuinely the right production choice. Say that — then explain what you would still have to build yourself (ID allocation, analytics pipeline, cache invalidation on delete), which shows you can distinguish the parts a managed service removes from the parts it does not.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>Your shortener serves 20,000 redirects/s at peak. Redis holds 20M hot links and has a 94% hit rate. The database is 8 shards, each handling 1,500 reads/s comfortably. A campaign link goes viral: it alone takes 8,000 requests/s.</p>
+    <p>(a) What database load do you see normally? (b) What happens when the viral link's cache entry expires? (c) What do you change?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Normal load.</strong> 6% of 20,000 = <strong>1,200 reads/s</strong> reaching the database, spread over 8 shards = 150/s each. Comfortably within budget; the cache is doing its job.</p>
+    <p><strong>(b) The expiry.</strong> The viral link lives on exactly <em>one</em> shard. When its cache entry expires, the 8,000 requests/s for that one code all miss simultaneously and land on a single shard that can take 1,500/s. That shard is now at 5× capacity, so it queues, then times out — and because it also serves a 1/8 slice of everything else, <strong>12.5% of all links in the system stop resolving</strong> because one link went viral. This is a cache stampede turning into a hot-shard failure.</p>
+    <p><strong>(c) The fixes, in order:</strong></p>
+    <ul>
+    <li><strong>Single-flight on cache miss.</strong> The first request to miss takes a short lock and refills; the others wait a few milliseconds for it rather than each querying the database. This alone turns 8,000 database queries into 1. It is the single highest-value change and should be your first answer.</li>
+    <li><strong>Do not let hot keys expire on a timer.</strong> Refresh-ahead: when a key is read and its TTL is nearly up, refresh it asynchronously while still serving the old value. Popular links then never have a miss window at all.</li>
+    <li><strong>Serve stale on error.</strong> If the database is unavailable or slow, return the last known value rather than failing. For a redirect this is almost always correct — an out-of-date destination beats a broken link.</li>
+    <li><strong>Push the hottest links to the CDN.</strong> A link taking 8,000 rps should be served as an edge-cached redirect and never reach your origin. Promote keys above a rate threshold automatically.</li>
+    </ul>
+    <p><strong>The lesson to state:</strong> a 94% hit rate sounds excellent and tells you almost nothing, because cache performance under skew is decided by what happens to the <em>hot</em> keys, not by the average. The failure here was not insufficient cache capacity — it was the absence of a policy for the miss.</p></details>`,
+
+  refs:[
+    ["docs","Snowflake ID","The distributed, coordination-free ID scheme this design's counter ranges are a simplification of. Read the bit layout — it makes the trade-off between machine id, time and sequence concrete.","https://en.wikipedia.org/wiki/Snowflake_ID"],
+    ["code","twitter-archive/snowflake","The original implementation and its README, which explains why they rejected UUIDs and database sequences.","https://github.com/twitter-archive/snowflake"],
+    ["docs","Consistent hashing","How to shard by code so that adding a shard moves 1/n of the keys rather than all of them.","https://en.wikipedia.org/wiki/Consistent_hashing"],
+    ["docs","Caching patterns and cache stampede","Redis' own guidance on cache-aside, TTL jitter and the single-flight pattern from the drill.","https://redis.io/docs/latest/develop/clients/patterns/"],
+    ["docs","Bloom filter","The structure to use for the custom-alias existence check, and a clear statement of which error direction it permits.","https://en.wikipedia.org/wiki/Bloom_filter"],
+    ["docs","HTTP redirect status codes","MDN on 301 vs 302 vs 307, including caching behaviour — the basis of the analytics trade-off.","https://developer.mozilla.org/en-US/docs/Web/HTTP/Status#redirection_messages"]
+  ]},
+
+{ id:"cd2", t:"Design a chat service (WhatsApp, Messenger)", tag:"Real-time", sum:"Persistent connections, delivery guarantees, message ordering and the offline queue.",
+  primer:`<h4>Start here — why chat is harder than it looks</h4>
+  <p>Sending a message sounds like a single database insert. The difficulty is that chat is the first system most people design where <strong>the server must push to the client</strong> rather than wait to be asked, and where <strong>the recipient is frequently not there</strong>.</p>
+  <p>Those two facts generate every hard problem: you need millions of persistent connections, you need to know which server holds each connection, you need somewhere to put messages for people who are offline, and you need to decide what "delivered" means when a phone is in a tunnel.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>WebSocket</strong> — an upgraded HTTP connection that stays open and allows either side to send at any time. The alternative, long polling, works and is worse: more overhead, higher latency, and the connection churn is brutal at scale.</li>
+  <li><strong>Connection registry</strong> — the map from user id to "which chat server currently holds their socket". Every message delivery needs this lookup, so it is on the hot path and must be fast.</li>
+  <li><strong>Fan-out</strong> — delivering one sent message to many recipients (a group of 500). The word appears in feed design too, and means the same thing.</li>
+  <li><strong>At-least-once delivery</strong> — the guarantee you can actually provide. It means duplicates are possible, so clients must deduplicate by message id. Exactly-once across an unreliable network is not achievable, and claiming it is a red flag.</li>
+  <li><strong>Ordering</strong> — messages must appear in a consistent order for everyone in the conversation. Wall-clock timestamps from client devices do not give you this, because clocks disagree.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>Chat is <strong>a per-conversation append-only log plus a delivery mechanism</strong>. The log is the source of truth and gives you ordering, history and replay after being offline. The socket is only an optimisation that makes delivery fast when the recipient happens to be connected. Separating those two — durable log first, real-time push second — is the framing that makes every subsequent question easy to answer.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["API & data","12–22"],["Architecture","22–32"],["Deep dive","32–48"],["Scale & failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> one-to-one and group messaging (up to 500 members), delivery and read receipts, online presence, message history, media attachments, push notifications when offline.</li>
+  <li><strong>Out of scope:</strong> voice and video calls, stories, payments. Say so.</li>
+  <li><strong>Non-functional:</strong> p99 delivery under 500 ms when both parties are online; messages are never lost; history is durable for years; works on flaky mobile networks.</li>
+  <li><strong>The scoping question that matters most:</strong> "is this end-to-end encrypted?" If yes, the server cannot read message content, which removes server-side search, server-side spam filtering and multi-device sync as you would naively build them. Ask it early — it changes the whole design.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>500M daily active users, 40 messages sent per user per day = 20B messages/day ≈ <strong>230,000 messages/s</strong> average, perhaps 700,000/s at peak.</li>
+  <li>Connections: if half are online at peak, that is <strong>250M concurrent WebSockets</strong>. A well-tuned server holds roughly 100k–500k connections, so you need <strong>500–2,500 chat servers</strong> just to terminate connections. Saying this number out loud is what makes the connection-registry discussion obviously necessary.</li>
+  <li>Storage: 20B messages/day × ~200 bytes of text and metadata = <strong>4 TB/day</strong>, 1.5 PB/year. Media dominates and goes to object storage, not the message store.</li>
+  <li>Fan-out amplification: a 500-person group turns one send into 500 deliveries. If 10% of traffic is group messages averaging 50 members, delivery volume is roughly 5× send volume — quote that ratio, it justifies the queue.</li></ul>
+
+  <h4>3 · Data model — 12–22 min</h4>
+  <pre>messages(conversation_id, seq, message_id, sender_id, body, created_at)
+    PRIMARY KEY ((conversation_id), seq)      -- partition by conversation
+conversations(conversation_id, type, member_ids, last_seq)
+receipts(conversation_id, user_id, delivered_seq, read_seq)</pre>
+  <p>Three decisions worth defending:</p>
+  <ul><li><strong>Partition by conversation, not by user.</strong> The dominant query is "give me the last 50 messages in this chat", which then reads one partition sequentially. Partitioning by user would scatter a conversation across members.</li>
+  <li><strong>A per-conversation monotonic <code>seq</code>, assigned by the server.</strong> This is what gives ordering; client timestamps are display metadata only. A single writer per conversation (or a lightweight sequencer) makes this cheap.</li>
+  <li><strong>Receipts are a high-water mark, not a row per message.</strong> Storing "user has read up to seq 4,812" is one small row; storing a receipt per message per user is a 500× write amplification in a group. This is the trick worth volunteering.</li></ul>
+
+  <h4>4 · Architecture — 22–32 min</h4>
+  ${flow([{t:"Client",d:"WebSocket + local db"},{t:"Gateway",d:"terminates TLS, routes"},{t:"Chat server",d:"holds sockets"},{t:"Sequencer + store",d:"assigns seq, persists"},{t:"Fan-out queue",d:"per-recipient delivery"},{t:"Push service",d:"APNs / FCM if offline"}])}
+  <p>Send path: client → chat server → sequencer assigns <code>seq</code> and the message is durably written → <em>then</em> acknowledged to the sender → fan-out enqueues one delivery per recipient → each delivery looks up the recipient in the connection registry and either pushes over their socket or falls through to a mobile push notification.</p>
+  <p><strong>Acknowledge only after the durable write</strong>, never before. The single tick in the sender's UI means "the server has it", and if you ack before persisting, a server crash loses a message the user believes was sent.</p>
+
+  <h4>5 · The deep dive — 32–48 min</h4>
+  <p><strong>The connection registry.</strong> Every delivery needs "which server holds user X?". Options: a Redis hash updated on connect and disconnect (simple, and the hot path is one lookup); or consistent hashing from user id to server (no lookup at all, but reconnections and rebalancing get awkward). Take Redis with a short TTL refreshed by heartbeat, so a server that dies without cleaning up expires naturally rather than black-holing messages forever.</p>
+  <p><strong>The offline case, which is the majority.</strong> If the recipient has no socket, the message is already durably in the log — so delivery is simply "nothing more to do now". When they reconnect, the client sends its last known <code>seq</code> per conversation and the server replays everything after it. This is why the log-first framing pays off: <em>offline delivery is not a separate mechanism, it is the same mechanism with a delay.</em></p>
+  <p><strong>Ordering and duplicates.</strong> Server-assigned per-conversation sequence numbers give a total order within a conversation, which is all users actually perceive. Across conversations, no ordering is needed. Clients deduplicate on a client-generated message id, which also makes retries safe — a message sent twice because the ack was lost appears once.</p>
+  <p><strong>Group fan-out.</strong> For 500 members, do not write 500 copies of the message. Write once to the conversation partition and fan out <em>notifications</em>, letting each client read from the shared log. Copy-per-recipient is only justified when recipients need independent retention or the per-user inbox must be independently queryable.</p>
+
+  <h4>6 · Scale and failure — 48–56 min</h4>
+  <ul><li><strong>A chat server dies</strong> holding 200k sockets. Clients reconnect with backoff and jitter — without jitter the reconnect storm kills the next server. On reconnect they replay from their last <code>seq</code>, so nothing is lost.</li>
+  <li><strong>Presence is expensive and low-value.</strong> "Online now" for every contact means a write per state change fanned out to everyone who can see you. Throttle it, accept staleness of tens of seconds, and be ready to say you would cut it first under load.</li>
+  <li><strong>Hot partitions:</strong> a very active group is one partition. Cap group size, and if a single conversation genuinely saturates a partition, shard by <code>(conversation_id, seq_bucket)</code>.</li>
+  <li><strong>Media</strong> is uploaded directly to object storage with a pre-signed URL; the message carries only a reference. Never move blobs through the chat servers.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>"Durable per-conversation log first, real-time push second" is the sentence to end on, because it explains ordering, offline delivery and history in one idea. Then name the trade-off you made: at-least-once with client-side deduplication rather than attempting exactly-once, because the latter is not achievable over an unreliable network.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>End-to-end encryption changes the architecture, not just the payload.</strong> With E2EE the server stores ciphertext it cannot read, so server-side search must move to the client, spam and abuse detection loses content signals and must rely on metadata and reports, and adding a second device means a key-exchange problem rather than a database query. Group messaging is worst: naive E2EE requires encrypting per recipient device, so a 500-member group with 2 devices each is 1,000 encryptions per message. Sender Keys solve this by encrypting content once under a shared group key distributed pairwise. Knowing why that optimisation exists is a strong senior signal.</li>
+  <li><strong>The three ticks are three different guarantees</strong> and confusing them is common: one tick means the server durably has it, two means the recipient's device acknowledged receipt, blue means the app reported it displayed. Each is a separate round trip and a separate write, and read receipts in a large group are the write-amplification problem the high-water mark exists to solve.</li>
+  <li><strong>Multi-device sync is the requirement that breaks naive designs.</strong> Once a user has a phone, a laptop and a tablet, "delivered" and "read" become per-device, history must sync to a newly-added device, and with E2EE that device was not present for the original key exchange. The usual answer is to treat each device as a separate identity in the protocol with its own keys, plus an encrypted history transfer from an existing device. Raise this before being asked; it is where the real complexity lives.</li>
+  <li><strong>Mobile push is a dependency you do not control.</strong> APNs and FCM have their own rate limits, their own latency, and they will drop notifications. They are best-effort, so never treat a push as delivery — the durable log remains the source of truth and the push is only a nudge to reconnect. Also: with E2EE the push payload cannot contain the message, so it says "new message" and the client fetches and decrypts.</li>
+  <li><strong>Deletion for everyone is a promise you cannot fully keep,</strong> and saying so honestly is better than hand-waving. You can remove it from the server and send a tombstone that compliant clients honour, but a client that already displayed and cached it, or took a screenshot, is beyond reach. Design the tombstone, state the limit.</li>
+  <li><strong>Why not Kafka as the message store?</strong> It is a fine transport and a poor store here, because the dominant read is "last 50 messages in this one conversation" — a random-access query by key. Kafka is optimised for sequential consumption of a partition, not point lookups across billions of conversations. Use it for the fan-out queue and a wide-column store (Cassandra, ScyllaDB) keyed by conversation for the log itself.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A chat service has 400M users, 60% online at peak. Each chat server holds 150,000 WebSocket connections using about 40 KB of memory per connection. Peak send rate is 600,000 messages/s, of which 15% go to groups averaging 80 members.</p>
+    <p>(a) How many chat servers and how much memory? (b) What is the actual delivery rate? (c) A datacentre holding 20% of connections fails. What happens in the next 60 seconds?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a)</strong> Concurrent connections: 400M × 0.6 = <strong>240M</strong>. At 150k per server that is <strong>1,600 chat servers</strong>, and at 40 KB per connection each server holds 150,000 × 40 KB = <strong>6 GB</strong> of connection state alone — before buffers, TLS state or the application. That memory figure is why chat servers are provisioned for RAM rather than CPU, and it is worth stating.</p>
+    <p><strong>(b) Delivery amplification.</strong> Direct messages: 600,000 × 0.85 = 510,000 sends, each delivering to 1 recipient = 510,000 deliveries/s. Group messages: 600,000 × 0.15 = 90,000 sends × 80 members = <strong>7.2M deliveries/s</strong>. Total ≈ <strong>7.7M deliveries/s</strong>, roughly <strong>13× the send rate</strong>. Group traffic is 15% of sends and 94% of delivery work — which is the whole argument for fanning out notifications against a shared log rather than writing a copy per recipient.</p>
+    <p><strong>(c) The datacentre failure.</strong> 48M connections drop at once. Three things happen in sequence, and the order matters:</p>
+    <ul>
+    <li><strong>A reconnect storm.</strong> 48M clients attempt to reconnect. Without exponential backoff <em>and jitter</em> they arrive as a synchronised wave, and the surviving datacentres — already at capacity — are hit with 48M TLS handshakes in a few seconds. Handshakes are CPU-expensive, so this can take down the healthy capacity that just absorbed the failure. Jitter is the load-bearing fix.</li>
+    <li><strong>Registry staleness.</strong> The connection registry still lists those users on dead servers until the heartbeat TTL expires. During that window, deliveries are routed into a black hole. This is exactly why entries carry a short TTL refreshed by heartbeat rather than being deleted on clean disconnect — a crashed server never gets to clean up.</li>
+    <li><strong>Capacity.</strong> The remaining 1,280 servers must absorb 240M connections, which needs 1,600 servers' worth of memory. They cannot, so you must have provisioned N+1 across failure domains, or you shed the excess and those users stay disconnected.</li>
+    </ul>
+    <p><strong>Critically, no messages are lost.</strong> Everything was durably written to the conversation log before the sender was acknowledged, so reconnecting clients replay from their last sequence number and catch up. The outage is a <em>latency and availability</em> event, not a durability one — and being able to say precisely which of those three properties broke is the mark of someone who has run a system like this.</p></details>`,
+
+  refs:[
+    ["post","How Discord Stores Trillions of Messages","Discord's migration from Cassandra to ScyllaDB, with the partition key design and hot-partition problems described above, in production numbers.","https://discord.com/blog/how-discord-stores-trillions-of-messages"],
+    ["post","How Discord Scaled Elixir to 5,000,000 Concurrent Users","The connection-registry and fan-out problem at real scale, including what broke first.","https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users"],
+    ["docs","The Signal Protocol","Double ratchet, Sender Keys for groups, and the multi-device problem. The specification behind every serious E2EE chat.","https://signal.org/docs/"],
+    ["docs","RFC 6455: The WebSocket Protocol","The transport this design depends on — read the handshake and the ping/pong framing that your heartbeat will use.","https://datatracker.ietf.org/doc/html/rfc6455"],
+    ["docs","Lamport timestamps","Why wall-clock time cannot order distributed events, and the minimal mechanism that can.","https://en.wikipedia.org/wiki/Lamport_timestamp"],
+    ["docs","Apple Push Notification service","The best-effort guarantees, payload size limits and rate behaviour of the dependency your offline path rests on.","https://developer.apple.com/documentation/usernotifications"]
+  ]},
+
+{ id:"cd3", t:"Design a news feed (Twitter/X, Instagram)", tag:"Social", sum:"Fan-out on write versus read, the celebrity problem, and ranking a timeline.",
+  primer:`<h4>Start here — the one question this design is about</h4>
+  <p>You follow 300 people. When you open the app, you need their most recent posts merged into one list. There are exactly two ways to produce that list, and the entire interview is about choosing between them:</p>
+  <ul>
+  <li><strong>Fan-out on write (push).</strong> When someone posts, immediately copy it into the precomputed timeline of every one of their followers. Reads are then a single fast lookup. Writes are expensive.</li>
+  <li><strong>Fan-out on read (pull).</strong> Store each post once. When someone opens the app, fetch the recent posts of all 300 people they follow and merge them. Writes are cheap. Reads are expensive.</li>
+  </ul>
+  <p>Neither works alone, and knowing <em>why</em> is the answer.</p>
+  <h4>Why pure push fails</h4>
+  <p>A celebrity with 100 million followers posts once. Push means 100 million timeline writes for a single action — a write amplification of 100,000,000×. The post takes minutes to propagate, and a handful of celebrities can saturate the entire write path.</p>
+  <h4>Why pure pull fails</h4>
+  <p>Every app open becomes 300 queries plus a merge, at hundreds of thousands of opens per second. Reads outnumber writes by roughly 100:1 in this product, so you have optimised the rare operation at the expense of the common one.</p>
+  <h4>The answer, and the vocabulary</h4>
+  <p><strong>Hybrid.</strong> Push for ordinary users, pull for the few thousand accounts with enormous followings, and merge the two at read time. This is what Twitter actually does, and being able to state the threshold — "above roughly 100k followers, stop pushing" — turns a memorised answer into a designed one.</p>
+  <ul>
+  <li><strong>Timeline</strong> — the precomputed list of post ids for one user, usually a capped list in Redis holding the most recent few hundred.</li>
+  <li><strong>Social graph</strong> — who follows whom. Read constantly, so it lives in its own heavily-cached service.</li>
+  <li><strong>Hydration</strong> — turning a list of post ids into full posts with author, text, media and counts. Done at read time so edits and deletions take effect immediately.</li>
+  </ul>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["API & data","12–20"],["Architecture","20–30"],["Deep dive","30–48"],["Scale & failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> post; follow and unfollow; a home timeline of people you follow; a user's own profile timeline; likes and reply counts.</li>
+  <li><strong>Out of scope:</strong> direct messages, ads, search, trends, notifications. Say it.</li>
+  <li><strong>Non-functional:</strong> timeline loads in under 200 ms at p99; a post is visible to followers within a few seconds; the feed must stay available even if ranking is degraded.</li>
+  <li><strong>The question to ask:</strong> "chronological or ranked?" Chronological is a merge; ranked adds a scoring model and changes the caching story entirely. Start chronological, then add ranking as an extension — this sequencing is itself a good signal.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>300M daily active users, each opening the app 10 times/day = 3B timeline reads/day ≈ <strong>35,000 reads/s</strong>, 100,000/s at peak.</li>
+  <li>Posts: 300M users × 0.5 posts/day = 150M posts/day ≈ <strong>1,700 writes/s</strong>. Confirm the ratio out loud: <strong>roughly 20:1 read-heavy</strong>, which is the argument for precomputing.</li>
+  <li>Fan-out cost: average 300 followers × 1,700 posts/s = <strong>510,000 timeline writes/s</strong> under pure push. Large but tractable with a queue — <em>until</em> a celebrity posts.</li>
+  <li>Timeline storage: 300M users × 800 post ids × 8 bytes = <strong>~2 TB</strong> in Redis. Significant, so cap aggressively and only materialise timelines for users who opened the app recently — inactive users are computed on demand.</li></ul>
+
+  <h4>3 · Data model — 12–20 min</h4>
+  <pre>posts(post_id PK, author_id, body, media_ids, created_at, reply_to)
+follows(follower_id, followee_id, created_at)   -- indexed both directions
+timeline:{user_id}  -&gt; Redis sorted set of post_id scored by time, capped at 800
+counters(post_id, likes, replies, reposts)      -- approximate, updated async</pre>
+  <p><code>post_id</code> is a Snowflake-style id: time-ordered, so sorting by id is sorting by time and you do not need a separate timestamp index or a score. Say that — it is a small decision with large downstream simplification.</p>
+
+  <h4>4 · Architecture — 20–30 min</h4>
+  ${flow([{t:"Post API",d:"write + validate"},{t:"Fan-out workers",d:"queue, per-follower"},{t:"Timeline cache",d:"Redis, capped lists"},{t:"Read API",d:"merge + hydrate"},{t:"Ranker",d:"optional scoring"}])}
+  <p>Write: persist the post, then enqueue a fan-out job. The job looks up followers, filters to the recently-active ones, and pushes the post id onto each of their capped timeline lists. The author's acknowledgement does not wait for fan-out.</p>
+  <p>Read: fetch the precomputed timeline, then fetch recent posts from the celebrities this user follows, merge by id, hydrate the top 50, and return.</p>
+
+  <h4>5 · The deep dive — 30–48 min: the hybrid and the celebrity problem</h4>
+  <p>Define the split concretely. An account above a follower threshold — say 100,000 — is marked <em>pull</em>. Its posts are never fanned out. At read time, the feed service fetches that user's pull-list (the celebrities they follow, usually a handful), reads each celebrity's recent posts from a small hot cache, and merges with the pushed timeline. Because a typical user follows very few such accounts, the read cost stays near constant.</p>
+  <p><strong>Details that show depth:</strong></p>
+  <ul>
+  <li><strong>Fan-out only to active users.</strong> Most accounts have not opened the app in months. Maintain a "seen in the last 30 days" set and skip everyone else; their timeline is built on demand at next login. This typically removes the majority of fan-out work.</li>
+  <li><strong>A new follow</strong> must backfill: when you follow someone, their recent posts should appear. Either backfill their last N posts into your timeline, or accept that the feed fills in going forward. Pick one and say why.</li>
+  <li><strong>Deletion</strong> is why you store ids and hydrate at read time. If you had denormalised full post bodies into 100M timelines, deleting a post would mean 100M updates. With ids, a deleted post simply fails hydration and is dropped from the response.</li>
+  <li><strong>Ranking,</strong> if asked: this becomes the two-stage funnel from recommendation systems — retrieve a few hundred candidates (from follows, plus out-of-network suggestions), score them with a model over engagement features, then re-rank for diversity. Note that ranking breaks simple pagination, because the list is no longer stable between requests — use a cursor that pins the candidate set for a session.</li>
+  </ul>
+
+  <h4>6 · Scale and failure — 48–56 min</h4>
+  <ul><li><strong>Fan-out lag</strong> is the visible failure: a queue backlog means posts appear late. Monitor queue depth and end-to-end propagation time, and shed by deprioritising fan-out to less-active followers first.</li>
+  <li><strong>Redis loss</strong> must be survivable. Timelines are a cache, not a source of truth — on loss, rebuild from the posts table on demand, degraded but correct. Never treat the timeline store as durable.</li>
+  <li><strong>Counters</strong> (likes, replies) are approximate and updated asynchronously. Exact counts on a viral post would be a hot-row write bottleneck for no user-visible benefit.</li>
+  <li><strong>Thundering herd on a celebrity post:</strong> the pull path means every one of their followers hits the same small cache entry simultaneously. Serve it from a replicated read cache and allow slight staleness.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the trade-off you made explicitly: you optimised for read latency by precomputing, then carved out the cases where precomputing is pathological. Name the threshold as a tunable rather than a constant, and note that the right value is measured — it is wherever fan-out cost crosses read-merge cost, and it shifts as the graph changes.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>The threshold is not really about follower count, it is about cost.</strong> Fan-out cost scales with followers; pull cost scales with how many pull-accounts a reader follows. The optimum is where the marginal fan-out write equals the marginal read-merge — which means an account with 200k <em>inactive</em> followers may still be cheaper to push than one with 80k highly active ones. Framing it as a cost function that you would measure, rather than a magic number, is the senior version of this answer.</li>
+  <li><strong>Timeline consistency is weaker than people assume, and that is fine.</strong> Two users refreshing at the same moment can see different orderings, a post can appear before its parent reply loads, and unfollowing does not retroactively purge the timeline. None of this matters to users, and saying explicitly which consistency guarantees you are <em>declining</em> to provide — and why they are unobservable — is stronger than pretending the feed is linearisable.</li>
+  <li><strong>The social graph is its own hard system.</strong> "Who follows X" for 100M followers is not a query you run on the fly during fan-out; it is a partitioned, heavily-cached adjacency list read in pages by the fan-out workers. Facebook built TAO specifically for this shape — a read-optimised, eventually-consistent graph cache in front of sharded MySQL — because ordinary caching of graph edges does not work when the fan-out is this wide.</li>
+  <li><strong>Ranking changes the infrastructure, not just the order.</strong> A chronological feed can be served from a capped Redis list. A ranked feed needs candidate generation, feature fetching per candidate, model inference at read time under a 200 ms budget, and a way to keep pagination stable while the underlying scores change. That is the recommender funnel, and it needs a feature store — which is why these three designs get asked together.</li>
+  <li><strong>Know the failure that actually happens: fan-out lag under a traffic spike.</strong> During a major event, post rate rises and so does the average follower count of the people posting. The queue backs up, propagation goes from seconds to minutes, and users perceive it as "the app is broken" even though nothing is down. The mitigations are prioritised queues (recent, active followers first), shedding fan-out for dormant users, and degrading gracefully to pull for accounts that would otherwise fan out widely — a dynamic threshold rather than a fixed one.</li>
+  <li><strong>The "why not just query the database" answer.</strong> For a small product, pull with a good index genuinely is correct and precomputation is premature. State the crossover: precompute once read volume times merge cost exceeds fan-out cost, which typically happens in the low millions of users. Interviewers notice when you can argue against your own design.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>Your platform has 200M users. The follower distribution is heavily skewed: 99.9% of accounts have fewer than 10,000 followers (median 150), while 2,000 accounts have over 1M followers, averaging 12M each. Post rate is 2,000/s overall, and the 2,000 large accounts post 50 times/day each.</p>
+    <p>(a) What is the fan-out cost under pure push? (b) How much of it comes from the large accounts? (c) Where should the threshold go?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Ordinary accounts.</strong> Their post rate is essentially the full 2,000/s (the large accounts contribute 2,000 × 50 ÷ 86,400 ≈ 1.2 posts/s, which is negligible). At a median 150 followers, fan-out is 2,000 × 150 = <strong>300,000 timeline writes/s</strong>. Entirely manageable with a queue and a few hundred workers.</p>
+    <p><strong>(b) Large accounts.</strong> 1.2 posts/s × 12M followers = <strong>14.4M timeline writes/s</strong>. That is <strong>48× the entire rest of the platform combined</strong>, generated by 0.001% of accounts making 0.06% of the posts.</p>
+    <p>And the average understates the problem, because it is bursty rather than steady. A single account with 100M followers posting once creates 100M writes that must land in seconds — an instantaneous spike no steady-state capacity plan covers. Under pure push, the platform's write capacity is effectively set by its largest account.</p>
+    <p><strong>(c) Where the threshold goes.</strong> Compute the crossover rather than guessing. Pushing costs <code>followers</code> writes per post. Pulling costs one extra cache read per follower <em>who opens the app</em>, but only for the celebrities they follow — and because a typical user follows very few large accounts, that merge is 2–5 extra reads regardless.</p>
+    <p>Set the threshold where fan-out stops being cheap relative to its bursts — around <strong>50,000–100,000 followers</strong>. Check what that captures: it marks perhaps 20,000–50,000 accounts as pull, removing essentially all 14.4M writes/s while adding a handful of reads to each timeline request. Fan-out drops from 14.7M/s to ~300,000/s, a <strong>98% reduction</strong>, at a read cost of a few milliseconds.</p>
+    <p><strong>Two refinements worth volunteering.</strong> First, make the threshold <em>dynamic</em>: under load, lower it so more accounts become pull and the queue drains. Second, weight by <em>active</em> followers — an account with 200k followers of whom 5k opened the app this month is cheap to push, while one with 60k highly engaged followers is not. The follower count is a proxy; the cost is the thing.</p></details>`,
+
+  refs:[
+    ["video","Timelines at Scale","Raffi Krikorian, InfoQ — Twitter's own account of the push/pull hybrid and the celebrity problem. Still the definitive talk on this design.","https://www.infoq.com/presentations/Twitter-Timeline-Scalability/"],
+    ["paper","TAO: Facebook's Distributed Data Store for the Social Graph","Bronson et al., USENIX ATC 2013 — why the social graph needs its own read-optimised store rather than ordinary caching.","https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson"],
+    ["docs","Redis sorted sets","The data structure timelines are built from — capped lists, range queries by score, and the memory characteristics that decide your cache budget.","https://redis.io/docs/latest/develop/data-types/sorted-sets/"],
+    ["paper","Recommending What Video to Watch Next: A Multitask Ranking System","Zhao et al., 2019 — what the ranking stage becomes once a feed stops being chronological.","https://research.google/pubs/recommending-what-video-to-watch-next-a-multitask-ranking-system/"],
+    ["post","FollowFeed: LinkedIn's Feed Made Faster and Smarter","A second real implementation to compare against Twitter's - LinkedIn chose a pull-heavy design and explains exactly why.","https://engineering.linkedin.com/blog/2016/03/followfeed--linkedin-s-feed-made-faster-and-smarter"],
+    ["docs","Snowflake ID","Time-sortable ids, which is what lets a timeline be a sorted set with no separate timestamp index.","https://en.wikipedia.org/wiki/Snowflake_ID"]
+  ]},
+
+{ id:"cd4", t:"Design a video streaming service (Netflix, YouTube)", tag:"Media", sum:"Transcoding pipelines, adaptive bitrate, and why the CDN is the whole design.",
+  primer:`<h4>Start here — the insight that reframes the question</h4>
+  <p>Candidates start designing databases and APIs. But the traffic here is not requests, it is <strong>bytes</strong>, and the numbers are unlike any other system: a single 4K stream is about 15 Mbps, so 10 million concurrent viewers is <strong>150 terabits per second</strong>. No datacentre on earth has that egress. The design is therefore not "how do I serve video" but "<strong>how do I avoid serving video</strong>" — by putting copies of it inside the viewer's own internet provider.</p>
+  <p>Say this in the first five minutes and the rest of the interview follows naturally.</p>
+  <h4>The two halves</h4>
+  ${flow([{t:"Upload & transcode",d:"offline, minutes to hours"},{t:"Distribute to CDN",d:"push, ahead of demand"},{t:"Playback",d:"adaptive, from the edge"}])}
+  <p>The control plane (browse, search, recommendations, accounts, billing) is a normal web application handling thousands of requests per second. The data plane (actual video bytes) is a content distribution problem handling terabits per second. They share almost nothing, and mixing them up is the most common way to lose this interview.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Transcoding</strong> — converting one uploaded master file into many versions: different resolutions (240p to 4K), bitrates, and codecs (H.264 for compatibility, AV1 for efficiency). One upload becomes dozens of outputs.</li>
+  <li><strong>Segments</strong> — video is cut into independent chunks of 2–10 seconds, each separately downloadable. This is what makes adaptive switching possible mid-playback.</li>
+  <li><strong>ABR (adaptive bitrate)</strong> — the <em>player</em> measures throughput and buffer level and chooses which quality to request for the next segment. The server is passive; the intelligence is on the client. This surprises people.</li>
+  <li><strong>Manifest</strong> — a small text file (HLS <code>.m3u8</code> or DASH <code>.mpd</code>) listing every available quality and segment URL. The player fetches this first; everything else follows from it.</li>
+  <li><strong>CDN / edge appliance</strong> — servers holding cached copies close to viewers. Netflix's Open Connect goes further and places its own hardware <em>inside</em> ISP networks.</li>
+  </ul>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–14"],["Pipeline","14–26"],["Playback","26–36"],["Deep dive","36–48"],["Scale & failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> upload and process video; browse and search a catalogue; play with adaptive quality; resume where you left off; subtitles and multiple audio tracks.</li>
+  <li><strong>Out of scope:</strong> live streaming (say this — live is a genuinely different design with a latency budget instead of a preparation window), DRM key management detail, recommendations.</li>
+  <li><strong>Non-functional:</strong> playback starts within 2 seconds; rebuffering under 0.5% of playing time; the catalogue is available even when processing is backed up.</li>
+  <li><strong>The clarifying question:</strong> "professionally published catalogue, or user-generated uploads?" A 10,000-title catalogue can be fully pre-positioned on every edge; a billion user uploads cannot, and the long tail must be pulled on demand. This changes the caching strategy completely.</li></ul>
+
+  <h4>2 · Numbers — 5–14 min</h4>
+  <p>This is the section that wins the interview. Do it carefully.</p>
+  <ul><li>200M subscribers, 10% watching at peak = <strong>20M concurrent streams</strong>. At an average 5 Mbps (a mix of mobile, HD and 4K) that is <strong>100 Tbps</strong> of egress.</li>
+  <li>Contrast: a very large datacentre might have 10–100 Gbps to 1 Tbps of internet egress. You are three orders of magnitude short. <em>This single comparison is the justification for everything that follows.</em></li>
+  <li>Storage: one 2-hour film at ~20 encoding profiles is roughly 300 GB of outputs from a 100 GB master. A 20,000-title catalogue is <strong>~6 PB</strong>, replicated to hundreds of edge locations — so the edge footprint dominates, and it is why you pre-position only the popular tail.</li>
+  <li>Transcoding cost: one 2-hour film across 20 profiles is thousands of CPU-hours if done serially. Split it into segments and transcode them in parallel across a fleet, and it becomes minutes of wall-clock. This is embarrassingly parallel — say that word.</li></ul>
+
+  <h4>3 · The ingest and transcode pipeline — 14–26 min</h4>
+  ${flow([{t:"Upload",d:"multipart to object store"},{t:"Split",d:"into GOP-aligned chunks"},{t:"Transcode",d:"parallel fleet, per profile"},{t:"Package",d:"HLS + DASH manifests"},{t:"QC + DRM",d:"validate, encrypt"},{t:"Publish",d:"push to CDN"}])}
+  <p>Uploads go directly to object storage with pre-signed URLs, in parts, so a failure resumes rather than restarting. The master is then split at <strong>group-of-pictures boundaries</strong> — you cannot cut mid-GOP because segments must decode independently — and each chunk is transcoded independently into every profile. A DAG orchestrator tracks the fan-out and fan-in; chunks that fail are retried individually rather than restarting the film.</p>
+  <p>The output is written once to origin storage and <em>pushed</em> to edges ahead of demand for popular content, rather than waiting for a cache miss. Pre-positioning during off-peak hours is the key optimisation: you are trading cheap night-time bandwidth for expensive peak-hour bandwidth.</p>
+
+  <h4>4 · The playback path — 26–36 min</h4>
+  <p>The player requests the manifest, then selects a starting quality, then fetches segments. Its algorithm balances two signals: measured throughput (how fast did the last segments arrive?) and buffer occupancy (how many seconds do I have in hand?). Buffer-based control is more stable — throughput estimates are noisy on mobile networks and cause quality oscillation, which viewers find more annoying than a consistently lower quality.</p>
+  <p><strong>Start-up is a separate problem from steady state.</strong> Time-to-first-frame dominates perceived quality, so players deliberately begin at a low bitrate and step up after the buffer fills. Say this; it explains why the first few seconds of a stream look soft.</p>
+  <p>Playback position is reported every 30 seconds or so to a lightweight service so you can resume on another device. This is high-volume and low-value per event — batch it, and never make it synchronous with playback.</p>
+
+  <h4>5 · The deep dive — 36–48 min: where the video actually lives</h4>
+  <p>Three tiers, and you should name all three:</p>
+  <ul>
+  <li><strong>ISP-embedded appliances.</strong> Servers physically installed inside internet providers. A viewer's bytes never cross the public internet — the ISP saves transit costs and the viewer gets the lowest possible latency, so both parties want this. This is Netflix's Open Connect model and it is why they can serve a third of peak internet traffic.</li>
+  <li><strong>Internet exchange points.</strong> For ISPs too small to host hardware, appliances at peering points one hop away.</li>
+  <li><strong>Origin (cloud object storage).</strong> The complete library, hit only on a cache miss. Should serve a small single-digit percentage of bytes.</li>
+  </ul>
+  <p><strong>What goes where</strong> is a prediction problem: popularity by region, by time of day, plus known releases. Fill appliances overnight based on predicted next-day demand. For user-generated content the same tiering applies but the tail is astronomically longer, so edges cache reactively on first request and only the head is pushed.</p>
+  <p><strong>Per-title encoding</strong> is the optimisation worth mentioning: a fixed bitrate ladder wastes bits on simple content (an animated cartoon needs far less than a fast-moving action scene at the same perceived quality). Analysing each title and choosing its own ladder cuts bandwidth by a meaningful fraction across the whole catalogue — and bandwidth is the dominant cost, so this is a large number.</p>
+
+  <h4>6 · Scale and failure — 48–56 min</h4>
+  <ul><li><strong>A cache miss at the edge</strong> falls back to a regional tier, then origin. Quality degrades before playback fails, because the player will step down rather than stall.</li>
+  <li><strong>A popular new release</strong> is the predictable spike — pre-position it everywhere before launch rather than discovering demand at 8pm.</li>
+  <li><strong>Transcoding backlog</strong> delays publication but must never affect playback of existing content. Keep the pipelines fully separate, and prioritise the queue by scheduled release date.</li>
+  <li><strong>Client-side resilience matters more than server-side here:</strong> the player retries segments, switches CDN on repeated failure, and drops quality before it stalls. Much of the availability story lives in the client, which is unusual and worth pointing out.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Finish on the framing you opened with: the control plane is an ordinary web service, the data plane is a bandwidth problem solved by moving bytes as close to viewers as physically possible, and the player — not the server — makes the quality decisions. Then name the cost lever you would pull first: better per-title encoding, because bandwidth dominates the bill and a percentage saved there exceeds anything you can save on compute.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Live streaming is a different system and you should say so if asked.</strong> There is no preparation window, so transcoding must happen in real time with a hard deadline; segments must be short (1–2 s) to reduce glass-to-glass latency, which increases request overhead; and you cannot pre-position content that does not exist yet. Low-latency HLS and DASH use chunked transfer to start delivering a segment before it is complete. Treating live as "the same but faster" is a trap.</li>
+  <li><strong>Codec choice is an economic decision with a compatibility constraint.</strong> AV1 is roughly 30% more efficient than H.264 at the same quality, which on a bandwidth-dominated cost base is enormous — but old devices cannot decode it in hardware, and software decoding drains batteries. So you encode multiple codec families and serve by device capability, which multiplies your storage and transcoding cost to save bandwidth. Quantifying that trade-off rather than declaring a winner is the senior answer.</li>
+  <li><strong>The buffer-versus-throughput debate has a real answer.</strong> Pure throughput-based ABR oscillates on mobile networks because bandwidth estimates are noisy, and viewers rate frequent quality switching as worse than stable lower quality. Buffer-based algorithms (BOLA and its descendants) use buffer occupancy as the control signal and are far more stable. Hybrid approaches use throughput at start-up, when the buffer is empty and gives no signal, then switch to buffer-based control. Knowing why start-up is the exception shows you understand the mechanism rather than the name.</li>
+  <li><strong>DRM constrains the caching design.</strong> Encrypted segments can still be cached at the edge because every viewer gets the same ciphertext; only the <em>keys</em> are per-session and served from a separate, tiny, highly-available license service. If you had encrypted per user, every segment would be uncacheable and the entire CDN strategy would collapse. That separation is the design insight, and it generalises.</li>
+  <li><strong>Thumbnail and preview generation is a hidden cost centre.</strong> Scrubbing previews mean generating a sprite sheet of frames per title, artwork must be produced per aspect ratio and locale, and personalised artwork means multiple variants tested per title. This is often more total compute than people expect and it belongs in the pipeline diagram.</li>
+  <li><strong>The metric that matters is not uptime.</strong> It is a quality-of-experience composite: time to first frame, rebuffer ratio, average bitrate delivered, and play-delay. A stream that never stalls at 480p may be worse than one that occasionally dips from 4K. Instrument from the <em>player</em>, because server-side metrics cannot see what the viewer experienced — and that client telemetry stream is itself a high-volume pipeline you must design for.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A service has 150M subscribers. At peak, 12% are watching. The bitrate mix is 30% mobile at 1.5 Mbps, 45% HD at 5 Mbps, 25% 4K at 15 Mbps. Edge appliances serve 92% of bytes; the rest comes from regional origin. Transit bandwidth costs £0.008 per GB.</p>
+    <p>(a) What is peak egress? (b) What does the origin traffic cost per month? (c) Per-title encoding could cut average bitrate 20%. What is that worth, and what does it cost you?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Peak egress.</strong> Concurrent viewers: 150M × 0.12 = <strong>18M</strong>. Average bitrate: (0.30 × 1.5) + (0.45 × 5) + (0.25 × 15) = 0.45 + 2.25 + 3.75 = <strong>6.45 Mbps</strong>. Total: 18M × 6.45 Mbps = <strong>116 Tbps</strong>.</p>
+    <p>Worth saying out loud: 4K is 25% of viewers and 58% of the bits. Any conversation about bandwidth cost is really a conversation about 4K.</p>
+    <p><strong>(b) Origin cost.</strong> 8% of 116 Tbps = 9.3 Tbps at peak. Peak is not constant — assume peak-equivalent hours give roughly 40% of peak as a daily average, so ~3.7 Tbps sustained. Over a month: 3.7 Tbps × 2.6M seconds ÷ 8 bits = <strong>~1.2 exabytes</strong>... which is clearly wrong as a billable figure, and noticing that is the point. Recompute: 3.7 Tbps = 462 GB/s, × 2.6M s = <strong>1.2 billion GB/month</strong>. At £0.008/GB that is <strong>~£9.6M/month</strong> — for the 8% that misses the edge.</p>
+    <p>That number reframes everything: pushing the edge hit rate from 92% to 96% halves it, saving nearly £5M a month. Edge hit rate is the single most valuable metric in this system, and it is worth stating that you would instrument it per region and per title.</p>
+    <p><strong>(c) Per-title encoding.</strong> A 20% bitrate reduction cuts both edge and origin bytes by 20%. On the origin bill alone that is <strong>~£1.9M/month</strong>, plus proportional savings on edge appliance capacity and ISP peering. Across a year it is comfortably eight figures.</p>
+    <p><strong>What it costs you:</strong> per-title analysis means transcoding each title multiple times to find its optimal ladder, so encoding compute rises substantially — plausibly 2–5× — and the pipeline gets slower and more complex. But encoding is a <em>one-time</em> cost per title while bandwidth is paid on <em>every stream</em>, so for anything with meaningful viewership the payback is immediate. The nuance to volunteer: this logic inverts for user-generated content, where most uploads are watched a handful of times and expensive per-title optimisation would never pay back. Encode the head carefully, the tail cheaply — and that asymmetry is the real design principle.</p></details>`,
+
+  refs:[
+    ["docs","Netflix Open Connect","The ISP-embedded appliance programme described above, with the deployment model and peering strategy in Netflix's own words.","https://openconnect.netflix.com/en/"],
+    ["docs","RFC 8216: HTTP Live Streaming","The HLS specification — read the manifest format and segment structure, which is what the player actually consumes.","https://datatracker.ietf.org/doc/html/rfc8216"],
+    ["docs","MPEG-DASH","The other adaptive streaming standard and its differences from HLS, including why most services ship both.","https://en.wikipedia.org/wiki/Dynamic_Adaptive_Streaming_over_HTTP"],
+    ["paper","A Buffer-Based Approach to Rate Adaptation","Huang et al., SIGCOMM 2014 — the evidence that buffer occupancy beats throughput estimation for stable ABR.","https://web.stanford.edu/class/cs244/papers/sigcomm2014-video.pdf"],
+    ["paper","BOLA: Near-Optimal Bitrate Adaptation for Online Videos","Spiteri et al., 2016 — the algorithm shipped in dash.js, with the optimisation framing worked through.","https://arxiv.org/abs/1601.06748"],
+    ["docs","AV1 codec","The efficiency gain that drives the codec economics above, and the hardware-decode constraint that limits it.","https://en.wikipedia.org/wiki/AV1"]
+  ]},
+
+{ id:"cd5", t:"Design a ride-hailing service (Uber, Lyft)", tag:"Geospatial", sum:"Indexing a moving world, matching under contention, and the state machine nobody designs.",
+  primer:`<h4>Start here — the query that defines the system</h4>
+  <p>"Find the nearest available drivers to this point." That sounds like a database query and it is the hardest part of the design, for one reason: <strong>the data moves</strong>. Hundreds of thousands of drivers report a new position every few seconds, so this is a write-heavy index over constantly-changing geographic data, queried with low latency.</p>
+  <h4>Why the obvious approaches fail</h4>
+  <ul>
+  <li><strong>A SQL query with latitude and longitude ranges.</strong> A B-tree index on two independent columns cannot serve a 2D proximity query efficiently — the database picks one column, scans a stripe of the planet, and filters. It also computes distance for every candidate.</li>
+  <li><strong>Keeping everything in one server's memory.</strong> Works until you have more drivers than fit, and gives you no failure story.</li>
+  </ul>
+  <p>The answer is to <strong>convert two dimensions into one</strong>, so an ordinary index works. That is what geohashing, S2 and H3 all do.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Geohash</strong> — interleave the bits of latitude and longitude to produce a single string. Nearby points share a prefix, so "find things near here" becomes a prefix scan. Simple, and it has an edge problem: two points either side of a cell boundary can be metres apart with completely different hashes, so you must always search the cell plus its eight neighbours.</li>
+  <li><strong>S2</strong> — Google's scheme, projecting the sphere onto a cube and using a space-filling curve. Cells are more uniform than geohash rectangles.</li>
+  <li><strong>H3</strong> — Uber's hexagonal grid. Hexagons have the useful property that all six neighbours are equidistant from the centre, which makes "expand the search radius" a clean, uniform operation. Squares have neighbours at two different distances (edge and corner), which distorts ring searches.</li>
+  <li><strong>Supply and demand</strong> — the marketplace framing. This is a two-sided matching problem, not a search problem, and saying so changes how you discuss it.</li>
+  <li><strong>ETA</strong> — estimated time of arrival, computed on a road graph, not as straight-line distance. A driver across a river is 200 m away and 15 minutes away.</li>
+  </ul>
+  <h4>The mental model</h4>
+  <p>Two systems with different characteristics, glued by a matching service: a <strong>very high write, eventually consistent</strong> location index, and a <strong>low volume, strongly consistent</strong> trip state machine. Keep them separate in your head and in your diagram. Location can be a few seconds stale with no harm; a trip being assigned to two drivers is a catastrophe.</p>`,
+
+  body:`${clock([["Scope","0–5"],["Numbers","5–12"],["Data model","12–20"],["Architecture","20–30"],["Deep dive","30–48"],["Scale & failure","48–56"],["Close","56–60"]])}
+  <h4>1 · Scope it — 0–5 min</h4>
+  <ul><li><strong>In scope:</strong> driver publishes location; rider requests a ride from A to B; system matches them; both track each other live; trip completes and is priced.</li>
+  <li><strong>Out of scope:</strong> payments (gesture at the payments design), driver onboarding, food delivery, pooling. Pooling especially — it is a different and much harder optimisation problem, so name it and set it aside.</li>
+  <li><strong>Non-functional:</strong> a match within 5 seconds; location updates visible within 2–3 seconds; a trip is never double-assigned; the system stays usable when one region fails.</li>
+  <li><strong>The question to ask:</strong> "city-scale or global?" It matters because rides are almost entirely local — nobody is matched across continents — so the system shards naturally by geography, and that observation buys you a lot.</li></ul>
+
+  <h4>2 · Numbers — 5–12 min</h4>
+  <ul><li>5M drivers, 20% online at peak = <strong>1M active drivers</strong>, each reporting every 4 seconds = <strong>250,000 location writes/s</strong>. This is the dominant load and it is pure write.</li>
+  <li>Rides: 20M/day ≈ 230/s average, perhaps 1,500/s at peak. Trivial in comparison — <em>say this contrast out loud</em>, because it tells the interviewer you know where to spend the next 40 minutes.</li>
+  <li>Matching reads: each request searches a few cells and scores maybe 50 candidates. 1,500/s × 50 = 75,000 candidate evaluations/s, which is comfortable.</li>
+  <li>Location storage: at 250,000 writes/s, keeping raw history is 20B points/day. Keep <em>current</em> position in memory (1M drivers × ~100 B = 100 MB — trivially small, which is the key insight) and stream history to cold storage for analytics.</li></ul>
+
+  <h4>3 · Data model — 12–20 min</h4>
+  <pre>driver_location  (in-memory, sharded by cell)
+  driver_id -&gt; {lat, lng, h3_cell, heading, updated_at, status}
+cell_index       cell_id -&gt; set of driver_ids        (the geospatial index)
+trips            trip_id PK, rider_id, driver_id, state, pickup, dropoff, price
+trip_events      trip_id, seq, event, at             (append-only audit log)</pre>
+  <p>The trip <code>state</code> is a strict state machine: <code>requested → matched → accepted → arrived → in_progress → completed</code>, with <code>cancelled</code> reachable from several states. Transitions are guarded and written transactionally with an append to <code>trip_events</code>. Candidates routinely skip this and it is where correctness actually lives — a trip is money and safety, not a row to be updated freely.</p>
+
+  <h4>4 · Architecture — 20–30 min</h4>
+  ${flow([{t:"Driver app",d:"location every 4s"},{t:"Location service",d:"in-memory cell index"},{t:"Matching",d:"search + rank + offer"},{t:"Trip service",d:"state machine, strong"},{t:"Pricing & ETA",d:"road graph"},{t:"Rider app",d:"live tracking"}])}
+  <p>Location writes go to a sharded in-memory service and never touch a disk-backed database on the hot path. Matching queries that service, ranks candidates by ETA, and offers the trip to the best driver. The trip service owns the state machine and is the only component that needs strong consistency.</p>
+
+  <h4>5 · The deep dive — 30–48 min</h4>
+  <p><strong>The geospatial index.</strong> Each driver's position maps to an H3 cell at a chosen resolution — roughly a cell a kilometre or so across in a city. The index is <code>cell → set of drivers</code>, sharded by cell id, so a city's load spreads across shards and a quiet region costs nothing. A search takes the rider's cell plus its ring of neighbours, unions the driver sets, and filters. If too few candidates, expand to the next ring — with hexagons every ring is uniformly further out, which makes this clean.</p>
+  <p><strong>Why updates are cheap:</strong> a driver usually stays in the same cell between updates, so the common case is overwriting a value, not moving between sets. Only cell changes touch the index structure. Point that out — it is why 250,000 writes/s is affordable.</p>
+  <p><strong>Matching is where the real difficulty is,</strong> and most candidates underplay it:</p>
+  <ul>
+  <li>Rank by <strong>ETA on the road network</strong>, not straight-line distance. A driver 300 m away on the far side of a motorway may be 10 minutes out. This needs a routing service over a road graph with live traffic — a genuine subsystem, and worth naming as one.</li>
+  <li><strong>Contention:</strong> at a busy time several riders want the same driver. Never let two matches claim one driver — the assignment must be an atomic compare-and-set on the driver's status, with losers falling through to their next candidate. This is the same race as the seat-booking problem, and saying so shows pattern recognition.</li>
+  <li><strong>Offers, not assignments.</strong> A driver can decline or simply not respond, so matching offers with a timeout (typically seconds), then moves to the next candidate. The driver is soft-locked during the offer so they are not offered two trips at once.</li>
+  <li><strong>Greedy nearest-driver is not optimal.</strong> Batching requests over a short window and solving an assignment problem across them reduces total wait time across the marketplace, at the cost of a few seconds of latency per rider. Mention it as the upgrade path — it signals you see this as a marketplace rather than a lookup.</li>
+  </ul>
+
+  <h4>6 · Scale and failure — 48–56 min</h4>
+  <ul><li><strong>Shard by geography.</strong> A city is largely self-contained, so regional deployments are natural and a failure in one region does not affect others. Handle cross-boundary searches by querying both regions at the edges.</li>
+  <li><strong>Location service loss:</strong> it is in-memory and it is a cache of a fast-changing truth — on restart it refills within one reporting interval, so a few seconds of degraded matching. Do not add replication complexity for data with a four-second lifetime; say that explicitly as a deliberate choice.</li>
+  <li><strong>Network loss mid-trip</strong> is the common real failure. The driver app buffers locations locally and uploads on reconnect; the trip state machine tolerates gaps because it advances on explicit events, not on continuous location.</li>
+  <li><strong>Surge pricing</strong> is computed per cell from the supply/demand ratio over a short window, smoothed and rate-limited so prices do not oscillate. It is also a fairness and regulatory question — acknowledge that rather than treating it as a pure optimisation.</li>
+  <li><strong>The thundering herd</strong> when an event ends: thousands of requests in one cell at once. Batch matching, expand search radius adaptively, and communicate wait times honestly rather than failing requests.</li></ul>
+
+  <h4>7 · Close it — 56–60 min</h4>
+  <p>Close on the split you opened with: a high-write, eventually-consistent location plane where staleness is harmless, and a low-volume, strongly-consistent trip plane where a race is a disaster — two completely different consistency budgets in one product. Then name the upgrade you would make next: batched assignment instead of greedy matching, because it improves the marketplace rather than any single request.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Why hexagons genuinely matter, not as trivia.</strong> With square cells, the eight neighbours sit at two different distances — edge-adjacent and corner-adjacent — so an expanding ring search covers an uneven area and biases results diagonally. Hexagons have six equidistant neighbours, so ring k is a uniform annulus and "expand the radius" means what it says. It also makes supply/demand aggregation per cell comparable across cells, which matters for surge pricing. That second reason is the one candidates never give.</li>
+  <li><strong>Cell resolution is a real tuning decision with a failure mode at each end.</strong> Cells too large and each search scans thousands of irrelevant drivers; too small and you must union many cells and still risk finding nobody in a sparse area. Dense city centres and empty rural areas want different resolutions, so mature systems use a hierarchy and pick the level by local density — which H3's nested resolutions support directly.</li>
+  <li><strong>ETA prediction is a machine-learning system, not a graph algorithm.</strong> Shortest-path over a road graph gives a route; the <em>time</em> depends on live traffic, time of day, weather, the driver's behaviour and how long pickup actually takes at that specific building. Production ETA is a model over graph features, continuously retrained, and its error directly drives both matching quality and rider trust. Treating it as Dijkstra is the tell of someone who has not thought about the product.</li>
+  <li><strong>The marketplace is a control system with feedback.</strong> Surge raises prices, which suppresses demand and attracts supply, which lowers surge — a loop that oscillates if tuned badly, exactly like any feedback controller. Smoothing, hysteresis and rate limits on price changes are not cosmetic; without them you get price flapping that erodes trust and is a regulatory problem. Framing surge as control theory rather than pricing is a genuinely senior move.</li>
+  <li><strong>Idempotency across an unreliable mobile network is essential.</strong> A rider taps "request" on a flaky connection, the response is lost, they tap again. Without an idempotency key on the request you have created two trips and possibly two drivers en route. Every state-changing mobile API needs a client-generated key — the same mechanism as the payments design, which is worth connecting explicitly.</li>
+  <li><strong>Safety and audit requirements shape the data model.</strong> Trip events are append-only and retained because they are evidence in disputes, insurance claims and investigations. Location history cannot simply be discarded for cost, and it cannot be freely queried either — it is precise movement data about real people, so access is controlled and audited. Raising privacy and retention unprompted distinguishes a senior answer in this domain particularly, because it is the part that has caused real-world harm.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A city has 40,000 online drivers at peak, reporting every 4 seconds, spread over 2,000 H3 cells — but unevenly: the busiest 50 cells hold 30% of drivers. A rider request searches its cell plus 2 rings (19 cells total) and needs at least 20 candidates.</p>
+    <p>(a) What is the write rate and per-shard load if you have 16 shards? (b) What happens to matching in the busiest cells versus the quietest? (c) A concert ends and 3,000 riders request within 60 seconds from 3 adjacent cells. What breaks?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a)</strong> Writes: 40,000 ÷ 4 = <strong>10,000 location updates/s</strong> for the city. Across 16 shards that is 625/s each <em>if evenly distributed</em> — but it is not. The busiest 50 cells hold 12,000 drivers producing 3,000 writes/s, and if those cells hash unevenly, one shard could take several times its share. The fix is to shard on cell id with enough cells per shard that the law of large numbers helps, and to monitor per-shard write rate rather than assuming uniformity.</p>
+    <p><strong>(b) Density asymmetry.</strong> In a busy cell, one cell alone holds ~240 drivers, so the 19-cell search returns hundreds of candidates — you scan and rank far more than the 20 you need, wasting work and ranking latency. In a quiet cell there may be 2 drivers across all 19 cells, so you fail to reach 20 candidates and must expand further, adding rings until you either find drivers or give up.</p>
+    <p>So the <em>same</em> search has opposite problems at the two extremes. The fix is adaptive: choose cell resolution by local density (finer cells downtown, coarser in the suburbs) and stop expanding as soon as you have enough candidates rather than always searching 19 cells. Volunteering that one fixed resolution cannot serve both is the insight here.</p>
+    <p><strong>(c) The concert.</strong> 3,000 requests in 60 seconds = 50/s concentrated in 3 cells, against a citywide normal of maybe 5/s. Three things break, in order:</p>
+    <ul>
+    <li><strong>Supply exhaustion, not compute.</strong> Those cells plus their rings might hold 400 drivers. The first few hundred riders are matched; the rest have no candidates at any radius. The system is not overloaded — there are genuinely not enough cars. Recognising that this is a marketplace failure rather than an engineering one is the most important part of the answer.</li>
+    <li><strong>Contention on every remaining driver.</strong> Dozens of riders race for the same few drivers, so the atomic claim rejects most attempts and each rider cycles through candidates, multiplying matching work at exactly the wrong moment. Batched assignment over a short window fixes this properly: solve the allocation once across all waiting riders instead of letting them fight.</li>
+    <li><strong>Search amplification.</strong> As radius expands to find anyone, each request scans more cells, so per-request cost rises just as request rate rises — a superlinear load increase. Cap the radius and fail fast with an honest wait estimate rather than scanning the whole city.</li>
+    </ul>
+    <p><strong>What you would actually build:</strong> detect the demand spike per cell, switch those cells to batched matching, surge to pull drivers in from surrounding areas, and — the part that matters most for user experience — tell riders a realistic wait rather than spinning. Some of the answer here is not technical, and saying so is a strength rather than a dodge.</p></details>`,
+
+  refs:[
+    ["tool","H3: Hexagonal hierarchical geospatial indexing","Uber's grid system, with an interactive explorer. The documentation's explanation of why hexagons beat squares for ring searches is the one to read.","https://h3geo.org/"],
+    ["code","uber/h3","The library itself — the resolution table showing average cell edge length per level is what you use to pick a resolution.","https://github.com/uber/h3"],
+    ["docs","S2 Geometry","Google's alternative: sphere-to-cube projection with a Hilbert curve. Compare its cell-hierarchy guide against H3 to understand the trade-offs.","https://s2geometry.io/"],
+    ["docs","Geohash","The simplest of the three, and the one to explain first in an interview because the bit-interleaving makes the 2D-to-1D idea obvious.","https://en.wikipedia.org/wiki/Geohash"],
+    ["docs","Redis geospatial indexes","A working geospatial index you can read the semantics of in ten minutes — GEOADD and GEOSEARCH are the operations this design needs.","https://redis.io/docs/latest/develop/data-types/geospatial/"],
+    ["paper","Contraction Hierarchies","Geisberger et al. — the preprocessing technique that makes continent-scale shortest-path queries fast enough for real-time ETA.","https://en.wikipedia.org/wiki/Contraction_hierarchies"]
+  ]}
+
+];

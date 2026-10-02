@@ -1,0 +1,329 @@
+<!-- topic source for llm/lm5; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "lm5",
+  "t": "KV cache, MQA and GQA",
+  "tag": "Inference",
+  "sum": "Why generation caches every past token's keys and values, the bytes-per-token formula worked for 7B and 70B models, why the cache (not compute) limits batch size and long context, and how multi-query and grouped-query attention shrink it.",
+  "viz": "kvcache",
+  "prereq": [
+    ["lm2", "Each token's query is compared with every allowed key, and the output is the weighted sum of values; with a causal mask a token only attends to itself and earlier tokens."],
+    ["lm3", "A decoder-only model is a stack of L blocks, each with a multi-head attention sub-layer; a 7B model has 32 layers of 32 heads of dimension 128."],
+    ["lm4", "With RoPE, each key is rotated by its own position when computed, and scores depend only on relative position, so a stored key stays valid for every later query."],
+    ["gpu2", "A kernel is memory-bound when it does few operations per byte moved; its time is then bytes ÷ bandwidth, not FLOPs ÷ peak."],
+    ["gpu10", "An LLM request has a prefill phase that processes the prompt in one pass and a decode phase that generates one token per step, each step reading all weights and the sequence's cache."]
+  ],
+  "myths": [
+    ["The KV cache is a small optimisation detail.", "For long contexts and large batches it is usually the largest consumer of GPU memory after the weights, and often larger than them: 32 sequences of 4,096 tokens on Llama 2 7B need 64 GiB of cache against 13.5 GB of weights. It decides how many requests a GPU can serve at once and how long a context it can hold."],
+    ["The KV cache stores the attention scores, or the queries.", "It stores the key and value vectors of every past token, in every layer and every KV head. Queries are used once, by the token that produced them, so they are never cached; scores and softmax weights are recomputed each step for the new query only."],
+    ["Caching removes the cost of long contexts.", "It removes the recomputation of past keys and values, so each decode step does O(t) attention work instead of O(t²). But every step still reads the whole cache from memory, and the cache grows by one token per step per sequence, so long contexts still cost memory capacity and bandwidth in proportion to their length."],
+    ["Multi-query attention is strictly better because it shrinks the cache most.", "Sharing one key and value head across all query heads cuts the cache by the number of heads (64× for a 64-head model) but measurably hurts quality and can make training less stable. Grouped-query attention with 8 KV heads keeps most of the saving and nearly all of the quality: in the GQA paper, uptrained GQA-8 scored 47.1 on average against 47.2 for multi-head and 46.6 for multi-query."],
+    ["GQA saves compute.", "GQA barely changes the arithmetic: queries still have all their heads and every query head still computes scores against every cached position. What it saves is memory and memory traffic: the cache, and the bytes read per decode step, shrink by the ratio of query heads to KV heads. Since decode is memory-bound, that is what makes it faster."],
+    ["Quantising the weights to 4 bits solves inference memory.", "It shrinks the weights, but the cache is separate and stays in 16-bit unless you also quantise it. For a 70B model at 32K tokens the cache per sequence (10 GiB with GQA-8) can rival the 4-bit weights of the whole model (about 35 GB) after only a few sequences."]
+  ],
+  "recap": [
+    "In a decoder, each token's keys and values in every layer depend only on that token and earlier ones, so once computed they never change; the KV cache stores them so each new token computes only its own query, key and value.",
+    "Generation has two phases: prefill processes the whole prompt in one parallel pass and fills the cache; decode then produces one token per step, appending one key and value per layer and attending over the cache.",
+    "Without a cache, generating T tokens recomputes past keys and values about T²/2 times (500,500 projections for 1,000 tokens); with it, T times.",
+    "Cache bytes per token = 2 (key and value) × layers × KV heads × head dimension × bytes per number: Llama 2 7B (32 × 32 × 128, fp16) needs 512 KiB per token, 2 GiB for a 4,096-token sequence.",
+    "Llama 2 70B with 8 KV heads needs 320 KiB per token; with standard multi-head attention (64 KV heads) it would need 2.5 MiB, eight times more, and 10 GiB per 4,096-token sequence.",
+    "Decode is memory-bound: each step reads all weights plus every active sequence's cache, so at large batch or long context the cache, not the weights, dominates step time and limits batch size.",
+    "Multi-query attention (MQA) shares one key and value head across all query heads; grouped-query attention (GQA) shares one per group, interpolating between MQA and multi-head attention (MHA).",
+    "The GQA paper uptrained T5-XXL from MHA using 5% of pretraining compute: GQA-8 reached an average of 47.1 against 47.2 for MHA and 46.6 for MQA, with 0.28 s per sample against 1.51 s for MHA and 0.24 s for MQA.",
+    "Llama 2 adopted GQA with 8 KV heads for its 34B and 70B models, and Llama 3 for all sizes; an MHA checkpoint can be converted by mean-pooling each group's key and value heads and briefly continuing training.",
+    "Further cache savings come from storing it in 8-bit, from paging and sharing it across requests (lm13), and from compressing keys and values into a latent vector (multi-head latent attention)."
+  ],
+  "glossary": [
+    ["Autoregressive generation", "Producing text one token at a time, each token conditioned on all previous ones and appended before the next step."],
+    ["Decode phase", "The generation phase that produces one token per step per sequence, reading all weights and the sequence's KV cache each step."],
+    ["GiB / KiB / MiB", "Binary units: 1 KiB = 1,024 bytes, 1 MiB = 1,024 KiB, 1 GiB = 1,024 MiB (about 1.074 × 10⁹ bytes)."],
+    ["FLOP", "One floating-point operation; a multiply-add counts as two. TFLOP/s means 10¹² per second."],
+    ["Grouped-query attention (GQA)", "Attention in which query heads are divided into groups and each group shares one key head and one value head."],
+    ["HBM", "High-bandwidth memory: the GPU's main memory, where weights and the KV cache live; 80 GB at about 3.35 TB/s on an H100 SXM."],
+    ["Head dimension", "The size of one head's query, key and value vectors, usually 128 in current LLMs."],
+    ["KV cache", "The stored key and value vectors of all previous tokens in every layer, kept during generation so they are not recomputed."],
+    ["KV head", "One key projection and one value projection; MHA has as many as query heads, GQA fewer, MQA one."],
+    ["Memory-bound", "Limited by how fast data can be read from memory rather than by arithmetic speed."],
+    ["Multi-head attention (MHA)", "Standard attention in which every head has its own query, key and value projections."],
+    ["Multi-head latent attention (MLA)", "DeepSeek's scheme that caches a small compressed latent vector per token per layer and reconstructs keys and values from it."],
+    ["Multi-query attention (MQA)", "Attention in which all query heads share a single key head and a single value head."],
+    ["Prefill phase", "The first phase of a request: one parallel forward pass over the whole prompt that fills the KV cache and produces the first output token."],
+    ["Tensor parallelism", "Splitting each weight matrix across several GPUs so they compute one layer together; attention is usually split by heads."],
+    ["Time per output token (TPOT)", "The time of one decode step as seen by a user: the gap between successive generated tokens."],
+    ["Time to first token (TTFT)", "The delay from sending a request to receiving the first generated token, dominated by queueing and prefill."],
+    ["Uptraining", "Continuing to train an existing checkpoint after changing its architecture, such as converting MHA to GQA, using a small fraction of the original compute."]
+  ],
+  "qa": [
+    ["E", "What is the KV cache and why is it needed?", "During generation, every new token must attend to the keys and values of all earlier tokens in every layer. Those keys and values never change once computed, because of the causal mask, so the model stores them and each step computes only the new token's query, key and value. Without the cache, generating T tokens would recompute past keys and values about T²/2 times instead of T times."],
+    ["E", "What exactly is stored, and what is not?", "For each layer, each KV head and each past token: one key vector and one value vector of the head dimension. Queries are not stored, because each is used only by its own token at its own step; attention scores and weights are recomputed each step for the new query."],
+    ["E", "Write the formula for KV-cache size.", "Bytes per token = 2 × layers × KV heads × head dimension × bytes per element. Multiply by context length for one sequence and by the number of concurrent sequences for a batch. For Llama 2 7B in fp16: 2 × 32 × 32 × 128 × 2 = 524,288 bytes, 512 KiB per token, 2 GiB per 4,096-token sequence."],
+    ["M", "Compute the KV cache of a 70B model with and without GQA at a 4,096-token context and batch 32.", "Llama 2 70B has 80 layers, 64 query heads, 8 KV heads, head dimension 128. With GQA: 2 × 80 × 8 × 128 × 2 = 320 KiB per token, 1.25 GiB per sequence, 40 GiB for 32 sequences. With MHA it would have 64 KV heads: 2.5 MiB per token, 10 GiB per sequence and 320 GiB for the batch, which would not fit on a node of 8 × 80 GB GPUs alongside the 138 GB of weights.", "Follow-up: How would you get the batch of 32 to fit in the MHA case? — Shorter contexts, an 8-bit cache, paged allocation so short requests do not reserve the maximum length, or fewer concurrent sequences; architecturally, GQA is the fix."],
+    ["M", "Why is the decode phase memory-bound, and how does the cache change that?", "Each decode step does one new token per sequence, so every weight read from memory is used for only batch-size multiply-adds, far below the arithmetic a GPU can do per byte. The cache adds more bytes: each step reads every active sequence's whole cache to compute one row of attention, with only a couple of FLOPs per byte read. On an H100, Llama 2 7B's weights take about 4 ms to read, but 27 sequences of 4,096 tokens add about 17 ms of cache reads per step.", "Follow-up: So what helps decode most? — Reading fewer bytes: GQA or MQA, cache quantisation, weight quantisation, and batching to amortise weight reads."],
+    ["M", "Compare MHA, MQA and GQA.", "MHA gives every query head its own key and value heads: best quality, largest cache. MQA shares one key and value head across all query heads: cache smaller by the head count (64× for 64 heads), fastest decode, but some quality loss and training instability. GQA shares one key and value head per group of query heads, typically 8 KV heads: about 8× smaller cache than MHA in a 64-head model, quality close to MHA, speed close to MQA. Most current LLMs use GQA."],
+    ["M", "What happens in prefill versus decode, and why do they behave so differently?", "Prefill runs the whole prompt in one forward pass: thousands of tokens share each weight read, so it is compute-bound and fills the cache for all prompt tokens at once; it determines time to first token. Decode generates one token per step: each step reads all weights and the cache for a single new token per sequence, so it is memory-bound; it determines time per output token. Serving systems schedule the two differently because one is limited by FLOPs and the other by bytes."],
+    ["M", "How does the GQA paper convert an existing multi-head model?", "Group the query heads, build each group's single key and value projection by mean-pooling the key and value projection matrices of the heads in that group, then continue pretraining (uptrain) the converted model for a small fraction of the original compute; they used 5% for T5-XXL. Mean-pooling worked better than picking one head or random initialisation."],
+    ["M", "Why does GQA work well with tensor parallelism?", "Attention is usually split across GPUs by heads. With 8 KV heads and 8 GPUs, each GPU holds one KV head and its group of query heads, so nothing is duplicated. With MQA's single KV head, every GPU needs a copy of it, so the cache per GPU is the same as GQA-8 anyway; the Llama 2 paper points this out as one reason it chose GQA for the models it serves on 8-GPU nodes."],
+    ["H", "Your service runs out of GPU memory at 20 concurrent users with 8K-token conversations on a 13B MHA model. Diagnose and fix.", "Llama 2 13B has 40 layers, 40 heads, head dimension 128: 2 × 40 × 40 × 128 × 2 = 800 KiB per token, so 8,192 tokens is 6.25 GiB per conversation and 20 users need 125 GiB, far more than an 80 GB GPU has after 26 GB of weights. Options in order of effort: paged KV allocation so conversations only hold what they use (lm13), an 8-bit cache (halves it), prefix sharing for common system prompts, capping context or summarising old turns, tensor parallelism over more GPUs, and switching to a GQA model, which at 8 KV heads would cut the cache 5× for this shape.", "Follow-up: What metric would have warned you? — KV-cache utilisation and preemption or eviction counts from the serving engine, alongside queue time; they rise before out-of-memory errors or latency spikes."],
+    ["H", "Why does the KV cache make long-context serving expensive even with FlashAttention?", "FlashAttention removes the n × n score matrix from memory but cannot remove the cache: each decode step must still read every cached key and value of the sequence, so step time grows linearly with context, and capacity falls inversely with it. A 128K-token conversation on Llama 3 8B (128 KiB per token) holds 16 GiB of cache, more than the model's 16 GB of weights, for a single user.", "Follow-up: What architectural ideas attack this? — Fewer KV heads (GQA, MQA), compressed latent caches (MLA), sliding-window layers that only keep recent tokens, cache quantisation, and offloading cold parts of the cache to CPU memory."],
+    ["H", "What is multi-head latent attention and how does it differ from GQA?", "GQA reduces the number of distinct key and value heads. MLA, introduced in DeepSeek-V2, instead projects each token's hidden state down to a small latent vector, caches only that latent, and reconstructs per-head keys and values from it with up-projection matrices; position information is handled with a small separate rotary component. It can make the cache smaller than GQA while keeping per-head keys and values distinct, at the cost of extra computation and more complex kernels.", "Follow-up: Why is the extra computation acceptable? — Decode is memory-bound, so trading bytes read for FLOPs is usually a win."],
+    ["H", "How would you estimate the maximum batch size for a model on one GPU?", "Free memory = GPU memory × usable fraction − weights − activation and framework overhead. Cache per sequence = bytes per token × (prompt + output length). Maximum concurrent sequences ≈ free memory ÷ cache per sequence. For Llama 3 8B on an 80 GB GPU at 90% usable: 72 − 16.1 ≈ 55.9 GB free; at 128 KiB per token and 4,096 tokens per sequence, about 104 sequences. Then check the latency target: each step reads weights plus all those caches, so step time rises with batch."]
+  ],
+  "refs": [
+    ["paper", "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints", "Ainslie et al., 2023. The public case: grouped-query attention and uptraining with 5% of pretraining compute.", "https://arxiv.org/abs/2305.13245"],
+    ["paper", "Fast Transformer Decoding: One Write-Head is All You Need", "Shazeer, 2019. The original multi-query attention paper and the memory-bandwidth argument for it.", "https://arxiv.org/abs/1911.02150"],
+    ["paper", "Llama 2: Open Foundation and Fine-Tuned Chat Models", "Touvron et al., 2023. Appendix A.2.1 compares MHA, MQA and GQA at 30B and explains the tensor-parallel argument.", "https://arxiv.org/abs/2307.09288"],
+    ["paper", "Efficient Memory Management for Large Language Model Serving with PagedAttention", "Kwon et al., 2023. The vLLM paper: paged allocation of the KV cache.", "https://arxiv.org/abs/2309.06180"],
+    ["paper", "DeepSeek-V2", "DeepSeek-AI, 2024. Introduces multi-head latent attention for a compressed KV cache.", "https://arxiv.org/abs/2405.04434"],
+    ["post", "Optimizing your LLM in production", "Hugging Face. KV cache, GQA and quantisation with measurements.", "https://huggingface.co/blog/optimize-llm"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team launches an internal assistant on one 80 GB GPU running a 7-billion-parameter model. The weights take 13.5 GB, so they expect plenty of room. In testing, with a handful of users and short questions, it is fast. Then they let employees paste whole documents and keep long conversations going, and the service starts rejecting requests at around two dozen concurrent users, with latency climbing steeply before it does. The GPU's compute is mostly idle. What has filled the memory is not the model; it is a data structure that grows with every token every user has typed or received.</p>
+<p>That structure is the <strong>KV cache</strong>. To generate text, a model produces one token at a time, and each new token's attention must look at the keys and values of every previous token in every layer. Recomputing them at every step would be hopelessly slow, so the serving engine keeps them in GPU memory. For that 7B model it is half a mebibyte per token per conversation; a 4,096-token conversation holds 2 GiB, and 27 of them fill the GPU. Reading that cache at every step is also what makes each generated token slow once the batch is large.</p>
+<p>The cache is why "how many users can one GPU serve?" and "how long a context can we offer?" are memory questions rather than compute questions, why serving engines manage memory like operating systems, and why model architects changed attention itself. Multi-query attention and grouped-query attention, now used by most open models, exist almost entirely to shrink this cache.</p>
+<p>This lesson builds the cache from the attention you already know, separates the prefill and decode phases, derives the bytes-per-token formula and works it for 7B and 70B models, shows why the cache limits batch size and dominates decode time, and then explains MQA and GQA, how an existing model is converted to GQA, and what the published results were. The lab computes cache sizes for real models and verifies in NumPy that cached decoding gives exactly the same result as recomputing everything.</p>
+</section>
+
+<section data-field="primer">
+<h4>Generation is a loop</h4>
+<p>A language model predicts the next token from all the tokens so far. To write a reply, it runs that prediction, appends the chosen token, and runs it again, one token per step, until it emits an end token. This is <strong>autoregressive generation</strong>. Each step, the new token needs attention over all earlier tokens: its query must be compared with every earlier token's key, and it must take a weighted sum of every earlier token's value, in every layer.</p>
+<h4>What can be reused</h4>
+<p>Here is the key observation. Because of the causal mask (lm2), token 5's key and value in layer 1 depend only on tokens 1 to 5. When token 6, 7 or 700 is generated later, token 5's key and value in layer 1 are exactly the same as they were. The same holds in every layer, since each layer's input for token 5 also depends only on tokens 1 to 5. So instead of recomputing all earlier keys and values at each step, the model can compute each token's keys and values once and store them. That store is the <strong>KV cache</strong>: for every layer, a growing list of key vectors and value vectors, one entry per token so far.</p>
+<h4>An analogy: a meeting with minutes</h4>
+<p>Picture a long meeting where each new speaker needs to respond to everything said so far. Without minutes, every speaker would have to ask everyone to repeat their previous points. With minutes, each point is written down once, in a compact form, and every later speaker simply reads the whole document. The minutes make speaking cheap but have their own cost: the document grows with every contribution, and reading the whole of it before each new speech takes longer and longer. The KV cache is exactly this: it turns recomputation into storage and reading, and its size and reading time grow with the conversation.</p>
+<h4>Two phases</h4>
+<p>A request therefore runs in two phases. In <strong>prefill</strong>, the model processes the whole prompt in one parallel forward pass, computing and storing keys and values for every prompt token in every layer, and produces the first output token. In <strong>decode</strong>, it generates one token per step: compute the new token's query, key and value in each layer, append the key and value to the cache, attend over the whole cache, and move on. Prefill is a big parallel computation; decode is a long series of small ones, each of which must read the model's weights and the sequence's whole cache from GPU memory.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="KV cache over time: prefill writes four prompt tokens' keys and values at once; each decode step appends one more column while the new query reads all columns">
+  <defs><marker id="lm5-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">one layer's cache for one sequence</text>
+    <text x="20" y="62" style="fill:var(--ink-2)">prefill</text>
+    <text x="20" y="112" style="fill:var(--ink-2)">decode step 1</text>
+    <text x="20" y="162" style="fill:var(--ink-2)">decode step 2</text>
+    <text x="20" y="212" style="fill:var(--ink-2)">decode step 3</text>
+    <g>
+      <rect x="130" y="44" width="40" height="30" style="fill:var(--s1);fill-opacity:0.35;stroke:var(--s1)"/><rect x="172" y="44" width="40" height="30" style="fill:var(--s1);fill-opacity:0.35;stroke:var(--s1)"/><rect x="214" y="44" width="40" height="30" style="fill:var(--s1);fill-opacity:0.35;stroke:var(--s1)"/><rect x="256" y="44" width="40" height="30" style="fill:var(--s1);fill-opacity:0.35;stroke:var(--s1)"/>
+      <text x="213" y="88" text-anchor="middle" style="fill:var(--muted)">4 prompt tokens written in one pass</text>
+      <rect x="130" y="94" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="172" y="94" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="214" y="94" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="256" y="94" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="298" y="94" width="40" height="30" style="fill:var(--accent);fill-opacity:0.4;stroke:var(--accent)"/>
+      <rect x="130" y="144" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="172" y="144" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="214" y="144" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="256" y="144" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="298" y="144" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="340" y="144" width="40" height="30" style="fill:var(--accent);fill-opacity:0.4;stroke:var(--accent)"/>
+      <rect x="130" y="194" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="172" y="194" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="214" y="194" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="256" y="194" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="298" y="194" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="340" y="194" width="40" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/><rect x="382" y="194" width="40" height="30" style="fill:var(--accent);fill-opacity:0.4;stroke:var(--accent)"/>
+    </g>
+    <path d="M440,209 C470,209 470,180 440,180" style="fill:none;stroke:none"/>
+    <line x1="470" y1="209" x2="428" y2="209" marker-end="url(#lm5-arrow)" style="stroke:var(--accent);fill:none"/>
+    <text x="476" y="205" style="fill:var(--accent)">new token's K, V appended;</text>
+    <text x="476" y="221" style="fill:var(--accent)">its query reads all 7</text>
+    <text x="476" y="110" style="fill:var(--ink-2)">each cell = one token's</text>
+    <text x="476" y="126" style="fill:var(--ink-2)">key + value, per KV head</text>
+    <text x="476" y="160" style="fill:var(--ink-2)">× every layer × every</text>
+    <text x="476" y="176" style="fill:var(--ink-2)">sequence in the batch</text>
+  </g>
+</svg>
+<figcaption>The cache grows by one entry per decode step and is never rewritten. Each step does little arithmetic (one query against all entries) but must read every entry, in every layer, which is why decode time grows with context length.</figcaption>
+</figure>
+<h4>How big is "big"?</h4>
+<p>Each cached entry is small, two vectors of 128 numbers per KV head per layer, but there are a lot of them. For Llama 2 7B, every token of every conversation costs half a mebibyte of cache; a 4,096-token conversation costs 2 GiB, about one seventh of the model's own weights. A GPU serving dozens of such conversations at once holds more cache than model. The body of this lesson derives the formula and shows how architecture changes (multi-query and grouped-query attention) cut the per-token figure by 4 to 64 times.</p>
+<p>Hold on to two facts: the cache costs memory proportional to (tokens so far) × (layers) × (key and value heads) × (head size), for every sequence being served; and every decode step reads all of it.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Generation without a cache</h4>
+<p>Start with the naive loop. To generate token t + 1, run the full model on tokens 1 … t and read the last position's logits. Every step recomputes every earlier token's hidden states in every layer, including their keys and values. Generating T tokens after a short prompt costs about 1 + 2 + … + T = T(T + 1)/2 token-passes through the model, so cost grows with the square of the output length: 500,500 token-passes for 1,000 generated tokens, against 1,000 if each token were processed once. Since a forward pass costs about 2N FLOPs per token for an N-parameter model (lm3), a 7B model generating 1,000 tokens would spend about 7 × 10¹⁵ FLOPs on recomputation alone.</p>
+<h4>2. Why past keys and values can be reused</h4>
+<p>The causal mask guarantees that token i's representation in layer 1 depends only on tokens 1 … i. Layer 2's input for token i is layer 1's output for token i, which therefore also depends only on tokens 1 … i; by induction, token i's hidden state at every layer, and so its key k = h W_K and value v = h W_V, are fixed the moment token i is known. With RoPE (lm4), the key is rotated by token i's own position, which is also fixed. Nothing that happens later can change them. The new token's query, however, is new at every step, and its attention weights over the past must be computed fresh, because they depend on that query.</p>
+<h4>3. Generation with a cache, step by step</h4>
+<p>With a cache, each decode step does this in every layer:</p>
+<ol>
+<li>Take the new token's hidden state h (one vector), compute its query q = hW_Q, key k = hW_K and value v = hW_V, and apply RoPE to q and k at the token's position.</li>
+<li>Append k and v to this layer's cache, which now holds t entries.</li>
+<li>Compute scores of q against all t cached keys (a 1 × t vector), scale, softmax, and take the weighted sum of the t cached values.</li>
+<li>Project with W_O, add to the residual stream, run the MLP, and pass the new token's vector to the next layer.</li>
+</ol>
+<p>Every matrix multiplication now involves one token instead of t, so the weight arithmetic per step is about 2N FLOPs regardless of position, and attention is O(t) instead of O(t²). The lab checks that this incremental procedure gives exactly the same outputs as recomputing the whole sequence with the causal mask, to floating-point precision. During <strong>prefill</strong>, the same cache is filled for all prompt tokens at once by an ordinary causal forward pass, which is why prefill can process thousands of tokens in about the time decode takes for a handful.</p>
+<h4>4. How big is the cache?</h4>
+<p>For each token, each layer stores one key vector and one value vector per KV head, each of length d_head, in some number format. So</p>
+<pre>KV bytes per token = 2 × n_layers × n_kv_heads × d_head × bytes_per_element</pre>
+<p>Multiply by the number of tokens in a sequence (prompt plus generated so far) for one sequence, and by the number of sequences being served at once for the whole batch. In standard multi-head attention, n_kv_heads equals the number of query heads, and n_kv_heads × d_head = d_model, so the formula is also 2 × n_layers × d_model × bytes: two numbers per layer per model dimension per token.</p>
+<p><strong>Worked: Llama 2 7B.</strong> 32 layers, 32 heads, d_head = 128, fp16 (2 bytes): 2 × 32 × 32 × 128 × 2 = 524,288 bytes = <strong>512 KiB per token</strong>. A 4,096-token conversation: 512 KiB × 4,096 = <strong>2 GiB</strong>. A batch of 32 such conversations: <strong>64 GiB</strong>, nearly five times the 13.5 GB of weights. The parameter count (6.74 billion) is fixed; the cache scales with users × context.</p>
+<p><strong>Worked: Llama 2 70B.</strong> 80 layers, 64 query heads but only 8 KV heads (grouped-query attention, section 8), d_head = 128: 2 × 80 × 8 × 128 × 2 = 327,680 bytes = <strong>320 KiB per token</strong>, 1.25 GiB per 4,096-token sequence. Had it used standard multi-head attention with 64 KV heads: 2 × 80 × 64 × 128 × 2 = 2,621,440 bytes = <strong>2.5 MiB per token</strong>, 10 GiB per sequence, 320 GiB for 32 sequences, more than eight 80 GB GPUs could hold alongside the 138 GB of weights. That factor of eight is why GQA exists.</p>
+<table>
+<thead><tr><th>Model</th><th>Layers × KV heads × d_head</th><th>Per token</th><th>Per 4K sequence</th><th>32 × 4K</th></tr></thead>
+<tbody>
+<tr><td>Llama 2 7B (MHA)</td><td>32 × 32 × 128</td><td>512 KiB</td><td>2.00 GiB</td><td>64 GiB</td></tr>
+<tr><td>Llama 3 8B (GQA-8)</td><td>32 × 8 × 128</td><td>128 KiB</td><td>0.50 GiB</td><td>16 GiB</td></tr>
+<tr><td>Llama 2 70B (GQA-8)</td><td>80 × 8 × 128</td><td>320 KiB</td><td>1.25 GiB</td><td>40 GiB</td></tr>
+<tr><td>70B with MHA</td><td>80 × 64 × 128</td><td>2.5 MiB</td><td>10 GiB</td><td>320 GiB</td></tr>
+<tr><td>70B with MQA</td><td>80 × 1 × 128</td><td>40 KiB</td><td>0.16 GiB</td><td>5 GiB</td></tr>
+</tbody>
+</table>
+<h4>5. The cache sets the batch size</h4>
+<p>Serving throughput comes from batching: processing many users' decode steps together so each read of the weights is shared (gpu10). The cache decides how big that batch can be. On one 80 GB H100, keeping 10% headroom for activations and fragmentation, Llama 2 7B leaves 72 − 13.5 = 58.5 GB for cache: at 2 GiB per 4,096-token sequence, <strong>27 sequences</strong>. Llama 3 8B, with a quarter of the cache per token thanks to GQA, leaves 55.9 GB and fits <strong>104 sequences</strong>, nearly four times as many despite being a slightly larger model. The same arithmetic in the GPU track gives about 150 sequences of 3,000 tokens for Llama 3 70B on four H100s. When requests' contexts vary, an engine that reserves the maximum context per request wastes most of this memory; paged allocation (lm13) reserves memory in small blocks as the cache actually grows.</p>
+<h4>6. The cache sets the decode speed</h4>
+<p>Each decode step must read every weight once (shared by the batch) and every active sequence's entire cache (not shared). Reading from GPU memory at about 3.35 TB/s on an H100, Llama 2 7B's 13.5 GB of weights take about 4.0 ms per step. A full batch of 27 sequences of 4,096 tokens adds 27 × 2 GiB = 58 GB of cache reads, about 17 ms. So at long context and high batch, cache reads, not weight reads, dominate the time per generated token. The arithmetic per byte of cache is tiny: each cached key is used for one dot product with one query per query head sharing it, so attention during decode does roughly as many FLOPs as bytes it reads, times the number of query heads per KV head. That ratio, the <em>group size</em>, is exactly what GQA raises.</p>
+<h4>7. Multi-query attention</h4>
+<p>Shazeer's 2019 paper "Fast Transformer Decoding: One Write-Head is All You Need" made the bandwidth argument explicitly: incremental decoding is limited by the memory bandwidth needed to reload the keys and values, so make them smaller. In <strong>multi-query attention</strong> (MQA), all query heads share a single key head and a single value head. Each head still has its own query projection, so heads can still look for different things; they just search the same keys and read the same values. The cache shrinks by a factor equal to the number of heads: a 64-head 70B-shape model would need 40 KiB per token instead of 2.5 MiB. Decode becomes much faster. The costs are some loss of quality, since the model has far less capacity in its keys and values, and reports of less stable training; and in tensor-parallel serving, where heads are split across GPUs, the single KV head must be copied to every GPU.</p>
+<h4>8. Grouped-query attention</h4>
+<p>Ainslie et al. (2023) proposed the middle ground. In <strong>grouped-query attention</strong> (GQA), the H query heads are divided into G groups, and each group shares one key head and one value head. G = H is ordinary multi-head attention; G = 1 is MQA. With G = 8, a model with 64 query heads has 8 query heads per KV head and a cache 8 times smaller than MHA. In code, GQA is a small change: the key and value projections produce G heads instead of H, and each KV head is repeated (or indexed) to serve the query heads in its group before the usual attention computation.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Multi-head, grouped-query and multi-query attention with 8 query heads: MHA has 8 key-value heads, GQA has 2 shared by groups of 4, MQA has 1 shared by all">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="105" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">MHA: 8 KV heads</text>
+    <text x="320" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">GQA: 2 KV heads</text>
+    <text x="535" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">MQA: 1 KV head</text>
+    <g>
+      <rect x="20" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="42" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="64" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="86" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="108" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="130" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="152" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="174" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/>
+      <rect x="20" y="140" width="18" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/><rect x="42" y="140" width="18" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/><rect x="64" y="140" width="18" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/><rect x="86" y="140" width="18" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/><rect x="108" y="140" width="18" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/><rect x="130" y="140" width="18" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/><rect x="152" y="140" width="18" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/><rect x="174" y="140" width="18" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/>
+      <line x1="29" y1="80" x2="29" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="51" y1="80" x2="51" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="73" y1="80" x2="73" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="95" y1="80" x2="95" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="117" y1="80" x2="117" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="139" y1="80" x2="139" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="161" y1="80" x2="161" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="183" y1="80" x2="183" y2="140" style="stroke:var(--line-2);fill:none"/>
+    </g>
+    <g>
+      <rect x="235" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="257" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="279" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="301" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="323" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="345" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="367" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="389" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/>
+      <rect x="266" y="140" width="22" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/><rect x="354" y="140" width="22" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/>
+      <line x1="244" y1="80" x2="277" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="266" y1="80" x2="277" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="288" y1="80" x2="277" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="310" y1="80" x2="277" y2="140" style="stroke:var(--line-2);fill:none"/>
+      <line x1="332" y1="80" x2="365" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="354" y1="80" x2="365" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="376" y1="80" x2="365" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="398" y1="80" x2="365" y2="140" style="stroke:var(--line-2);fill:none"/>
+    </g>
+    <g>
+      <rect x="450" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="472" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="494" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="516" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="538" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="560" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="582" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/><rect x="604" y="40" width="18" height="40" style="fill:var(--s1);fill-opacity:0.4;stroke:var(--s1)"/>
+      <rect x="524" y="140" width="22" height="40" style="fill:var(--s2);fill-opacity:0.4;stroke:var(--s2)"/>
+      <line x1="459" y1="80" x2="535" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="481" y1="80" x2="535" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="503" y1="80" x2="535" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="525" y1="80" x2="535" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="547" y1="80" x2="535" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="569" y1="80" x2="535" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="591" y1="80" x2="535" y2="140" style="stroke:var(--line-2);fill:none"/><line x1="613" y1="80" x2="535" y2="140" style="stroke:var(--line-2);fill:none"/>
+    </g>
+    <text x="10" y="100" style="fill:var(--muted)">query heads ↑</text>
+    <text x="10" y="200" style="fill:var(--muted)">cached key/value heads</text>
+    <text x="105" y="222" text-anchor="middle" style="fill:var(--ink-2)">cache ×1</text>
+    <text x="320" y="222" text-anchor="middle" style="fill:var(--ink-2)">cache ÷4</text>
+    <text x="535" y="222" text-anchor="middle" style="fill:var(--ink-2)">cache ÷8</text>
+  </g>
+</svg>
+<figcaption>Eight query heads (top row) in each design; the bottom row is what gets cached. GQA keeps several distinct key/value heads, so groups of query heads can still attend to different features, while cutting the cache by the group size.</figcaption>
+</figure>
+<p>The GQA paper also answered a practical question: what if you already have a trained MHA model? They <strong>uptrained</strong> it: build each group's key projection by mean-pooling the key projection matrices of the heads in that group (and likewise for values), then continue pretraining for a small fraction of the original compute. With 5% of T5-XXL's pretraining compute, the converted GQA-8 model averaged 47.1 across their summarisation, translation and question-answering benchmarks, against 47.2 for the original multi-head model and 46.6 for an MQA conversion, while its inference time per sample was 0.28 s against 1.51 s for multi-head and 0.24 s for MQA. GQA keeps nearly all of the quality and nearly all of the speed.</p>
+<h4>9. GQA in parameter and FLOP terms</h4>
+<p>GQA also shrinks the key and value projection matrices: in Llama 3 8B, W_K and W_V are 4,096 × 1,024 rather than 4,096 × 4,096, so attention has 42 million weights per layer instead of 67 million (lm3 counted this). Model designers usually spend the saved parameters elsewhere; the Llama 2 authors, comparing MHA, MQA and GQA at 30B, enlarged the MLP to keep total parameters equal. The arithmetic of attention itself hardly changes: each query head still computes scores against every cached position. What changes is bytes: the cache is smaller, and each cached key is read once and used by every query head in its group, which raises attention's arithmetic intensity during decode by the group size and moves it towards the compute-bound regime.</p>
+<h4>10. One request, traced with numbers</h4>
+<p>Put the pieces together for one request to Llama 3 8B on an H100: a 2,000-token prompt (a document plus a question) and a 300-token answer, served alone. <strong>Prefill</strong> processes 2,000 tokens in one pass: about 2 × 8 × 10⁹ × 2,000 = 32 × 10¹² FLOPs for the weights. An H100 SXM's dense bf16 peak is about 989 TFLOP/s, so at a realistic 50-60% of peak this is about 55-65 ms, plus attention. During that pass the cache for all 2,000 tokens is written: 2,000 × 128 KiB = 250 MiB. The first output token appears after prefill (plus any queueing): that is the <strong>time to first token</strong>.</p>
+<p><strong>Decode</strong> then runs 300 steps. Each step reads the 16.1 GB of weights (about 4.8 ms at 3.35 TB/s) and the cache, which grows from 250 MiB to about 288 MiB (well under 0.1 ms to read), so each step takes roughly 5 ms and the user sees about 200 tokens per second; 300 tokens take about 1.5 s. Now serve 64 such requests together. Prefill work scales with the number of prompts, and decode steps still read the weights once (shared) but now also read 64 caches of about 280 MiB each, roughly 18 GB per step, about 5.4 ms. Each step now takes about 10 ms, so every user sees about 100 tokens per second, but the GPU produces about 6,400 tokens per second in total, about 32 times the single-user throughput. With an MHA model of the same shape, those 64 caches would be four times larger, about 72 GB, more than the roughly 56 GB left after the weights, so the batch would not even fit; at the batch that does fit, each step would spend about four times as long reading cache per request. This is the trade-off the whole lesson revolves around: batching amortises weight reads, the cache does not amortise, and GQA shrinks the part that does not amortise.</p>
+<h4>11. Choosing the number of KV heads</h4>
+<p>For a model designer, the number of KV heads is a dial between quality and serving cost. The considerations are the ones this lesson has built up. Fewer KV heads mean a smaller cache, more concurrent users and faster long-context decode, but less capacity in the keys and values. The number should usually be at least the tensor-parallel degree you expect to serve with, so every GPU holds distinct heads rather than copies; 8 matches the common 8-GPU node. Very long-context models benefit most, because their cache dominates; short-context, low-concurrency deployments benefit least. In practice most open models from 2024 onwards use 8 KV heads at sizes from 8B to 70B and beyond, and some use even more aggressive schemes such as MLA or sliding-window layers. When choosing a model to deploy, look up its layer count, KV head count and head dimension before anything else: those three numbers, multiplied by your expected context and concurrency, tell you whether it will fit.</p>
+<h4>12. Other ways to shrink or manage the cache</h4>
+<p>Several further techniques attack the same memory, and you should know what each one trades. <strong>Cache quantisation</strong> stores keys and values in 8-bit (or lower) formats instead of 16-bit, halving the bytes with a small accuracy cost; it is a configuration option in common serving engines. <strong>Sliding-window attention</strong> in some layers keeps only the most recent w tokens' keys and values, capping the cache for those layers. <strong>Paged allocation</strong> and <strong>prefix sharing</strong> do not shrink the cache per token but stop memory being wasted on reserved-but-unused space and on duplicate copies of shared prompts (lm13). <strong>Offloading</strong> moves rarely used parts of the cache to CPU memory. And <strong>multi-head latent attention</strong> changes the architecture again, caching a compressed latent per token (deep section).</p>
+</section>
+
+<section data-field="deep">
+<h4>Arithmetic intensity of decode attention</h4>
+<p>During decode, for one KV head with g query heads in its group and a cache of t tokens, attention reads 2·t·d_head numbers (keys and values) and performs about 4·t·d_head·g FLOPs (scores and weighted sum for each query head). Its arithmetic intensity is therefore about g FLOPs per number read, or g/2 FLOPs per byte in fp16. For MHA (g = 1) that is 0.5 FLOP per byte, hopelessly memory-bound on a GPU whose ridge point (gpu2) is hundreds of FLOPs per byte. GQA-8 raises it to 4, MQA with 64 heads to 32: still memory-bound, but with proportionally fewer bytes per unit of useful work. Unlike weight reads, cache reads cannot be amortised by batching, because each sequence's cache is used only by that sequence. This is why, at long context, decode throughput stops improving with batch size: more sequences mean more cache bytes per step, linearly.</p>
+<h4>Multi-head latent attention</h4>
+<p>DeepSeek-V2 introduced <strong>MLA</strong>. Rather than reducing the number of KV heads, it projects each token's hidden state down to a compressed latent vector of a few hundred dimensions, caches only that latent (plus a small decoupled rotary key component, because RoPE's position-dependent rotation would otherwise prevent a key trick described next), and reconstructs full per-head keys and values with up-projection matrices. At inference the up-projections can be absorbed into the query and output projections, so attention can be computed directly against the latents. The result is a cache smaller than GQA's while keeping per-head key diversity. The cost is implementation complexity and extra matrix multiplications, a good trade when decode is limited by bytes rather than FLOPs.</p>
+<h4>Why sharing keys and values costs so little quality</h4>
+<p>Empirically, the key and value projections of different heads in a trained MHA model are fairly redundant, which is why mean-pooling them is a good starting point. Intuitively, the query projection decides what each head looks for, and that remains per-head; the keys only need to expose enough features for the queries to discriminate positions, and the values enough content to be useful. A shared key space with 8 × 128 dimensions is still large. MQA's single 128-dimensional key space is more restrictive, which matches the measured gap. The Llama 2 ablation at 30B parameters found GQA comparable to MHA on most evaluations and better than MQA on average, after compensating the parameter loss with a wider MLP.</p>
+<h4>Tensor parallelism and the number of KV heads</h4>
+<p>When a model is split across GPUs by heads, each GPU holds a slice of query heads and the matching KV heads, and keeps the cache for those heads only. If there are fewer KV heads than GPUs, as with MQA on 8 GPUs, every GPU must hold a copy of the shared head and its cache, so the cache per GPU is no smaller than with GQA-8. The Llama 2 paper notes this explicitly: on an 8-GPU node, MQA's cache would either be duplicated (making it equal to GQA's) or sharded across the batch dimension, which complicates serving. Matching the number of KV heads to the typical tensor-parallel degree is one reason 8 became the common choice.</p>
+<h4>Prefill, chunked prefill and the cache</h4>
+<p>Prefill writes the cache for the whole prompt in one pass; for a 32K-token prompt that is a large, compute-bound operation that can stall the decode steps of other users sharing the GPU. Serving engines split long prompts into chunks and interleave them with decode steps (chunked prefill), and some systems run prefill and decode on separate GPU pools and transfer the cache between them (disaggregated serving, gpu10). Both depend on the cache being a well-defined, transferable object, which is also what makes prefix caching possible: if two requests share their first 2,000 tokens, the cache for those tokens is identical and can be computed once and shared (lm13).</p>
+<h4>Verifying a cache implementation</h4>
+<p>Cache bugs are subtle because the model still produces fluent text. Typical ones: applying RoPE to cached keys at the wrong position (for instance, the position within the current chunk rather than within the sequence), forgetting to apply it to the new key before appending, appending before computing attention so the token attends to itself twice, or reusing a cache slot from a previous request in a batched engine. The reliable test is the one in the lab: for a fixed input, compare the logits of cached incremental decoding with a full non-cached forward pass at every position, to a tight tolerance. Run it for multiple batch sizes and for prompts that cross any chunk or page boundary the engine uses.</p>
+<h4>Cache eviction and long conversations</h4>
+<p>When memory runs out, an engine must pause some sequences: either drop their cache and recompute it later from the tokens (cheap to store, costs prefill compute) or copy it to CPU memory (costs PCIe bandwidth). Research methods instead evict individual tokens from the cache, keeping the ones attention uses most plus the first few "attention sink" tokens (lm2), which bounds memory for streaming but loses exact recall of evicted content. For products, the simpler and more predictable lever is conversation management: summarising or truncating old turns so the cache stays within budget.</p>
+</section>
+
+<section data-field="prod">
+<h4>The public case: grouped-query attention (Ainslie et al., Google, 2023) and its adoption in Llama 2</h4>
+<p>The GQA paper begins from MQA's problem: it "drastically speeds up decoder inference" but "can lead to quality degradation", and it may not be desirable to train a separate model just for faster inference. The authors made two contributions. First, an <strong>uptraining</strong> recipe: convert an existing multi-head checkpoint by mean-pooling the key and value projection heads within each group, then continue pretraining with 5% of the original compute. Second, <strong>grouped-query attention</strong> itself, with an intermediate number of KV heads. On T5-XXL, measured on a TPU with input length 2,048 and output length 32, the multi-head model took 1.51 s per sample and averaged 47.2 across seven summarisation, translation and question-answering datasets; the uptrained MQA model took 0.24 s and averaged 46.6; the uptrained GQA-8 model took 0.28 s and averaged 47.1. Their timing plots show cost growing only slowly as groups are added, so 8 groups buys back most of MHA's quality for little speed.</p>
+<p>Meta adopted it within weeks. The Llama 2 paper (July 2023) states that the 34B and 70B models use GQA "to improve inference scalability", and its appendix compares MHA, MQA and GQA variants of a 30B model trained on 150B tokens, widening the MLP to keep parameter counts equal: GQA performed comparably to MHA on most tasks and better than MQA on average. It also gives the serving rationale: the largest models are hosted on 8 A100s with tensor parallelism, where MQA's single KV head cannot be sharded across heads. Llama 3 then used GQA with 8 KV heads at every size, which is why Llama 3 8B's cache is a quarter of Llama 2 7B's per token.</p>
+<h4>Failure modes in production</h4>
+<p><strong>Out-of-memory under load, not at startup.</strong> The model loads fine; failures appear when concurrency or context grows. Symptoms: rising preemption or eviction counts in the serving engine, then errors or latency spikes. Fix by sizing the cache explicitly (maximum concurrent tokens), using paged allocation, capping context, or moving to a GQA model.</p>
+<p><strong>Latency that grows with conversation length.</strong> Time per output token creeps up over a long chat because each step reads a longer cache. Expected behaviour, but it surprises teams who benchmarked with short prompts. Benchmark at realistic context lengths.</p>
+<p><strong>Mis-sized capacity plans.</strong> Planning with parameter counts alone ("7B fits easily") ignores that 32 users with 4K contexts need 64 GiB of cache on an MHA model. Every capacity estimate should include the bytes-per-token formula times expected concurrent tokens.</p>
+<p><strong>Quality changes from cache quantisation.</strong> 8-bit caches are usually safe, but some models and long-context tasks degrade; evaluate on long-input tasks before enabling it.</p>
+<h4>What it means for cost</h4>
+<p>Because throughput comes from batching and the cache limits the batch, the cache feeds directly into cost per token. Doubling the average context of your traffic roughly halves the number of concurrent sequences a GPU can hold and lengthens each decode step, so cost per output token rises even though the model is unchanged. This is why providers price long-context requests higher, why prompt caching discounts exist (a reused prefix's cache is computed once), and why product decisions such as how much conversation history to resend each turn show up on the GPU bill. When comparing two candidate models for a long-document product, compare their KV bytes per token as carefully as their parameter counts: a model with a quarter of the cache per token can serve several times more users on the same hardware.</p>
+<h4>What to monitor</h4>
+<p>KV-cache utilisation (fraction of cache blocks in use), number of running and waiting sequences, preemptions, time to first token and time per output token by context-length bucket, and tokens per second per GPU. Engines such as vLLM expose these as metrics; dashboards that show cache utilisation next to latency make capacity problems obvious before they become outages.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> compute KV-cache sizes for real model shapes, see how many sequences fit on one GPU and how long a decode step spends reading weights versus cache, and verify in NumPy that cached GQA decoding equals full recomputation. NumPy only, instant.</p>
+<pre>import numpy as np
+
+# ---- 1. KV-cache size calculator
+def kv_bytes_per_token(layers, kv_heads, head_dim, bytes_per=2):
+    return 2 * layers * kv_heads * head_dim * bytes_per            # 2 = one key + one value
+models = {                     # layers, query heads, kv heads, head dim, params (B)
+    "Llama 2 7B (MHA)":      (32, 32, 32, 128, 6.74),
+    "Llama 3 8B (GQA-8)":    (32, 32, 8, 128, 8.03),
+    "Llama 2 70B (GQA-8)":   (80, 64, 8, 128, 69.0),
+    "70B if it were MHA":    (80, 64, 64, 128, 69.0),
+    "70B if it were MQA":    (80, 64, 1, 128, 69.0),
+}
+print(f"{'model':22s} {'per token':&gt;10s} {'4K-token seq':&gt;13s} {'32 x 4K':&gt;9s}")
+for name, (L, hq, hkv, hd, p) in models.items():
+    b = kv_bytes_per_token(L, hkv, hd)
+    print(f"{name:22s} {b/1024:8.0f} KiB {b*4096/2**30:10.2f} GiB {32*b*4096/2**30:7.1f} GiB")
+
+# ---- 2. how many sequences fit, and what a decode step must read (one H100: 80 GB, 3.35 TB/s)
+hbm, bw = 80e9, 3.35e12
+for name in ("Llama 2 7B (MHA)", "Llama 3 8B (GQA-8)"):
+    L, hq, hkv, hd, p = models[name]
+    weights = p * 1e9 * 2; free = 0.9 * hbm - weights; b = kv_bytes_per_token(L, hkv, hd)
+    n_seq = int(free // (b * 4096))
+    t_w, t_kv = weights / bw, n_seq * 4096 * b / bw
+    print(f"\n{name}: weights {weights/1e9:.1f} GB, free for cache {free/1e9:.1f} GB -&gt; {n_seq} sequences of 4,096 tokens")
+    print(f"  one decode step reads weights {t_w*1e3:.1f} ms + KV cache {t_kv*1e3:.1f} ms at full batch")
+
+# ---- 3. incremental decoding with a KV cache gives exactly the same outputs as recomputing everything
+rng = np.random.default_rng(0)
+d, hq, hkv, n = 32, 8, 2, 10; hd = d // hq; group = hq // hkv
+Wq = rng.normal(0, d ** -0.5, (d, hq * hd)); Wk = rng.normal(0, d ** -0.5, (d, hkv * hd)); Wv = rng.normal(0, d ** -0.5, (d, hkv * hd))
+def softmax(z): z = z - z.max(-1, keepdims=True); e = np.exp(z); return e / e.sum(-1, keepdims=True)
+def gqa_full(X):                                                     # all positions at once, causal
+    T = len(X); q = (X @ Wq).reshape(T, hq, hd); k = (X @ Wk).reshape(T, hkv, hd); v = (X @ Wv).reshape(T, hkv, hd)
+    k, v = np.repeat(k, group, axis=1), np.repeat(v, group, axis=1)  # each KV head serves `group` query heads
+    s = np.einsum("thd,shd-&gt;hts", q, k) / np.sqrt(hd)
+    s = np.where(np.triu(np.ones((T, T), bool), 1), -np.inf, s)
+    return np.einsum("hts,shd-&gt;thd", softmax(s), v).reshape(T, d)
+X = rng.normal(size=(n, d)); full = gqa_full(X)
+K_cache, V_cache, outs = [], [], []
+for t in range(n):                                                   # one token per step, cache grows by one row
+    x = X[t]
+    K_cache.append((x @ Wk).reshape(hkv, hd)); V_cache.append((x @ Wv).reshape(hkv, hd))
+    q = (x @ Wq).reshape(hq, hd)
+    K = np.repeat(np.stack(K_cache), group, axis=1); V = np.repeat(np.stack(V_cache), group, axis=1)
+    w = softmax(np.einsum("hd,shd-&gt;hs", q, K) / np.sqrt(hd))
+    outs.append(np.einsum("hs,shd-&gt;hd", w, V).reshape(d))
+print("\ncached decoding == full recompute:", np.allclose(np.stack(outs), full),
+      f"| cache holds {len(K_cache)} x {hkv} KV heads x {hd} dims (MHA would hold {hq} heads)")
+
+# ---- 4. work saved: projections computed with and without a cache for a 1,000-token generation
+T = 1000
+print(f"key/value projections for {T} generated tokens: without cache {T*(T+1)//2:,}, with cache {T:,}")
+
+# ---- 5. converting MHA heads to GQA by mean-pooling (the GQA paper's uptraining start point)
+Wk_mha = rng.normal(size=(d, hq, hd))
+Wk_gqa = Wk_mha.reshape(d, hkv, group, hd).mean(axis=2)
+print("MHA key projection", Wk_mha.shape, "-&gt; GQA key projection", Wk_gqa.shape, "(mean of each group of", group, "heads)")</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li><strong>Section 1</strong> prints 512 KiB per token for Llama 2 7B, 128 KiB for Llama 3 8B, 320 KiB for Llama 2 70B, 2,560 KiB for the same 70B shape with MHA and 40 KiB with MQA, with per-sequence and per-batch totals matching the lesson's table.</li>
+<li><strong>Section 2</strong> shows 27 sequences of 4,096 tokens fitting on an 80 GB GPU for Llama 2 7B versus 104 for Llama 3 8B, and a full-batch decode step reading about 4 ms of weights but about 17 ms of cache.</li>
+<li><strong>Section 3</strong> prints <code>True</code>: token-by-token decoding with a cache of 2 KV heads gives the same outputs as the full causal computation with 8 query heads.</li>
+<li><strong>Section 4</strong>: 500,500 key/value projections without a cache against 1,000 with one, for 1,000 generated tokens.</li>
+<li><strong>Section 5</strong> shows the GQA conversion: an MHA key projection of 8 heads becomes 2 by averaging groups of 4.</li>
+</ol>
+<p><strong>Try next.</strong> Add an 8-bit cache option, and compute the maximum context for one sequence of Llama 3 70B on 4 × 80 GB GPUs.</p>
+</section>
+
+<section data-field="drill">
+<b>Estimate — how many users fit?</b>
+<p>You serve Llama 3 70B (80 layers, 64 query heads, 8 KV heads, head dimension 128) in bf16 on one node of 8 × 80 GB GPUs with tensor parallelism. Average conversations are 6,000 tokens. How many can be served concurrently, and what would the number be if the model used MHA?</p>
+<details><summary>Answer</summary>
+<p><strong>Memory available:</strong> 8 × 80 = 640 GB; at 90% usable, 576 GB. Weights: about 70.6B × 2 bytes ≈ 141 GB. Free for cache ≈ <strong>435 GB</strong> (ignoring activation overhead, which is small at decode).</p>
+<p><strong>Cache per conversation:</strong> 2 × 80 × 8 × 128 × 2 = 327,680 bytes = 320 KiB per token; × 6,000 = 1.97 GB.</p>
+<p><strong>Concurrency:</strong> 435 ÷ 1.97 ≈ <strong>220 conversations</strong>.</p>
+<p><strong>With MHA</strong> (64 KV heads): 2.5 MiB per token, 15.7 GB per conversation, about <strong>27 conversations</strong>: eight times fewer. Each decode step would also read eight times more cache bytes, so it would be slower at the same batch.</p>
+<p><strong>Caveats to mention:</strong> conversations vary in length, so paged allocation matters; the latency target may cap the batch below the memory limit, because each step reads all active caches (220 × 1.97 GB ≈ 433 GB, about 16 ms per step at 8 × 3.35 TB/s aggregate on top of the weights); and an 8-bit cache would double capacity.</p></details>
+<hr>
+<b>Diagnose — the assistant that slows down over time</b>
+<p>Users report that a chat assistant's answers stream quickly at the start of a conversation but noticeably slower after an hour of back-and-forth. GPU compute utilisation is low. What is happening and what are your options?</p>
+<details><summary>Answer</summary>
+<p>Each decode step reads the whole conversation's KV cache, so time per output token grows linearly with conversation length; after an hour the context may be tens of thousands of tokens, making cache reads dominate each step. Low compute utilisation confirms the step is memory-bound. As the caches of long conversations grow, the server can also batch fewer users, so per-user throughput falls further, and it may be evicting and recomputing caches. Options: summarise or truncate older turns to bound the context; enable prefix caching so the system prompt is shared; quantise the cache to 8-bit; serve a GQA model or one with sliding-window layers; and check engine metrics for preemptions, which add recomputation stalls.</p></details>
+</section>

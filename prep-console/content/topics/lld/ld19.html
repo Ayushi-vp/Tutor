@@ -1,0 +1,171 @@
+<!-- topic source for lld/ld19; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld19",
+  "t": "Implement a read-write lock",
+  "tag": "Concurrency",
+  "sum": "Many readers or one writer — and the starvation problem you must choose a side on.",
+  "qa": [
+    [
+      "E",
+      "What does a read-write lock allow?",
+      "Any number of concurrent readers, or exactly one writer, never both. It pays off when reads dominate and readers do not conflict with each other, so only writers need exclusivity."
+    ],
+    [
+      "M",
+      "What is writer starvation and how do you prevent it?",
+      "Readers keep arriving and keep being admitted, so the reader count never reaches zero and a waiting writer never proceeds. Prevent it by making new readers yield once a writer is waiting — a single clause in the reader's wait predicate."
+    ],
+    [
+      "M",
+      "Why notify one writer but notify all readers?",
+      "Only one writer can hold the lock, so waking more is waste. All waiting readers can proceed together, which is the entire point of the lock — waking them one at a time would serialise them and throw the benefit away."
+    ],
+    [
+      "H",
+      "When is a read-write lock slower than a plain mutex?",
+      "When critical sections are short. The lock maintains more state, and the reader counter is a shared cache line that every reader writes, so it ping-pongs between cores and can cost more than the work it protects. For read-dominated data, copy-on-write behind an atomic reference is usually better than either."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "Readers–writers problem",
+      "The formal statement of both variants and the starvation trade-off between them.",
+      "https://en.wikipedia.org/wiki/Readers%E2%80%93writers_problem"
+    ],
+    [
+      "docs",
+      "ReentrantReadWriteLock",
+      "Java's implementation — the class documentation is explicit about fair versus non-fair mode, upgrade being unsupported, and when the lock is not worth using.",
+      "https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/locks/ReentrantReadWriteLock.html"
+    ],
+    [
+      "docs",
+      "Copy-on-write",
+      "The lock-free alternative for read-dominated data, and the staleness window it accepts.",
+      "https://en.wikipedia.org/wiki/Copy-on-write"
+    ],
+    [
+      "docs",
+      "False sharing",
+      "Why a shared counter written by every reader costs more than it appears to — the cache-line effect behind the drill's answer.",
+      "https://en.wikipedia.org/wiki/False_sharing"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+
+</section>
+
+<section data-field="primer">
+<h4>Start here — why a plain mutex is wasteful</h4>
+  <p>A mutex serialises everything. But if a data structure is read far more than it is written — a configuration map, a routing table, a cache — then readers do not conflict with each other at all. Only a writer needs exclusivity.</p>
+  <p>A read-write lock encodes that: <strong>any number of readers, or exactly one writer, never both.</strong> With a 95% read workload this can be a large throughput win.</p>
+  <h4>The problem you must solve, not avoid</h4>
+  <p>Readers arrive continuously. A writer waits for the current readers to finish — but new readers keep arriving and keep being admitted, so the reader count never reaches zero and <strong>the writer waits forever</strong>. That is writer starvation, and it is not a corner case; it is the normal behaviour of the naive implementation under read-heavy load, which is exactly the load this lock is for.</p>
+  <h4>The three policies</h4>
+  <ul>
+  <li><strong>Reader-preferring</strong> — admit a reader whenever no writer holds the lock. Maximum read throughput, and writers can starve indefinitely.</li>
+  <li><strong>Writer-preferring</strong> — once a writer is waiting, block new readers. Writers cannot starve; a stream of writers can starve readers.</li>
+  <li><strong>Fair (FIFO)</strong> — serve in arrival order. Neither starves, and throughput is lower because a single waiting writer stops readers from batching.</li>
+  </ul>
+  <p>There is no universally correct answer. <strong>Writer-preferring is the right default</strong>, because writes are usually rare and latency-sensitive, and a starved writer is a far worse outcome than slightly delayed readers.</p>
+</section>
+
+<section data-field="body">
+<h4>Requirements</h4>
+  <p><code>acquire_read</code>, <code>release_read</code>, <code>acquire_write</code>, <code>release_write</code>, thread-safe, no starvation of writers, with context managers. Clarify: reentrant? Can a reader upgrade to a writer? Both answers have sharp edges and should be discussed rather than assumed.</p>
+  <h4>Writer-preferring implementation</h4>
+  <pre><span class="k">class</span> ReadWriteLock:
+    <span class="k">def</span> __init__(self):
+        self._lock = threading.Lock()
+        self._ok_to_read  = threading.Condition(self._lock)
+        self._ok_to_write = threading.Condition(self._lock)
+        self._readers = 0          <span class="c"># currently reading</span>
+        self._writer = <span class="k">False</span>       <span class="c"># a writer holds the lock</span>
+        self._waiting_writers = 0  <span class="c"># the key to writer preference</span>
+
+    <span class="k">def</span> acquire_read(self):
+        <span class="k">with</span> self._lock:
+            <span class="c"># yield to any waiting writer — this is the whole policy</span>
+            <span class="k">while</span> self._writer <span class="k">or</span> self._waiting_writers &gt; 0:
+                self._ok_to_read.wait()
+            self._readers += 1
+
+    <span class="k">def</span> release_read(self):
+        <span class="k">with</span> self._lock:
+            self._readers -= 1
+            <span class="k">if</span> self._readers == 0:
+                self._ok_to_write.notify()      <span class="c"># exactly one writer</span>
+
+    <span class="k">def</span> acquire_write(self):
+        <span class="k">with</span> self._lock:
+            self._waiting_writers += 1
+            <span class="k">try</span>:
+                <span class="k">while</span> self._writer <span class="k">or</span> self._readers &gt; 0:
+                    self._ok_to_write.wait()
+                self._writer = <span class="k">True</span>
+            <span class="k">finally</span>:
+                self._waiting_writers -= 1
+
+    <span class="k">def</span> release_write(self):
+        <span class="k">with</span> self._lock:
+            self._writer = <span class="k">False</span>
+            <span class="k">if</span> self._waiting_writers &gt; 0:
+                self._ok_to_write.notify()      <span class="c"># next writer first</span>
+            <span class="k">else</span>:
+                self._ok_to_read.notify_all()   <span class="c"># let the herd of readers in</span></pre>
+  <h4>The three decisions</h4>
+  <ul>
+  <li><strong><code>_waiting_writers</code> in the reader's wait predicate</strong> is the entire writer-preference policy, in one clause. Remove it and you have a reader-preferring lock with the starvation bug.</li>
+  <li><strong><code>notify</code> for writers, <code>notify_all</code> for readers.</strong> Only one writer can proceed, so waking more is waste. <em>All</em> waiting readers can proceed together, which is the point of the lock — waking one at a time would serialise them and throw away the benefit.</li>
+  <li><strong>Decrement <code>_waiting_writers</code> in a <code>finally</code>.</strong> If the wait is interrupted or times out and the counter is not decremented, readers are blocked forever by a writer that no longer exists. A permanent deadlock caused by an error path.</li>
+  </ul>
+  <h4>Extensions and their traps</h4>
+  <ul><li><strong>Upgrade (read → write)</strong> is a deadlock generator: two readers both requesting an upgrade each wait for the other to release its read lock, and neither can. Either forbid it, or allow only one designated upgradeable reader at a time.</li>
+  <li><strong>Reentrancy:</strong> a thread acquiring the read lock twice is fine <em>unless</em> a writer starts waiting in between — then the second acquire blocks on a lock the same thread already holds. Track per-thread hold counts if you must support it, and prefer to forbid it.</li>
+  <li><strong>Timed acquisition</strong> so a caller can give up rather than block indefinitely, which also makes the lock debuggable.</li></ul>
+<h4>Complexity and trade-offs</h4><p>Each acquire/release is O(1) under an internal mutex with condition variables. A readers-writer lock only helps when reads dominate and critical sections are long enough to amortise its overhead; for short sections a plain mutex is often faster.</p><h4>Test plan — say these out loud, then write the first three</h4><ul><li>Many readers can hold the lock simultaneously (count concurrent holders with a barrier).</li><li>A writer excludes readers and other writers.</li><li>With writer preference, a waiting writer blocks new readers, so it is not starved by a stream of readers.</li><li>Releasing without holding raises an error.</li><li>Stress test: shared counter invariants hold under random mixes of readers and writers.</li></ul><h4>Edge cases checklist</h4><ul><li>Reentrancy: a thread re-acquiring read while holding read can deadlock with writer preference.</li><li>Upgrading read to write deadlocks if two readers try simultaneously — disallow or provide an explicit upgradable mode.</li><li>Fairness vs throughput trade-off.</li><li>Exceptions inside critical sections — use context managers to always release.</li></ul><h4>Follow-ups, with the answer in one breath</h4><ul><li><strong>Reader vs writer preference?</strong> Reader preference maximises throughput but can starve writers; writer preference prevents that but reduces read concurrency; fair (FIFO) is a middle ground.</li><li><strong>Why is upgrading dangerous?</strong> Two readers each waiting for the other to release before writing — a deadlock; require release-then-acquire or a single upgradable holder.</li><li><strong>Alternatives?</strong> Copy-on-write snapshots (readers never block), sequence locks, or RCU for read-mostly data.</li><li><strong>In Python?</strong> The GIL does not remove the need for it for compound operations; the standard library has no RW lock, so implement with Condition.</li></ul>
+</section>
+
+<section data-field="deep">
+<h4>The senior layer</h4>
+  <ul>
+  <li><strong>A read-write lock is often slower than a plain mutex, and knowing when is the mark of experience.</strong> It maintains more state, so acquisition is more expensive, and the reader counter is itself a contended cache line that every reader writes to — on a many-core machine that single line ping-pongs between caches and can cost more than the critical section it protects. The win only materialises when critical sections are <em>long</em> and reads genuinely dominate. For a short read of a few fields, a plain mutex is usually faster. Measure rather than assume.</li>
+  <li><strong>Copy-on-write is frequently the better answer for read-heavy data.</strong> If writes are rare, keep an immutable structure behind an atomic reference: readers take the reference with no lock at all and no cache-line contention, and a writer builds a new copy and swaps the pointer. Readers holding the old version continue safely. Cost is the copy per write and a window where readers see slightly stale data. For a configuration map read millions of times a second and written once an hour, this is enormously better than any lock — and proposing it shows you are solving the problem rather than implementing the requested primitive.</li>
+  <li><strong>Writer preference is the default, but the decision belongs to the workload.</strong> If writers are frequent, writer preference makes readers starve instead, and you have moved the problem. If both are frequent you probably want a fair lock — or, better, to reconsider whether a read-write lock is the right tool at all, since heavy contention on both sides suggests sharding the data so that different threads touch different locks.</li>
+  <li><strong>Invariants worth asserting:</strong> readers and writer are never both non-zero; the writer flag is never true with readers greater than zero; waiting-writer count is never negative. Check them under the lock in a debug build and the classic bugs surface on the first stress test rather than in production.</li>
+  <li><strong>Test for starvation explicitly, not just for correctness.</strong> A correctness test passes on the reader-preferring implementation. The test that matters runs a continuous stream of readers with one writer and asserts the writer acquires within a bounded time. Without that test, the starvation bug ships — and it is the reason the lock was written in the first place.</li>
+  </ul>
+</section>
+
+<section data-field="prod">
+
+</section>
+
+<section data-field="lab">
+
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+    <p>A routing table is read on every request (200,000 reads/s, each holding the lock ~200 ns) and updated on config change (about 10 writes/hour, each taking ~50 µs). The team has implemented a reader-preferring read-write lock.</p>
+    <p>(a) Will the writer starve? (b) Is the read-write lock helping? (c) What would you use instead?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Will the writer starve?</strong> Almost certainly yes, and the arithmetic shows why. Reads arrive every 5 µs on average and each holds the lock for 200 ns. For the reader count to reach zero, there must be a gap in arrivals longer than the current readers need to drain. With Poisson arrivals at 200,000/s the probability of a 200 ns window with no arrival is high in isolation — but with multiple reader threads overlapping, the count rarely hits zero, and every new arrival is admitted because the reader-preferring policy does not check for waiting writers.</p>
+    <p>In practice the writer waits an unbounded time, and the symptom is that a config change "sometimes doesn't take effect" — intermittent, unreproducible, and blamed on the config system rather than the lock. Adding the single <code>_waiting_writers &gt; 0</code> clause to the reader predicate fixes it and bounds the writer's wait to the drain time of readers already admitted.</p>
+    <p><strong>(b) Is the lock helping?</strong> Almost certainly not, and this is the more interesting answer.</p>
+    <p>The critical section is <strong>200 ns</strong>. Acquiring and releasing a read-write lock involves taking an internal mutex, checking two or three conditions, and incrementing a shared counter — plausibly 50–100 ns of uncontended work, and far more under contention. The reader counter is a single cache line written by every one of the 200,000 readers per second across every core, so it ping-pongs continuously between core caches; a cache-line transfer is on the order of 100 ns on its own.</p>
+    <p>So the lock overhead is <em>comparable to or greater than the work it protects</em>, and the coordination is worse than serialising — you have added contention on the counter in order to avoid contention on the data. A plain mutex would likely be faster here, because at least it involves one atomic operation rather than several plus condition-variable bookkeeping.</p>
+    <p><strong>(c) What to use instead: copy-on-write.</strong> The workload is 200,000 reads/s against 10 writes per <em>hour</em> — a ratio of about 72 million to one. That is the textbook case for an immutable snapshot behind an atomic reference:</p>
+    <ul>
+    <li><strong>Readers</strong> load the reference and use it. <em>No lock, no atomic write, no shared cache line being modified</em> — just a read of a pointer that stays in every core's cache. Effectively free, and perfectly scalable across cores.</li>
+    <li><strong>Writers</strong> build a complete new routing table, then atomically swap the reference. Takes 50 µs plus a copy, ten times an hour — utterly irrelevant.</li>
+    <li><strong>Readers holding the old reference</strong> continue using it safely until they finish; it is garbage-collected (or reference-counted) once nobody holds it.</li>
+    </ul>
+    <p>The cost is a brief window — bounded by the length of a read — in which some threads use the old table and some the new. For a routing table that is entirely acceptable, and it should be stated explicitly as the trade being made.</p>
+    <p><strong>The general lesson:</strong> the question "which locking policy?" was the wrong question. When reads overwhelmingly dominate and the data can be replaced wholesale, the right move is to remove the coordination rather than optimise it. A read-write lock earns its keep with <em>long</em> critical sections and a genuine mix of reads and writes; for short reads of rarely-changed data it is a pessimisation dressed as an optimisation.</p></details>
+</section>

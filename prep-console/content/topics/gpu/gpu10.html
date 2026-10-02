@@ -1,0 +1,453 @@
+<!-- topic source for gpu/gpu10; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "gpu10",
+  "t": "LLM inference performance: modelling latency and throughput",
+  "tag": "Inference",
+  "sum": "Predict an LLM service's speed with arithmetic: time to first token from prefill FLOPs, time per output token from bytes read per decode step, the batch-size trade-off and the KV-cache ceiling, tensor parallelism for latency, the speculative-decoding formula, prefill-decode interference — and how DeepSeek's production numbers fit the model.",
+  "prereq": [
+    [
+      "gpu2",
+      "Decode matmuls have arithmetic intensity roughly equal to the batch size, so they are memory-bound until the batch reaches the ridge point; decode attention's intensity is the GQA group size."
+    ],
+    [
+      "gpu3",
+      "A forward pass costs about 2N FLOPs per token; the KV cache takes 2 × layers × KV heads × head dim × bytes per token (about 320 KiB for Llama 3 70B in BF16)."
+    ],
+    [
+      "lm13",
+      "Serving engines batch requests continuously, store the KV cache in pages, reuse cached prefixes and can decode speculatively with a draft model."
+    ]
+  ],
+  "myths": [
+    [
+      "A faster GPU makes every part of inference faster in proportion to its FLOPs.",
+      "Prefill is compute-bound and speeds up with FLOPs; decode is memory-bound and speeds up with bandwidth. Moving from an H100 to an H200 leaves FLOPs unchanged but raises bandwidth by 43%, so decode gets up to 43% faster and prefill doesn't change. Knowing which phase dominates your traffic tells you which specification matters."
+    ],
+    [
+      "Batching trades latency for throughput one-for-one.",
+      "While decode is memory-bound, adding sequences to a batch adds very little to the step time, because every step reads the full weights anyway. In the worked example, going from batch 1 to batch 32 raises throughput 27-fold while per-user speed falls by only 15%. The trade becomes steep only as KV-cache reads grow and the step approaches compute-bound."
+    ],
+    [
+      "More tensor parallelism always gives lower latency.",
+      "Each extra GPU divides the bytes read per step, but adds per-layer all-reduces whose cost doesn't shrink, and the fixed overheads of small kernels stay. Going from 4 to 8 GPUs for a 70B model cuts batch-1 decode time noticeably, but going further has diminishing returns, and each replica now costs more GPUs, lowering throughput per GPU."
+    ],
+    [
+      "Speculative decoding always speeds up generation.",
+      "It turns several memory-bound decode steps into one verification pass, which is nearly free only while the target model is memory-bound. At large batch sizes the GPU is already busy with compute, so verifying rejected draft tokens wastes real FLOPs; and with a poorly matched draft model, low acceptance rates mean the drafting cost isn't repaid. Gains range from about 1.3× to 3× depending on the draft, task and batch."
+    ],
+    [
+      "Average latency is the number to optimise.",
+      "Users feel tail latency: the p95 or p99 time to first token during a burst, or a stall in the middle of an answer when a long prompt is prefilled alongside it. Averages hide queueing spikes, preemptions when the KV cache fills, and prefill-decode interference. Serving targets are set on percentiles, and capacity is planned so the tail meets them at peak load."
+    ]
+  ],
+  "recap": [
+    "An LLM request has two phases: prefill processes the whole prompt at once and produces the first token; decode then generates one token per step, each step reading all the weights and that sequence's KV cache.",
+    "Time to first token is queueing plus prefill, which is compute-bound: about 2 × parameters × prompt tokens ÷ (GPUs × peak FLOP/s × efficiency).",
+    "Time per output token is one decode step, which is memory-bound: about (weight bytes + KV bytes read) ÷ (GPUs × bandwidth) plus communication.",
+    "Because weights are read once per step for the whole batch, throughput rises almost linearly with batch size while per-user speed falls slowly — until KV-cache reads dominate, memory runs out, or the step becomes compute-bound.",
+    "The KV cache is often the real ceiling: its size per token times context length times concurrent sequences must fit in the memory left after the weights.",
+    "Tensor parallelism divides the bytes each GPU reads per step, lowering latency, but adds per-layer communication and uses more GPUs per replica.",
+    "Speculative decoding produces (1 − α^(γ+1)) / (1 − α) tokens per target pass for acceptance rate α and γ drafted tokens — about 3.4 at α = 0.8, γ = 4 — and helps most when decode is memory-bound.",
+    "Long prefills in the same batch stall every decoding user; chunked prefill interleaves them and disaggregation runs prefill and decode on separate GPU pools.",
+    "Capacity planning combines traffic shape, latency targets and this per-replica model, then validates with load tests; DeepSeek's published V3/R1 statistics show the same phases, parallelism choices and economics at production scale."
+  ],
+  "glossary": [
+    [
+      "Chunked prefill",
+      "Splitting a long prompt's prefill into pieces processed alongside ongoing decode steps, so decoding users aren't stalled."
+    ],
+    [
+      "Continuous batching",
+      "Adding and removing sequences from the running batch at every decode step, rather than waiting for a whole batch to finish."
+    ],
+    [
+      "Decode step",
+      "One forward pass that generates the next token for every sequence in the batch."
+    ],
+    [
+      "Disaggregated serving",
+      "Running prefill and decode on separate GPU pools, each configured for its own bottleneck, and transferring the KV cache between them."
+    ],
+    [
+      "E2E latency",
+      "End-to-end request time: TTFT plus (output tokens − 1) × TPOT."
+    ],
+    [
+      "Goodput",
+      "Throughput counting only requests that met their latency targets."
+    ],
+    [
+      "ITL (inter-token latency)",
+      "The time between consecutive output tokens seen by a user; for steady decoding, roughly the decode step time."
+    ],
+    [
+      "KV cache",
+      "The keys and values of all tokens of each active sequence, read in full at every decode step."
+    ],
+    [
+      "MBU (model bandwidth utilisation)",
+      "Bytes that must be read per decode step × steps per second ÷ peak bandwidth; the decode counterpart of MFU."
+    ],
+    [
+      "Multi-token prediction (MTP)",
+      "Extra heads trained to predict tokens beyond the next one, usable as a built-in draft for speculative decoding."
+    ],
+    [
+      "Preemption",
+      "When the KV cache is full, a server evicts (and later recomputes or reloads) some sequences' caches, causing latency spikes for them."
+    ],
+    [
+      "Prefill",
+      "The phase that processes the whole prompt in one forward pass, filling the KV cache and producing the first token."
+    ],
+    [
+      "Prefix caching",
+      "Keeping the KV cache of shared prompt prefixes (system prompts, documents, conversation history) so later requests skip their prefill."
+    ],
+    [
+      "SLO (service-level objective)",
+      "A target such as 'p95 time to first token under 1 s', against which goodput and capacity are measured."
+    ],
+    [
+      "Speculative decoding",
+      "Drafting several tokens cheaply and verifying them with the target model in one pass, keeping the accepted ones; output is identical to normal decoding."
+    ],
+    [
+      "Tensor parallelism (TP) degree",
+      "The number of GPUs each weight matrix is split across within one model replica."
+    ],
+    [
+      "TPOT (time per output token)",
+      "Average time to generate each token after the first; often used interchangeably with inter-token latency."
+    ],
+    [
+      "TTFT (time to first token)",
+      "Time from a request's arrival to its first output token: queueing plus prefill."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What are TTFT and TPOT, and what mainly determines each?",
+      "Time to first token is queueing plus the prefill of the prompt, which is compute-bound and grows with prompt length. Time per output token is the duration of one decode step, which is memory-bandwidth-bound: bytes of weights and KV cache read per step divided by bandwidth, plus communication. End-to-end latency is TTFT plus (output tokens − 1) × TPOT."
+    ],
+    [
+      "E",
+      "Why is prefill compute-bound and decode memory-bound?",
+      "Prefill pushes all prompt tokens through each weight matrix in one pass — hundreds or thousands of rows per matmul — so each weight read serves many FLOPs and intensity is far above the ridge point. Decode processes one new token per sequence per step, so each weight read serves only batch-size rows; at typical batch sizes the intensity is well below the ridge, and each step also reads the whole KV cache, whose intensity is only the GQA group size."
+    ],
+    [
+      "E",
+      "Estimate batch-1 decode speed for a 70B BF16 model on 4 H100s with tensor parallelism.",
+      "Each GPU holds 35 GB of weights and must read all of them every step. At a realistic 80% of 3.35 TB/s, that is about 13 ms, plus about 3 ms for 160 small all-reduces (two per layer): about 16 ms per token, or about 60 tokens per second for the user. The arithmetic takes about 0.1 ms, so the GPU is almost entirely waiting on memory."
+    ],
+    [
+      "M",
+      "Why does throughput rise almost linearly with batch size in decode, and what stops it?",
+      "Each decode step reads the full weights regardless of batch size, so more sequences share that cost and each adds only its own KV-cache reads and a little compute. In the 70B example, batch 1 gives about 61 tokens/s total and batch 32 about 1,670, with per-user speed falling only from 61 to 52 tokens/s. It stops when the KV cache for all sequences no longer fits in memory (about 150 sequences of 3,000 tokens here), when KV reads dominate the step, when the step becomes compute-bound, or when the step time breaks the latency target.",
+      "Follow-up: Which limit usually binds first for long contexts? — KV-cache memory: at 320 KiB per token, 3,000-token contexts fill the free memory of 4 H100s at around 150 sequences, long before compute-bound."
+    ],
+    [
+      "M",
+      "How does tensor parallelism change latency and cost?",
+      "Splitting each weight matrix across more GPUs divides the bytes each GPU reads per decode step, so step time falls roughly in proportion — 70B BF16 on 4 H100s reads 35 GB per GPU per step, on 8 reads 17.5 GB. But each layer adds all-reduces whose latency doesn't shrink, and each replica now uses twice the GPUs, so throughput per GPU usually falls. For cost per token, use the fewest GPUs that hold the weights and enough KV cache; for strict latency, use more TP.",
+      "Follow-up: When would you use pipeline parallelism for inference instead? — When the model doesn't fit in one NVLink domain; PP adds little communication but doesn't reduce per-token latency, since each token still passes through every stage in sequence."
+    ],
+    [
+      "M",
+      "How much does speculative decoding help, and when does it stop helping?",
+      "A draft proposes γ tokens and the target verifies them in one pass; with per-token acceptance probability α, the expected tokens per target pass is (1 − α^(γ+1)) / (1 − α) — about 3.4 at α = 0.8, γ = 4. The real speed-up is lower because drafting takes time and verifying γ + 1 tokens costs slightly more than one decode step. It helps most at small batches where the verification FLOPs are nearly free; at large batches decode is closer to compute-bound and wasted verification FLOPs cost real time.",
+      "Follow-up: What did DeepSeek-V3 report for its built-in draft? — Its multi-token-prediction module's second-token prediction was accepted 85-90% of the time, giving about 1.8× more tokens per second."
+    ],
+    [
+      "M",
+      "What sets the maximum number of concurrent sequences a server can hold?",
+      "Memory: free HBM after weights, activations and runtime overheads, divided by KV bytes per sequence (KV per token × context length). For Llama 3 70B in BF16 on 4 × 80 GB H100s, about 148 GB remains for cache at 90% utilisation; at 320 KiB per token and 3,000-token contexts that is about 150 sequences. FP8 KV cache doubles it; longer contexts cut it proportionally; prefix sharing lets identical prefixes be stored once."
+    ],
+    [
+      "M",
+      "Why do long prefills hurt other users' latency, and what fixes it?",
+      "When a long prompt is prefilled in the same iteration as ongoing decodes, every decoding sequence waits for that compute-heavy prefill: a 32,000-token prompt on a 70B model across 4 H100s takes about 2.3 s, so every active user sees a 2.3-second pause mid-answer. Chunked prefill splits long prompts into pieces (a token budget per step) interleaved with decode steps, bounding the stall; Sarathi-Serve reported 2.6-5.6× higher serving capacity under latency targets. Disaggregation runs prefill and decode on separate GPU pools and transfers the KV cache; DistServe reported up to 7.4× more requests within SLOs."
+    ],
+    [
+      "H",
+      "Walk through a capacity plan for a chat service.",
+      "Start from traffic: peak requests per second and the distributions of prompt and output lengths, plus the fraction of prompt tokens that hit a prefix cache. Set targets such as p95 TTFT under 1 s and p95 inter-token latency under 50 ms. Model one replica: prefill time from FLOPs, decode step time from bytes as a function of batch, and the KV-cache limit on batch. Choose the largest batch that meets the latency targets; its tokens per second is the replica's capacity. Replicas = peak output-token demand ÷ capacity, plus headroom for bursts and slow autoscaling (loading a 70B model takes minutes). Then validate with a load test replaying realistic traffic.",
+      "Follow-up: What usually breaks the plan? — Longer contexts than assumed (agents, documents), which shrink the KV-limited batch; and bursty arrivals, which make queueing dominate TTFT."
+    ],
+    [
+      "H",
+      "How does inference arithmetic change for a mixture-of-experts model?",
+      "FLOPs per token follow active parameters, but bytes follow the experts actually touched. At batch 1 each token reads only its few experts, so decode is cheap; at large batch, tokens are routed to many different experts, so nearly all expert weights are read each step while each expert sees only a fraction of the batch — each expert's matmul has intensity roughly equal to the tokens routed to it. MoE serving therefore needs very large batches and expert parallelism across many GPUs so each expert gets enough tokens, with all-to-all communication per layer. DeepSeek's V3/R1 service decoded with expert parallelism across 144 GPUs (18 nodes), two routed experts per GPU."
+    ],
+    [
+      "H",
+      "Use DeepSeek's published inference statistics to estimate their cost per million output tokens.",
+      "DeepSeek reported about 14.8k output tokens per second per 8-GPU H800 node during decode. At their stated $2 per GPU-hour, a node costs $16 per hour and produces about 14,800 × 3,600 ≈ 53 million output tokens per hour: roughly $0.30 per million output tokens for decode nodes alone. Prefill nodes processed about 73.7k input tokens per second each, including cached ones, so input is several times cheaper per token. Their 24-hour average was 226.75 nodes costing $87,072 a day against a theoretical $562,027 of revenue at R1 prices — the 545% cost-profit margin they quoted, before free-tier traffic and discounts.",
+      "Follow-up: Why so cheap despite 20-22 tokens/s per user? — Huge batches: slow per-user speed is the price of amortising weight and expert reads across many users per step."
+    ],
+    [
+      "H",
+      "Your service's p99 inter-token latency spikes every few minutes even though average load is moderate. What are the likely causes?",
+      "Candidates: long prompts arriving and being prefilled in the same step as decodes (check whether chunked prefill is enabled and its token budget); KV-cache exhaustion causing preemption, where some sequences are evicted and later recomputed (watch cache usage and preemption counters); recompilation or CUDA-graph misses for unusual batch sizes; periodic host-side work such as logging, garbage collection or metrics scraping stalling the scheduler; and, with tensor parallelism, one slow GPU or link delaying every all-reduce. Correlate spike times with prompt lengths, cache usage and preemptions before changing anything."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Efficiently Scaling Transformer Inference",
+      "Pope et al. (2022) — analytical models of inference latency, memory and partitioning; PaLM 540B at 29 ms per token.",
+      "https://arxiv.org/abs/2211.05102"
+    ],
+    [
+      "post",
+      "LLM Inference Performance Engineering: Best Practices",
+      "Databricks — TTFT, TPOT, MBU, batching and hardware comparisons with measurements.",
+      "https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices"
+    ],
+    [
+      "docs",
+      "DeepSeek-V3/R1 Inference System Overview",
+      "DeepSeek (2025) — production parallelism, per-node throughput, cache-hit rates, costs and margins.",
+      "https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md"
+    ],
+    [
+      "paper",
+      "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve",
+      "Agrawal et al. (2024) — chunked prefill and stall-free batching; 2.6-5.6× serving capacity.",
+      "https://arxiv.org/abs/2403.02310"
+    ],
+    [
+      "paper",
+      "DistServe",
+      "Zhong et al. (2024) — disaggregating prefill and decode; up to 7.4× more requests within SLOs.",
+      "https://arxiv.org/abs/2401.09670"
+    ],
+    [
+      "paper",
+      "Fast Inference from Transformers via Speculative Decoding",
+      "Leviathan, Kalman and Matias (2022) — the expected-tokens formula and speed-up analysis.",
+      "https://arxiv.org/abs/2211.17192"
+    ],
+    [
+      "paper",
+      "Efficient Memory Management for Large Language Model Serving with PagedAttention",
+      "Kwon et al. (2023) — the vLLM paper: KV-cache paging and its effect on batch size and throughput.",
+      "https://arxiv.org/abs/2309.06180"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A company is about to launch an assistant built on a 70-billion-parameter model. Product wants the first words of an answer on screen within a second and text streaming at least as fast as people read. Finance wants to know how many GPUs to reserve and what each million tokens will cost. Engineering has a week before launch and no time to benchmark every configuration. The questions sound like they need experiments, but most of them can be answered in an afternoon with the arithmetic from this track: FLOPs for the prompt, bytes for each generated token, memory for the KV cache.</p>
+<p>The answers are often surprising to people who haven't done the arithmetic. A single user on four H100s gets about 60 tokens per second — and 32 users on the same four GPUs still get about 52 each, because each decode step reads the same weights whatever the batch. The limit on concurrency is usually not compute at all but memory for the KV cache. A single 30,000-token prompt can freeze every other user's answer for two seconds. And at the scale of a large provider, the economics are dominated by batch size: DeepSeek published that its V3/R1 service produced about 14,800 output tokens per second per 8-GPU node while each user saw only 20-22 tokens per second, and reported a theoretical cost-profit margin of 545%.</p>
+<p>This lesson builds a quantitative model of LLM serving that predicts these numbers. It defines the metrics users and operators care about — time to first token, time per output token, throughput, goodput — then models prefill as compute-bound and decode as memory-bound, sweeps the batch size to show the throughput-latency curve and the KV-cache ceiling, quantifies tensor parallelism, quantisation and speculative decoding, and explains prefill-decode interference and its fixes. The mechanisms themselves (continuous batching, PagedAttention, prefix caching) are covered in lm13; here the goal is to predict their effect with numbers, and to check the model against published production data.</p>
+</section>
+
+<section data-field="primer">
+<h4>The kitchen and the conveyor belt</h4>
+<p>Think of a restaurant where every dish is made in two stages. First the chef reads the whole order and preps everything at once — a big burst of work, done fast because it can use every burner (prefill). Then courses come out one at a time, each needing a trip to a walk-in pantry to fetch every ingredient in the restaurant, whether the course uses them or not (decode — every step reads all the weights). The pantry trip takes the same time whether you're plating one table's course or forty tables' courses, so a smart kitchen plates many tables' next course on each trip. Diners each wait a little longer per course, but the kitchen serves far more people. The catch: every table's order history must stay on the counter (the KV cache), and the counter has limited space.</p>
+<p>The analogy's limit: in a real GPU the "pantry trip" is streaming tens of gigabytes of weights from HBM, and the counter space is the same memory that holds the weights.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Timeline of one request: queueing, then a prefill block producing the first token, then a series of short decode steps each producing one token; TTFT spans queue and prefill, inter-token latency is one decode step">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">One request, time →</text>
+    <rect x="20" y="40" width="70" height="30" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="60" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">queue</text>
+    <rect x="90" y="40" width="130" height="30" style="fill:var(--s1);opacity:0.5;stroke:var(--line-2)"/>
+    <text x="155" y="60" text-anchor="middle" style="fill:var(--ink);font-size:11px">prefill (all prompt tokens)</text>
+    <g style="fill:var(--s2);opacity:0.5;stroke:var(--line-2)">
+      <rect x="220" y="40" width="34" height="30"/><rect x="256" y="40" width="34" height="30"/><rect x="292" y="40" width="34" height="30"/><rect x="328" y="40" width="34" height="30"/><rect x="364" y="40" width="34" height="30"/><rect x="400" y="40" width="34" height="30"/><rect x="436" y="40" width="34" height="30"/><rect x="472" y="40" width="34" height="30"/><rect x="508" y="40" width="34" height="30"/><rect x="544" y="40" width="34" height="30"/>
+    </g>
+    <text x="400" y="60" text-anchor="middle" style="fill:var(--ink);font-size:11px">decode: one token per step</text>
+    <line x1="20" y1="88" x2="220" y2="88" style="stroke:var(--accent);stroke-width:2;fill:none"/>
+    <text x="120" y="104" text-anchor="middle" style="fill:var(--accent);font-size:11px">TTFT = queue + prefill</text>
+    <line x1="256" y1="88" x2="290" y2="88" style="stroke:var(--accent);stroke-width:2;fill:none"/>
+    <text x="273" y="104" text-anchor="middle" style="fill:var(--accent);font-size:11px">ITL</text>
+    <line x1="20" y1="124" x2="578" y2="124" style="stroke:var(--ink-2);stroke-width:1;fill:none"/>
+    <text x="300" y="140" text-anchor="middle" style="fill:var(--ink-2);font-size:11px">end-to-end latency = TTFT + (output tokens − 1) × TPOT</text>
+    <text x="20" y="172" style="fill:var(--ink-2)">prefill: compute-bound — time ≈ 2 · N · prompt tokens / delivered FLOP/s</text>
+    <text x="20" y="194" style="fill:var(--ink-2)">decode step: memory-bound — time ≈ (weights + KV cache) bytes / delivered bandwidth</text>
+  </g>
+</svg>
+<figcaption>Each request is one compute-heavy prefill followed by many memory-heavy decode steps. The user sees TTFT once and inter-token latency on every subsequent token, and each is governed by a different hardware limit.</figcaption>
+</figure>
+<h4>Why the goals pull against each other</h4>
+<p>Users and operators want different things from the same GPUs. A user wants a short wait for the first word (TTFT) and a steady stream afterwards — people read at roughly 4-8 tokens per second, so anything above about 20 tokens per second feels instant, while a chat that pauses mid-sentence feels broken. An operator wants each GPU to produce as many tokens per second as possible, because that sets the cost per token. The two meet in the batch size. Serving one user at a time gives the fastest stream and wastes nearly all of the GPU's compute; packing hundreds of users into each step makes tokens cheap and each user's stream slower; admitting every new prompt immediately helps TTFT but stalls everyone already streaming. Every serving technique in this lesson — batching policies, parallelism, quantisation, speculative decoding, chunked prefill, disaggregation — is a way of moving along or shifting this trade-off, and the arithmetic below tells you by how much.</p>
+<h4>Two simple models predict most of it</h4>
+<p><strong>Prefill is compute-bound.</strong> A 2,000-token prompt through a 70B model is 2 × 70 × 10<sup>9</sup> × 2,000 = 2.8 × 10<sup>14</sup> FLOPs; four H100s delivering about half their 989 TFLOP/s peak do it in about 0.14 s. <strong>Decode is memory-bound.</strong> Each step must read every weight — 140 GB in BF16, 35 GB per GPU on four GPUs — which at about 80% of 3.35 TB/s takes about 13 ms, plus communication, however few tokens are being generated. Notice that neither number depends much on the other: prefill cares about FLOPs, decode about bytes, which is why the two phases are increasingly run and tuned separately. Everything else in this lesson refines these two lines: adding the KV cache to decode's bytes, adding batch size, adding parallelism and queueing.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The metrics</h4>
+<ul>
+<li><strong>TTFT</strong> (time to first token): from request arrival to the first output token — queueing plus prefill. Users perceive it as responsiveness.</li>
+<li><strong>TPOT</strong> (time per output token) or <strong>ITL</strong> (inter-token latency): the gap between successive tokens once streaming starts — essentially one decode step. It sets reading speed: 50 ms per token is 20 tokens per second, comfortably faster than reading.</li>
+<li><strong>End-to-end latency</strong>: TTFT + (output tokens − 1) × TPOT. For a 500-token answer at 25 ms per token, 12.5 s after the first token.</li>
+<li><strong>Throughput</strong>: total tokens per second across all users on a replica or fleet — what determines cost.</li>
+<li><strong>Goodput</strong>: throughput counting only requests that met their latency targets. A server can raise throughput by batching so aggressively that most requests miss their target; goodput exposes that.</li>
+</ul>
+<p>Targets are set on percentiles (p50, p95, p99) under realistic load, because users notice the slow tail, not the average.</p>
+
+<h4>2. Modelling prefill</h4>
+<p>Prefill runs the whole prompt through the model in one pass: 2N FLOPs per prompt token for the weights, plus the attention term (4·L·T·d per token for context T, gpu3), which matters for long prompts. With thousands of tokens per matmul, it is compute-bound and reaches perhaps 40-70% of peak:</p>
+<pre>prefill time ≈ 2 · N · prompt_tokens / (GPUs · peak FLOP/s · efficiency)</pre>
+<p>For Llama 3 70B on four H100s at 50% efficiency: 2,000 tokens take about 142 ms; 32,000 tokens take about 2.3 s, and more once attention's quadratic term is added. Real systems report similar efficiency: Pope et al. (Google) reached 76% MFU processing input tokens for PaLM 540B at large batch. The main lever beyond hardware is <strong>not doing the work</strong>: prefix caching reuses the KV cache of repeated prefixes (system prompts, documents in a conversation, earlier turns), so only the new tokens are prefilled. DeepSeek reported that 56.3% of its input tokens over a day hit its on-disk KV cache.</p>
+
+<h4>3. Modelling a decode step</h4>
+<p>Each decode step generates one token for every sequence in the batch. It must read all weights once, and each sequence's entire KV cache:</p>
+<pre>bytes per GPU per step = weight bytes / TP  +  Σ(context lengths) × KV bytes per token / TP
+step time ≈ bytes per GPU / (bandwidth × efficiency)  +  communication
+compute check: 2 · N · batch / (GPUs · peak · efficiency)  — must stay smaller</pre>
+<p>Llama 3 70B in BF16 has KV of 2 × 80 layers × 8 KV heads × 128 × 2 bytes = 320 KiB per token. With tensor parallelism across four H100s, each GPU holds 35 GB of weights. At batch 1: 35 GB at 80% of 3.35 TB/s ≈ 13 ms, plus about 160 all-reduces (two per layer) at roughly 20 µs each ≈ 3 ms: <strong>about 16 ms per token, about 61 tokens per second</strong>. The arithmetic is 0.14 TFLOPs, about 0.07 ms per GPU — the GPUs spend over 99% of the step waiting for memory. (Pope et al.'s PaLM 540B figure of 29 ms per token with int8 weights on TPUs is the same regime.)</p>
+
+<h4>4. The batch-size curve and the KV ceiling</h4>
+<p>Now add sequences. Weights are read once per step for the whole batch, so they cost the same; each sequence adds its own KV reads and a little compute. With 3,000 tokens of average context per sequence (the lab computes this):</p>
+<table><thead><tr><th>Batch</th><th>Step time</th><th>Per user</th><th>Total throughput</th><th>Bound</th></tr></thead><tbody>
+<tr><td>1</td><td>16.4 ms</td><td>61 tok/s</td><td>61 tok/s</td><td>memory (weights)</td></tr>
+<tr><td>8</td><td>17.0 ms</td><td>59 tok/s</td><td>471 tok/s</td><td>memory</td></tr>
+<tr><td>32</td><td>19.2 ms</td><td>52 tok/s</td><td>1,667 tok/s</td><td>memory</td></tr>
+<tr><td>64</td><td>22.1 ms</td><td>45 tok/s</td><td>2,892 tok/s</td><td>memory (KV growing)</td></tr>
+<tr><td>128</td><td>28.0 ms</td><td>36 tok/s</td><td>4,572 tok/s</td><td>memory (KV ≈ weights)</td></tr>
+<tr><td>~150</td><td>30.0 ms</td><td>33 tok/s</td><td>~5,000 tok/s</td><td>KV cache full</td></tr>
+</tbody></table>
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="Throughput versus per-user speed as batch grows for Llama 3 70B on 4 H100s: total throughput rises from 61 to about 5,000 tokens per second while per-user speed falls from 61 to 33, ending at the KV-cache memory limit">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="70" y1="230" x2="610" y2="230" style="stroke:var(--line-2);fill:none"/>
+    <line x1="70" y1="230" x2="70" y2="30" style="stroke:var(--line-2);fill:none"/>
+    <text x="340" y="262" text-anchor="middle" style="fill:var(--ink-2)">total throughput (tokens/s)</text>
+    <text x="20" y="130" text-anchor="middle" transform="rotate(-90 20 130)" style="fill:var(--ink-2)">per-user tokens/s</text>
+    <g style="fill:var(--muted);font-size:11px">
+      <text x="70" y="246" text-anchor="middle">0</text><text x="178" y="246" text-anchor="middle">1,000</text><text x="286" y="246" text-anchor="middle">2,000</text><text x="394" y="246" text-anchor="middle">3,000</text><text x="502" y="246" text-anchor="middle">4,000</text><text x="610" y="246" text-anchor="middle">5,000</text>
+      <text x="62" y="234" text-anchor="end">0</text><text x="62" y="164" text-anchor="end">20</text><text x="62" y="98" text-anchor="end">40</text><text x="62" y="32" text-anchor="end">60</text>
+    </g>
+    <polyline points="77,29 121,35 250,59 382,82 564,111 610,121" style="stroke:var(--accent);stroke-width:2.5;fill:none"/>
+    <g style="fill:var(--accent)"><circle cx="77" cy="29" r="4"/><circle cx="121" cy="35" r="4"/><circle cx="250" cy="59" r="4"/><circle cx="382" cy="82" r="4"/><circle cx="564" cy="111" r="4"/><circle cx="610" cy="121" r="4"/></g>
+    <g style="fill:var(--ink);font-size:11px">
+      <text x="84" y="22">B=1</text><text x="128" y="50">B=8</text><text x="256" y="76">B=32</text><text x="388" y="100">B=64</text><text x="520" y="130">B=128</text><text x="560" y="148">KV full ≈150</text>
+    </g>
+    <line x1="70" y1="164" x2="610" y2="164" style="stroke:var(--crit);stroke-dasharray:5 4;fill:none"/>
+    <text x="600" y="158" text-anchor="end" style="fill:var(--crit);font-size:11px">example SLO: 20 tokens/s per user</text>
+  </g>
+</svg>
+<figcaption>Moving right along the curve, the GPUs serve 80× more tokens while each user slows by about half. Here the KV cache runs out before the latency target is reached — typical at long contexts — so FP8 KV or fewer KV bytes would buy more throughput.</figcaption>
+</figure>
+<p>Three limits end the free lunch. <strong>KV reads</strong> grow with batch × context and are never shared, so step time rises (by batch 128 the KV bytes equal the weight bytes). <strong>KV memory</strong>: 80 GB × 4 GPUs at 90% utilisation, minus 140 GB of weights, leaves about 148 GB for cache — about 150 sequences of 3,000 tokens. <strong>Compute</strong>: at batch 150 the step's matmuls need only about 5 ms, so compute-bound is far away; with shorter contexts or FP8 KV, much larger batches fit and compute becomes the limit around a few hundred sequences. Which limit binds first depends on context length, which is why agent and document workloads with long contexts are so much more expensive to serve than short chats.</p>
+
+<h4>5. Tensor parallelism: buying latency</h4>
+<p>Tensor parallelism divides the weight and KV bytes each GPU reads per step. For the 70B model at batch 1: on 4 GPUs, 35 GB per GPU, about 16 ms per token; on 8 GPUs, 17.5 GB per GPU — about 6.5 ms of memory time plus the same ~3 ms of all-reduces, about 10 ms per token, 100 tokens per second. Doubling the GPUs bought 1.6× lower latency, not 2×, because communication and fixed overheads don't shrink. Meanwhile, throughput per GPU usually falls: an 8-GPU replica must run a bigger batch to match two 4-GPU replicas. The rule: use the smallest TP degree that fits the weights plus enough KV cache for the target batch, and raise it only when the latency target demands. (With FP8 weights, 70 GB, the same model fits on 2 H100s with modest KV room, halving GPUs per replica at a cost in latency and batch size.)</p>
+
+<h4>6. Quantisation as a serving lever</h4>
+<p>Every byte removed from a decode step is time saved (gpu2, gpu4). <strong>FP8 or int8 weights</strong> halve the weight bytes: on four H100s, the batch-1 step's memory time falls from 13 to 6.5 ms, and 70 GB is freed for KV cache, raising the maximum batch from about 150 to about 220 sequences of 3,000 tokens. <strong>FP8 KV cache</strong> halves KV bytes, doubling concurrency again and halving the KV part of each step. <strong>4-bit weights</strong> go further for bandwidth-bound small-batch serving. Prefill, being compute-bound, speeds up only if the arithmetic itself moves to FP8 or FP4, not merely the storage. Each change needs quality validation on the product's own evaluations.</p>
+
+<h4>7. Speculative decoding, quantified</h4>
+<p>Decode is memory-bound, so verifying several tokens in one pass costs about the same as generating one. Speculative decoding exploits this: a cheap draft (a small model, extra prediction heads, or n-gram lookup) proposes γ tokens; the target model processes all γ + 1 positions in one forward pass and accepts the longest prefix consistent with its own distribution, plus one token of its own. The output distribution is exactly the target's. If each draft token is accepted independently with probability α, the expected number of tokens per target pass is a geometric sum:</p>
+<pre>E[tokens per target pass] = 1 + α + α² + … + α^γ = (1 − α^(γ+1)) / (1 − α)
+α = 0.8, γ = 4:  (1 − 0.8^5) / 0.2 = 3.36
+α = 0.6, γ = 4:  (1 − 0.6^5) / 0.4 = 2.31</pre>
+<p>The wall-clock speed-up is lower: if a draft pass costs c of a target decode step and verification costs slightly more than one step, the speed-up is roughly E / (1 + γ·c). With c = 0.05, 3.36 / 1.2 ≈ 2.8×. Published gains span that range: PyTorch's gpt-fast saw about 2× for CodeLlama-34B with a 7B draft on code and 1.3× for Llama-7B with TinyLlama (gpu2); DeepSeek-V3's multi-token-prediction head had its second-token prediction accepted 85-90% of the time, giving about 1.8× more tokens per second. The gains shrink as batch grows: at large batches the target step is closer to compute-bound, so verifying tokens that are then rejected costs real FLOPs.</p>
+
+<h4>8. Scheduling: prefill-decode interference</h4>
+<p>Continuous batching (lm13) adds new requests to the running batch at any step. When a new request's prefill runs in the same step as everyone's decode, every decoding user waits for it. A 32,000-token prompt on four H100s is about 2.3 s of prefill: every active user's stream pauses for 2.3 seconds mid-answer, and p99 inter-token latency explodes.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Three schedules: mixed batching where a long prefill stalls all decodes; chunked prefill where the prefill is split into pieces interleaved with decode steps; disaggregation where prefill runs on a separate GPU pool and hands the KV cache to decode GPUs">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Naive: long prefill blocks decode</text>
+    <g style="fill:var(--s2);opacity:0.55"><rect x="20" y="30" width="30" height="20"/><rect x="52" y="30" width="30" height="20"/></g>
+    <rect x="84" y="30" width="250" height="20" style="fill:var(--crit);opacity:0.45"/>
+    <text x="209" y="44" text-anchor="middle" style="fill:var(--ink);font-size:11px">32K-token prefill: all users stall ~2.3 s</text>
+    <g style="fill:var(--s2);opacity:0.55"><rect x="336" y="30" width="30" height="20"/><rect x="368" y="30" width="30" height="20"/><rect x="400" y="30" width="30" height="20"/></g>
+    <text x="20" y="84" style="fill:var(--ink);font-weight:600">Chunked prefill: fixed token budget per step</text>
+    <g style="stroke:var(--line-2)">
+      <rect x="20" y="94" width="30" height="20" style="fill:var(--s2);opacity:0.55"/>
+      <rect x="52" y="94" width="44" height="20" style="fill:var(--s1);opacity:0.5"/><rect x="98" y="94" width="44" height="20" style="fill:var(--s1);opacity:0.5"/><rect x="144" y="94" width="44" height="20" style="fill:var(--s1);opacity:0.5"/><rect x="190" y="94" width="44" height="20" style="fill:var(--s1);opacity:0.5"/><rect x="236" y="94" width="44" height="20" style="fill:var(--s1);opacity:0.5"/><rect x="282" y="94" width="44" height="20" style="fill:var(--s1);opacity:0.5"/>
+    </g>
+    <text x="340" y="108" style="fill:var(--ink-2);font-size:11px">each step: decode tokens + a prefill chunk → ITL bounded</text>
+    <text x="20" y="148" style="fill:var(--ink);font-weight:600">Disaggregated: separate pools</text>
+    <rect x="20" y="158" width="200" height="22" style="fill:var(--s1);opacity:0.5;stroke:var(--line-2)"/>
+    <text x="120" y="173" text-anchor="middle" style="fill:var(--ink);font-size:11px">prefill GPUs (compute-bound)</text>
+    <rect x="300" y="158" width="300" height="22" style="fill:var(--s2);opacity:0.5;stroke:var(--line-2)"/>
+    <text x="450" y="173" text-anchor="middle" style="fill:var(--ink);font-size:11px">decode GPUs (memory-bound, big batches)</text>
+    <text x="260" y="173" text-anchor="middle" style="fill:var(--accent);font-size:11px">KV →</text>
+    <text x="20" y="206" style="fill:var(--muted);font-size:11px">Blue: decode steps. Grey-blue: prefill work. Disaggregation adds a KV-cache transfer but removes interference.</text>
+  </g>
+</svg>
+<figcaption>The same work scheduled three ways. Chunking bounds how long any decode step can take; disaggregation separates the two phases entirely so each pool can be sized and batched for its own bottleneck.</figcaption>
+</figure>
+<p><strong>Chunked prefill</strong> limits the tokens processed per step (for example 512-2,048) and splits long prompts into chunks that ride along with decode steps. Each step's time is bounded, so inter-token latency stays predictable, and the decode steps' spare compute is used productively by the prefill chunk. Sarathi-Serve, which introduced "stall-free batching" on this principle, reported 2.6× higher serving capacity under latency targets for Mistral-7B on one A100, 3.7× for Yi-34B on two, and up to 5.6× for Falcon-180B. <strong>Disaggregation</strong> puts prefill and decode on different GPU pools: prefill nodes run compute-bound batches of prompts; decode nodes run large memory-bound batches; the KV cache is transferred between them over the network. DistServe reported serving up to 7.4× more requests (or 12.6× tighter latency targets) within SLOs than the systems it compared against. The cost is the KV transfer and operating two pools.</p>
+
+<h4>9. A real system: DeepSeek's V3/R1 service</h4>
+<p>In February 2025 DeepSeek published an overview of its production inference system for DeepSeek-V3 and R1 (671B total, 37B active parameters, MoE), and it reads like a worked example of this lesson. Prefill and decode are <strong>disaggregated</strong>. Prefill runs with expert parallelism across 32 GPUs (4 nodes), each GPU holding 9 routed experts; decode runs with expert parallelism across 144 GPUs (18 nodes), 2 routed experts per GPU — a much wider spread, because decode needs huge batches so each expert sees enough tokens per step to be efficient. Matmuls and expert dispatch use FP8, attention (MLA) and the combine step BF16. Over one day: 608 billion input tokens, of which 342 billion (56.3%) hit the on-disk KV cache and skipped prefill; 168 billion output tokens; average per-user output speed 20-22 tokens per second; average KV length per output token 4,989 tokens. Each H800 node delivered about 73,700 input tokens per second in prefill (including cache hits) or about 14,800 output tokens per second in decode.</p>
+<p>The economics follow. At DeepSeek's stated $2 per GPU-hour, a decode node costs $16 per hour and produces about 14,800 × 3,600 ≈ 53 million output tokens: roughly <strong>$0.30 per million output tokens</strong>. The service averaged 226.75 nodes over the day (peak 278), $87,072 in daily cost, against $562,027 of theoretical revenue at R1 prices — the 545% cost-profit margin they reported, before discounts and free usage. Note the per-user speed: 20-22 tokens per second is modest, the visible price of running decode at very large batch to amortise weight and expert reads — exactly the throughput-latency trade-off of section 4.</p>
+</section>
+
+<section data-field="deep">
+<h4>Queueing: why TTFT explodes before the GPUs are "full"</h4>
+<p>TTFT includes waiting in the queue, and queues follow the behaviour from sc1: as utilisation approaches 100%, waiting time grows like 1/(1 − utilisation). A replica whose prefill capacity is 10 requests per second is comfortable at 5 per second and miserable at 9.5, even though it is "only" 95% busy — especially with bursty arrivals and a wide spread of prompt lengths, where one long prompt holds up many short ones. Capacity plans therefore target peak utilisation well below 100% (often 60-80%) for the latency-critical phase, and admission control or priority queues protect interactive traffic from batch jobs sharing the same fleet.</p>
+<h4>MoE inference: bytes follow the experts you touch</h4>
+<p>For a mixture-of-experts model, FLOPs per token follow the active parameters, but the bytes read per decode step depend on how many distinct experts the batch touches. At batch 1 a token reads only its few experts — cheap. At batch 1,000 with 256 experts and 8 chosen per token, nearly every expert is touched each step, so nearly all expert weights are read, yet each expert processes only about 1,000 × 8 / 256 ≈ 31 tokens — an intensity of about 31 FLOP/byte for its matmul, well below the ridge. To make experts efficient, the batch per expert must grow, which means enormous global batches and experts spread across many GPUs (expert parallelism) with all-to-all communication each layer (gpu8). DeepSeek's EP144 decode configuration is this reasoning in production, and large NVLink domains such as NVL72 exist partly to make it cheaper.</p>
+<h4>Attention at long context</h4>
+<p>Decode attention's bytes are the KV cache, and its intensity is the GQA group size (gpu2), so at long context it dominates the step: at 32,000 tokens, one sequence of Llama 3 70B reads 10.5 GB of KV per step — more than a quarter of what the weights cost per GPU on 4 GPUs, for a single user. Techniques that shrink KV bytes — FP8 KV, grouped or latent attention (MLA), sliding-window layers, KV eviction and compression — are therefore as important for long-context serving as weight quantisation is for short contexts, and Flash-Decoding-style split-KV kernels (gpu7) are needed to keep the GPU busy when the batch is small.</p>
+<h4>Operating points: the same hardware, different products</h4>
+<p>One deployment can be tuned for very different products. A coding assistant with strict latency targets might run a 70B model at batch 16 on eight GPUs with speculative decoding — perhaps 100 tokens per second per user and a high cost per token. A batch summarisation service with no latency target runs the same model at the KV-limited batch on four GPUs with FP8 weights and KV — each request slow, tokens several times cheaper. Providers often price these as separate tiers (interactive versus batch APIs at a discount), which is the throughput-latency curve of section 4 turned into a price list.</p>
+<h4>Where the simple model is wrong</h4>
+<p>The roofline model gives lower bounds. Real engines lose time to scheduling on the CPU between steps (mitigated by CUDA graphs and asynchronous scheduling, gpu6), to kernels that run below bandwidth at small shapes, to padding and fragmentation, to sampling and detokenisation, and to all-reduce latency that the bandwidth term underestimates. Databricks' measurements of MBU (gpu2) show it typically between 50% and 80% and falling as tensor parallelism rises. A good practice is to calibrate the model: measure the step time at two batch sizes, fit the fixed and per-sequence costs, and then use the fitted model for planning rather than the datasheet.</p>
+<h4>Offloading and cache hierarchies</h4>
+<p>KV caches don't have to live only in HBM. Systems keep hot prefixes in GPU memory, warm ones in host memory, and cold ones on local NVMe or distributed storage — DeepSeek's "on-disk KV cache" served over half of its input tokens — and load them back instead of recomputing prefill. Whether loading beats recomputing depends on arithmetic: loading costs bytes ÷ link bandwidth (PCIe, network, disk), recomputing costs 2N FLOPs per token on the GPU. For a 70B model, recomputing one token costs 1.4 × 10<sup>11</sup> FLOPs (about 0.07 µs on four H100s at half peak), while loading its 320 KiB over a 50 GB/s link takes about 6.5 µs — so per token, recomputing is faster than loading over the network; but recomputation competes with other requests for GPU compute, while loading uses otherwise idle links. Real systems weigh both, and prefix caches pay off most when prefixes are long and heavily reused.</p>
+</section>
+
+<section data-field="prod">
+<h4>Metrics that matter in production</h4>
+<p>Serving dashboards track TTFT and ITL percentiles (p50, p95, p99), end-to-end latency, output tokens per second per replica and per GPU, queue length and queueing time, number of running and waiting sequences, KV-cache utilisation, preemption counts, prefix-cache hit rate, and prompt and output length distributions. The last two matter because they explain most changes in the others: a product change that lengthens system prompts or adds retrieved documents shifts load from decode to prefill and shrinks the KV-limited batch, and it shows up first as rising TTFT and cache utilisation.</p>
+<h4>Failure modes and their signatures</h4>
+<p><strong>KV-cache exhaustion.</strong> When the cache fills, engines such as vLLM preempt sequences — evicting their cache and recomputing it later — or stop admitting new requests. Symptoms: cache utilisation pinned near 100%, preemption counters rising, and sporadic very slow requests. Fixes: FP8 KV, lower maximum concurrency, capping context length, or more replicas.</p>
+<p><strong>Prefill storms.</strong> A burst of long prompts (a batch job, a new document feature) spikes TTFT for everyone and, without chunked prefill, ITL for everyone mid-stream. Fixes: chunked prefill with a sensible token budget, separate pools or priority for batch traffic, disaggregation at larger scale.</p>
+<p><strong>Latency cliffs at specific batch sizes.</strong> CUDA graphs captured only for some batch sizes, so others pad up or run uncaptured (gpu6); or tile and wave quantization in matmuls (gpu1).</p>
+<p><strong>Slow autoscaling.</strong> Starting a replica means provisioning a GPU node and loading tens to hundreds of gigabytes of weights and compiling kernels — minutes, not seconds. Capacity must be provisioned ahead of predictable peaks, with headroom for unpredictable ones.</p>
+<h4>Load testing honestly</h4>
+<p>Benchmarks that send identical short prompts at a fixed rate overstate capacity. Realistic load tests replay production-like distributions of prompt and output lengths, prefix-sharing patterns and arrival burstiness, measure percentiles rather than averages, and report goodput at the latency targets — the open-loop, coordinated-omission-aware methodology of sc16 applied to LLMs. Tools such as vLLM's serving benchmark and NVIDIA's GenAI-Perf generate such load. The output of a load test is a curve of goodput versus request rate, and the planning number is the rate at which p95 targets are still met, not the rate at which the server starts returning errors.</p>
+<h4>Turning the model into a plan</h4>
+<p>Record the configuration with every measurement — model version, quantisation, engine version, TP degree, batch limits, GPU type — because each of them moves the numbers by tens of percent.</p>
+<p>A production capacity plan combines: traffic forecast (peak requests per second, token distributions, cache-hit rates), targets (p95 TTFT, p95 ITL), the calibrated per-replica model (prefill capacity, decode step time versus batch, KV limit), and operational headroom (failures, deploys, bursts). It yields replicas per region and GPUs per replica, and a cost per million tokens that product and finance can use (gpu12). DeepSeek's published figures are a useful sanity check for any such plan: at very large batch, output tokens can cost well under a dollar per million on H800-class hardware; at low batch and strict latency, costs are an order of magnitude higher.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> build the serving model from this lesson and reproduce the batch-size table — including where the KV cache runs out. Pure Python 3.12; no GPU needed.</p>
+<pre>N, LAYERS, KV_HEADS, HDIM = 70e9, 80, 8, 128   # Llama 3 70B
+GPUS, PEAK, BW, HBM = 4, 989e12, 3.35e12, 80e9  # 4 x H100, tensor parallel
+EFF_C, EFF_M = 0.5, 0.8                         # achievable fractions of peak
+COMM_S = 160 * 20e-6                            # 2 all-reduces/layer, ~20 us each
+WBYTES, KVBYTES = 2, 2                          # BF16 weights and KV cache
+
+kv_tok = 2 * LAYERS * KV_HEADS * HDIM * KVBYTES
+w_gpu = N * WBYTES / GPUS
+prompt, ctx = 2000, 3000
+print(f"prefill {prompt} tokens: {2 * N * prompt / (GPUS * PEAK * EFF_C) * 1e3:.0f} ms")
+max_batch = int((HBM * 0.9 - w_gpu) * GPUS / (kv_tok * ctx))
+print(f"KV room for ~{max_batch} sequences of {ctx} tokens")
+for B in [1, 8, 32, 64, 128, max_batch]:
+    mem = (w_gpu + B * ctx * kv_tok / GPUS) / (BW * EFF_M)
+    comp = 2 * N * B / (GPUS * PEAK * EFF_C)
+    step = max(mem, comp) + COMM_S
+    print(f"B={B:4d}: {step * 1e3:5.1f} ms, {1 / step:4.0f} tok/s/user, {B / step:6.0f} tok/s total")
+
+a, g = 0.8, 4
+print("speculative tokens per target pass:", round((1 - a ** (g + 1)) / (1 - a), 2))</pre>
+<p><strong>What to look for.</strong> Prefill of 2,000 tokens takes about 142 ms. The KV cache fits about 150 sequences of 3,000 tokens. Throughput climbs from 61 to about 5,000 tokens per second while per-user speed falls from 61 to 33, and the step stays memory-bound throughout — the KV limit arrives first.</p>
+<p><strong>Try:</strong> set <code>KVBYTES = 1</code> (FP8 KV) and watch the maximum batch double; set <code>WBYTES = 1</code> for FP8 weights; set <code>GPUS = 8</code> for lower batch-1 latency; set <code>ctx = 32000</code> for a long-context workload and see concurrency collapse.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>Same 70B model on 4 × H100 (35 GB of weights per GPU, 320 KiB of KV per token). Batch 64 sequences with about 2,048 tokens of context each. Estimate the decode step time, per-user tokens/s, aggregate throughput, and check whether the step is still memory-bound. Then say what you would change to double throughput without breaking a 40 ms inter-token latency target.</p>
+<details><summary>Answer</summary>
+<p>KV read per step: 64 × 2,048 × 320 KiB ≈ 43 GB in total, about 10.7 GB per GPU.</p>
+<p>Bytes per GPU per step: 35 + 10.7 ≈ 45.7 GB → at 80% of 3.35 TB/s ≈ <strong>17 ms</strong>, plus about 3 ms of all-reduces ≈ <strong>20 ms</strong> per step.</p>
+<p>Per user: about <strong>50 tokens/s</strong>. Aggregate: 64 × 50 ≈ <strong>3,200 tokens/s</strong> — about 50 times the batch-1 throughput for about 25% more latency per token.</p>
+<p>Compute check: 2 × 70 × 10<sup>9</sup> × 64 ≈ 9 × 10<sup>12</sup> FLOPs per step, about 2.2 × 10<sup>12</sup> per GPU → about 4.5 ms at 50% of peak, well below 17 ms: <strong>still memory-bound</strong>.</p>
+<p><strong>Doubling throughput within 40 ms:</strong> batch 128 would need 21.5 GB of KV per GPU — 56.5 GB per step, about 21 ms + 3 ms ≈ 24 ms — and the total 86 GB of KV fits in the ~148 GB free, so simply raising the batch gives about 5,300 tokens/s at about 42 tokens/s per user. To go further, FP8 KV halves the KV bytes (more sequences and shorter steps), and FP8 weights halve the 35 GB per GPU — together allowing roughly 250+ sequences within the 40 ms target. Speculative decoding would help per-user latency more than throughput at these batch sizes.</p>
+</details>
+</section>

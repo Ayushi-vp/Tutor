@@ -1,0 +1,546 @@
+
+/* ============================================================
+   DATA — machine coding, the concurrency set.
+   Appends to LLD. These reward precision: state the invariant,
+   say which lock protects it, and name the failure mode.
+   ============================================================ */
+LLD.push(
+
+{ id:"ld16", t:"Implement a bounded blocking queue", tag:"Concurrency", sum:"Producer-consumer done properly — condition variables, spurious wakeups, and why you use while not if.",
+  primer:`<h4>Start here — the problem in one sentence</h4>
+  <p>Producers add items, consumers remove them, the queue has a maximum size. A producer facing a full queue must <strong>wait</strong> rather than fail or spin; a consumer facing an empty queue must do the same. Both must wake as soon as the situation changes.</p>
+  <p>This is the foundation under thread pools, batching servers, logging appenders and every pipeline in this section — so interviewers ask it directly, and they ask it because the obvious implementation is subtly wrong in three specific ways.</p>
+  <h4>Why the naive versions fail</h4>
+  <ul>
+  <li><strong>Busy-waiting</strong> — <code>while queue.full(): pass</code>. Correct and it burns a core doing nothing, starving the very consumer that would make room.</li>
+  <li><strong>Sleeping</strong> — <code>while full: sleep(10ms)</code>. Better, and it adds up to 10 ms of latency to every handoff while still waking pointlessly.</li>
+  <li><strong>A plain lock</strong> — a mutex gives mutual exclusion but no way to <em>wait for a condition</em>. You need a condition variable: release the lock, sleep, and reacquire atomically when signalled.</li>
+  </ul>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Condition variable</strong> — a wait queue attached to a lock. <code>wait()</code> atomically releases the lock and blocks; <code>notify()</code> wakes one waiter, <code>notify_all()</code> wakes all. The atomicity is the whole point: without it there is a window between checking the condition and sleeping in which a signal is lost.</li>
+  <li><strong>Spurious wakeup</strong> — a thread can return from <code>wait()</code> without anyone signalling it. Permitted by the specification on most platforms, which is why you re-check the condition in a loop.</li>
+  <li><strong>Lost wakeup</strong> — a signal sent while no one is waiting is discarded. Signalling without holding the lock is how you produce one.</li>
+  </ul>`,
+
+  body:`<h4>Requirements</h4>
+  <p><code>put(item)</code> blocks while full, <code>take()</code> blocks while empty, both thread-safe with any number of producers and consumers, plus timed variants and a clean shutdown. Clarify: FIFO or priority? Must <code>put</code> be fair, or may a producer be starved? Is there a maximum wait?</p>
+  <h4>The implementation</h4>
+  <pre><span class="k">class</span> BoundedQueue:
+    <span class="k">def</span> __init__(self, capacity):
+        self.items = deque()
+        self.capacity = capacity
+        self.lock = threading.Lock()
+        self.not_full  = threading.Condition(self.lock)
+        self.not_empty = threading.Condition(self.lock)
+        self.closed = <span class="k">False</span>
+
+    <span class="k">def</span> put(self, item, timeout=<span class="k">None</span>):
+        <span class="k">with</span> self.not_full:
+            deadline = time.monotonic() + timeout <span class="k">if</span> timeout <span class="k">else None</span>
+            <span class="k">while</span> len(self.items) &gt;= self.capacity <span class="k">and not</span> self.closed:
+                remaining = deadline - time.monotonic() <span class="k">if</span> deadline <span class="k">else None</span>
+                <span class="k">if</span> remaining <span class="k">is not None and</span> remaining &lt;= 0:
+                    <span class="k">raise</span> Timeout
+                <span class="k">if not</span> self.not_full.wait(remaining):
+                    <span class="k">raise</span> Timeout
+            <span class="k">if</span> self.closed: <span class="k">raise</span> QueueClosed
+            self.items.append(item)
+            self.not_empty.notify()        <span class="c"># exactly one consumer can proceed</span>
+
+    <span class="k">def</span> take(self, timeout=<span class="k">None</span>):
+        <span class="k">with</span> self.not_empty:
+            <span class="k">while not</span> self.items <span class="k">and not</span> self.closed:
+                <span class="k">if not</span> self.not_empty.wait(timeout): <span class="k">raise</span> Timeout
+            <span class="k">if not</span> self.items: <span class="k">raise</span> QueueClosed
+            item = self.items.popleft()
+            self.not_full.notify()
+            <span class="k">return</span> item
+
+    <span class="k">def</span> close(self):
+        <span class="k">with</span> self.lock:
+            self.closed = <span class="k">True</span>
+            self.not_full.notify_all(); self.not_empty.notify_all()</pre>
+  <h4>The three decisions that matter</h4>
+  <ul>
+  <li><strong><code>while</code>, never <code>if</code>.</strong> Two reasons, and name both: spurious wakeups mean <code>wait()</code> can return unsignalled, and — more importantly — between being signalled and reacquiring the lock, another thread may have taken the item. The condition must be re-verified after waking, not assumed.</li>
+  <li><strong>Two condition variables on one lock.</strong> One shared condition would mean waking producers when an item is added, which is pointless. Separate conditions wake only the threads that can actually make progress. With a single condition you must use <code>notify_all</code>, which produces a thundering herd of threads that check, fail and sleep again.</li>
+  <li><strong>Signal while holding the lock.</strong> Releasing first opens a window in which a waiter checks the condition, finds it false, and sleeps just after the signal was sent — a lost wakeup that deadlocks both sides.</li>
+  </ul>
+  <h4>Extensions</h4>
+  <ul><li><strong>Batch take:</strong> drain up to n items in one lock acquisition. For a consumer that processes in batches this cuts lock traffic by a factor of n and is what the batching-server design needs.</li>
+  <li><strong>Priority:</strong> replace the deque with a heap. Note that <code>put</code> becomes O(log n) and FIFO fairness is gone — a low-priority item can starve indefinitely.</li>
+  <li><strong>Lock-free</strong> via a ring buffer with atomic head and tail indices. Faster under extreme contention, far harder to get right, and it cannot block — so it needs a separate wait strategy. Mention it as an option, do not attempt it in 45 minutes.</li></ul>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Shutdown is the part that separates a toy from something usable.</strong> A blocked consumer waiting on an empty queue will wait forever unless something wakes it. The <code>closed</code> flag plus <code>notify_all</code> is the mechanism, and the semantics need deciding: does close mean "drain what is queued then stop" (graceful) or "stop now" (abrupt)? The version above lets consumers drain remaining items and then raises — usually what you want, and worth stating as a deliberate choice rather than an accident.</li>
+  <li><strong>Fairness is not free and usually not needed.</strong> Most condition variables wake an arbitrary waiter, so a producer can in principle be starved while others repeatedly win the race. A fair queue hands the lock to the longest waiter, at a measurable throughput cost because it forces a context switch rather than letting a running thread reacquire. Default to unfair, and say you would only make it fair if starvation were observed — this is the same trade as an unfair mutex and the reasoning transfers.</li>
+  <li><strong><code>notify</code> versus <code>notify_all</code> is a correctness question, not an optimisation.</strong> Single-notify is safe here only because every waiter on <code>not_empty</code> waits for the same condition and one item satisfies exactly one of them. The moment waiters wait for <em>different</em> conditions on the same variable — for instance a batch-take wanting n items while a single-take wants one — signalling one thread can wake the wrong one, which then sleeps again and the item sits untaken. That is a lost wakeup caused by an over-optimisation, and it is worth naming as the reason to be conservative.</li>
+  <li><strong>The queue's capacity is a backpressure policy in disguise.</strong> Unbounded means producers never block and memory grows without limit under overload — the failure from the batching-server design. Bounded means producers block, which propagates backpressure up the pipeline to whatever is feeding them. That propagation is the feature: it is how a system slows down instead of falling over, and choosing the capacity is choosing how much burst you absorb before applying it.</li>
+  <li><strong>Test it with a property, not an example.</strong> Run k producers and m consumers over random items, then assert that the multiset of items taken equals the multiset put, that the queue never exceeded capacity (check under the lock), and that the process terminates. Concurrency bugs appear under specific interleavings that no hand-written test reproduces, so randomised stress plus a thread sanitiser finds them and unit tests do not.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>Consider this <code>take</code>:</p>
+    <pre><span class="k">def</span> take(self):
+    <span class="k">with</span> self.lock:
+        <span class="k">if not</span> self.items:
+            self.cond.wait()
+        item = self.items.popleft()
+        self.not_full.notify()
+        <span class="k">return</span> item</pre>
+    <p>There is one condition variable shared by producers and consumers. Find three distinct bugs and describe a failing interleaving for each.</p>
+    <details><summary>Answer</summary>
+    <p><strong>Bug 1 — <code>if</code> instead of <code>while</code>.</strong></p>
+    <p>Interleaving: consumers C1 and C2 both find the queue empty and wait. A producer adds one item and calls <code>notify_all</code> (or the runtime wakes both spuriously). C1 wakes, reacquires the lock, and pops the item. C2 then wakes, reacquires, and — because it used <code>if</code> — does <strong>not</strong> re-check. It calls <code>popleft()</code> on an empty deque and raises <code>IndexError</code>.</p>
+    <p>This is the canonical failure and it happens whenever more waiters wake than there are items. Even with single-notify, spurious wakeups alone can produce it. Fix: <code>while not self.items: self.cond.wait()</code>.</p>
+    <p><strong>Bug 2 — one condition variable for two different conditions.</strong></p>
+    <p>Producers wait for "not full" and consumers wait for "not empty", but both sleep on <code>self.cond</code>. Interleaving: the queue is full, so producers P1 and P2 are waiting. A consumer takes an item and calls <code>notify()</code> on that same variable — which wakes <em>one arbitrary waiter</em>. If it wakes another consumer rather than a producer, that consumer finds the queue non-empty, takes an item, and signals again; but the producers may never be selected. With a single <code>notify</code> on a shared variable, a signal intended for a producer can be consumed by a consumer and <strong>the wakeup is lost</strong> — producers block forever although there is room.</p>
+    <p>Note the code compounds this by signalling <code>self.not_full</code> while waiters sleep on <code>self.cond</code> — a signal sent to a variable nobody is waiting on is simply discarded. Fix: two condition variables over one lock, each signalled by the operation that satisfies it.</p>
+    <p><strong>Bug 3 — no shutdown path.</strong></p>
+    <p>Interleaving: the application is stopping. Producers have finished and no more items will arrive. Every consumer is blocked inside <code>wait()</code> with no one left to signal them. They wait forever, the threads never exit, and if they are non-daemon threads <strong>the process never terminates</strong>. Nothing throws and nothing logs — the service simply hangs on shutdown, which is a genuinely common production symptom.</p>
+    <p>Fix: a <code>closed</code> flag checked in the wait predicate, and a <code>close()</code> that sets it and calls <code>notify_all</code> on both conditions so every blocked thread re-evaluates and exits.</p>
+    <p><strong>A fourth worth mentioning:</strong> there is no timeout, so a consumer cannot be interrupted, cannot report that it is stuck, and cannot participate in a bounded shutdown. Timed variants are not a nicety — they are what makes the component observable and controllable from outside.</p>
+    <p><strong>The pattern to carry away:</strong> every condition-variable use has the same skeleton — acquire the lock, loop while the predicate is false calling <code>wait()</code>, act, signal the condition you just made true, release. Deviating from that skeleton in any of the three ways above produces a bug that appears under load and not in testing.</p></details>`,
+
+  refs:[
+    ["docs","Producer–consumer problem","The classic formulation, with the semaphore and monitor solutions side by side.","https://en.wikipedia.org/wiki/Producer%E2%80%93consumer_problem"],
+    ["docs","threading.Condition","Python's condition variable, with the explicit note that wait() may return spuriously and the predicate must be re-checked.","https://docs.python.org/3/library/threading.html#condition-objects"],
+    ["docs","java.util.concurrent.BlockingQueue","The production interface — read the method table for the four ways each operation can behave (throw, return special value, block, time out).","https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/BlockingQueue.html"],
+    ["docs","Monitor (synchronisation)","Why a lock alone is insufficient and what a condition variable adds, with the lost-wakeup problem explained.","https://en.wikipedia.org/wiki/Monitor_(synchronization)"]
+  ]},
+
+{ id:"ld17", t:"Implement a thread pool with graceful shutdown", tag:"Concurrency", sum:"Workers, a task queue, futures, and the shutdown sequence nobody designs until it hangs.",
+  primer:`<h4>Start here — why a pool rather than a thread per task</h4>
+  <p>Creating a thread costs roughly a megabyte of stack and a system call, and a thousand runnable threads spend more time context-switching than working. A pool creates a fixed number of workers once and feeds them tasks through a queue, so thread creation cost is paid once and concurrency is bounded by design.</p>
+  <p>The bounded part matters as much as the reuse: a pool is a <strong>concurrency limiter</strong>. Ten workers means at most ten tasks touch the database at once, which is backpressure you get for free.</p>
+  ${flow([{t:"submit(task)",d:"returns a Future"},{t:"Task queue",d:"bounded"},{t:"Worker ×N",d:"take, run, set result"},{t:"Future",d:"caller awaits"}])}
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Future / promise</strong> — a handle to a result that does not exist yet. The caller can wait on it, poll it, or attach a callback. It also carries the exception if the task threw, which is how errors cross the thread boundary.</li>
+  <li><strong>Graceful shutdown</strong> — stop accepting new tasks, let queued and running ones finish, then exit.</li>
+  <li><strong>Poison pill</strong> — a sentinel value placed on the queue that tells a worker to exit. One per worker.</li>
+  <li><strong>Rejection policy</strong> — what <code>submit</code> does when the queue is full: block, throw, discard, or run the task on the caller's thread.</li>
+  </ul>
+  <h4>The thing that goes wrong</h4>
+  <p><strong>Exceptions.</strong> If a task throws and the worker does not catch it, the worker thread dies. Do that four times and your eight-thread pool silently becomes a four-thread pool, then zero, and tasks queue forever with no error anywhere. <em>A worker loop must catch everything.</em></p>`,
+
+  body:`<h4>Requirements</h4>
+  <p><code>submit(fn, *args) → Future</code>, N worker threads, a bounded queue with a rejection policy, exceptions delivered to the caller through the future, graceful and immediate shutdown. Clarify: fixed or dynamic pool size? Must tasks run in submission order? Is there a per-task timeout?</p>
+  <h4>The implementation</h4>
+  <pre><span class="k">class</span> Future:
+    <span class="k">def</span> __init__(self):
+        self._cond = threading.Condition()
+        self._done, self._value, self._exc, self._cancelled = <span class="k">False</span>, <span class="k">None</span>, <span class="k">None</span>, <span class="k">False</span>
+    <span class="k">def</span> set_result(self, v):  self._finish(value=v)
+    <span class="k">def</span> set_exception(self, e): self._finish(exc=e)
+    <span class="k">def</span> _finish(self, value=<span class="k">None</span>, exc=<span class="k">None</span>):
+        <span class="k">with</span> self._cond:
+            self._value, self._exc, self._done = value, exc, <span class="k">True</span>
+            self._cond.notify_all()
+    <span class="k">def</span> result(self, timeout=<span class="k">None</span>):
+        <span class="k">with</span> self._cond:
+            <span class="k">while not</span> self._done:
+                <span class="k">if not</span> self._cond.wait(timeout): <span class="k">raise</span> Timeout
+        <span class="k">if</span> self._exc: <span class="k">raise</span> self._exc      <span class="c"># re-raise in the caller's thread</span>
+        <span class="k">return</span> self._value
+
+<span class="k">class</span> ThreadPool:
+    <span class="k">def</span> __init__(self, n_workers, queue_size=1000, on_reject=<span class="c">'block'</span>):
+        self.q = BoundedQueue(queue_size)
+        self.on_reject, self.shutdown_flag = on_reject, <span class="k">False</span>
+        self.workers = [threading.Thread(target=self._run, daemon=<span class="k">False</span>)
+                        <span class="k">for</span> _ <span class="k">in</span> range(n_workers)]
+        <span class="k">for</span> w <span class="k">in</span> self.workers: w.start()
+
+    <span class="k">def</span> submit(self, fn, *args):
+        <span class="k">if</span> self.shutdown_flag: <span class="k">raise</span> RejectedExecution(<span class="c">"pool is shut down"</span>)
+        fut = Future()
+        <span class="k">if not</span> self.q.offer((fn, args, fut)):
+            <span class="k">return</span> self._reject(fn, args, fut)
+        <span class="k">return</span> fut
+
+    <span class="k">def</span> _run(self):
+        <span class="k">while</span> <span class="k">True</span>:
+            job = self.q.take()
+            <span class="k">if</span> job <span class="k">is</span> POISON: <span class="k">return</span>
+            fn, args, fut = job
+            <span class="k">try</span>:
+                fut.set_result(fn(*args))
+            <span class="k">except</span> BaseException <span class="k">as</span> e:
+                fut.set_exception(e)      <span class="c"># worker survives; caller sees it</span></pre>
+  <p><strong>The <code>try/except</code> around <code>fn()</code> is the most important line in the class.</strong> Catching <code>BaseException</code> rather than <code>Exception</code> is deliberate — a task raising something outside the normal hierarchy would otherwise kill the worker.</p>
+  <h4>Shutdown</h4>
+  <pre><span class="k">def</span> shutdown(self, wait=<span class="k">True</span>, timeout=<span class="k">None</span>):
+    self.shutdown_flag = <span class="k">True</span>            <span class="c"># 1. reject new submissions</span>
+    <span class="k">for</span> _ <span class="k">in</span> self.workers:
+        self.q.put(POISON)                <span class="c"># 2. one pill per worker</span>
+    <span class="k">if</span> wait:
+        <span class="k">for</span> w <span class="k">in</span> self.workers:
+            w.join(timeout)               <span class="c"># 3. wait, bounded</span>
+            <span class="k">if</span> w.is_alive(): log.warning(<span class="c">"worker did not stop"</span>)</pre>
+  <p><strong>One poison pill per worker, placed at the back of the queue,</strong> so every queued task is processed before any worker sees a pill. That gives drain-then-stop semantics for free. An immediate shutdown instead drains the queue, cancels the pending futures, and signals running tasks to stop — which they can only honour if they check a cancellation flag.</p>
+  <h4>Rejection policies</h4>
+  <ul><li><strong>Block</strong> — the caller waits for room. Propagates backpressure; risks stalling a request thread.</li>
+  <li><strong>Abort</strong> — throw immediately. Honest and lets the caller decide.</li>
+  <li><strong>Caller-runs</strong> — the submitting thread executes the task itself. Elegant: it slows the producer by exactly the cost of the work, which is self-regulating backpressure.</li>
+  <li><strong>Discard</strong> — drop the task. Only acceptable when the work is genuinely optional, such as metrics.</li></ul>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Pool size is set by the workload, and the formula is worth quoting.</strong> For CPU-bound work, roughly the number of cores — more threads just add context switches. For I/O-bound work, <code>cores × (1 + wait_time / service_time)</code>: if a task spends 90 ms waiting and 10 ms computing, the ratio is 9, so ~10 threads per core keeps the CPU busy. Getting this backwards — 200 threads for CPU work, or 4 for I/O work — is the most common sizing mistake and each fails in a different way.</li>
+  <li><strong>Non-daemon workers plus a shutdown hook, not daemon threads.</strong> Daemon threads let the process exit with tasks half-finished, which for anything writing data is a correctness problem. Non-daemon threads keep the process alive until they stop, which means you <em>must</em> implement shutdown properly — and that pressure is a feature. Register the shutdown at exit so it happens even on an unhandled error path.</li>
+  <li><strong>Never submit a task that waits on another task in the same pool.</strong> If the pool has N workers and N tasks each block waiting for a subtask they submitted, every worker is blocked and no worker is free to run the subtasks. The pool deadlocks with an empty CPU and a full queue. This is thread-pool starvation, it is not detected by anything, and the fixes are a separate pool for nested work or a design that does not nest. Raising it unprompted is a strong signal.</li>
+  <li><strong>Cancellation is cooperative and you should say so plainly.</strong> A future can be cancelled before it starts by removing it from the queue. Once a task is running, there is no safe way to stop it from outside — killing a thread mid-operation leaves locks held and state inconsistent. So a long task must periodically check a cancellation flag, and <code>cancel()</code> returning <code>False</code> for a running task is honest rather than a limitation.</li>
+  <li><strong>Unbounded queues turn a thread pool into a memory leak.</strong> The default in several standard libraries is an unbounded queue, which means <code>submit</code> never blocks, backpressure never propagates, and under overload the queue grows until the process dies — having accepted work it will never complete. Bounding the queue and choosing a rejection policy is the single most important configuration decision, and it is the same lesson as the batching server and the logging appender.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A web service uses an 8-thread pool with an unbounded queue for outbound HTTP calls. Each call normally takes 50 ms. Traffic is 200 requests/s, one pool task each. The downstream service degrades and calls now take 5 seconds.</p>
+    <p>(a) What is the pool's throughput before and after? (b) What happens to the queue and to memory? (c) What should the configuration have been?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Throughput.</strong> Little's Law: throughput = concurrency ÷ service time.</p>
+    <ul>
+    <li><em>Normal:</em> 8 ÷ 0.05 s = <strong>160 tasks/s</strong>. Against 200/s arriving, the pool is <em>already</em> slightly undersized — the queue grows even in the healthy case, at 40/s. Worth noticing before the incident: this pool was on the edge and nobody could tell, because an unbounded queue absorbs the difference silently until memory runs out.</li>
+    <li><em>Degraded:</em> 8 ÷ 5 s = <strong>1.6 tasks/s</strong>. Throughput has fallen by a factor of 100 while arrivals are unchanged.</li>
+    </ul>
+    <p><strong>(b) Queue and memory.</strong> The queue grows at 200 − 1.6 ≈ <strong>198 tasks/s</strong>. After one minute it holds ~12,000 tasks; after ten minutes, ~119,000. Each holds a closure, its arguments and a future, plus whatever request context they capture — if that is a kilobyte each, ten minutes is roughly <strong>120 MB</strong> of tasks that will never usefully complete.</p>
+    <p>The insidious part is what happens to latency. A task submitted after ten minutes sits behind 119,000 others at 1.6/s — a queueing delay of <strong>over 20 hours</strong>. Every one of those requests has long since timed out at the client, so the pool is spending its entire capacity on work nobody is waiting for. Meanwhile the request threads that submitted them may still be blocked holding connections.</p>
+    <p>Outcome: memory climbs until the process is killed, and before that every request is failing by timeout. <em>No error is raised by the pool itself</em> — <code>submit</code> succeeds every time, which is exactly the problem.</p>
+    <p><strong>(c) What it should have been.</strong></p>
+    <ul>
+    <li><strong>A bounded queue</strong> sized to a few seconds of work — at 160/s and a 2-second tolerance, roughly 300 entries. Beyond that, reject. The pool then fails fast and visibly instead of accumulating.</li>
+    <li><strong>Rejection policy: abort, not block.</strong> Throwing lets the calling request return a 503 immediately, which is a far better outcome than a request thread blocked for hours. Caller-runs would be wrong here, because it would push a 5-second downstream call onto a request thread.</li>
+    <li><strong>A per-task timeout,</strong> so a 5-second call is abandoned at, say, 1 second. This alone restores throughput to 8 tasks/s and caps the damage.</li>
+    <li><strong>Drop tasks whose deadline has passed</strong> at dequeue time — if the client gave up 20 hours ago, executing the task is pure waste. Same lesson as the batching-server queue.</li>
+    <li><strong>A circuit breaker</strong> on the downstream service, so once it is clearly degraded you stop calling it entirely and fail fast rather than filling the pool.</li>
+    <li><strong>Size the pool properly:</strong> this is I/O-bound with a 50 ms wait and negligible compute, so 8 threads was far too few. Even at 200/s with 50 ms service time you need ≥10 concurrent, and headroom suggests 20–30.</li>
+    </ul>
+    <p><strong>The principle:</strong> an unbounded queue converts a <em>latency</em> problem in a dependency into a <em>memory and availability</em> problem in your own service. Bounding it and rejecting early keeps the failure where it started and keeps it visible.</p></details>`,
+
+  refs:[
+    ["docs","java.util.concurrent.ThreadPoolExecutor","The production reference — read the class documentation on queueing policies and the four rejection handlers, which is the clearest treatment anywhere.","https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/ThreadPoolExecutor.html"],
+    ["docs","concurrent.futures","Python's executor and Future API, including the cancellation semantics and why a running task cannot be cancelled.","https://docs.python.org/3/library/concurrent.futures.html"],
+    ["docs","Little's Law","The relationship used in the drill to turn service time and concurrency into throughput.","https://en.wikipedia.org/wiki/Little%27s_law"],
+    ["docs","Thread pool","The general pattern, including the sizing formula for I/O-bound versus CPU-bound workloads.","https://en.wikipedia.org/wiki/Thread_pool"]
+  ]},
+
+{ id:"ld18", t:"Implement a connection pool", tag:"Concurrency", sum:"Borrow, return, validate, evict — and the leak that takes a service down at 3am.",
+  primer:`<h4>Start here — why pool connections at all</h4>
+  <p>Opening a database connection costs a TCP handshake, a TLS negotiation and an authentication round trip — commonly 20–100 ms. If every query pays that, your 2 ms query takes 50 ms. Worse, databases cap concurrent connections, and a service that opens one per request will exhaust that cap and lock out everything else.</p>
+  <p>So: keep a set of open connections, hand them out, take them back. The pool is simultaneously a <strong>performance optimisation</strong> and a <strong>concurrency limit on the database</strong>, and the second is the more important one.</p>
+  <h4>The failure that defines the design</h4>
+  <p><strong>Connection leaks.</strong> A caller borrows a connection and does not return it — an early return, an exception on a path without cleanup, a forgotten <code>close()</code>. Each leak permanently shrinks the pool. Nothing fails immediately; the pool just gets smaller until, some hours later, every request blocks waiting for a connection that will never come back. The symptom is a total outage with no obvious cause and no recent deploy.</p>
+  <h4>The vocabulary</h4>
+  <ul>
+  <li><strong>Borrow / return</strong> — the two operations. Enforced with a context manager or try/finally so the return cannot be skipped.</li>
+  <li><strong>Validation</strong> — checking a connection still works before handing it out. Databases and load balancers close idle connections without telling you.</li>
+  <li><strong>Max lifetime</strong> — retire a connection after a fixed age regardless of health, so the pool rotates rather than accumulating long-lived connections that a proxy may silently drop.</li>
+  <li><strong>Leak detection</strong> — warn when a connection has been held longer than any legitimate operation should take.</li>
+  </ul>`,
+
+  body:`<h4>Requirements</h4>
+  <p>Fixed maximum size, borrow with a timeout, validate before use, replace broken connections, retire old ones, and detect leaks. Clarify: is the resource expensive to create (affects min-idle sizing)? Is it safe to share across threads? Must borrows be fair?</p>
+  <h4>The implementation</h4>
+  <pre><span class="k">class</span> PooledConn:
+    conn, created_at, last_used_at, borrowed_by, borrowed_at
+
+<span class="k">class</span> ConnectionPool:
+    <span class="k">def</span> __init__(self, factory, max_size=20, min_idle=5,
+                 max_lifetime=1800, idle_timeout=600, borrow_timeout=5,
+                 leak_threshold=30, clock=time.monotonic):
+        self.factory, self.max_size, self.clock = factory, max_size, clock
+        self.idle = deque()                  <span class="c"># available PooledConns</span>
+        self.in_use = {}                     <span class="c"># id -&gt; PooledConn</span>
+        self.total = 0
+        self.lock = threading.Lock()
+        self.available = threading.Condition(self.lock)
+
+    <span class="k">def</span> borrow(self):
+        deadline = self.clock() + self.borrow_timeout
+        <span class="k">with</span> self.available:
+            <span class="k">while</span> <span class="k">True</span>:
+                <span class="k">while</span> self.idle:
+                    pc = self.idle.popleft()
+                    <span class="k">if</span> self._expired(pc) <span class="k">or not</span> self._validate(pc):
+                        self._destroy(pc); <span class="k">continue</span>
+                    self._mark_borrowed(pc); <span class="k">return</span> pc
+                <span class="k">if</span> self.total &lt; self.max_size:
+                    pc = self._create()      <span class="c"># grow on demand</span>
+                    self._mark_borrowed(pc); <span class="k">return</span> pc
+                remaining = deadline - self.clock()
+                <span class="k">if</span> remaining &lt;= 0: <span class="k">raise</span> PoolExhausted
+                self.available.wait(remaining)
+
+    <span class="k">def</span> release(self, pc, broken=<span class="k">False</span>):
+        <span class="k">with</span> self.available:
+            self.in_use.pop(id(pc), <span class="k">None</span>)
+            <span class="k">if</span> broken <span class="k">or</span> self._expired(pc):
+                self._destroy(pc)
+            <span class="k">else</span>:
+                pc.last_used_at = self.clock()
+                self.idle.append(pc)
+            self.available.notify()
+
+    @contextmanager
+    <span class="k">def</span> connection(self):
+        pc = self.borrow(); broken = <span class="k">False</span>
+        <span class="k">try</span>:
+            <span class="k">yield</span> pc.conn
+        <span class="k">except</span> ConnectionError:
+            broken = <span class="k">True</span>; <span class="k">raise</span>
+        <span class="k">finally</span>:
+            self.release(pc, broken)</pre>
+  <p><strong>The context manager is the API you expose</strong>, and the raw borrow/release should be discouraged or private. A <code>finally</code> the caller cannot forget removes the entire leak class by construction, which is far better than detecting leaks after the fact.</p>
+  <h4>Validation strategy</h4>
+  <ul><li><strong>On borrow</strong> — safest, and it costs a round trip per borrow. Mitigate by skipping validation for connections used within the last few seconds.</li>
+  <li><strong>On return</strong> — cheaper in the hot path, but a connection can die while idle afterwards.</li>
+  <li><strong>Background</strong> — a keeper thread pings idle connections periodically and evicts dead ones. Best of both, and it also maintains <code>min_idle</code>.</li></ul>
+  <p>Combine: background validation for idle connections, plus a cheap age check on borrow, plus honest error handling if a query fails on a connection that looked fine.</p>
+  <h4>Leak detection</h4>
+  <pre><span class="k">def</span> _check_leaks(self):
+    now = self.clock()
+    <span class="k">for</span> pc <span class="k">in</span> list(self.in_use.values()):
+        held = now - pc.borrowed_at
+        <span class="k">if</span> held &gt; self.leak_threshold <span class="k">and not</span> pc.leak_reported:
+            log.warning(<span class="c">"possible leak: held %.1fs by %s"</span>, held, pc.borrowed_by)
+            pc.leak_reported = <span class="k">True</span></pre>
+  <p>Capture a stack trace at borrow time (only when leak detection is enabled — it is expensive) so the warning points at the code that took the connection. That single feature turns an unreproducible 3am outage into a one-line fix.</p>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Bigger pools are usually slower, which is counterintuitive and true.</strong> A database has a fixed number of cores and disks; beyond that, more concurrent connections cause context switching, lock contention and cache thrashing inside the database, so total throughput <em>falls</em>. The widely-cited starting formula is <code>connections = cores × 2 + effective_spindles</code> — often a pool of 10 to 20 for a machine that people instinctively give 200. Being able to say that a smaller pool frequently improves p99 latency is a genuinely counterintuitive, checkable piece of knowledge.</li>
+  <li><strong>The pool size is your concurrency limit on the database, so treat it as a shared budget.</strong> Ten service instances each with a 50-connection pool present 500 connections to one database, which may exceed its limit and lock out migrations, monitoring and everyone else. Size pools by dividing the database's safe concurrency across all consumers, and reserve headroom for administrative connections. This is a capacity conversation between services, not a per-service setting.</li>
+  <li><strong>Max lifetime exists because of things between you and the database.</strong> Load balancers, NAT gateways and firewalls silently drop idle TCP connections after a few minutes, and the client does not find out until the next query fails with a confusing error. Retiring connections after a lifetime shorter than the shortest infrastructure timeout means the pool rotates before anything else drops them. Set it to a few minutes less than the network idle timeout, and mention that this is why "the first query after lunch always fails" is a classic symptom.</li>
+  <li><strong>Transactions turn a leak into a much worse problem.</strong> A connection returned with an open transaction carries locks and an uncommitted snapshot to the next borrower, causing bizarre cross-request behaviour and blocking other writers. The pool must roll back on return unless the caller explicitly committed — defensive, cheap, and it converts a silent corruption into a clean reset.</li>
+  <li><strong>Test with an injected clock and a fake factory.</strong> Expiry, idle timeout and leak detection are all time-dependent, so a controllable clock lets you assert exact behaviour at the boundary without sleeping. A factory that can be told to produce broken connections lets you test the validate-and-replace path, which is otherwise only exercised during an incident.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A service runs 6 instances, each with a 25-connection pool against one Postgres with <code>max_connections = 100</code>. Borrow timeout is 5 s. One endpoint has a bug: on a validation error it returns early without releasing its connection. That endpoint is hit about 3 times per minute.</p>
+    <p>(a) What is wrong with the pool sizing? (b) Trace what the leak does over time. (c) What would have caught it?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) The sizing is already broken before any bug.</strong> 6 instances × 25 = <strong>150 connections</strong> demanded against a limit of 100. Under full load, instances 1–4 take their connections, and instances 5 and 6 get <code>FATAL: too many connections</code> — not a pool timeout, a hard database rejection. There is also no headroom for migrations, monitoring or a psql session for the engineer debugging it, so the first thing that fails during an incident is your ability to investigate.</p>
+    <p>Proper sizing: reserve ~10 for administration, leaving 90 across 6 instances = <strong>15 each</strong>, and probably fewer — on a machine with 8 cores the throughput-optimal pool is around 20 <em>in total</em>, not per instance. The instinct to raise the pool when things are slow makes it worse.</p>
+    <p><strong>(b) The leak.</strong> Three leaked connections per minute per instance that receives that traffic. Assume the load balancer spreads it, so roughly 0.5/min per instance.</p>
+    <table><thead><tr><th>Elapsed</th><th>Leaked per instance</th><th>Usable pool</th><th>Symptom</th></tr></thead><tbody>
+    <tr><td>1 hour</td><td>30</td><td>25 → 0</td><td>total failure</td></tr>
+    <tr><td>30 min</td><td>15</td><td>10</td><td>latency climbing under load</td></tr>
+    <tr><td>10 min</td><td>5</td><td>20</td><td>nothing visible</td></tr>
+    </tbody></table>
+    <p>The progression is what makes this hard to diagnose. For the first half hour, nothing is wrong — the pool has spare capacity and absorbs it. Then borrow waits start appearing at peak only, so it looks like a load problem. Then requests begin failing with <code>PoolExhausted</code> after a 5-second wait, which means every failing request also <em>holds a request thread for 5 seconds</em>, so the web server's own thread pool saturates and the service stops responding to healthy endpoints too.</p>
+    <p>Critically: <strong>no deploy happened, the database is healthy, and the failing endpoint is not the one that broke.</strong> The bug is in a rarely-hit validation path; the visible outage is everywhere else.</p>
+    <p><strong>(c) What would have caught it.</strong></p>
+    <ul>
+    <li><strong>A context manager as the only public API.</strong> A <code>finally</code>-based release makes the early-return path impossible to write. This is prevention rather than detection and it is the real answer.</li>
+    <li><strong>Leak detection with a borrow-time stack trace.</strong> A warning at 30 seconds — "connection held 34s by validate_order at handlers.py:212" — points directly at the bug within minutes of the first occurrence, hours before the outage.</li>
+    <li><strong>Pool metrics as first-class monitoring:</strong> connections in use, idle, and pending borrows. A steadily rising in-use count with flat traffic is unmistakable and is visible from the first ten minutes. Most teams monitor the database and not the pool, which is why this class of incident is common.</li>
+    <li><strong>Alert on borrow wait time,</strong> not just failures. Waits appear long before exhaustion.</li>
+    <li><strong>A max lifetime</strong> would eventually retire leaked connections — but note it does not help here: max lifetime applies on <em>return</em>, and a leaked connection is never returned. Worth stating, because it is a plausible-sounding fix that does not work.</li>
+    </ul>
+    <p><strong>The lesson:</strong> resource pools fail slowly and then all at once, in a component nobody is watching, triggered by code unrelated to the symptom. Make the safe usage the only usage, and instrument the pool itself.</p></details>`,
+
+  refs:[
+    ["post","About Pool Sizing","HikariCP wiki — the counterintuitive result that smaller pools are faster, with the formula and the benchmark behind it. The single best thing to read on this.","https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing"],
+    ["code","HikariCP","A production connection pool small enough to read, with leak detection, max lifetime and validation implemented exactly as described.","https://github.com/brettwooldridge/HikariCP"],
+    ["docs","PostgreSQL connection limits and pooling","Why max_connections is low, what each connection costs the server, and where an external pooler fits.","https://www.postgresql.org/docs/current/runtime-config-connection.html"],
+    ["docs","Object pool pattern","The general pattern and the guidance on when pooling is premature — for cheap objects it is usually a pessimisation.","https://en.wikipedia.org/wiki/Object_pool_pattern"]
+  ]},
+
+{ id:"ld19", t:"Implement a read-write lock", tag:"Concurrency", sum:"Many readers or one writer — and the starvation problem you must choose a side on.",
+  primer:`<h4>Start here — why a plain mutex is wasteful</h4>
+  <p>A mutex serialises everything. But if a data structure is read far more than it is written — a configuration map, a routing table, a cache — then readers do not conflict with each other at all. Only a writer needs exclusivity.</p>
+  <p>A read-write lock encodes that: <strong>any number of readers, or exactly one writer, never both.</strong> With a 95% read workload this can be a large throughput win.</p>
+  <h4>The problem you must solve, not avoid</h4>
+  <p>Readers arrive continuously. A writer waits for the current readers to finish — but new readers keep arriving and keep being admitted, so the reader count never reaches zero and <strong>the writer waits forever</strong>. That is writer starvation, and it is not a corner case; it is the normal behaviour of the naive implementation under read-heavy load, which is exactly the load this lock is for.</p>
+  <h4>The three policies</h4>
+  <ul>
+  <li><strong>Reader-preferring</strong> — admit a reader whenever no writer holds the lock. Maximum read throughput, and writers can starve indefinitely.</li>
+  <li><strong>Writer-preferring</strong> — once a writer is waiting, block new readers. Writers cannot starve; a stream of writers can starve readers.</li>
+  <li><strong>Fair (FIFO)</strong> — serve in arrival order. Neither starves, and throughput is lower because a single waiting writer stops readers from batching.</li>
+  </ul>
+  <p>There is no universally correct answer. <strong>Writer-preferring is the right default</strong>, because writes are usually rare and latency-sensitive, and a starved writer is a far worse outcome than slightly delayed readers.</p>`,
+
+  body:`<h4>Requirements</h4>
+  <p><code>acquire_read</code>, <code>release_read</code>, <code>acquire_write</code>, <code>release_write</code>, thread-safe, no starvation of writers, with context managers. Clarify: reentrant? Can a reader upgrade to a writer? Both answers have sharp edges and should be discussed rather than assumed.</p>
+  <h4>Writer-preferring implementation</h4>
+  <pre><span class="k">class</span> ReadWriteLock:
+    <span class="k">def</span> __init__(self):
+        self._lock = threading.Lock()
+        self._ok_to_read  = threading.Condition(self._lock)
+        self._ok_to_write = threading.Condition(self._lock)
+        self._readers = 0          <span class="c"># currently reading</span>
+        self._writer = <span class="k">False</span>       <span class="c"># a writer holds the lock</span>
+        self._waiting_writers = 0  <span class="c"># the key to writer preference</span>
+
+    <span class="k">def</span> acquire_read(self):
+        <span class="k">with</span> self._lock:
+            <span class="c"># yield to any waiting writer — this is the whole policy</span>
+            <span class="k">while</span> self._writer <span class="k">or</span> self._waiting_writers &gt; 0:
+                self._ok_to_read.wait()
+            self._readers += 1
+
+    <span class="k">def</span> release_read(self):
+        <span class="k">with</span> self._lock:
+            self._readers -= 1
+            <span class="k">if</span> self._readers == 0:
+                self._ok_to_write.notify()      <span class="c"># exactly one writer</span>
+
+    <span class="k">def</span> acquire_write(self):
+        <span class="k">with</span> self._lock:
+            self._waiting_writers += 1
+            <span class="k">try</span>:
+                <span class="k">while</span> self._writer <span class="k">or</span> self._readers &gt; 0:
+                    self._ok_to_write.wait()
+                self._writer = <span class="k">True</span>
+            <span class="k">finally</span>:
+                self._waiting_writers -= 1
+
+    <span class="k">def</span> release_write(self):
+        <span class="k">with</span> self._lock:
+            self._writer = <span class="k">False</span>
+            <span class="k">if</span> self._waiting_writers &gt; 0:
+                self._ok_to_write.notify()      <span class="c"># next writer first</span>
+            <span class="k">else</span>:
+                self._ok_to_read.notify_all()   <span class="c"># let the herd of readers in</span></pre>
+  <h4>The three decisions</h4>
+  <ul>
+  <li><strong><code>_waiting_writers</code> in the reader's wait predicate</strong> is the entire writer-preference policy, in one clause. Remove it and you have a reader-preferring lock with the starvation bug.</li>
+  <li><strong><code>notify</code> for writers, <code>notify_all</code> for readers.</strong> Only one writer can proceed, so waking more is waste. <em>All</em> waiting readers can proceed together, which is the point of the lock — waking one at a time would serialise them and throw away the benefit.</li>
+  <li><strong>Decrement <code>_waiting_writers</code> in a <code>finally</code>.</strong> If the wait is interrupted or times out and the counter is not decremented, readers are blocked forever by a writer that no longer exists. A permanent deadlock caused by an error path.</li>
+  </ul>
+  <h4>Extensions and their traps</h4>
+  <ul><li><strong>Upgrade (read → write)</strong> is a deadlock generator: two readers both requesting an upgrade each wait for the other to release its read lock, and neither can. Either forbid it, or allow only one designated upgradeable reader at a time.</li>
+  <li><strong>Reentrancy:</strong> a thread acquiring the read lock twice is fine <em>unless</em> a writer starts waiting in between — then the second acquire blocks on a lock the same thread already holds. Track per-thread hold counts if you must support it, and prefer to forbid it.</li>
+  <li><strong>Timed acquisition</strong> so a caller can give up rather than block indefinitely, which also makes the lock debuggable.</li></ul>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>A read-write lock is often slower than a plain mutex, and knowing when is the mark of experience.</strong> It maintains more state, so acquisition is more expensive, and the reader counter is itself a contended cache line that every reader writes to — on a many-core machine that single line ping-pongs between caches and can cost more than the critical section it protects. The win only materialises when critical sections are <em>long</em> and reads genuinely dominate. For a short read of a few fields, a plain mutex is usually faster. Measure rather than assume.</li>
+  <li><strong>Copy-on-write is frequently the better answer for read-heavy data.</strong> If writes are rare, keep an immutable structure behind an atomic reference: readers take the reference with no lock at all and no cache-line contention, and a writer builds a new copy and swaps the pointer. Readers holding the old version continue safely. Cost is the copy per write and a window where readers see slightly stale data. For a configuration map read millions of times a second and written once an hour, this is enormously better than any lock — and proposing it shows you are solving the problem rather than implementing the requested primitive.</li>
+  <li><strong>Writer preference is the default, but the decision belongs to the workload.</strong> If writers are frequent, writer preference makes readers starve instead, and you have moved the problem. If both are frequent you probably want a fair lock — or, better, to reconsider whether a read-write lock is the right tool at all, since heavy contention on both sides suggests sharding the data so that different threads touch different locks.</li>
+  <li><strong>Invariants worth asserting:</strong> readers and writer are never both non-zero; the writer flag is never true with readers greater than zero; waiting-writer count is never negative. Check them under the lock in a debug build and the classic bugs surface on the first stress test rather than in production.</li>
+  <li><strong>Test for starvation explicitly, not just for correctness.</strong> A correctness test passes on the reader-preferring implementation. The test that matters runs a continuous stream of readers with one writer and asserts the writer acquires within a bounded time. Without that test, the starvation bug ships — and it is the reason the lock was written in the first place.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A routing table is read on every request (200,000 reads/s, each holding the lock ~200 ns) and updated on config change (about 10 writes/hour, each taking ~50 µs). The team has implemented a reader-preferring read-write lock.</p>
+    <p>(a) Will the writer starve? (b) Is the read-write lock helping? (c) What would you use instead?</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Will the writer starve?</strong> Almost certainly yes, and the arithmetic shows why. Reads arrive every 5 µs on average and each holds the lock for 200 ns. For the reader count to reach zero, there must be a gap in arrivals longer than the current readers need to drain. With Poisson arrivals at 200,000/s the probability of a 200 ns window with no arrival is high in isolation — but with multiple reader threads overlapping, the count rarely hits zero, and every new arrival is admitted because the reader-preferring policy does not check for waiting writers.</p>
+    <p>In practice the writer waits an unbounded time, and the symptom is that a config change "sometimes doesn't take effect" — intermittent, unreproducible, and blamed on the config system rather than the lock. Adding the single <code>_waiting_writers &gt; 0</code> clause to the reader predicate fixes it and bounds the writer's wait to the drain time of readers already admitted.</p>
+    <p><strong>(b) Is the lock helping?</strong> Almost certainly not, and this is the more interesting answer.</p>
+    <p>The critical section is <strong>200 ns</strong>. Acquiring and releasing a read-write lock involves taking an internal mutex, checking two or three conditions, and incrementing a shared counter — plausibly 50–100 ns of uncontended work, and far more under contention. The reader counter is a single cache line written by every one of the 200,000 readers per second across every core, so it ping-pongs continuously between core caches; a cache-line transfer is on the order of 100 ns on its own.</p>
+    <p>So the lock overhead is <em>comparable to or greater than the work it protects</em>, and the coordination is worse than serialising — you have added contention on the counter in order to avoid contention on the data. A plain mutex would likely be faster here, because at least it involves one atomic operation rather than several plus condition-variable bookkeeping.</p>
+    <p><strong>(c) What to use instead: copy-on-write.</strong> The workload is 200,000 reads/s against 10 writes per <em>hour</em> — a ratio of about 72 million to one. That is the textbook case for an immutable snapshot behind an atomic reference:</p>
+    <ul>
+    <li><strong>Readers</strong> load the reference and use it. <em>No lock, no atomic write, no shared cache line being modified</em> — just a read of a pointer that stays in every core's cache. Effectively free, and perfectly scalable across cores.</li>
+    <li><strong>Writers</strong> build a complete new routing table, then atomically swap the reference. Takes 50 µs plus a copy, ten times an hour — utterly irrelevant.</li>
+    <li><strong>Readers holding the old reference</strong> continue using it safely until they finish; it is garbage-collected (or reference-counted) once nobody holds it.</li>
+    </ul>
+    <p>The cost is a brief window — bounded by the length of a read — in which some threads use the old table and some the new. For a routing table that is entirely acceptable, and it should be stated explicitly as the trade being made.</p>
+    <p><strong>The general lesson:</strong> the question "which locking policy?" was the wrong question. When reads overwhelmingly dominate and the data can be replaced wholesale, the right move is to remove the coordination rather than optimise it. A read-write lock earns its keep with <em>long</em> critical sections and a genuine mix of reads and writes; for short reads of rarely-changed data it is a pessimisation dressed as an optimisation.</p></details>`,
+
+  refs:[
+    ["docs","Readers–writers problem","The formal statement of both variants and the starvation trade-off between them.","https://en.wikipedia.org/wiki/Readers%E2%80%93writers_problem"],
+    ["docs","ReentrantReadWriteLock","Java's implementation — the class documentation is explicit about fair versus non-fair mode, upgrade being unsupported, and when the lock is not worth using.","https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/locks/ReentrantReadWriteLock.html"],
+    ["docs","Copy-on-write","The lock-free alternative for read-dominated data, and the staleness window it accepts.","https://en.wikipedia.org/wiki/Copy-on-write"],
+    ["docs","False sharing","Why a shared counter written by every reader costs more than it appears to — the cache-line effect behind the drill's answer.","https://en.wikipedia.org/wiki/False_sharing"]
+  ]},
+
+{ id:"ld20", t:"Implement deadlock-free money transfer", tag:"Concurrency", sum:"Two locks, two threads, opposite order — the classic deadlock and the three ways out.",
+  primer:`<h4>Start here — the smallest possible deadlock</h4>
+  <p>Transfer money from account A to B. You must lock both, or another thread could read a half-completed transfer. So:</p>
+  <pre><span class="k">def</span> transfer(a, b, amount):
+    <span class="k">with</span> a.lock:
+        <span class="k">with</span> b.lock:
+            a.balance -= amount
+            b.balance += amount</pre>
+  <p>Correct, and it deadlocks. Thread 1 transfers A→B and takes A's lock. Thread 2 simultaneously transfers B→A and takes B's lock. Thread 1 now waits for B; thread 2 waits for A. <strong>Neither will ever proceed.</strong> No error, no timeout, no CPU usage — the two threads are simply gone, and if those are request threads, two requests hang forever.</p>
+  <h4>The four conditions</h4>
+  <p>A deadlock requires all four of these simultaneously, and breaking <em>any one</em> prevents it:</p>
+  <ul>
+  <li><strong>Mutual exclusion</strong> — the resource cannot be shared. (Rarely removable.)</li>
+  <li><strong>Hold and wait</strong> — a thread holds one lock while requesting another.</li>
+  <li><strong>No preemption</strong> — a lock cannot be taken away from its holder.</li>
+  <li><strong>Circular wait</strong> — a cycle in the "waiting for" graph.</li>
+  </ul>
+  <p>The practical fix attacks <strong>circular wait</strong>, and it is almost embarrassingly simple.</p>
+  <h4>The answer</h4>
+  <p><strong>Impose a global ordering on locks and always acquire in that order.</strong> If every thread takes the lower-numbered account's lock first, a cycle is impossible: any two threads contending for the same pair agree on which to take first, so one of them gets both. One comparison removes an entire class of bug.</p>`,
+
+  body:`<h4>Requirements</h4>
+  <p>Transfer between accounts atomically and thread-safely, with no deadlock under any interleaving, correct under self-transfer, and detectable insufficient funds. Clarify: must a failed transfer be retryable? Are multi-account transfers (three-way) required? Both change the approach.</p>
+  <h4>Solution 1 — lock ordering (the default)</h4>
+  <pre><span class="k">class</span> Account:
+    <span class="k">def</span> __init__(self, id):
+        self.id, self.balance, self.lock = id, 0, threading.Lock()
+
+<span class="k">def</span> transfer(a, b, amount):
+    <span class="k">if</span> a.id == b.id:
+        <span class="k">raise</span> ValueError(<span class="c">"cannot transfer to self"</span>)   <span class="c"># else self-deadlock</span>
+    first, second = (a, b) <span class="k">if</span> a.id &lt; b.id <span class="k">else</span> (b, a)
+    <span class="k">with</span> first.lock:
+        <span class="k">with</span> second.lock:
+            <span class="k">if</span> a.balance &lt; amount:
+                <span class="k">raise</span> InsufficientFunds
+            a.balance -= amount
+            b.balance += amount</pre>
+  <p><strong>The self-transfer check is not decoration.</strong> Without it, <code>a</code> and <code>b</code> being the same account means acquiring the same non-reentrant lock twice from one thread, which deadlocks instantly and deterministically — a bug that shows up the first time a user transfers to themselves.</p>
+  <p><strong>Ordering by a stable identity.</strong> Use a permanent account id, not a memory address or hash, which can vary between processes or runs. If no natural ordering exists, assign every lockable object a monotonically increasing sequence number at creation.</p>
+  <h4>Solution 2 — try-lock with backoff</h4>
+  <pre><span class="k">def</span> transfer(a, b, amount, tries=100):
+    <span class="k">for</span> _ <span class="k">in</span> range(tries):
+        <span class="k">if</span> a.lock.acquire(timeout=0.001):
+            <span class="k">try</span>:
+                <span class="k">if</span> b.lock.acquire(timeout=0.001):
+                    <span class="k">try</span>:
+                        <span class="k">return</span> self._apply(a, b, amount)
+                    <span class="k">finally</span>: b.lock.release()
+            <span class="k">finally</span>: a.lock.release()
+        time.sleep(random.uniform(0, 0.001))   <span class="c"># jitter, or they re-collide</span>
+    <span class="k">raise</span> CouldNotAcquire</pre>
+  <p>Breaks <em>hold and wait</em>: if the second lock is unavailable, release the first and retry. Useful when no natural ordering exists. <strong>The random backoff is essential</strong> — without it, two threads retry in lockstep and livelock, each repeatedly grabbing and releasing, making no progress while burning CPU. That is arguably worse than a deadlock, because it looks like the system is working.</p>
+  <h4>Solution 3 — a single coarse lock</h4>
+  <p>One global lock for all transfers. Trivially deadlock-free and correct. It serialises every transfer in the system, which at low volume is entirely fine — and saying "I would start here and only shard the locking if measurement showed contention" is a legitimate, mature answer rather than a cop-out.</p>
+  <h4>Extensions</h4>
+  <ul><li><strong>Multi-account transactions:</strong> lock ordering generalises directly — sort all participating accounts by id and acquire in order. Try-lock does not generalise nearly as well.</li>
+  <li><strong>Lock striping:</strong> with millions of accounts, a lock per account is a lot of objects. Hash accounts into N locks; ordering still works on lock index, but two accounts may share a lock, so you must handle "both map to the same lock" without double-acquiring.</li>
+  <li><strong>The database version:</strong> the same problem exists in SQL, and the same fix applies — update rows in a consistent order (say, ascending primary key) or the database will detect a deadlock and abort one transaction, which you must then retry.</li></ul>`,
+
+  deep:`<h4>The senior layer</h4>
+  <ul>
+  <li><strong>Lock ordering must be a documented, enforced invariant, not a local convention.</strong> It only works if <em>every</em> code path obeys it, so one function somewhere taking B before A reintroduces the cycle. Encode it: wrap multi-lock acquisition in a single helper that sorts, and make direct <code>lock.acquire()</code> on these objects private. Some teams go further and assert lock-ordering at runtime in debug builds, tracking which locks a thread holds and failing loudly on an out-of-order acquisition — which turns a rare production deadlock into a deterministic test failure.</li>
+  <li><strong>Deadlocks are invisible in ordinary monitoring,</strong> which is why they are so damaging. The threads consume no CPU, throw nothing and log nothing; they simply stop. The service's error rate may not move at all — requests time out at the client instead. Detection therefore has to be deliberate: a watchdog that periodically checks for threads blocked beyond a threshold, lock acquisition timeouts so a wait becomes an exception rather than an eternity, and thread dumps on demand. <em>Always prefer a timed acquire in production code</em>, because a timeout converts an undiagnosable hang into a logged error with a stack trace.</li>
+  <li><strong>The atomicity requirement is what forces two locks, so question it.</strong> If transfers were modelled as an append-only ledger — insert a debit row and a credit row in one transaction — you would not lock two mutable balances at all, and balances become derived. That is the payments-ledger design, and it sidesteps this entire problem. Raising it shows you can question the premise: the deadlock is a consequence of mutable per-account state, not an inherent property of transferring money.</li>
+  <li><strong>Testing for deadlock needs stress plus a watchdog, not unit tests.</strong> Run many threads performing random transfers among a small set of accounts — a small set is essential, because it maximises contention — with a test-level timeout that fails if the run does not complete. Assert afterwards that the total balance across all accounts is unchanged, which catches both lost updates and partial transfers. Deterministic unit tests will never produce the interleaving.</li>
+  <li><strong>Know which solution to pick and why.</strong> Lock ordering when a stable ordering exists, which is nearly always — it is deterministic, has no retry loop, and has no livelock risk. Try-lock when ordering is impossible, for example when the set of resources is discovered during the operation. A single coarse lock when contention is genuinely low; complexity you do not need is its own kind of bug.</li>
+  </ul>`,
+
+  drill:`<b>Work it out</b>
+    <p>A payments service processes 500 transfers/s among 10,000 accounts. It uses per-account locks with no ordering. One account — the platform's fee account — is a party to 40% of all transfers.</p>
+    <p>(a) What is the probability of a deadlock-prone pair, and how often will it happen? (b) What is the effect of the hot fee account? (c) Fix both problems.</p>
+    <details><summary>Answer</summary>
+    <p><strong>(a) Deadlock frequency.</strong> A deadlock requires two concurrent transfers over the same pair of accounts in opposite directions, overlapping in the window between acquiring the first lock and the second — a window of perhaps a microsecond.</p>
+    <p>For two random accounts out of 10,000 the chance of any given pair colliding is minuscule. But the calculation that matters is not per-pair, it is over time: with 500 transfers/s over months, a rare interleaving is a certainty. This is the defining characteristic of the bug — <strong>it is vanishingly unlikely in testing and inevitable in production</strong>, so it surfaces as an unexplained hang weeks after release, typically under peak load when the windows widen.</p>
+    <p>And the fee account changes the arithmetic completely. 40% of 500/s = 200 transfers/s touch it, so at any moment there are typically several concurrent transfers involving that one account, many in opposite directions (fees in, payouts out). The pair (fee_account, X) and (X, fee_account) now collide frequently rather than rarely — <strong>deadlocks go from a monthly mystery to a daily incident.</strong></p>
+    <p><strong>(b) The hot account has a second, separate problem.</strong> Even with deadlocks fixed, every one of those 200 transfers/s must serialise on the fee account's single lock. If a transfer holds it for 50 µs, the maximum throughput through that lock is 20,000/s — fine at 200/s, but the lock is now a global serialisation point and any increase in critical-section duration (a slow disk write, a log line, a network call inside the lock) directly caps the whole platform. <em>Never do I/O inside a lock</em> is the practical rule this illustrates.</p>
+    <p><strong>(c) The fixes.</strong></p>
+    <ul>
+    <li><strong>Lock ordering by account id</strong> — one comparison, eliminates deadlock entirely and deterministically. Do this first; it is free.</li>
+    <li><strong>Enforce it structurally:</strong> a single <code>with_accounts_locked(*accounts)</code> helper that sorts and acquires, with direct lock access made private. A convention that lives in developers' heads will be violated.</li>
+    <li><strong>Timed acquisition</strong> so that even if something slips through, a thread raises after a second rather than hanging forever — and logs a stack trace identifying the participants.</li>
+    <li><strong>Shard the hot account.</strong> Split the fee account into N sub-accounts (<code>fee_00</code> … <code>fee_15</code>), pick one at random per transfer, and treat the logical balance as their sum. Contention drops by a factor of N, and the sum is computed on read. This is the same hot-key fix as the cache, the partitioned log and the feed — worth naming as the recurring pattern it is.</li>
+    <li><strong>Or remove the mutable balance entirely</strong> — an append-only ledger with derived balances has no per-account lock to contend on, because appends to different rows do not conflict. This is the structurally best answer and the largest change.</li>
+    </ul>
+    <p><strong>What to say in the interview:</strong> lead with lock ordering because it is correct and costs one line, then immediately point out that ordering fixes the deadlock but not the contention, and that the hot account needs sharding or a different data model. Recognising that there are <em>two</em> problems here — a correctness bug and a scalability bottleneck, with different fixes — is what the question is designed to surface.</p></details>`,
+
+  refs:[
+    ["docs","Deadlock","The four Coffman conditions, and the standard prevention strategies mapped to each.","https://en.wikipedia.org/wiki/Deadlock"],
+    ["docs","Dining philosophers problem","The same circular-wait structure as a teaching problem, with the resource-hierarchy solution that lock ordering generalises.","https://en.wikipedia.org/wiki/Dining_philosophers_problem"],
+    ["docs","PostgreSQL: explicit locking and deadlock detection","How a database handles the same problem — detection and victim abort rather than prevention — and why you must order your updates anyway.","https://www.postgresql.org/docs/current/explicit-locking.html"],
+    ["docs","Lock (computer science)","Granularity, striping and the trade-offs between coarse and fine-grained locking.","https://en.wikipedia.org/wiki/Lock_(computer_science)"]
+  ]}
+
+);

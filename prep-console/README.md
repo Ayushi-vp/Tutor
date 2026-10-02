@@ -88,12 +88,13 @@ The app must be running and this PC awake. To keep it running without a terminal
 .\scripts\windows-task.ps1 -Install              # starts at sign-in, restarts if it crashes
 .\scripts\windows-task.ps1 -Install -AtStartup   # starts at boot instead (run as admin)
 .\scripts\windows-task.ps1 -Status
+.\scripts\windows-task.ps1 -Restart              # after changing .env or pulling new code
 .\scripts\windows-task.ps1 -Uninstall
 ```
 
 This also schedules a nightly backup at 03:00. Logs go to `logs\app.log` and `logs\backup.log`.
-After changing `.env` or pulling new code, run `.\start.ps1` once to rebuild, then restart the task
-(`Stop-ScheduledTask PrepConsole; Start-ScheduledTask PrepConsole`).
+If the app exits, the task starts it again after 10 seconds. Do not also run `.\start.ps1` in a terminal
+while the task is installed: both need port 5000.
 
 ### Backups
 

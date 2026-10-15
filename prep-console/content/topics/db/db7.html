@@ -1,0 +1,593 @@
+<!-- topic source for db/db7; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "db7",
+  "t": "Query processing: parsing, join algorithms, the cost-based optimizer and EXPLAIN",
+  "tag": "Internals",
+  "sum": "What happens between sending SQL and getting rows: parsing, rewriting, the iterator execution model, nested-loop, hash and merge joins with their costs worked for real table sizes, cardinality estimation and why it is the optimizer's weak spot, join-order search, and how to read an EXPLAIN ANALYZE plan line by line.",
+  "prereq": [
+    [
+      "db3",
+      "Logical processing order; inner, outer, semi- and anti-joins; GROUP BY and aggregates."
+    ],
+    [
+      "db6",
+      "Composite, covering and partial indexes; index, index-only and bitmap scans; the planner uses statistics such as selectivity and correlation."
+    ],
+    [
+      "db1",
+      "Relational algebra: selection, projection and join compose, and equivalence rules such as pushing selections below joins let a system rewrite queries."
+    ]
+  ],
+  "myths": [
+    [
+      "The database runs my query the way I wrote it.",
+      "SQL says what result you want; the optimizer chooses the join order, the join algorithms, which indexes to use and where to filter. Two queries that look very different often produce the same plan, and the same query can get a different plan tomorrow if statistics change."
+    ],
+    [
+      "Hash joins are always faster than nested loops.",
+      "A nested loop with an index on the inner side is the best plan when the outer side has a handful of rows: each probe is a few page reads and no hash table is built. Hash joins win when both sides are large. The disaster case is a nested loop chosen because the optimizer thought the outer side had 10 rows when it really had 10 million."
+    ],
+    [
+      "EXPLAIN shows how long the query will take.",
+      "Plain EXPLAIN shows estimates in arbitrary cost units based on statistics; it never runs the query. EXPLAIN ANALYZE runs it and shows actual times and row counts next to the estimates, which is where problems become visible. Comparing estimated rows with actual rows at each node is the single most useful diagnostic."
+    ],
+    [
+      "If the optimizer picks a bad plan, the cost model is wrong.",
+      "Research on real workloads, notably Leis et al. (2015), found the cost model matters much less than cardinality estimates, which are routinely wrong by orders of magnitude in multi-join queries. Most bad plans come from wrong row-count estimates caused by stale statistics, correlated columns or complex predicates."
+    ],
+    [
+      "Adding more RAM to work_mem makes every query faster.",
+      "work_mem is per sort or hash operation, per query, per connection; a query with five hash joins can use five times work_mem, and 200 connections can multiply that. Raising it globally risks running out of memory; raise it for the session or role that runs the heavy analytical query."
+    ]
+  ],
+  "recap": [
+    "A query is parsed into a tree, analysed against the catalog, rewritten (views expanded, subqueries flattened), planned by a cost-based optimizer, and executed as a tree of operators that pull rows from their children.",
+    "A nested-loop join compares each outer row with the inner side; with an index on the inner join column it costs one index probe per outer row and is ideal when the outer side is small.",
+    "A hash join builds a hash table on the smaller input and probes it with the larger, costing roughly one pass over each when the table fits in memory, and spilling to disk in partitions when it does not.",
+    "A merge join walks two inputs sorted on the join key in step; it is cheap when both are already sorted, for example from indexes, and otherwise pays for the sorts.",
+    "The optimizer estimates each plan's cost from table statistics (row counts, distinct values, most common values, histograms, correlation) and picks the cheapest; it searches join orders with dynamic programming and falls back to heuristics for very many tables.",
+    "Cardinality estimation multiplies selectivities assuming independence, so correlated predicates and multi-join queries produce large errors, which are the main cause of bad plans.",
+    "EXPLAIN ANALYZE shows, per node, the estimated cost and rows and the actual time, rows and loops; read it bottom-up and look for the first node where estimated and actual rows diverge.",
+    "Fixes for bad plans are, in order: refresh or extend statistics, rewrite the query or add the right index, and only then planner settings for a session."
+  ],
+  "glossary": [
+    [
+      "ANALYZE (statistics)",
+      "The command that samples a table and stores per-column statistics for the planner; run automatically by autovacuum in PostgreSQL."
+    ],
+    [
+      "Build side / probe side",
+      "In a hash join, the input loaded into the hash table (ideally the smaller) and the input streamed through it."
+    ],
+    [
+      "Cardinality estimate",
+      "The planner's prediction of how many rows an operator will output."
+    ],
+    [
+      "Cost (planner units)",
+      "An abstract number combining estimated page reads and CPU work; only comparable between plans of the same query."
+    ],
+    [
+      "Dynamic programming (join ordering)",
+      "Building the best plan for every subset of tables from the best plans of smaller subsets, as introduced by System R."
+    ],
+    [
+      "EXPLAIN / EXPLAIN ANALYZE",
+      "Commands that show the chosen plan with estimates, or run the query and add actual times and row counts."
+    ],
+    [
+      "GEQO",
+      "PostgreSQL's genetic query optimizer, used instead of exhaustive search when a query has 12 or more FROM items by default."
+    ],
+    [
+      "Grace hash join",
+      "A hash join that partitions both inputs to disk by hash so each partition pair fits in memory, then joins partition by partition."
+    ],
+    [
+      "Hash join",
+      "A join that builds a hash table on one input's join key and looks up each row of the other input in it."
+    ],
+    [
+      "HashAggregate / GroupAggregate",
+      "The two GROUP BY strategies: a hash table of groups updated per row, or a walk over input sorted by the grouping key."
+    ],
+    [
+      "Histogram",
+      "A statistic dividing a column's values into buckets of equal row counts, used to estimate range selectivity."
+    ],
+    [
+      "Interesting order",
+      "A row order produced by an access path that a later step can use, such as an order matching ORDER BY or a merge join key (Selinger, 1979)."
+    ],
+    [
+      "Iterator (Volcano) model",
+      "An execution model where each operator offers a next-row call and pulls rows from its children on demand."
+    ],
+    [
+      "Merge join",
+      "A join that walks two inputs sorted on the join key in parallel, matching equal keys."
+    ],
+    [
+      "Most common values (MCV)",
+      "A per-column list of the most frequent values and their frequencies, used for equality selectivity."
+    ],
+    [
+      "Nested-loop join",
+      "A join that, for each outer row, searches the inner input for matches, by scanning it or probing an index."
+    ],
+    [
+      "ORM",
+      "Object-relational mapper: a library that maps database rows to program objects and generates SQL (db13)."
+    ],
+    [
+      "Parse tree",
+      "The structured representation of a SQL statement produced by the parser."
+    ],
+    [
+      "Pipelining",
+      "Passing rows from one operator to the next as they are produced, without storing the whole intermediate result."
+    ],
+    [
+      "Plan cache / prepared statement",
+      "Reusing a planned query for many executions with different parameter values, saving planning time."
+    ],
+    [
+      "Selectivity",
+      "The fraction of rows that satisfy a condition, between 0 and 1."
+    ],
+    [
+      "Top-N heapsort",
+      "A sort used under ORDER BY ... LIMIT n that keeps only the best n rows in a small heap instead of sorting everything."
+    ],
+    [
+      "work_mem",
+      "PostgreSQL's memory limit per sort or hash operation before it spills to temporary files."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Describe the three main join algorithms in one sentence each.",
+      "A nested-loop join takes each outer row and looks for matches in the inner input, ideally through an index. A hash join builds a hash table on the smaller input's join key and probes it with every row of the larger input. A merge join walks two inputs that are sorted on the join key side by side, matching equal keys."
+    ],
+    [
+      "E",
+      "What is the difference between EXPLAIN and EXPLAIN ANALYZE?",
+      "EXPLAIN shows the plan the optimizer would use with its estimated costs and row counts, without running the query. EXPLAIN ANALYZE executes the query and adds actual time, actual rows and loop counts per node, so you can compare estimates to reality; be careful running it on INSERT, UPDATE or DELETE, since they really execute (wrap them in a transaction you roll back)."
+    ],
+    [
+      "E",
+      "What does a query optimizer do?",
+      "It turns the parsed query into many equivalent plans, choosing join order, join algorithms and access paths, estimates the cost of each from table statistics, and picks the cheapest. Because SQL is declarative, this is what lets the same query stay fast as data and indexes change."
+    ],
+    [
+      "M",
+      "When is a nested-loop join the best choice?",
+      "When the outer input is small and the inner input has an index on the join column: cost is roughly outer rows times a few page reads per probe, with no build phase and immediate first rows, which also suits LIMIT queries. For 10 outer rows and a 10-million-row inner table with an index, that is about 40 page reads, while a hash join would scan the whole inner table.",
+      "Follow-up: What happens if the estimate of 10 outer rows was wrong and there are 2 million? — The plan does 2 million index probes, usually random reads, and can run thousands of times slower than a hash join; this misestimate is the classic cause of sudden query slowdowns."
+    ],
+    [
+      "M",
+      "Estimate the cost of joining orders (1,000 pages) with customers (500 pages) using a block nested loop, a hash join and a sort-merge join with 102 buffer pages.",
+      "Block nested loop with 100 outer pages per block: 1,000 + (1,000 / 100) × 500 = 6,000 page reads. Hash join: customers do not fit in 100 pages, so partition both (read and write each once) then join (read each again): 3 × 1,500 = 4,500. Sort-merge: sorting each in two passes costs about 2 × 2 × 1,500 = 6,000, plus a 1,500-page merge, about 7,500, but only 1,500 if both are already sorted by the key.",
+      "Follow-up: How do these change if customers fit in memory? — The hash join becomes one read of each, 1,500 pages, which is why hash joins dominate when the build side fits in work_mem."
+    ],
+    [
+      "M",
+      "Why does the optimizer care about row-count estimates more than anything else?",
+      "Every choice depends on them: whether an index scan beats a sequential scan, which table is the hash build side, whether a nested loop is affordable, and the join order. A cost formula with the wrong input picks confidently wrong plans. Leis et al. showed that cardinality errors, not cost-model errors, explain most slow plans in realistic multi-join queries."
+    ],
+    [
+      "M",
+      "How does PostgreSQL estimate the rows for WHERE city = 'Pune' AND state = 'MH'?",
+      "It estimates each condition separately from statistics, using the most-common-values list or histogram (for example 1% for Pune and 10% for MH), then multiplies them assuming independence: 0.1%. Because every Pune row is in MH, the true answer is 1%, a tenfold underestimate. CREATE STATISTICS with dependencies on (city, state) teaches the planner the correlation."
+    ],
+    [
+      "M",
+      "Read this plan line: Hash Join (cost=226.23..709.73 rows=100 width=488) (actual time=0.515..2.920 rows=100 loops=1).",
+      "The planner estimated a startup cost of 226 (the cost before the first row, mostly building the hash table) and a total cost of 710 units, 100 output rows of 488 bytes each. Actually the first row came after 0.5 ms, the last after 2.9 ms, and 100 rows were produced in one execution. Estimate and actual rows match, so this node was planned with good information."
+    ],
+    [
+      "M",
+      "A query does ORDER BY created_at LIMIT 10 with a filter on a rare status and is very slow. What might the plan be doing?",
+      "It may be walking an index on created_at in order, expecting to find ten matching rows quickly because it assumes matches are spread evenly; if the rare status rows are all old, it reads almost the whole index before finding ten. The fix is a composite index (status, created_at), or a partial index on created_at for that status, so the filter and the order are served together."
+    ],
+    [
+      "H",
+      "How does the optimizer search join orders, and what happens with 20 tables?",
+      "PostgreSQL, following System R, uses dynamic programming: compute the best plan for each single table, then each pair, then each triple built from the best smaller plans, keeping the cheapest per subset (and per interesting order). The number of subsets grows exponentially, so at geqo_threshold (12 FROM items by default) PostgreSQL switches to a genetic search; and from_collapse_limit and join_collapse_limit (8 by default) stop it from reordering beyond that many items, so join order in the SQL text starts to matter.",
+      "Follow-up: How would you help a 20-table query? — Precompute stable parts in a materialized view or CTE with MATERIALIZED, reduce joins that only filter into EXISTS, and check that the joins it keeps are on indexed keys with good estimates."
+    ],
+    [
+      "H",
+      "A report query became 100x slower after a large data load, with no code change. How do you investigate?",
+      "Get the current plan with EXPLAIN (ANALYZE, BUFFERS) and compare it with the old one if pg_stat_statements or auto_explain recorded it. Look for the lowest node where estimated rows differ wildly from actual rows: after a bulk load, statistics are stale until ANALYZE runs, so the planner may still think a table is small and choose a nested loop. Run ANALYZE on the loaded tables; if the estimate is still wrong, consider extended statistics or a higher statistics target for the skewed column.",
+      "Follow-up: How do you prevent it? — Run ANALYZE as the last step of every bulk load, and monitor last_analyze and n_mod_since_analyze in pg_stat_user_tables."
+    ],
+    [
+      "H",
+      "Why can a prepared statement be slower than the same query sent as plain text?",
+      "PostgreSQL plans a prepared statement with the actual parameters for its first five executions, then may switch to a generic plan that ignores parameter values if that looks no more expensive on average. For skewed data, the generic plan can be terrible for some values, such as a tenant with 10 million rows using a plan built for typical tenants with 100. plan_cache_mode = force_custom_plan, or per-tenant query shapes, avoid it."
+    ],
+    [
+      "H",
+      "Your app's 'similar documents' query joins a vector search result (top 50) to documents and permissions tables. What plan do you want and how do you make sure you get it?",
+      "The vector search should run first and produce about 50 rows, then nested-loop joins with index probes into documents and permissions by primary key, so the whole query touches a few hundred pages. Check with EXPLAIN ANALYZE that the planner estimates about 50 rows from the vector step; if it misestimates and chooses hash joins over the full permissions table, write the vector search as a CTE with LIMIT (or MATERIALIZED) so its row count is fixed, and make sure the join keys are indexed."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "PostgreSQL — Using EXPLAIN",
+      "Every plan node type and the meaning of cost, rows, width, actual time and loops, with real plans including the hash join used here.",
+      "https://www.postgresql.org/docs/current/using-explain.html"
+    ],
+    [
+      "paper",
+      "Selinger et al. — Access Path Selection in a Relational Database Management System (SIGMOD 1979)",
+      "The System R optimizer: selectivity factors, cost formulas, interesting orders and dynamic-programming join ordering.",
+      "https://courses.cs.duke.edu/compsci516/cps216/spring03/papers/selinger-etal-1979.pdf"
+    ],
+    [
+      "paper",
+      "Leis et al. — How Good Are Query Optimizers, Really? (VLDB 2015)",
+      "The Join Order Benchmark: 113 queries on IMDB data show cardinality estimates are routinely off by orders of magnitude.",
+      "https://www.vldb.org/pvldb/vol9/p204-leis.pdf"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Statistics Used by the Planner",
+      "Most common values, histograms, n_distinct, correlation and extended statistics.",
+      "https://www.postgresql.org/docs/current/planner-stats.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Query Planning configuration",
+      "random_page_cost, work_mem-related settings, join_collapse_limit, from_collapse_limit and geqo_threshold.",
+      "https://www.postgresql.org/docs/current/runtime-config-query.html"
+    ],
+    [
+      "docs",
+      "SQLite — EXPLAIN QUERY PLAN",
+      "How SQLite reports scans, searches, automatic indexes and Bloom filters, as used in the lab.",
+      "https://www.sqlite.org/eqp.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A reporting query at a mid-sized company ran in 300 milliseconds every morning for a year. One Monday it took 40 minutes, and the dashboard timed out. Nothing had been deployed. The query text was identical. The data had grown by a weekend's worth of rows, about 2%. What changed was a single decision made inside the database: which of two tables to read first, and how to join them.</p>
+<p>Over the weekend a bulk import had loaded a few million rows into one table, and the statistics the database keeps about that table had not been refreshed. The database still believed a filter on it would match about ten rows. With ten rows, the best strategy is obvious: for each of the ten, look up its partners through an index, a few page reads each. So it chose that strategy. In reality the filter matched two million rows, and two million index lookups, most of them random reads, took 40 minutes. A different strategy, building a hash table on one side and streaming the other side through it, would have taken under a second.</p>
+<p>This is the hidden half of SQL. Because SQL is declarative (db3), the database must decide <em>how</em> to compute every result: the order in which to join tables, the algorithm for each join, which index to use, when to sort. That decision is made by the <strong>query optimizer</strong>, a component that has been refined since IBM's System R in the late 1970s, and it is made from estimates. When the estimates are right, the optimizer is astonishingly good. When they are wrong, it picks plans that are wrong by factors of thousands, and the query text gives no hint why.</p>
+<p>This lesson follows a query through the database: parsing, rewriting, planning and execution. It explains the three join algorithms with their costs worked out for real table sizes, how the optimizer estimates row counts and searches join orders, why estimation is its weak spot (a 2015 study of production-grade optimizers found estimates routinely off by orders of magnitude), and how to read <code>EXPLAIN ANALYZE</code> output, which is the skill that actually resolves incidents like the one above.</p>
+</section>
+
+<section data-field="primer">
+<h4>From text to rows in four steps</h4>
+<p>When a database receives <code>SELECT …</code>, it does four things. It <strong>parses</strong> the text into a tree that reflects the grammar (this SELECT list, these FROM items, this WHERE condition), rejecting syntax errors. It <strong>analyses</strong> the tree against the catalog: do these tables and columns exist, what are their types, which function does this name refer to. It <strong>rewrites</strong> the tree: views are expanded into their definitions, some subqueries are flattened into joins, constant expressions are folded. Then it <strong>plans</strong>: it considers many physical ways to compute the result, estimates the cost of each, and picks the cheapest. Finally it <strong>executes</strong> the chosen plan.</p>
+<figure>
+<svg viewBox="0 0 640 210" width="100%" role="img" aria-label="Query processing pipeline: SQL text to parser, analyzer, rewriter, planner using statistics, executor producing rows">
+  <defs><marker id="db7-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="40" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="66" text-anchor="middle" style="fill:var(--ink)">SQL text</text>
+    <rect x="130" y="40" width="90" height="44" rx="6" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="175" y="60" text-anchor="middle" style="fill:var(--ink);font-weight:600">parse</text>
+    <text x="175" y="76" text-anchor="middle" style="fill:var(--ink-2)">syntax tree</text>
+    <rect x="250" y="40" width="100" height="44" rx="6" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="300" y="60" text-anchor="middle" style="fill:var(--ink);font-weight:600">analyse +</text>
+    <text x="300" y="76" text-anchor="middle" style="fill:var(--ink);font-weight:600">rewrite</text>
+    <rect x="380" y="40" width="110" height="44" rx="6" style="fill:var(--accent);fill-opacity:.14;stroke:var(--accent)"/>
+    <text x="435" y="60" text-anchor="middle" style="fill:var(--ink);font-weight:600">plan</text>
+    <text x="435" y="76" text-anchor="middle" style="fill:var(--ink-2)">enumerate + cost</text>
+    <rect x="520" y="40" width="110" height="44" rx="6" style="fill:var(--s3);fill-opacity:.14;stroke:var(--s3)"/>
+    <text x="575" y="60" text-anchor="middle" style="fill:var(--ink);font-weight:600">execute</text>
+    <text x="575" y="76" text-anchor="middle" style="fill:var(--ink-2)">operator tree</text>
+    <line x1="100" y1="62" x2="128" y2="62" marker-end="url(#db7-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="220" y1="62" x2="248" y2="62" marker-end="url(#db7-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="350" y1="62" x2="378" y2="62" marker-end="url(#db7-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="490" y1="62" x2="518" y2="62" marker-end="url(#db7-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="250" y="130" width="100" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="300" y="155" text-anchor="middle" style="fill:var(--ink)">catalog</text>
+    <rect x="380" y="130" width="110" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="435" y="148" text-anchor="middle" style="fill:var(--ink)">statistics</text>
+    <text x="435" y="163" text-anchor="middle" style="fill:var(--muted)">rows, MCVs, histograms</text>
+    <line x1="300" y1="130" x2="300" y2="86" marker-end="url(#db7-arrow)" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <line x1="435" y1="130" x2="435" y2="86" marker-end="url(#db7-arrow)" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <line x1="630" y1="84" x2="630" y2="120" marker-end="url(#db7-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="575" y="138" text-anchor="middle" style="fill:var(--ink)">rows</text>
+    <text x="10" y="200" style="fill:var(--muted)">Only the planner consults statistics, and only its decisions change from day to day for the same text.</text>
+  </g>
+</svg>
+<figcaption>The highlighted step is where performance is decided. Parsing and rewriting are deterministic; planning depends on statistics, which drift as data changes, which is why a query can slow down with no code change.</figcaption>
+</figure>
+<h4>The planner as a route planner</h4>
+<p>A good analogy for the planner is a satellite navigation system. You give it a destination (the result), not a route. It knows the road network (tables, indexes, join algorithms) and has estimates of traffic on each road (how many rows each step will produce). It enumerates candidate routes, estimates the total time for each and picks the fastest. When its traffic estimates are good, it picks routes better than most humans would. When its estimates are wrong, say it believes a motorway is clear when it is jammed, it confidently sends you into the jam, and the route it picked was "optimal" for the world it believed in.</p>
+<p>The analogy also explains the main tools for fixing bad plans. Better traffic data (refreshed or richer statistics) fixes most problems at the source. New roads (indexes) give the planner better options. And as a last resort you can forbid a road (planner settings that disable an algorithm for a session), which is like telling the satnav to avoid motorways: occasionally necessary, usually a sign the real problem is the data it is working from.</p>
+<h4>Plans are trees of operators</h4>
+<p>The chosen plan is a tree. Leaves read data: a sequential scan of a table, an index scan, a bitmap scan (db6). Inner nodes transform rows: filter, join, sort, aggregate, limit. The root produces the result. Execution in most databases follows the <strong>iterator model</strong> (also called Volcano): the root asks its child for a row, that child asks its own children, and so on, so rows flow upward one at a time, on demand. This is why <code>LIMIT 10</code> can stop a huge plan early, and why some operators (a sort, the build phase of a hash join) are "blocking": they must consume their entire input before producing a first row. <code>EXPLAIN</code> prints this tree, indented, with the root at the top.</p>
+<h4>What you control</h4>
+<p>As an engineer you never pick the plan directly in PostgreSQL, but you control every input to it. You control the <em>query</em>: how predicates are written (sargable or not), whether a semi-join is expressed as EXISTS, whether a large aggregation happens before or after a join. You control the <em>physical design</em>: which indexes exist, whether a table is partitioned, how columns are typed. You control the <em>statistics</em>: when ANALYZE runs, how detailed the statistics are, and whether the planner knows about correlated columns. And you control a few <em>settings</em>: memory per operation, the relative cost of random reads. The rest of this lesson explains how each input feeds the decision, so that when a plan goes wrong you can tell which input to change.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Parsing, analysis and rewriting</h4>
+<p>The <strong>parser</strong> checks the grammar and builds a <strong>parse tree</strong>; a missing comma fails here, before any table is examined. The <strong>analyser</strong> resolves names against the catalog: <code>orders</code> becomes a specific table with an internal id, <code>o.amount</code> becomes column 3 of type integer, <code>sum(o.amount)</code> becomes the integer-sum aggregate. Type errors and unknown columns fail here.</p>
+<p>The <strong>rewriter</strong> transforms the tree into an equivalent but more plannable form. Views are replaced by their defining query, so a query over a view is planned as a query over the underlying tables (which is why views normally cost nothing at run time). Simple subqueries in FROM are pulled up into the main join tree; <code>IN</code> and <code>EXISTS</code> subqueries become semi-joins, and <code>NOT EXISTS</code> becomes an anti-join (db3); CTEs referenced once are inlined in PostgreSQL 12+ (db4). Constant expressions such as <code>now() - interval '1 day'</code> are evaluated once. Outer joins are simplified to inner joins when a WHERE condition makes the NULL-padded rows impossible, which is the db3 ON-versus-WHERE trap seen from the planner's side. The output is a tree of relational algebra (db1): scans, selections, projections, joins and aggregates in no particular physical form yet.</p>
+
+<h4>2. The nested-loop join</h4>
+<p>Physical join algorithms are where most of the cost lives, so take them one at a time, with two concrete tables: <code>orders</code> with 100,000 rows in 1,000 pages, and <code>customers</code> with 40,000 rows in 500 pages, joined on <code>orders.customer_id = customers.id</code>. Costs are in page reads, the traditional unit.</p>
+<p>A <strong>nested-loop join</strong> takes each row of the <em>outer</em> input and searches the <em>inner</em> input for matches. Its cost depends entirely on how that search is done.</p>
+<ul>
+<li><strong>Naive, row at a time</strong>: for each of 100,000 orders, scan all 500 customer pages. 1,000 + 100,000 × 500 = 50,001,000 page reads. Nobody does this on purpose.</li>
+<li><strong>Page at a time</strong>: for each orders page, scan customers once and compare all pairs of rows between the two pages: 1,000 + 1,000 × 500 = 501,000.</li>
+<li><strong>Block nested loop</strong>: load as many outer pages as memory allows, say 100 with 102 buffer pages, and scan the inner input once per block: 1,000 + (1,000 / 100) × 500 = 6,000.</li>
+<li><strong>Index nested loop</strong>: if <code>customers.id</code> has an index (it does: it is the primary key), each order probes the index: about 3-4 page reads per probe, of which the upper levels are cached, so roughly 1-2 real reads. 1,000 + 100,000 × ~1.5 ≈ 151,000 reads, many random. Worse than a hash join for the full table, but now suppose a filter leaves only 50 orders: 50 × ~1.5 ≈ 75 reads plus finding the 50 orders. Nothing beats that.</li>
+</ul>
+<p>So nested loops are either terrible or ideal, depending on the size of the outer input. They are ideal for small outer inputs with an indexed inner side, which is the shape of most OLTP queries ("this user's 20 orders with their products"). They also produce their first row immediately, which suits <code>LIMIT</code>. They are the only algorithm that works for arbitrary join conditions such as <code>a.ts BETWEEN b.start AND b.end</code>, since hash and merge joins need an equality condition. And they are the algorithm behind the opening story: correct for ten outer rows, catastrophic for two million.</p>
+
+<h4>3. The hash join</h4>
+<p>A <strong>hash join</strong> runs in two phases. In the <strong>build</strong> phase it reads the smaller input, the <em>build side</em>, and inserts every row into an in-memory hash table keyed on the join column. In the <strong>probe</strong> phase it reads the larger input, the <em>probe side</em>, and for each row computes the hash of its join key and looks up matching rows in the table. Each input is read once.</p>
+<p>If the build side fits in memory (PostgreSQL's limit is <code>work_mem</code> times a multiplier, per hash operation), the cost is one read of each: 500 + 1,000 = 1,500 page reads. If it does not fit, the classic solution is the <strong>Grace hash join</strong>: first partition both inputs by a hash of the join key into, say, 20 partition files each, so that matching rows always land in partition files with the same number; then join each pair of partitions in memory. Each input is read, written and read again: 3 × (1,000 + 500) = 4,500 page reads. PostgreSQL reports this as <code>Batches: N</code> greater than 1 in EXPLAIN ANALYZE; seeing many batches is a sign the hash table spilled to disk and that more <code>work_mem</code> for that query would help.</p>
+<p>Hash joins need an equality join condition, have a blocking build phase (no rows come out until the build side has been read entirely), and lose any ordering of the inputs. They are the workhorse of analytical queries joining large tables, and they are robust: their cost is roughly linear in input size whatever the selectivity. That robustness is why the Leis study found engines that rely on hash joins and full scans tolerate bad estimates far better than those that lean on index nested loops.</p>
+
+<h4>4. The merge join</h4>
+<p>A <strong>merge join</strong> needs both inputs sorted on the join key. It then walks them together like the merge step of merge sort: compare the current keys; advance whichever side is smaller; on equality, output the matching pairs (handling runs of duplicate keys by remembering where the run started on one side). Once sorted, the join itself reads each input once: 1,500 page reads.</p>
+<p>The cost question is the sort. If both inputs come from indexes in join-key order, or one was already sorted by an earlier step, the sort is free and the merge join is very cheap and pipelined. Otherwise each input is sorted, and an external sort of data larger than memory takes passes: with 100 pages of memory, sorting 1,000 pages needs one pass to create sorted runs and one pass to merge them, reading and writing everything each time, about 2 × 2 × 1,000 = 4,000 for orders and 2,000 for customers, so the whole sort-merge is about 7,500. Merge joins also emit rows in join-key order, which a later ORDER BY or GROUP BY on that key can use. Selinger's 1979 paper called such useful orderings <strong>interesting orders</strong> and made the optimizer keep the cheapest plan for each one, rather than only the overall cheapest, precisely so that a slightly more expensive sorted plan can win when a later step needs the order.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Three join algorithms side by side: nested loop probing an index per outer row, hash join building a table on the small side and probing with the large, merge join walking two sorted inputs in step">
+  <defs><marker id="db7-j" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Index nested loop</text>
+    <rect x="20" y="35" width="70" height="120" rx="4" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="55" y="100" text-anchor="middle" style="fill:var(--ink)">outer</text>
+    <polygon points="160,40 120,100 200,100" style="fill:var(--s2);fill-opacity:.12;stroke:var(--s2)"/>
+    <text x="160" y="88" text-anchor="middle" style="fill:var(--ink)">index</text>
+    <line x1="90" y1="55" x2="130" y2="75" marker-end="url(#db7-j)" style="fill:none;stroke:var(--accent)"/>
+    <line x1="90" y1="85" x2="130" y2="85" marker-end="url(#db7-j)" style="fill:none;stroke:var(--accent)"/>
+    <line x1="90" y1="115" x2="130" y2="95" marker-end="url(#db7-j)" style="fill:none;stroke:var(--accent)"/>
+    <text x="20" y="180" style="fill:var(--ink-2)">one probe per outer row</text>
+    <text x="20" y="198" style="fill:var(--ink-2)">cost ≈ outer × probe</text>
+    <text x="20" y="216" style="fill:var(--good)">best: few outer rows</text>
+    <text x="230" y="20" style="fill:var(--ink);font-weight:600">Hash join</text>
+    <rect x="230" y="35" width="60" height="60" rx="4" style="fill:var(--s3);fill-opacity:.12;stroke:var(--s3)"/>
+    <text x="260" y="70" text-anchor="middle" style="fill:var(--ink)">build</text>
+    <line x1="290" y1="65" x2="318" y2="65" marker-end="url(#db7-j)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="320" y="40" width="80" height="50" rx="4" style="fill:var(--accent);fill-opacity:.12;stroke:var(--accent)"/>
+    <text x="360" y="62" text-anchor="middle" style="fill:var(--ink)">hash</text>
+    <text x="360" y="78" text-anchor="middle" style="fill:var(--ink)">table</text>
+    <rect x="230" y="105" width="60" height="70" rx="4" style="fill:var(--s4);fill-opacity:.12;stroke:var(--s4)"/>
+    <text x="260" y="145" text-anchor="middle" style="fill:var(--ink)">probe</text>
+    <line x1="290" y1="135" x2="345" y2="92" marker-end="url(#db7-j)" style="fill:none;stroke:var(--accent)"/>
+    <text x="230" y="198" style="fill:var(--ink-2)">read each side once</text>
+    <text x="230" y="216" style="fill:var(--good)">best: large inputs, equality</text>
+    <text x="440" y="20" style="fill:var(--ink);font-weight:600">Merge join</text>
+    <g style="font-family:var(--mono)">
+      <text x="450" y="50" style="fill:var(--ink)">1 3 3 5 8</text>
+      <text x="450" y="110" style="fill:var(--ink)">1 2 3 5 9</text>
+    </g>
+    <text x="580" y="50" style="fill:var(--muted)">A sorted</text>
+    <text x="580" y="110" style="fill:var(--muted)">B sorted</text>
+    <line x1="455" y1="58" x2="455" y2="96" style="fill:none;stroke:var(--accent)"/>
+    <line x1="485" y1="58" x2="490" y2="96" style="fill:none;stroke:var(--accent)"/>
+    <line x1="500" y1="58" x2="490" y2="96" style="fill:none;stroke:var(--accent)"/>
+    <line x1="515" y1="58" x2="508" y2="96" style="fill:none;stroke:var(--accent)"/>
+    <text x="440" y="180" style="fill:var(--ink-2)">walk both in step</text>
+    <text x="440" y="198" style="fill:var(--ink-2)">sort first if needed</text>
+    <text x="440" y="216" style="fill:var(--good)">best: inputs already sorted</text>
+    <text x="20" y="242" style="fill:var(--muted)">Lab, 200,000 × 5,000 rows: nested loop ≈ 57 s (extrapolated), hash 64 ms, merge with sorts 203 ms.</text>
+  </g>
+</svg>
+<figcaption>Each algorithm wins in a different regime. The planner's job is to recognise the regime from row estimates, which is why an estimate that is off by a factor of 1,000 can flip it to the wrong column of this picture.</figcaption>
+</figure>
+<p>The comparison, using our two tables and 102 buffer pages:</p>
+<table>
+<thead><tr><th>Algorithm</th><th>Page reads</th><th>Needs</th><th>Good when</th></tr></thead>
+<tr><td>Block nested loop</td><td>6,000</td><td>nothing</td><td>non-equality joins, small inputs</td></tr>
+<tr><td>Index nested loop (all orders)</td><td>~151,000, random</td><td>index on inner key</td><td>few outer rows (50 orders: ~75)</td></tr>
+<tr><td>Hash join, build fits</td><td>1,500</td><td>equality, memory</td><td>large unsorted inputs</td></tr>
+<tr><td>Grace hash join</td><td>4,500</td><td>equality</td><td>build side exceeds memory</td></tr>
+<tr><td>Sort-merge, both unsorted</td><td>~7,500</td><td>equality or range-equality</td><td>output order needed later</td></tr>
+<tr><td>Merge, both pre-sorted</td><td>1,500</td><td>sorted inputs</td><td>index order available</td></tr>
+</table>
+<p>The lab runs all three in Python on 200,000 orders and 5,000 customers: the hash join took about 64 ms and 205,000 units of work; the merge join, including two sorts, about 203 ms; the nested loop without an index was so slow it was run on 1% of the orders, taking 571 ms for that 1%, about 57 seconds extrapolated, for a billion comparisons.</p>
+
+<h4>5. Statistics and cardinality estimation</h4>
+<p>To cost a plan, the planner must know how many rows each step produces: its <strong>cardinality estimate</strong>. It starts from statistics gathered by <code>ANALYZE</code> (run automatically by autovacuum in PostgreSQL after enough rows change), which samples each table and stores per column: the fraction of NULLs, the number of distinct values, a list of <strong>most common values</strong> (MCVs) with their frequencies, a <strong>histogram</strong> of the remaining values (bucket boundaries chosen so each bucket holds the same number of rows), and the <strong>correlation</strong> between value order and physical order. The default statistics target of 100 means up to 100 MCVs and 100 histogram buckets, from a sample of 300 × 100 = 30,000 rows.</p>
+<p>From these it estimates <strong>selectivities</strong>. <code>status = 'shipped'</code>: look up 'shipped' in the MCV list, say frequency 0.62. <code>amount &gt; 500</code>: find where 500 falls in the histogram, say in the 87th of 100 buckets, so about 13% match. <code>customer_id = $1</code> for a value not in the MCVs: assume the remaining rows are spread evenly across the remaining distinct values. A join's output is estimated from the distinct counts of both join columns: for a key/foreign-key join, roughly the size of the foreign-key side times the selectivity of the filters on both sides.</p>
+<p>The weakest link is how conditions are combined. For <code>A AND B</code> the planner multiplies selectivities, assuming the conditions are independent. That is exact for unrelated columns and badly wrong for correlated ones: <code>city = 'Pune' AND state = 'MH'</code> at 1% and 10% is estimated at 0.1% of rows when the truth is 1%, a tenfold underestimate. In a multi-join query, such errors multiply through every join. Selinger's 1979 System R paper had to use magic constants for predicates it had no statistics for (a selectivity of 1/10 for <code>column = value</code> without an index), and modern planners still fall back to defaults for complex expressions, functions on columns and many LIKE patterns. <code>CREATE STATISTICS</code> on column groups (functional dependencies, multi-column distinct counts and MCVs) and expression statistics are the PostgreSQL tools that address the common cases.</p>
+
+<h4>6. The cost model</h4>
+<p>Given row estimates, each operator's cost is computed from simple formulas. PostgreSQL charges <code>seq_page_cost</code> (1.0) per page read sequentially, <code>random_page_cost</code> (4.0 by default) per page read at random, <code>cpu_tuple_cost</code> (0.01) per row processed, <code>cpu_operator_cost</code> (0.0025) per operator or function evaluated, and so on. A sequential scan of a 345-page, 10,000-row table with no filter therefore costs 345 × 1.0 + 10,000 × 0.01 = 445, which is exactly the <code>Seq Scan on tenk2 … cost=0.00..445.00</code> in the PostgreSQL documentation's example below. Costs are reported as two numbers, <strong>startup cost</strong> (work before the first row, such as building a hash table or sorting) and <strong>total cost</strong>, because a LIMIT query cares mostly about the first, and a full result about the second.</p>
+<p>The units are arbitrary and only meaningful for comparing plans of the same query. The default <code>random_page_cost</code> of 4 encodes the assumption that random reads are four times as expensive as sequential ones; on SSDs, and when most data is cached, many teams set it to about 1.1, which makes index scans more attractive. That is a legitimate tuning knob; the documentation notes it can be set per tablespace.</p>
+
+<h4>7. Searching for the best plan</h4>
+<p>For a single table, the planner compares access paths: sequential scan, each usable index scan, index-only scan, bitmap scan, each with its cost and its output order. For joins it must also choose an <strong>order</strong>. Three tables can be joined in 12 left-deep orders, and more if "bushy" trees (joining two join results) are allowed; the count grows factorially. System R's answer, still used by PostgreSQL, is <strong>dynamic programming</strong>: compute the cheapest plan for every single table, then for every pair of tables using the best single-table plans, then for every set of three from the best pairs, and so on, keeping for each subset the cheapest plan overall and the cheapest per interesting order. Plans that join tables with no join condition between them (cross products) are generally skipped. This finds the cheapest plan the cost model can see, but the work grows exponentially with the number of tables.</p>
+<p>PostgreSQL therefore has limits. <code>from_collapse_limit</code> and <code>join_collapse_limit</code> (8 by default) stop the planner from merging subqueries and explicit JOINs into one search space beyond eight items; beyond that, the join order written in the query is partly kept. At <code>geqo_threshold</code> (12 FROM items by default) it switches from exhaustive search to the <strong>genetic query optimizer</strong>, a randomised search that is much faster but may miss the best plan. Queries with dozens of joins, common in generated SQL from ORMs and BI tools, are where planning time and plan quality both suffer.</p>
+
+<h4>8. Execution: iterators, pipelining and memory</h4>
+<p>The executor turns the plan tree into operators that each implement "give me the next row". A <code>Limit</code> node asks its child for rows until it has ten, then stops asking, and the whole subtree stops. A <code>Nested Loop</code> asks its outer child for a row, then asks its inner child (re-scanned with the outer row's key as a parameter) for matches. A <code>Hash Join</code> first drains its inner child into a hash table, then streams its outer child. Operators that pass rows along as they arrive are <strong>pipelined</strong>; operators that must see everything first (Sort, Hash, HashAggregate) are blocking and need memory.</p>
+<p>Memory-hungry operators are bounded by <code>work_mem</code> (4 MB by default in PostgreSQL), per operator. A sort that exceeds it writes sorted runs to temporary files and merges them (<code>Sort Method: external merge Disk: …</code> in EXPLAIN ANALYZE); a hash join that exceeds it (scaled by <code>hash_mem_multiplier</code>) splits into batches. Modern engines add <strong>parallel query</strong>, where several worker processes each scan part of a table and their partial results are gathered (<code>Gather</code> nodes), and some analytical engines replace row-at-a-time iterators with <strong>vectorised</strong> execution over batches of values or compile plans to machine code, which db12 touches on for columnar stores.</p>
+
+<h4>9. Grouping, sorting and limits</h4>
+<p>Joins are not the only operators with several algorithms. GROUP BY can be computed two ways. A <strong>HashAggregate</strong> reads its input once and keeps a hash table with one entry per group, updating each group's running sum or count as rows arrive; it needs memory proportional to the number of groups, not rows, and outputs groups in no particular order. A <strong>GroupAggregate</strong> needs its input sorted by the grouping columns and walks it, emitting each group when the key changes; it uses almost no memory and preserves order, so it wins when the input is already sorted (from an index or a merge join) or when there are too many groups to hash. For "revenue per day over a year" with 365 groups, hashing is trivially cheap; for "count per user" over 50 million users, the hash table may exceed <code>work_mem</code> and spill, and a sort-based plan may be chosen instead.</p>
+<p>Sorting has its own shortcut for the most common pattern in applications, <code>ORDER BY … LIMIT n</code>. A full sort of a million rows to keep ten is wasteful, so PostgreSQL uses a <strong>top-N heapsort</strong> when a LIMIT sits above a sort: it keeps only the best n rows seen so far in a small heap, which EXPLAIN ANALYZE reports as <code>Sort Method: top-N heapsort  Memory: 25kB</code>. Better still is an index that already delivers the order (db6), in which case the plan is an index scan under a <code>Limit</code> node and the query reads only the first few entries. <strong>Incremental sort</strong> (PostgreSQL 13+) handles the in-between case: if rows arrive sorted by <code>a</code> from an index and the query wants <code>ORDER BY a, b</code>, it only sorts each group of equal <code>a</code> values by <code>b</code>, which can stream results and use far less memory.</p>
+<p><code>DISTINCT</code> and <code>UNION</code> deduplicate with the same two strategies (hash or sort), which is why db3 advised UNION ALL when duplicates are impossible: it removes an entire hash or sort operator from the plan. Window functions (db4) add a <code>WindowAgg</code> node, normally above a Sort on the PARTITION BY and ORDER BY columns. In every case the planner compares the strategies with the same cost model and the same row estimates, so the estimate of the number of groups (from the distinct-count statistics) matters as much for aggregation as row counts do for joins.</p>
+
+<h4>10. Reading EXPLAIN ANALYZE, line by line</h4>
+<p>Here is a real plan from the PostgreSQL documentation (version 18 output, which shows buffer counts by default and row counts with decimals). The query joins the first 100 rows of <code>tenk1</code> by <code>unique1</code> to <code>tenk2</code> and sorts by another column:</p>
+<pre>EXPLAIN ANALYZE SELECT * FROM tenk1 t1, tenk2 t2
+WHERE t1.unique1 &lt; 100 AND t1.unique2 = t2.unique2 ORDER BY t1.fivethous;
+
+Sort  (cost=713.05..713.30 rows=100 width=488) (actual time=2.995..3.002 rows=100.00 loops=1)
+  Sort Key: t1.fivethous
+  Sort Method: quicksort  Memory: 74kB
+  Buffers: shared hit=440
+  -&gt;  Hash Join  (cost=226.23..709.73 rows=100 width=488) (actual time=0.515..2.920 rows=100.00 loops=1)
+        Hash Cond: (t2.unique2 = t1.unique2)
+        Buffers: shared hit=437
+        -&gt;  Seq Scan on tenk2 t2  (cost=0.00..445.00 rows=10000 width=244) (actual time=0.026..1.790 rows=10000.00 loops=1)
+              Buffers: shared hit=345
+        -&gt;  Hash  (cost=224.98..224.98 rows=100 width=244) (actual time=0.476..0.477 rows=100.00 loops=1)
+              Buckets: 1024  Batches: 1  Memory Usage: 35kB
+              Buffers: shared hit=92
+              -&gt;  Bitmap Heap Scan on tenk1 t1  (cost=5.06..224.98 rows=100 width=244) (actual time=0.030..0.450 rows=100.00 loops=1)
+                    Recheck Cond: (unique1 &lt; 100)
+                    Heap Blocks: exact=90
+                    Buffers: shared hit=92
+                    -&gt;  Bitmap Index Scan on tenk1_unique1  (cost=0.00..5.04 rows=100 width=0) (actual time=0.013..0.013 rows=100.00 loops=1)
+                          Index Cond: (unique1 &lt; 100)
+Planning Time: 0.187 ms
+Execution Time: 3.036 ms</pre>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="The plan as a tree: Sort at the root, Hash Join below, with a sequential scan of tenk2 as probe side and a Hash of a bitmap heap scan of tenk1 as build side; rows flow upward">
+  <defs><marker id="db7-up" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="240" y="10" width="160" height="34" rx="5" style="fill:var(--s4);fill-opacity:.12;stroke:var(--s4)"/>
+    <text x="320" y="31" text-anchor="middle" style="fill:var(--ink)">Sort  100 rows · 74 kB</text>
+    <rect x="240" y="70" width="160" height="34" rx="5" style="fill:var(--accent);fill-opacity:.12;stroke:var(--accent)"/>
+    <text x="320" y="91" text-anchor="middle" style="fill:var(--ink)">Hash Join  100 rows</text>
+    <rect x="60" y="140" width="190" height="34" rx="5" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="155" y="161" text-anchor="middle" style="fill:var(--ink)">Seq Scan tenk2  10,000 rows</text>
+    <rect x="390" y="130" width="150" height="34" rx="5" style="fill:var(--s3);fill-opacity:.12;stroke:var(--s3)"/>
+    <text x="465" y="151" text-anchor="middle" style="fill:var(--ink)">Hash  100 rows · 35 kB</text>
+    <rect x="380" y="180" width="170" height="30" rx="5" style="fill:var(--s2);fill-opacity:.12;stroke:var(--s2)"/>
+    <text x="465" y="199" text-anchor="middle" style="fill:var(--ink)">Bitmap Heap Scan tenk1</text>
+    <rect x="380" y="222" width="170" height="30" rx="5" style="fill:var(--s2);fill-opacity:.12;stroke:var(--s2)"/>
+    <text x="465" y="241" text-anchor="middle" style="fill:var(--ink)">Bitmap Index Scan</text>
+    <line x1="320" y1="70" x2="320" y2="46" marker-end="url(#db7-up)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="155" y1="140" x2="270" y2="106" marker-end="url(#db7-up)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="465" y1="130" x2="370" y2="106" marker-end="url(#db7-up)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="465" y1="180" x2="465" y2="166" marker-end="url(#db7-up)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="465" y1="222" x2="465" y2="212" marker-end="url(#db7-up)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="40" y="200" style="fill:var(--muted)">probe side: streamed</text>
+    <text x="560" y="150" style="fill:var(--muted)">build side</text>
+    <text x="20" y="28" style="fill:var(--muted)">rows flow up ↑</text>
+  </g>
+</svg>
+<figcaption>Read the indented text as this tree, from the leaves up. The planner put the 100-row input on the build side and streamed the 10,000-row table past it, exactly the hash-join shape from section 3.</figcaption>
+</figure>
+<p>Read it bottom-up, like the executor runs it. The <strong>Bitmap Index Scan</strong> finds index entries with <code>unique1 &lt; 100</code>: estimated 100 rows, actual 100. The <strong>Bitmap Heap Scan</strong> fetches those rows from 90 heap pages (<code>Heap Blocks: exact=90</code>, exact meaning the bitmap did not become lossy). The <strong>Hash</strong> node loads them into a hash table: 1,024 buckets, 1 batch (it fitted in memory), 35 kB. The <strong>Seq Scan on tenk2</strong> streams all 10,000 rows of the other table (345 pages, all already in cache: <code>shared hit=345</code>, no disk reads). The <strong>Hash Join</strong> probes the table with each tenk2 row and emits 100 matches. The <strong>Sort</strong> orders them by fivethous in memory with quicksort, 74 kB.</p>
+<p>Now the numbers on each line. <code>cost=226.23..709.73</code> is startup and total cost in planner units. <code>rows=100</code> in the first parentheses is the estimate; <code>rows=100.00</code> in the second is the actual average per loop. <code>width=488</code> is the estimated average row size in bytes. <code>actual time=0.515..2.920</code> is milliseconds to the first row and to the last row, per loop. <code>loops=1</code> is how many times the node ran; inside a nested loop, the inner node has loops equal to the outer row count, and you must multiply its time and rows by loops to get totals. <code>Buffers: shared hit</code> counts pages found in PostgreSQL's buffer cache, <code>read</code> pages fetched from the OS or disk.</p>
+<p>The diagnostic habit: for every node, compare estimated rows to actual rows. Here they match everywhere, so the plan is trustworthy. In the opening story, the lowest mismatched node would have said something like <code>rows=10</code> estimated and <code>rows=2000000</code> actual under a Nested Loop with <code>loops=2000000</code> on its inner index scan. The first node, reading from the bottom, where estimates diverge from reality by more than about ten times is almost always where the problem starts, because every decision above it was made on a wrong number.</p>
+
+<h4>11. Fixing a bad plan, in order</h4>
+<p>When a plan is bad, fix the cause rather than the symptom, in this order. <strong>First, the statistics.</strong> If estimates are wrong on a single table, run <code>ANALYZE</code> (stale statistics after bulk loads are the commonest cause); raise the statistics target for a skewed column (<code>ALTER TABLE … ALTER COLUMN … SET STATISTICS 1000</code>); add extended statistics for correlated columns. <strong>Second, the physical design.</strong> Add or change an index so the good plan exists and is cheap (db6). <strong>Third, the query.</strong> Rewrite <code>NOT IN</code> as <code>NOT EXISTS</code>, make predicates sargable, pre-aggregate before joining, or fix a misestimated subquery's size with a <code>MATERIALIZED</code> CTE. <strong>Last, planner settings</strong>, scoped to one session or role: <code>SET enable_nestloop = off</code> for a known reporting query, a higher <code>work_mem</code> for an analytical job, or adjusted <code>random_page_cost</code> globally on SSD storage. PostgreSQL has no built-in query hints, deliberately; the <code>pg_hint_plan</code> extension provides them for emergencies. MySQL and Oracle support optimizer hints in the query text. Hints freeze today's best plan into tomorrow's data, which is why they are a last resort.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why cardinality estimation is fundamentally hard</h4>
+<p>Leis and colleagues built the Join Order Benchmark from the IMDB data set, with 113 queries that join between 3 and 16 tables, and compared the row-count estimates of several commercial and open-source optimizers against true counts for every intermediate result. All of them routinely produced large errors, and errors grew with the number of joins: a small error on each base table, multiplied through six joins under the independence assumption, becomes orders of magnitude. They then injected each system's estimates into PostgreSQL and measured the resulting plans: with one system's estimates 78% of queries ran within 2x of the plan built from true counts, with another only 53%, and every estimator occasionally produced plans that timed out. Their experiments on the cost model were reassuring by contrast: even simple cost models were good enough once cardinalities were right. The lesson for practitioners is to invest in estimates (statistics, schema design that avoids correlated predicates across joins, simpler queries) rather than in fiddling with cost constants.</p>
+
+<h4>Robust plans and adaptive execution</h4>
+<p>The same study found that when nested-loop joins were disabled and hash tables could grow at run time, most queries ran close to optimal despite bad estimates, because hash joins degrade gracefully when an input is bigger than expected while index nested loops degrade catastrophically. This is a general design principle: prefer operators whose cost is not very sensitive to the estimate. Several engines now go further with <strong>adaptive execution</strong>. SQL Server has adaptive joins that choose between nested loop and hash join after counting the actual rows of the first input; Oracle has adaptive plans and statistics feedback; Spark SQL's adaptive query execution re-plans between stages using actual partition sizes. PostgreSQL's planning is still fully static, which is why its EXPLAIN ANALYZE discipline matters so much.</p>
+
+<h4>Parameterised queries and generic plans</h4>
+<p>Planning is not free: for complex queries it can take milliseconds, comparable to execution for simple ones. Prepared statements let a client plan once and execute many times. PostgreSQL's policy is to build a custom plan using the actual parameter values for the first five executions, then compare their average cost with a generic plan that assumes typical values; if the generic plan is not more expensive, it switches to it and stops planning. For uniformly distributed data, that is a pure win. For skewed data, such as a multi-tenant table where one tenant has 40% of the rows, the generic plan built for "a typical tenant" (a nested loop over an index) can be disastrous for the big tenant. The <code>plan_cache_mode</code> setting can force custom or generic plans. Connection poolers and ORMs that prepare statements implicitly make this a frequent and confusing source of "same query, different speed" reports.</p>
+
+<h4>Join elimination and other rewrites</h4>
+<p>The rewriter and planner remove work when they can prove it is unnecessary. A LEFT JOIN to a table whose columns are not used, on that table's unique key, cannot change the result (each left row matches at most one right row and nothing from it is selected), so PostgreSQL removes the join entirely. This is why views that join many lookup tables are not as expensive as they look when queries use only some columns. Other rewrites include predicate pushdown into subqueries and views, partition pruning (skipping partitions whose bounds cannot match the WHERE clause, at plan time and, for parameters, at execution time), and transforming <code>OR</code> conditions on indexed columns into bitmap ORs. Knowing which rewrites exist helps you write SQL that is clear without being slow: you can write the readable version and check the plan, rather than hand-optimising.</p>
+
+<h4>The physical design feedback loop</h4>
+<p>The optimizer can only choose among plans that the physical design makes possible. That makes index design (db6), partitioning and statistics part of query optimisation. In practice the loop is: find the expensive queries (<code>pg_stat_statements</code> sorted by total time), read their plans, identify the operator that dominates time or the first misestimate, change the physical design or statistics, and verify. Tools such as <code>auto_explain</code> (which logs the plans of slow queries automatically, optionally with ANALYZE data) and plan visualisers make this loop faster, and capturing plans before and after deployments or upgrades is the cheapest way to diagnose a regression later.</p>
+</section>
+
+<section data-field="prod">
+<h4>The stale-statistics incident</h4>
+<p>The opening story is the most common query-plan incident in PostgreSQL deployments, and it has a recognisable signature. A query that was fast becomes slow right after a bulk load, a big delete, or the creation of a new table that is populated in the same transaction. EXPLAIN ANALYZE shows a nested loop whose outer input was estimated at a few rows and actually returned millions. <code>pg_stat_user_tables</code> shows <code>last_autoanalyze</code> from before the load and a large <code>n_mod_since_analyze</code>. Running <code>ANALYZE</code> on the table fixes it immediately. The permanent fix is procedural: every batch job that loads or deletes a large fraction of a table ends with <code>ANALYZE</code>, because autovacuum's analyze threshold (10% of the table plus 50 rows by default) can lag behind bulk changes, and because a freshly created and loaded table has no statistics at all until it runs.</p>
+
+<h4>Plan flips and plan instability</h4>
+<p>A subtler failure is a plan that flips between two alternatives as data slowly changes: one day the planner estimates 5,000 rows and picks a hash join, the next 4,800 and picks a nested loop, and latency doubles or halves with no deployment. Monitoring per-query latency in <code>pg_stat_statements</code> (mean and standard deviation of execution time) catches it; <code>auto_explain</code> with a duration threshold captures the slow plan when it happens. Fixes are the same hierarchy as before, aimed at making the good plan clearly cheapest: a better index, a better estimate, or a query shape whose plan is robust. Some teams on other databases pin plans (SQL Server's Query Store, Oracle's SQL Plan Management); PostgreSQL users rely on pg_hint_plan for the rare cases that need it.</p>
+
+<h4>Spills and memory</h4>
+<p>Sorts and hashes that spill to disk show up as <code>external merge</code>, multiple hash <code>Batches</code>, and <code>temp read/written</code> buffers in EXPLAIN (ANALYZE, BUFFERS), and in aggregate as <code>temp_bytes</code> in <code>pg_stat_database</code>; setting <code>log_temp_files</code> logs each temporary file above a size. The remedy for a specific heavy query is a higher <code>work_mem</code> for its session or role, not globally: because the limit applies per operation per connection, a global 256 MB with 300 connections and multi-join queries can exhaust RAM and invite the OS out-of-memory killer (os9). Analytical workloads often run under a dedicated role with a larger work_mem and a lower connection limit.</p>
+
+<h4>ORMs and generated SQL</h4>
+<p>Object-relational mappers and BI tools generate SQL that humans would not write: dozens of joins from eager loading, deeply nested subqueries, <code>IN</code> lists with thousands of literals, and every column selected. Planning time itself becomes significant (visible as <code>Planning Time</code> in EXPLAIN ANALYZE, sometimes larger than execution), join-order search hits the collapse limits, and estimates degrade with each join. db13 covers ORM patterns; from the optimizer's side, the practical rules are to log the generated SQL for slow endpoints, read its plan like any other, and replace the worst offenders with hand-written queries or views.</p>
+
+<h4>Query plans for LLM-backed features</h4>
+<p>AI features add new shapes to old plans. Retrieval queries combine an approximate vector search (whose row count the planner estimates poorly, since the index returns "the top k" rather than rows matching a predicate) with relational joins and filters for permissions and metadata; the robust shape is to fix the candidate set first (a CTE with LIMIT, or a materialized step) and then nested-loop into indexed tables by primary key. Analytics over LLM call logs are classic large-table aggregations that want hash aggregates, parallel scans and partition pruning by time. And text-to-SQL systems, where a model writes queries against your database, need guardrails grounded in this lesson: run generated SQL under a role with a statement timeout and limited <code>work_mem</code>, inspect EXPLAIN cost before executing, and reject plans with enormous estimated row counts or cross joins.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> feel the cost difference between join algorithms, and watch SQLite's planner change strategy when an index appears. Python 3.12 standard library. Save as <code>db7.py</code>.</p>
+<pre>import random, sqlite3, time
+
+random.seed(7)
+customers = [(c, f"c{c}") for c in range(5_000)]                  # build side: small
+orders = [(o, random.randrange(5_000), random.randrange(100)) for o in range(200_000)]
+
+def nested_loop(outer, inner):            # compare every pair
+    out, cmp = [], 0
+    for o in outer[:2_000]:               # only 1% of orders: the full run is too slow
+        for c in inner:
+            cmp += 1
+            if o[1] == c[0]:
+                out.append((o[0], c[1]))
+    return out, cmp * 100                 # scale comparisons back to all orders
+
+def hash_join(probe, build):              # build a hash table on the small side
+    table = {c[0]: c for c in build}
+    return [(o[0], table[o[1]][1]) for o in probe if o[1] in table], len(build) + len(probe)
+
+def merge_join(left, right):              # both sorted on the join key
+    left, right = sorted(left, key=lambda r: r[1]), sorted(right)
+    out, i, j, steps = [], 0, 0, 0
+    while i &lt; len(left) and j &lt; len(right):
+        steps += 1
+        if left[i][1] &lt; right[j][0]:
+            i += 1
+        elif left[i][1] &gt; right[j][0]:
+            j += 1
+        else:
+            out.append((left[i][0], right[j][1])); i += 1
+    return out, steps
+
+for name, fn in [("nested loop", nested_loop), ("hash join", hash_join), ("merge join", merge_join)]:
+    t0 = time.perf_counter()
+    rows, work = fn(orders, customers)
+    ms = (time.perf_counter() - t0) * 1000
+    print(f"{name:&lt;12} rows={len(rows):&gt;7,}  work units={work:&gt;13,}  {ms:8.1f} ms")
+
+# How SQLite plans the same join, without and with an index on the join column
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE customer (id INTEGER PRIMARY KEY, name TEXT)")
+db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INT, amount INT)")
+db.executemany("INSERT INTO customer VALUES (?,?)", customers)
+db.executemany("INSERT INTO orders VALUES (?,?,?)", orders)
+db.execute("ANALYZE")
+q = "SELECT c.name, sum(o.amount) FROM orders o JOIN customer c ON c.id = o.customer_id WHERE c.id &lt; 50 GROUP BY c.name"
+for label in ("before index", "after index"):
+    if label == "after index":
+        db.execute("CREATE INDEX ix_orders_customer ON orders (customer_id)")
+        db.execute("ANALYZE")
+    plan = [r[3] for r in db.execute("EXPLAIN QUERY PLAN " + q)]
+    print(f"{label}: " + " | ".join(plan))</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li>The nested loop is run on only 1% of orders (2,000 rows) because the full run would take around a minute; its work counter is scaled to the full join: about a billion comparisons. The hash join does about 205,000 units of work (5,000 inserts plus 200,000 probes) in tens of milliseconds. The merge join's work is similar, but its time includes sorting both inputs, so it is slower than the hash join here.</li>
+<li>SQLite before the index: <code>SCAN o | BLOOM FILTER ON c (id=?) | SEARCH c USING INTEGER PRIMARY KEY</code>: it scans all orders, uses a Bloom filter (a bit array that cheaply rules out non-matching keys, db5) to skip orders whose customer cannot match the <code>c.id &lt; 50</code> filter, and probes customers by primary key. That is a nested loop with the big table outside.</li>
+<li>After indexing <code>orders.customer_id</code>: <code>SEARCH c … (rowid&lt;?) | SEARCH o USING INDEX ix_orders_customer</code>: the join order flipped. It now finds the 50 customers first and probes orders through the new index, an index nested loop with the small side outside.</li>
+</ol>
+<p><strong>Try next.</strong> Change the filter to <code>c.id &lt; 4000</code> and rerun: with 80% of customers selected, check whether SQLite still prefers the index. Then remove the <code>ANALYZE</code> calls and see whether the plan changes: SQLite, like PostgreSQL, plans better with statistics. If you have PostgreSQL available elsewhere, run the documentation's tenk1/tenk2 query with <code>EXPLAIN (ANALYZE, BUFFERS)</code> and compare your output with the plan in section 10.</p>
+</section>
+
+<section data-field="drill">
+<b>Diagnose: the dashboard query that went from 2 s to 9 minutes</b>
+<p>After a migration that backfilled 30 million historical rows into <code>events</code>, a dashboard query slowed from 2 seconds to 9 minutes. The relevant part of EXPLAIN ANALYZE:</p>
+<pre>Nested Loop  (cost=1.13..2450.10 rows=12 width=40) (actual time=0.09..538211.4 rows=2841902 loops=1)
+  -&gt;  Index Scan using events_type_ts on events e  (cost=0.56..1180.33 rows=12 width=24)
+        (actual time=0.05..19420.7 rows=2841902 loops=1)
+        Index Cond: ((type = 'purchase') AND (ts &gt;= '2026-09-01'))
+  -&gt;  Index Scan using users_pkey on users u  (cost=0.57..105.80 rows=1 width=24)
+        (actual time=0.18..0.18 rows=1 loops=2841902)
+        Index Cond: (id = e.user_id)</pre>
+<p>Explain what happened and what you would do.</p>
+<details><summary>Answer</summary>
+<p><strong>Read bottom-up and compare estimates.</strong> The events index scan was estimated at 12 rows and returned 2,841,902: an error of about 240,000x. The users lookup is fine per call (0.18 ms) but ran 2,841,902 times (<code>loops</code>), so it contributed about 2.84 million × 0.18 ms ≈ 512 seconds, almost all of the 538 s. A nested loop is the right plan for 12 rows and a terrible one for 2.8 million.</p>
+<p><strong>Why the estimate was wrong.</strong> The backfill inserted 30 million rows, and statistics were not refreshed (autovacuum's analyze may not have run yet, or the histogram for ts still ends before September, so the planner thinks almost no rows are that recent). Possibly also correlation: type = 'purchase' and recent ts multiplied as independent.</p>
+<p><strong>Fix, in order.</strong> Run <code>ANALYZE events;</code> and re-check: the estimate should jump to millions and the planner should switch to a hash join (scan users once into a hash table, or vice versa), bringing the query back to seconds. Add <code>ANALYZE</code> as the final step of the backfill job. If the estimate is still badly off, add extended statistics on (type, ts) or raise the statistics target on ts. If the dashboard only needs aggregates, a pre-aggregated daily table would make it independent of the raw event volume altogether. Do not reach for <code>enable_nestloop = off</code> globally; at most, set it for this report's session while the root cause is fixed.</p>
+</details>
+</section>

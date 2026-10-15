@@ -1,0 +1,718 @@
+<!-- topic source for lld/ld25; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld25",
+  "t": "An evaluation-harness runner: workers, rate limits, retries, resumable runs and error bars",
+  "tag": "AI systems",
+  "sum": "Build the tool every model change goes through: a dataset, a pluggable model, exact-match, regex and LLM-judge scorers, a worker pool sharing a token-bucket rate limit, retries with jittered backoff, a JSONL results cache keyed by the run's configuration so a crashed run resumes where it stopped, and a report with Wilson and bootstrap confidence intervals and per-slice scores.",
+  "prereq": [
+    ["ev3", "Metrics for generated output: exact match, pattern match and model-graded scores, and what each misses."],
+    ["ev4", "LLM-as-judge: a model grades outputs against a rubric, with known biases that must be calibrated."],
+    ["ev7", "Statistics of evals: a score from n examples has sampling error; intervals and paired comparisons say how much."],
+    ["ld2", "A token bucket refills at a steady rate and lets each request spend a token, allowing short bursts."],
+    ["ld4", "Retries with full jitter, and the difference between transient and permanent errors."],
+    ["ld17", "A thread pool runs submitted tasks on a fixed number of worker threads."]
+  ],
+  "myths": [
+    ["An accuracy of 80% on 100 examples means the model is 80% accurate.", "It means 80 of these 100 were right. With 100 examples, the 95% interval for the true rate runs from about 71% to 87%; with 10 examples it would be 49% to 94%. A two-point difference between two runs on 100 examples is well inside the noise. Every score in a report needs its interval, and comparisons need paired analysis on the same examples."],
+    ["Errors should count as wrong answers.", "A timeout or a rate-limit failure says nothing about what the model would have answered. Scoring it as zero mixes infrastructure reliability into the quality metric — a provider outage during the run lowers 'accuracy'. Count errors separately, report them, and either retry them or exclude them from the mean with the exclusion stated."],
+    ["More workers make the evaluation faster.", "Only until the provider's rate limit is the bottleneck. Beyond that, extra workers just collect 429 errors and retries. The runner needs a shared rate limiter so the pool runs at the allowed rate, with concurrency sized to latency × rate."],
+    ["If the run crashed, rerun it from scratch.", "A thousand-example run with an LLM judge can cost real money and an hour. Writing each finished result to an append-only file as it completes, keyed by the run's configuration, lets a rerun skip everything already done — and guarantees a changed model or dataset never reuses stale results."],
+    ["The normal-approximation interval p ± 1.96·√(p(1−p)/n) is fine.", "It breaks exactly where evals often live: small n or scores near 0 or 1. At 10 out of 10 it gives an interval of width zero; at 8 out of 10 its upper bound is above 100%. The Wilson interval behaves well in both cases (8/10 gives 49%-94%, 10/10 gives 72%-100%) and costs one line more."]
+  ],
+  "recap": [
+    "An eval harness runs a model over a dataset, scores each output, and reports scores with uncertainty and breakdowns.",
+    "Scorers are pluggable: exact match after normalisation, regex patterns, and model-graded judges mapped to a 0-1 scale.",
+    "A worker pool provides concurrency; a shared token bucket keeps the whole pool under the provider's rate limit.",
+    "Transient errors are retried with exponential backoff and full jitter; permanent errors are recorded once, without retries.",
+    "Errors are reported separately and excluded from quality means, never silently scored as zero.",
+    "Every finished example is appended to a JSONL file as it completes, tagged with a run key.",
+    "The run key hashes everything that changes results — model, parameters, scorers, dataset — so stale results are never reused.",
+    "A crashed run resumes by loading the file, skipping finished examples and ignoring a torn final line.",
+    "Binary scores get Wilson intervals; continuous scores get a seeded percentile bootstrap.",
+    "Per-slice scores reveal where the model fails; a deterministic seed makes the whole report reproducible."
+  ],
+  "glossary": [
+    ["Bootstrap", "Estimating uncertainty by resampling the observed scores with replacement many times and looking at the spread of the resampled means."],
+    ["Confidence interval", "A range computed from the data that, by construction, contains the true value in 95% of repeated experiments (for a 95% interval)."],
+    ["fsync", "An operating-system call that forces written data from memory buffers to the disk, so it survives a crash."],
+    ["Full jitter", "Waiting a uniformly random time between zero and the exponential backoff cap before retrying."],
+    ["JSONL", "JSON Lines: one JSON object per line, so a file can be appended to and read line by line."],
+    ["LLM-as-judge", "Using a model to grade another model's output against a rubric."],
+    ["Paired comparison", "Comparing two models on the same examples, analysing the per-example differences, which cancels out example difficulty."],
+    ["Rate limit", "The maximum request rate a provider allows; exceeding it returns errors (HTTP 429)."],
+    ["Run key", "A hash of the model, parameters, scorers and dataset that identifies which cached results belong to a run."],
+    ["Scorer", "A function that turns one example and one model output into a score."],
+    ["Slice", "A subset of examples sharing a tag (language, difficulty, length), scored separately."],
+    ["Torn write", "A line partly written when a process crashed, left incomplete at the end of a file."],
+    ["Wilson interval", "A confidence interval for a proportion that stays inside 0-1 and works for small samples and extreme rates."]
+  ],
+  "qa": [
+    ["E", "What does an eval runner do, end to end?", "It loads a dataset of inputs with expected answers, calls the model on each input (concurrently, within rate limits, retrying transient failures), scores each output with one or more scorers, stores per-example results, and produces a report: each metric's mean with a confidence interval, error counts, latency, and scores per slice."],
+    ["E", "Compare exact match, regex and LLM-judge scorers.", "Exact match after normalisation is strict and cheap but fails on correct answers phrased differently (the solution's model scores 0% exact and 80% on the regex). A regex checks for a pattern such as the expected answer as a whole word, tolerating surrounding text, but can be gamed or miss paraphrases. A judge model handles open-ended answers with a rubric, at the cost of money, latency, bias and its own error rate, so it needs calibration against human labels."],
+    ["E", "Why record errors separately from scores?", "Because an error is not an answer. If timeouts count as zero, a provider incident during the run looks like a quality regression. Report the error count, retry transient errors, and compute quality metrics only over scored examples, stating how many were excluded."],
+    ["M", "How do you size concurrency for a rate limit?", "By Little's law, the number of requests in flight equals throughput times latency. At a limit of 50 requests per second and 2 seconds per call, about 100 concurrent calls saturate the limit. Use a pool of roughly that size with a shared token bucket enforcing the rate, so extra workers wait locally instead of collecting 429s.", "Follow-up: Why still keep the token bucket if the pool is sized right? — Latency varies; when calls get faster, a fixed pool would exceed the rate. The bucket is the actual guarantee."],
+    ["M", "How does resumability work, and what must the cache key include?", "Each finished example is appended to a JSONL file with the run key and flushed to disk. On restart, the runner reads the file, keeps lines with the current run key, and skips those examples. The key is a hash of everything that could change a result: model name and version, sampling parameters, prompt template, scorers, and the dataset's content. If any changes, the key changes and nothing stale is reused."],
+    ["M", "What is wrong with the normal-approximation interval, and what do you use instead?", "p ± 1.96·√(p(1−p)/n) has width zero when p is 0 or 1 and can go below 0 or above 1; it under-covers for small n. Use the Wilson interval for pass/fail scores: for 80/100 it gives 71.1%-86.7%, for 8/10 49%-94%, for 10/10 72%-100%. For continuous scores such as judge ratings, use a bootstrap.", "Follow-up: How many examples to detect a 5-point difference? — Roughly 2·(1.96 + 0.84)²·p(1−p)/δ²; at p = 0.8 and δ = 0.05, about 1,000 per model unpaired, fewer with a paired design."],
+    ["M", "How do you compare two models fairly?", "Run both on the same examples and analyse paired differences: for each example, model A's score minus model B's. Example difficulty cancels, so the interval on the mean difference is much narrower than comparing two separate intervals. Report the difference with its interval, and how many examples each model won, lost and tied."],
+    ["M", "What do retries look like in an eval runner?", "Retry only transient errors (rate limits, overload, timeouts) with exponential backoff and full jitter, up to a cap; record permanent errors (invalid request, content too long) after one attempt. Use a per-example deterministic random generator for jitter so runs are reproducible, and record the attempt count, because an example that needed four attempts hints at an unhealthy dependency."],
+    ["H", "How do you make sure a resumed run gives the same results as an uninterrupted one?", "Make each example's processing a pure function of the example and the configuration: temperature-0 or seeded sampling where the API allows, deterministic jitter, scorers without hidden state. Persist results only after scoring completes, so a crash never leaves half a record that is reused. Ignore a torn last line on reload. The solution's test crashes a run after 24 examples, resumes with a different worker count, checks that only the remaining 36 examples call the model, and compares the final results with an uninterrupted run.", "Follow-up: What if the model is non-deterministic even at temperature 0? — Then resumption mixes samples from different times; that is acceptable if you treat the eval as a sample and report intervals, but record timestamps and the model version per result."],
+    ["H", "Your judge scorer says model B is 3 points better; the exact-match scorer says it is 1 point worse. What do you do?", "First check the intervals and paired differences — both may be noise. Then look at examples where the scorers disagree: the judge may reward longer or more confident answers (a known bias), or exact match may punish B's different phrasing of correct answers. Calibrate the judge against a human-labelled sample and report its agreement. Decide which scorer reflects the product's notion of correct, and fix the other or demote it to a secondary metric."],
+    ["H", "How would you scale this to 100,000 examples and several models nightly?", "Shard the dataset across machines, each with its own runner and a slice of the global rate limit (or a shared rate limiter in Redis, cd12); write results to object storage or a database rather than local files, keeping the run key and example id as the key; cache model outputs separately from scores so changing a scorer re-scores without re-calling the model; use provider batch APIs for non-urgent runs, which are cheaper; and report per-slice results with clustered intervals where examples come in groups.", "Follow-up: Why separate output caching from scoring? — Model calls are the expensive part; scorers change often. Keying outputs by (model config, example) and scores by (output, scorer) lets either change independently."],
+    ["H", "When are the intervals in this report wrong?", "When examples are not independent. If questions come in groups — several questions about one passage, several turns of one conversation — results within a group are correlated, and treating them as independent understates the uncertainty. Use clustered standard errors or bootstrap over groups rather than examples. Intervals also miss systematic error: a biased judge or a dataset that does not represent production traffic produces a precise, wrong number."]
+  ],
+  "refs": [
+    ["post", "A statistical approach to model evaluations (Anthropic, 2024)", "Five recommendations: report standard errors via the central limit theorem, cluster standard errors, reduce variance within questions, analyse paired differences, and use power analysis.", "https://www.anthropic.com/research/statistical-approach-to-model-evals"],
+    ["paper", "Adding error bars to evals (Evan Miller, 2024)", "Formulas for analysing evaluation data, comparing two models and planning the size of an evaluation.", "https://arxiv.org/abs/2411.00640"],
+    ["docs", "Inspect (UK AI Security Institute)", "An open-source eval framework organised around datasets, solvers and scorers, with model-call caching, concurrency controls and eval logs.", "https://inspect.aisi.org.uk/"],
+    ["docs", "Binomial proportion confidence interval", "The Wilson score interval and why the normal approximation fails for small samples and extreme proportions.", "https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval"],
+    ["code", "EleutherAI lm-evaluation-harness", "A widely used open-source harness for running benchmarks across many models.", "https://github.com/EleutherAI/lm-evaluation-harness"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>The team is about to switch the support assistant from one model to a cheaper one. Someone runs the eval: 200 questions, a loop that calls the model and checks the answer. It takes forty minutes because calls run one at a time. Halfway through a second run the laptop sleeps, and the run starts again from zero. The third run hits the provider's rate limit after parallelising, and 31 questions fail with HTTP 429; the script scores them as wrong, and the new model "loses" by 6 points. Rerun the next morning: the new model "wins" by 2. The decision gets made on whichever run someone believed, and nobody can say how big a difference would actually matter.</p>
+<p>Every model change, prompt change and retrieval tweak in an AI product should go through an evaluation harness, and building its runner is a natural machine-coding round for AI-engineer roles: it combines concurrency, rate limiting, retries, durable state and statistics in one small system. The model and the scorers are the easy part. The interviewer is listening for the engineering around them: does the pool respect a shared rate limit? Are transient errors retried and permanent ones not? Are errors kept out of the quality score? Does a crash lose an hour of paid calls, or resume? Can a changed dataset ever reuse stale results? And does the report say how uncertain each number is?</p>
+<p>This lesson builds the runner in stages: requirements; entities (examples, a model callable, scorers, a token bucket, a results store, the runner, the report); a naive loop and everything wrong with it; then concurrency with a worker pool and a shared token bucket; retries with jittered backoff and error classification; resumable runs via an append-only JSONL store keyed by a hash of the run's configuration; and a report with Wilson intervals for pass/fail scores, a seeded bootstrap for judge scores, and per-slice breakdowns. The worked example scores 100 questions: 80% on the regex scorer with a 95% interval of 71.1%-86.7%, 85% on the judge scorer with 79.0%-90.3%, and a slice that shows every failure sits in "long" questions. The full solution is a runnable Python 3.12 file with eight tests, including a crash-and-resume test and a 16-worker stress test.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: marking a stack of exam papers with a team</h4>
+<p>A head examiner has 1,000 exam papers to mark and a team of markers. Each marker takes the next paper from the pile, marks it against the answer key — some questions by exact answer, some by "the key word appears", essays by a rubric — and writes the result on a register. The exam board's office can only process so many queries a minute, so markers queue at a single phone line when they need to check something. If a query fails because the line is busy, they wait a little and try again; if the paper itself is illegible, they write "unmarkable" rather than a zero. At the end of each paper, the mark goes on the register in ink, so if the building is evacuated at paper 600, marking resumes at 601 tomorrow — unless the answer key changed overnight, in which case the old marks are not reused. Finally the head examiner reports the average with a margin of error, and the average for each section.</p>
+<p>The markers are the <strong>worker pool</strong>; the phone line is the <strong>shared rate limiter</strong>; the answer key and rubric are the <strong>scorers</strong>; "try again after a wait" is a <strong>retry with backoff</strong>; "unmarkable" is an <strong>error recorded separately</strong>; the inked register is the <strong>append-only results store</strong>; "unless the answer key changed" is the <strong>run key</strong>; the margin of error is the <strong>confidence interval</strong>; section averages are <strong>slices</strong>.</p>
+<p>The analogy breaks in a way that matters: the papers here are not fixed. A model's answer can vary between calls, and the "exam" is a sample of the questions users will actually ask. The margin of error is not a formality; it is the difference between "the new model is better" and "we cannot tell yet".</p>
+
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="Runner architecture. The dataset minus already-finished examples feeds a thread pool of N workers. Each worker acquires a token from a shared token bucket, calls the model, retries transient errors with jittered backoff, runs the scorers, and appends one JSON line to the results file tagged with the run key. On restart the file is loaded and finished examples are skipped. The report reads all results and computes means, Wilson or bootstrap intervals, error counts and per-slice scores.">
+  <defs><marker id="ld25-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="30" width="110" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="65" y="52" text-anchor="middle" style="fill:var(--ink);font-weight:600">dataset</text>
+    <text x="65" y="70" text-anchor="middle" style="fill:var(--muted)">minus finished ids</text>
+    <rect x="150" y="20" width="200" height="150" rx="6" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="250" y="14" text-anchor="middle" style="fill:var(--muted)">thread pool (N workers)</text>
+    <rect x="165" y="32" width="170" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="250" y="50" text-anchor="middle" style="fill:var(--ink)">1. acquire token</text>
+    <rect x="165" y="64" width="170" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="250" y="82" text-anchor="middle" style="fill:var(--ink)">2. call model (retry transient)</text>
+    <rect x="165" y="96" width="170" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="250" y="114" text-anchor="middle" style="fill:var(--ink)">3. run scorers</text>
+    <rect x="165" y="128" width="170" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="250" y="146" text-anchor="middle" style="fill:var(--ink)">4. append result + fsync</text>
+    <line x1="120" y1="60" x2="148" y2="60" marker-end="url(#ld25-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="390" y="20" width="110" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="445" y="40" text-anchor="middle" style="fill:var(--ink)">token bucket</text>
+    <text x="445" y="57" text-anchor="middle" style="fill:var(--muted)">shared: ≤ rate/s</text>
+    <line x1="335" y1="45" x2="388" y2="45" marker-end="url(#ld25-arrow)" style="fill:none;stroke:var(--crit)"/>
+    <rect x="520" y="20" width="110" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="575" y="40" text-anchor="middle" style="fill:var(--ink)">model API</text>
+    <text x="575" y="57" text-anchor="middle" style="fill:var(--muted)">429 / 529 / 200</text>
+    <line x1="335" y1="77" x2="518" y2="52" marker-end="url(#ld25-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="390" y="120" width="240" height="56" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="510" y="140" text-anchor="middle" style="fill:var(--ink);font-weight:600">results.jsonl (append-only)</text>
+    <text x="510" y="158" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">{"id":"ex017","run_key":"9f2c…",…}</text>
+    <line x1="335" y1="141" x2="388" y2="148" marker-end="url(#ld25-arrow)" style="fill:none;stroke:var(--good)"/>
+    <path d="M510,176 C510,215 65,215 65,92" marker-end="url(#ld25-arrow)" style="fill:none;stroke:var(--good);stroke-dasharray:4 3"/>
+    <text x="300" y="210" text-anchor="middle" style="fill:var(--good)">on restart: load lines with this run key, skip those ids</text>
+    <rect x="390" y="228" width="240" height="44" rx="4" style="fill:var(--surface-2);stroke:var(--s4)"/>
+    <text x="510" y="246" text-anchor="middle" style="fill:var(--ink)">report: mean ± CI, errors, slices</text>
+    <text x="510" y="263" text-anchor="middle" style="fill:var(--muted)">Wilson (binary) · bootstrap (continuous)</text>
+    <line x1="510" y1="178" x2="510" y2="226" marker-end="url(#ld25-arrow)" style="fill:none;stroke:var(--s4)"/>
+  </g>
+</svg>
+<figcaption>The pool controls concurrency, the bucket controls rate, and the append-only file is both the output and the checkpoint. Because the run key is part of every line, the same file can never mix results from two different configurations.</figcaption>
+</figure>
+
+<h4>Where the runner sits</h4>
+<p>The runner is the middle of a loop that every AI team runs repeatedly: curate a dataset (ev2), run candidates through it, compare, ship or iterate, and add new failure cases from production back into the dataset. Because it runs on every prompt edit and every model upgrade, its properties compound: a runner that takes an hour and loses work on a crash gets run less often; one whose numbers carry no uncertainty gets over-trusted. Fast, resumable and honest is what makes the whole loop work.</p>
+
+<h4>What the round expects</h4>
+<p>An <code>Example</code> type; a model as a callable; scorer classes behind one interface; a runner with <code>run(dataset)</code> that uses a pool, a shared rate limiter and retries; durable per-example results with resumption; a report with means, intervals, error counts and slices; and tests with a fake model, including a crash-and-resume test. Strong answers explain why errors are not zeros, why the run key hashes the configuration, and why the Wilson interval beats the textbook formula.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Entities &amp; API</span></div><div class="ck"><span class="ck-m">10–14</span><span class="ck-t">Naive loop</span></div><div class="ck"><span class="ck-m">14–28</span><span class="ck-t">Pool, rate, retries</span></div><div class="ck"><span class="ck-m">28–37</span><span class="ck-t">Resume, report, CIs</span></div><div class="ck"><span class="ck-m">37–45</span><span class="ck-t">Scale &amp; extensions</span></div></div>
+
+<h4>1 · Clarify the requirements</h4>
+<p>Ask: how big are datasets (hundreds or hundreds of thousands)? What is the provider's rate limit and typical latency? Which scorers are needed — exact answers, patterns, open-ended grading? Is the judge another model call (with its own rate limit)? Must runs survive crashes and be resumable? How will results be compared between models — is a confidence interval expected? Are examples grouped (several questions per document)? Should the same configuration give identical results?</p>
+<p>Agreed scope: datasets up to tens of thousands; a model callable; exact-match, regex and judge scorers; a configurable worker pool with a shared token bucket; up to four attempts for transient errors with full-jitter backoff, no retries for permanent ones; a JSONL results file with a run key for resumption; a report with means, 95% intervals (Wilson for binary, bootstrap for continuous), error counts, retries, median latency and per-slice means; deterministic given a seed. Out of scope: distributed execution and dashboards (extensions).</p>
+
+<h4>2 · Entities and the interface</h4>
+<pre>Example(id, input, expected, tags)                          # frozen
+Model = Callable[[str], str]                                # raises TransientError or another exception
+Scorer: name, binary, __call__(example, output) -&gt; float    # ExactMatch, RegexMatch, JudgeScorer
+TokenBucket(rate, burst).acquire()                          # shared by all workers
+ResultStore(path, run_key).done / .save(record)             # append-only JSONL, reload on start
+run_key(model_name, params, scorers, dataset) -&gt; str        # hash of everything that changes results
+EvalRunner(model, model_name, scorers, store, RunConfig).run(dataset) -&gt; list[record]
+report(records, scorers, seed) -&gt; dict                      # metrics with ci95, errors, slices</pre>
+<p>Each piece has one job, and the seams make testing easy: the model is a plain function (a fake in tests), the sleep function is injected (a list's <code>append</code> in the retry test, so backoff is recorded instead of waited), and the store takes a file path (a temporary directory in tests).</p>
+
+<h4>3 · Stage one: the naive loop</h4>
+<pre>correct = 0
+for ex in dataset:
+    out = model(ex.input)                 # one at a time; any exception kills the run
+    correct += out.strip() == ex.expected
+print(correct / len(dataset))             # no interval, no slices, nothing saved</pre>
+<p>It is serial, so 1,000 two-second calls take 33 minutes. One rate-limit error ends the run. If you wrap it in try/except and count failures as wrong, an outage looks like a quality drop. Nothing is saved, so a crash at example 900 costs 900 paid calls. The exact-string check is too strict for real outputs. And the single number has no uncertainty, so a reader cannot tell whether 0.78 versus 0.80 means anything. Each stage below fixes one of these.</p>
+
+<h4>4 · Stage two: scorers</h4>
+<p>All scorers share one interface: a <code>name</code>, a <code>binary</code> flag (which decides the interval method), and a call returning a score in [0, 1]. <strong>ExactMatch</strong> normalises both strings (lower-case, strip punctuation, collapse whitespace) and compares. <strong>RegexMatch</strong> takes a pattern with an <code>{expected}</code> placeholder, inserted with <code>re.escape</code> so an expected answer containing regex characters is matched literally; the solution uses <code>\b{expected}\b</code>, which accepts "The answer is Paris." but rejects "Parisian food". <strong>JudgeScorer</strong> wraps a judge function returning a 1-5 rating and maps it to (rating − 1) / 4 — in production a model call with a rubric, in tests a deterministic stub that gives 5 if the expected answer appears and 2 otherwise. A scorer that raises does not crash the run: the record is marked <code>scorer_error</code>, because a bug in grading is not the model's failure and should be visible as such.</p>
+<p>The worked example shows why several scorers matter. The fake model answers "The answer is Paris." when right and "London." when wrong (every fifth question). Exact match scores <strong>0%</strong> — every answer has extra words. The regex scores <strong>80%</strong>. The judge scores <strong>85%</strong>: 80 answers at 1.0 and 20 at 0.25.</p>
+
+<h4>5 · Stage three: a worker pool and a shared rate limit</h4>
+<p>Model calls are slow and I/O-bound, so a thread pool runs many at once. The question is how many. By Little's law, requests in flight = throughput × latency: at a provider limit of 50 requests per second and 2 seconds per call, 100 calls in flight saturate the limit, and more workers only produce 429 errors. Sizing the pool is not enough on its own, though — when calls get faster, a fixed pool exceeds the rate — so every worker also takes a token from one shared <strong>token bucket</strong> before each attempt, including retries. The bucket refills at <code>rate</code> tokens per second up to <code>burst</code>; a worker that finds it empty computes how long until the next token, releases the lock, and sleeps (sleeping while holding the lock would block every other worker). The concurrency test runs 40 calls with 6 workers at 100 per second and a burst of 1: peak concurrency never exceeds 6, and the run takes at least 0.39 seconds, as the rate dictates.</p>
+
+<h4>6 · Stage four: retries and error classification</h4>
+<p>Errors fall into two kinds. <strong>Transient</strong> ones — rate limited, overloaded, timed out — may succeed later, so the worker retries: up to <code>max_attempts</code> (4), each retry after a <strong>full-jitter</strong> wait, uniform between zero and base × 2<sup>attempt − 1</sup> (50, 100, 200 ms), so workers that failed together do not retry together (ld4). The random generator is seeded per example (<code>Random(f"{seed}:{id}")</code>), so the waits are reproducible run to run. <strong>Permanent</strong> ones — an invalid request, an input that is too long — will fail identically, so the worker records them after one attempt. The retry test scripts all three cases: question 1 fails twice then succeeds (status ok, 3 attempts), question 2 always fails transiently (error after 4 attempts), question 3 raises a permanent error (error after 1 attempt); exactly 2 + 3 backoff sleeps were requested, each within its cap.</p>
+<p>Errors are then kept <em>out</em> of the quality metrics. The report shows <code>errors: 2</code> and computes exact match over the 3 scored examples, stating n = 3. Counting the errors as wrong would make a rate-limit storm look like a worse model.</p>
+
+<h4>7 · Stage five: resumable runs</h4>
+<p><strong>Append, flush, fsync.</strong> When an example finishes — model called, scorers run — its record is serialised to one JSON line, appended to <code>results.jsonl</code> under a lock, flushed and fsynced so it survives a crash or power loss. Results are only written once complete, so there is never a half-scored record to reuse.</p>
+<p><strong>The run key.</strong> Every line carries a <code>run_key</code>: a hash of the model name, its parameters (temperature, prompt template version), the scorer names, and a hash of the whole dataset's content. On start, the store reads the file and keeps only lines whose key matches. Change the model, a parameter, the scorers, or one example, and the key changes, so nothing stale is reused — the test checks all four changes produce different keys. Different runs can share one file safely.</p>
+<p><strong>Reload, skip, continue.</strong> <code>run</code> skips every example whose id is already in the store. If the process crashed mid-write, the last line is incomplete JSON; the loader skips lines that do not parse (the torn-line test writes half a record and checks it is ignored). A fatal error inside the run — a <code>KeyboardInterrupt</code>, a bug — sets a stop flag so idle workers start nothing new, cancels queued work and re-raises, leaving everything finished on disk. The crash test runs 60 examples with a model that dies on its 25th call: 24 results survive; the rerun, with a different worker count, calls the model exactly 36 times; and its results equal those of an uninterrupted run.</p>
+
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Timeline of a crash and resume. Run one processes examples 1 to 24, each appended to the file, then crashes on example 25. Run two loads the file, finds 24 finished ids with the same run key, and calls the model only for examples 25 to 60. A third run with a changed temperature has a different run key and reuses nothing.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="10" y="40" style="fill:var(--ink)">run 1</text>
+    <rect x="70" y="26" width="240" height="22" rx="3" style="fill:var(--good)"/>
+    <text x="190" y="41" text-anchor="middle" style="fill:var(--surface)">ex 1-24 appended</text>
+    <text x="325" y="42" style="fill:var(--crit);font-weight:700">✕ crash at 25</text>
+    <text x="10" y="92" style="fill:var(--ink)">run 2</text>
+    <rect x="70" y="78" width="240" height="22" rx="3" style="fill:var(--surface-2);stroke:var(--good);stroke-dasharray:4 3"/>
+    <text x="190" y="93" text-anchor="middle" style="fill:var(--good)">skipped (key matches)</text>
+    <rect x="312" y="78" width="300" height="22" rx="3" style="fill:var(--s1)"/>
+    <text x="462" y="93" text-anchor="middle" style="fill:var(--surface)">ex 25-60: 36 model calls</text>
+    <text x="10" y="144" style="fill:var(--ink)">run 3</text>
+    <rect x="70" y="130" width="542" height="22" rx="3" style="fill:var(--s3)"/>
+    <text x="341" y="145" text-anchor="middle" style="fill:var(--surface)">temperature changed → new run key → all 60 called</text>
+    <text x="70" y="190" style="fill:var(--muted)">results.jsonl lines:</text>
+    <text x="70" y="208" style="fill:var(--ink);font-family:var(--mono)">{"id":"ex000","run_key":"k1",…} … {"id":"ex024","run_key":"k1",…} {"id":"ex000","run_key":"k2",…}</text>
+  </g>
+</svg>
+<figcaption>The file is the checkpoint. The run key decides which lines count, so resuming is safe and a configuration change can never be silently answered with old results.</figcaption>
+</figure>
+
+<h4>8 · Stage six: the report and its intervals</h4>
+<p><strong>Binary scores: Wilson.</strong> For a pass/fail scorer with s successes out of n, the textbook interval p ± 1.96·√(p(1−p)/n) misbehaves at small n and extreme p: at 8 of 10 it gives 55%-105%, at 10 of 10 an interval of zero width. The Wilson interval fixes both. With z = 1.96: centre = (p + z²/2n) / (1 + z²/n) and half-width = z·√(p(1−p)/n + z²/4n²) / (1 + z²/n). Worked for the regex scorer, 80 of 100: z²/n = 0.038416, so centre = (0.8 + 0.019208) / 1.038416 = 0.7889; half-width = 1.96 × √(0.0016 + 0.000096) / 1.038416 = 1.96 × 0.04118 / 1.038416 = 0.0777; interval <strong>71.1%-86.7%</strong>, exactly what the test asserts. For comparison: 8 of 10 gives 49.0%-94.3%, 800 of 1,000 gives 77.4%-82.4%. To halve the width you need four times the examples.</p>
+<p><strong>Continuous scores: bootstrap.</strong> Judge scores take values like 0.25 and 1.0, so the solution resamples the 100 scores with replacement 2,000 times (seeded), computes each resample's mean, and takes the 2.5th and 97.5th percentiles: the judge's 85% has an interval of <strong>79.0%-90.3%</strong>. The seed makes the report reproducible.</p>
+<p><strong>Slices.</strong> Each example carries tags; the report computes each metric per tag. In the worked example every question tagged "long" (40 of them) contains all 20 failures: regex 50% on long questions, 100% on short ones. A single 80% hides that entirely, and slices are usually where the actionable finding lives.</p>
+<p><strong>What else.</strong> Counts of errors, scorer errors and retried examples, and median latency. A comparison between two models should use <em>paired</em> differences on the same examples, which the record format supports directly (join two runs' records by id).</p>
+<table>
+<thead><tr><th>Metric</th><th>Mean</th><th>95% interval</th><th>Method</th></tr></thead>
+<tr><td>exact</td><td>0.0%</td><td>0.0%-3.7%</td><td>Wilson, 0/100</td></tr>
+<tr><td>regex</td><td>80.0%</td><td>71.1%-86.7%</td><td>Wilson, 80/100</td></tr>
+<tr><td>judge</td><td>85.0%</td><td>79.0%-90.3%</td><td>bootstrap, 2,000 resamples</td></tr>
+<tr><td>regex on "long" / "short"</td><td>50% / 100%</td><td>n = 40 / 60</td><td>slices</td></tr>
+</table>
+
+<h4>9 · The full solution</h4>
+<p>Eight tests: scorers; the end-to-end report including the exact Wilson bounds and slice values; retries and error classification with recorded backoff; crash and resume against an uninterrupted run; cache-key invalidation; rate limit and concurrency; torn-line recovery; and 500 examples on 16 workers with every id written exactly once. Python 3.12, standard library only, a few seconds (most of it fsync).</p>
+<pre>"""An evaluation-harness runner: a dataset, a pluggable model, scorers (exact match, regex, an LLM-judge
+stub), a worker pool with a shared rate limiter, retries with backoff, resumable runs backed by a
+JSONL results cache keyed by the run configuration, and a report with confidence intervals
+(Wilson for pass/fail scores, a seeded bootstrap for continuous ones) and per-slice breakdowns.
+Python 3.12, standard library only.  Run: python eval_runner.py"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import statistics
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Protocol
+
+
+# ---------------------------------------------------------------- data
+@dataclass(frozen=True)
+class Example:
+    id: str
+    input: str
+    expected: str
+    tags: tuple[str, ...] = ()
+
+
+class TransientError(Exception):
+    """Rate limited, overloaded, timed out: worth retrying."""
+
+
+Model = Callable[[str], str]
+
+
+# ---------------------------------------------------------------- scorers
+class Scorer(Protocol):
+    name: str
+    binary: bool
+
+    def __call__(self, ex: Example, output: str) -&gt; float: ...
+
+
+def _norm(s: str) -&gt; str:
+    return " ".join(re.sub(r"[^\w\s]", "", s.lower()).split())
+
+
+@dataclass
+class ExactMatch:
+    name: str = "exact"
+    binary: bool = True
+
+    def __call__(self, ex: Example, output: str) -&gt; float:
+        return float(_norm(output) == _norm(ex.expected))
+
+
+@dataclass
+class RegexMatch:
+    pattern: str
+    name: str = "regex"
+    binary: bool = True
+
+    def __call__(self, ex: Example, output: str) -&gt; float:
+        return float(re.search(self.pattern.format(expected=re.escape(ex.expected)), output) is not None)
+
+
+@dataclass
+class JudgeScorer:
+    """An LLM-as-judge scorer. `judge` returns a 1-5 rating; the scorer maps it to [0, 1].
+    In tests the judge is a deterministic stub; in production it is a model call with a rubric."""
+    judge: Callable[[str, str, str], int]
+    name: str = "judge"
+    binary: bool = False
+
+    def __call__(self, ex: Example, output: str) -&gt; float:
+        rating = self.judge(ex.input, ex.expected, output)
+        if not 1 &lt;= rating &lt;= 5:
+            raise ValueError(f"judge returned {rating}, expected 1-5")
+        return (rating - 1) / 4
+
+
+# ---------------------------------------------------------------- rate limiting
+class TokenBucket:
+    """Shared by all workers: at most `rate` calls per second on average, bursts up to `burst`."""
+
+    def __init__(self, rate: float, burst: int = 1, clock=time.monotonic, sleep=time.sleep) -&gt; None:
+        self.rate, self.burst, self.clock, self.sleep = rate, burst, clock, sleep
+        self.tokens, self.last = float(burst), clock()
+        self.lock = threading.Lock()
+
+    def acquire(self) -&gt; None:
+        while True:
+            with self.lock:
+                now = self.clock()
+                self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
+                self.last = now
+                if self.tokens &gt;= 1:
+                    self.tokens -= 1
+                    return
+                wait = (1 - self.tokens) / self.rate
+            self.sleep(wait)                              # sleep outside the lock
+
+
+# ---------------------------------------------------------------- results cache (resumability)
+class ResultStore:
+    """Append-only JSONL file of finished examples for one run key. Safe for many threads;
+    a crash loses at most the line being written, which is ignored on reload."""
+
+    def __init__(self, path: str, run_key: str) -&gt; None:
+        self.path, self.run_key, self.lock = path, run_key, threading.Lock()
+        self.done: dict[str, dict] = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue                          # torn final line after a crash
+                    if rec.get("run_key") == run_key:
+                        self.done[rec["id"]] = rec
+
+    def save(self, rec: dict) -&gt; None:
+        rec = {**rec, "run_key": self.run_key}
+        line = json.dumps(rec, sort_keys=True) + "\n"
+        with self.lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            self.done[rec["id"]] = rec
+
+
+def run_key(model_name: str, model_params: dict, scorers: list, dataset: list[Example]) -&gt; str:
+    """Anything that changes results changes the key, so stale results are never reused."""
+    blob = json.dumps({"model": model_name, "params": model_params,
+                       "scorers": [s.name for s in scorers],
+                       "data": hashlib.sha256(json.dumps([asdict(e) for e in dataset]).encode()).hexdigest()},
+                      sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- the runner
+@dataclass
+class RunConfig:
+    workers: int = 8
+    rate_per_s: float = 50.0
+    burst: int = 5
+    max_attempts: int = 4
+    backoff_base_s: float = 0.05
+    seed: int = 0
+
+
+class EvalRunner:
+    def __init__(self, model: Model, model_name: str, scorers: list, store: ResultStore,
+                 cfg: RunConfig | None = None, sleep=time.sleep) -&gt; None:
+        self.model, self.model_name, self.scorers, self.store = model, model_name, scorers, store
+        self.cfg = cfg or RunConfig()
+        self.sleep = sleep
+        self.bucket = TokenBucket(self.cfg.rate_per_s, self.cfg.burst, sleep=sleep)
+        self.model_calls = 0
+        self._calls_lock = threading.Lock()
+        self._stop = threading.Event()                    # set by a fatal error: start no new work
+
+    def run(self, dataset: list[Example]) -&gt; list[dict]:
+        todo = [ex for ex in dataset if ex.id not in self.store.done]
+        pool = ThreadPoolExecutor(self.cfg.workers, thread_name_prefix="eval")
+        try:
+            for fut in [pool.submit(self._one, ex) for ex in todo]:
+                fut.result()                              # re-raises a fatal error from a worker
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True) # stop promptly; finished work is on disk
+            raise
+        pool.shutdown(wait=True)
+        return [self.store.done[ex.id] for ex in dataset]
+
+    def _one(self, ex: Example) -&gt; None:
+        if self._stop.is_set():
+            return
+        try:
+            self._run_example(ex)
+        except BaseException:
+            self._stop.set()
+            raise
+
+    def _run_example(self, ex: Example) -&gt; None:
+        rng = random.Random(f"{self.cfg.seed}:{ex.id}")   # deterministic jitter per example
+        t0, attempts, output, error = time.perf_counter(), 0, None, None
+        while attempts &lt; self.cfg.max_attempts:
+            attempts += 1
+            self.bucket.acquire()
+            with self._calls_lock:
+                self.model_calls += 1
+            try:
+                output = self.model(ex.input)
+                break
+            except TransientError as e:
+                error = f"TransientError: {e}"
+                if attempts &lt; self.cfg.max_attempts:
+                    cap = self.cfg.backoff_base_s * 2 ** (attempts - 1)
+                    self.sleep(rng.uniform(0, cap))           # full jitter
+            except Exception as e:                        # a permanent failure: do not retry
+                error = f"{type(e).__name__}: {e}"
+                break
+        rec = {"id": ex.id, "tags": list(ex.tags), "attempts": attempts,
+               "latency_s": round(time.perf_counter() - t0, 4)}
+        if output is None:
+            rec.update(status="error", error=error, scores={})
+        else:
+            scores, serr = {}, None
+            for s in self.scorers:
+                try:
+                    scores[s.name] = s(ex, output)
+                except Exception as e:                    # a scorer bug is not the model's failure
+                    serr = f"{s.name}: {type(e).__name__}: {e}"
+            rec.update(status="ok" if serr is None else "scorer_error", output=output,
+                       scores=scores, error=serr)
+        self.store.save(rec)
+
+
+# ---------------------------------------------------------------- statistics and the report
+def wilson(successes: int, n: int, z: float = 1.96) -&gt; tuple[float, float]:
+    if n == 0:
+        return (0.0, 1.0)
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def bootstrap_ci(values: list[float], seed: int = 0, iters: int = 2000, alpha: float = 0.05) -&gt; tuple[float, float]:
+    if not values:
+        return (0.0, 1.0)
+    rng, n = random.Random(seed), len(values)
+    means = sorted(sum(rng.choices(values, k=n)) / n for _ in range(iters))
+    return (means[int(alpha / 2 * iters)], means[int((1 - alpha / 2) * iters) - 1])
+
+
+def report(results: list[dict], scorers: list, seed: int = 0) -&gt; dict:
+    ok = [r for r in results if r["status"] == "ok"]
+    out = {"n": len(results), "scored": len(ok),
+           "errors": sum(r["status"] == "error" for r in results),
+           "scorer_errors": sum(r["status"] == "scorer_error" for r in results),
+           "retried": sum(r["attempts"] &gt; 1 for r in results), "metrics": {}, "slices": {}}
+    lat = sorted(r["latency_s"] for r in results)
+    out["latency_p50_s"] = lat[len(lat) // 2] if lat else 0.0
+    for s in scorers:
+        vals = [r["scores"][s.name] for r in ok]
+        mean = sum(vals) / len(vals) if vals else 0.0
+        ci = wilson(round(sum(vals)), len(vals)) if s.binary else bootstrap_ci(vals, seed)
+        out["metrics"][s.name] = {"mean": round(mean, 4), "ci95": (round(ci[0], 4), round(ci[1], 4)), "n": len(vals)}
+    for tag in sorted({t for r in ok for t in r["tags"]}):
+        rows = [r for r in ok if tag in r["tags"]]
+        out["slices"][tag] = {s.name: round(sum(r["scores"][s.name] for r in rows) / len(rows), 4)
+                              for s in scorers} | {"n": len(rows)}
+    return out
+
+
+# ---------------------------------------------------------------- tests
+def make_dataset(n: int = 100) -&gt; list[Example]:
+    caps = ["Paris", "Rome", "Madrid", "Berlin", "Lisbon"]
+    return [Example(f"ex{i:03d}", f"Q{i}: capital #{i % 5}?", caps[i % 5],
+                    ("geo", "long" if i % 5 in (0, 1) else "short")) for i in range(n)]
+
+
+def fake_model(fail_every: int = 5) -&gt; Model:
+    """Correct except on every fail_every-th question, where it answers 'London'."""
+    caps = ["Paris", "Rome", "Madrid", "Berlin", "Lisbon"]
+
+    def model(prompt: str) -&gt; str:
+        i = int(prompt[1:prompt.index(":")])
+        return "London." if i % fail_every == 0 else f"The answer is {caps[i % 5]}."
+    return model
+
+
+def stub_judge(question: str, expected: str, output: str) -&gt; int:
+    return 5 if expected.lower() in output.lower() else 2
+
+
+def store(tmp: str, key: str = "k") -&gt; ResultStore:
+    return ResultStore(os.path.join(tmp, "results.jsonl"), key)
+
+
+SCORERS = [ExactMatch(), RegexMatch(r"\b{expected}\b"), JudgeScorer(stub_judge)]
+
+
+def test_scorers() -&gt; None:
+    ex = Example("a", "q", "Paris")
+    assert ExactMatch()(ex, " paris! ") == 1.0 and ExactMatch()(ex, "It is Paris") == 0.0
+    assert RegexMatch(r"\b{expected}\b")(ex, "It is Paris.") == 1.0
+    assert RegexMatch(r"\b{expected}\b")(ex, "Parisian food") == 0.0
+    assert JudgeScorer(stub_judge)(ex, "Paris") == 1.0 and JudgeScorer(stub_judge)(ex, "Rome") == 0.25
+
+
+def test_end_to_end_report_and_intervals() -&gt; None:
+    with tempfile.TemporaryDirectory() as tmp:
+        data = make_dataset(100)
+        runner = EvalRunner(fake_model(5), "fake", SCORERS, store(tmp), RunConfig(workers=8, rate_per_s=1e6, burst=100))
+        rep = report(runner.run(data), SCORERS)
+    m = rep["metrics"]
+    assert m["exact"]["mean"] == 0.0                      # 'The answer is Paris.' is not an exact match
+    assert m["regex"]["mean"] == 0.8 and m["regex"]["ci95"] == (0.7112, 0.8666)   # Wilson, n = 100
+    assert m["judge"]["mean"] == 0.85                     # 80 x 1.0 + 20 x 0.25
+    lo, hi = m["judge"]["ci95"]
+    assert lo &lt; 0.85 &lt; hi and hi - lo &lt; 0.15
+    assert rep["slices"]["long"] == {"exact": 0.0, "regex": 0.5, "judge": 0.625, "n": 40}   # every failure is here
+    assert rep["slices"]["short"]["regex"] == 1.0 and rep["slices"]["short"]["n"] == 60
+
+
+def test_retries_transient_then_records_permanent_errors() -&gt; None:
+    calls: dict[str, int] = {}
+    lock = threading.Lock()
+
+    def flaky(prompt: str) -&gt; str:
+        with lock:
+            calls[prompt] = calls.get(prompt, 0) + 1
+            n = calls[prompt]
+        if prompt.startswith("Q1:") and n &lt; 3:
+            raise TransientError("overloaded")           # succeeds on the 3rd attempt
+        if prompt.startswith("Q2:"):
+            raise TransientError("always overloaded")    # exhausts retries
+        if prompt.startswith("Q3:"):
+            raise ValueError("prompt too long")          # permanent: no retry
+        return "Paris"
+    with tempfile.TemporaryDirectory() as tmp:
+        slept: list[float] = []
+        r = EvalRunner(flaky, "f", [ExactMatch()], store(tmp), RunConfig(workers=2, rate_per_s=1e6, burst=10),
+                       sleep=slept.append)
+        res = {x["id"]: x for x in r.run(make_dataset(5))}
+    assert res["ex001"]["status"] == "ok" and res["ex001"]["attempts"] == 3
+    assert res["ex002"]["status"] == "error" and res["ex002"]["attempts"] == 4
+    assert res["ex003"]["status"] == "error" and res["ex003"]["attempts"] == 1
+    assert len(slept) == 2 + 3 and all(0 &lt;= s &lt;= 0.05 * 4 for s in slept)
+    rep = report(list(res.values()), [ExactMatch()])
+    assert rep["errors"] == 2 and rep["metrics"]["exact"]["n"] == 3           # errors are not zeros
+
+
+def test_resume_after_crash_reuses_finished_work() -&gt; None:
+    data = make_dataset(60)
+
+    class Crash(BaseException):                          # not an Exception: kills the run like Ctrl-C
+        pass
+    seen: list[str] = []
+
+    def crashing(prompt: str) -&gt; str:
+        seen.append(prompt)
+        if len(seen) == 25:
+            raise Crash()
+        return fake_model()(prompt)
+    with tempfile.TemporaryDirectory() as tmp:
+        key = run_key("fake", {"t": 0}, SCORERS, data)
+        try:
+            EvalRunner(crashing, "fake", SCORERS, store(tmp, key), RunConfig(workers=1, rate_per_s=1e6)).run(data)
+        except Crash:
+            pass
+        st = store(tmp, key)
+        assert len(st.done) == 24                         # finished work survived
+        r2 = EvalRunner(fake_model(), "fake", SCORERS, st, RunConfig(workers=4, rate_per_s=1e6, burst=20))
+        resumed = r2.run(data)
+        assert r2.model_calls == 36                       # only the unfinished examples were called
+        with tempfile.TemporaryDirectory() as tmp2:
+            clean = EvalRunner(fake_model(), "fake", SCORERS, store(tmp2, key),
+                               RunConfig(workers=4, rate_per_s=1e6, burst=20)).run(data)
+        strip = lambda rows: [{k: v for k, v in x.items() if k != "latency_s"} for x in rows]
+        assert strip(resumed) == strip(clean)             # same results as an uninterrupted run
+        assert report(resumed, SCORERS) ["metrics"] == report(clean, SCORERS)["metrics"]
+
+
+def test_config_change_invalidates_cache() -&gt; None:
+    data = make_dataset(10)
+    k1 = run_key("model-a", {"temperature": 0}, SCORERS, data)
+    assert k1 != run_key("model-a", {"temperature": 0.7}, SCORERS, data)
+    assert k1 != run_key("model-b", {"temperature": 0}, SCORERS, data)
+    assert k1 != run_key("model-a", {"temperature": 0}, SCORERS[:1], data)
+    assert k1 != run_key("model-a", {"temperature": 0}, SCORERS, data[:9])
+    with tempfile.TemporaryDirectory() as tmp:
+        EvalRunner(fake_model(), "a", SCORERS, store(tmp, k1), RunConfig(rate_per_s=1e6, burst=20)).run(data)
+        assert len(store(tmp, k1).done) == 10 and len(store(tmp, "other").done) == 0
+
+
+def test_rate_limit_and_concurrency() -&gt; None:
+    in_flight, peak, lock = [0], [0], threading.Lock()
+
+    def slow(prompt: str) -&gt; str:
+        with lock:
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+        time.sleep(0.02)
+        with lock:
+            in_flight[0] -= 1
+        return "Paris"
+    with tempfile.TemporaryDirectory() as tmp:
+        t0 = time.monotonic()
+        EvalRunner(slow, "s", [ExactMatch()], store(tmp), RunConfig(workers=6, rate_per_s=100, burst=1)).run(make_dataset(40))
+        elapsed = time.monotonic() - t0
+    assert peak[0] &lt;= 6 and peak[0] &gt;= 2                  # pool size caps concurrency
+    assert elapsed &gt;= 0.38                                # 40 calls at 100/s with burst 1: &gt;= ~0.39 s
+
+
+def test_torn_line_is_ignored_on_reload() -&gt; None:
+    with tempfile.TemporaryDirectory() as tmp:
+        st = store(tmp, "k")
+        st.save({"id": "ex000", "status": "ok", "scores": {}, "tags": [], "attempts": 1, "latency_s": 0})
+        with open(st.path, "a", encoding="utf-8") as f:
+            f.write('{"id": "ex001", "status": "o')       # crash mid-write
+        assert set(store(tmp, "k").done) == {"ex000"}
+
+
+def test_stress_many_workers_unique_results() -&gt; None:
+    with tempfile.TemporaryDirectory() as tmp:
+        data = make_dataset(500)
+        st = store(tmp)
+        EvalRunner(fake_model(), "f", SCORERS, st, RunConfig(workers=16, rate_per_s=1e6, burst=100)).run(data)
+        with open(st.path, encoding="utf-8") as f:
+            ids = [json.loads(line)["id"] for line in f]
+    assert len(ids) == 500 and len(set(ids)) == 500
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
+    for t in tests:
+        t()
+        print("ok ", t.__name__)
+    print(f"{len(tests)} tests passed")</pre>
+
+<h4>10 · Edge cases</h4>
+<p><strong>Duplicate example ids</strong>: the store keys by id, so a duplicate would be skipped as already done; validate ids are unique before running. <strong>Empty dataset or all errors</strong>: means over zero scored examples are undefined; the report returns n = 0 and the widest interval, and the caller should treat it as a failed run. <strong>Judge returns out-of-range ratings</strong>: the scorer raises and the record is a scorer error, visible in the report. <strong>Rate limit headers</strong>: real providers send <code>Retry-After</code>; honour it instead of the formula when present. <strong>Very slow examples</strong>: add a per-call timeout so one stuck call cannot hold a worker forever. <strong>Disk full</strong>: an append failure must stop the run loudly; silently continuing would lose results that appear to have been saved.</p>
+
+<h4>11 · Extensions the interviewer will ask for</h4>
+<p><strong>Paired comparison</strong> of two runs: join by id, compute per-example differences, report the mean difference with a bootstrap interval and win/loss/tie counts. <strong>Cache model outputs separately from scores</strong>, so a new scorer re-scores without re-calling the model. <strong>Clustered intervals</strong> when examples come in groups (bootstrap over groups). <strong>Multiple samples per example</strong> at non-zero temperature, to reduce variance and measure consistency (pass@k). <strong>Async</strong> with <code>asyncio.Semaphore</code> and an async token bucket for thousands of concurrent calls. <strong>Distributed runs</strong>: shard examples across machines with a shared rate limiter (cd12) and a shared result store. <strong>Cost tracking</strong> per example from usage fields, and a budget that stops the run. <strong>Batch APIs</strong> for large, non-urgent runs at lower cost.</p>
+
+<h4>12 · Complexity</h4>
+<p>Wall time ≈ max(n × latency / workers, n / rate) plus retries, so the run is bounded by whichever of concurrency or rate limit binds. Each example does O(attempts) model calls, O(scorers) scoring, and one append with an fsync — the fsync (milliseconds on many disks) can dominate for fast fake models, which is why the stress test is the slowest. Reloading the store is O(file size). The report is O(n × scorers) plus O(B × n) for B bootstrap resamples per continuous metric. Memory is O(n) records.</p>
+</section>
+
+<section data-field="deep">
+<h4>Five statistical habits that change decisions</h4>
+<p>Anthropic's 2024 write-up on the statistics of model evaluations, with Evan Miller's accompanying paper, makes five recommendations that map directly onto this runner. Report a standard error (or interval) with every score, via the central limit theorem. Cluster standard errors when questions come in related groups, because correlated questions carry less information than their count suggests. Reduce variance within questions — for example by sampling several answers per question when using chain-of-thought — so the score reflects the model rather than one lucky sample. Analyse paired differences when comparing two models on the same questions, so per-question difficulty cancels. And use power analysis before running, to know how many questions are needed to detect the difference you care about. The runner's record format (one line per example per run, with id and tags) is exactly what all five need.</p>
+
+<h4>Power: how many examples are enough</h4>
+<p>For two unpaired proportions near p, detecting a difference δ with 95% confidence and 80% power needs about n ≈ 2 × (1.96 + 0.84)² × p(1 − p) / δ² examples per model. At p = 0.8: δ = 10 points needs about 250; δ = 5 points about 1,000; δ = 2 points about 6,300. Paired designs on the same examples need fewer, often several times fewer when the two models agree on most examples, because only disagreements carry information. This arithmetic, done before building a dataset, prevents the most common eval mistake: declaring a winner from a difference smaller than the noise.</p>
+
+<h4>Judges need their own evaluation</h4>
+<p>A judge scorer is a model making errors of its own: preferences for longer answers, for its own model family's style, for the first of two options in pairwise comparisons, and sensitivity to rubric wording. Before trusting a judge metric, measure its agreement with human labels on a sample (ev4), keep that sample as a regression test for the judge, and fix its version, prompt and temperature in the run key so judge changes invalidate cached scores. When the judge and a deterministic scorer disagree, the disagreements are the most informative examples to read.</p>
+
+<h4>Determinism and what "the same run" means</h4>
+<p>Reproducibility has layers. The runner's own randomness (jitter, bootstrap) is seeded. Scorers are pure functions. The model may not be: even at temperature 0, providers do not always guarantee identical outputs, because batching and numerical details vary. So "resume gives the same results" is guaranteed for the runner's logic and for stored outputs, not for fresh model calls; record the model version and timestamp per result, and treat an eval as a sample whose uncertainty the intervals describe. Separating output caching from scoring also makes a re-score fully deterministic: the outputs are fixed, only the scorer runs.</p>
+
+<h4>Slices can reverse the headline</h4>
+<p>Aggregate scores can mislead when slices have different sizes. Suppose model B beats model A on both short and long questions, but B's run happened to include more long (harder) questions because some short ones errored: B's overall average can still come out lower. This is Simpson's paradox, and it is one more reason to compare models on exactly the same examples, with errors handled the same way, and to read per-slice tables before the headline. Slices also guide what to fix: a 50% score on "long" questions with 100% on "short" points at context handling or truncation, not at the model's knowledge.</p>
+
+<h4>Contamination and dataset hygiene</h4>
+<p>An eval measures what it was meant to only if the model has not seen the answers. Public benchmarks leak into training data; internal datasets leak into prompts when engineers paste failing examples as few-shot demonstrations. Keep a held-out set that is never used in prompts or tuning, version datasets (their hash is already in the run key), and rotate in fresh examples from recent production traffic. A sudden jump on an old dataset with no jump on fresh examples is the signature of contamination, not progress.</p>
+
+<h4>Rate limits are shared resources</h4>
+<p>Provider limits apply per organisation or API key, not per process. An eval run that saturates the limit can starve the production service using the same key — a self-inflicted outage during an experiment. Use a separate key or workspace for evals, set the runner's rate below the limit with headroom for production, and prefer batch interfaces for large offline runs. If several eval jobs run at once, they need a shared limiter (a Redis-backed token bucket, cd12), not one bucket each.</p>
+</section>
+
+<section data-field="prod">
+<h4>How eval runners fail in practice</h4>
+<p><strong>Decisions made on noise.</strong> Symptom: model choices flip between runs. Cause: small datasets and no intervals; differences of a few points on 100-200 examples. Fix: intervals on every metric, paired comparisons, and power analysis to size the dataset.</p>
+<p><strong>Outages scored as regressions.</strong> Symptom: a candidate model's score drops during a provider incident. Cause: errors counted as zeros. Fix: separate error accounting; rerun or exclude errors, and alert when the error rate exceeds a threshold so the run is flagged as unreliable.</p>
+<p><strong>Stale results reused.</strong> Symptom: a "new" run shows identical numbers to the last. Cause: a cache keyed by example id only, not by configuration. Fix: a run key that hashes model, parameters, prompt version, scorers and dataset.</p>
+<p><strong>Production starved by an eval.</strong> Symptom: users see rate-limit errors while an eval runs. Cause: eval and production share an API key and the eval saturates it. Fix: separate keys, a runner rate below the limit, batch APIs.</p>
+<p><strong>Lost runs.</strong> Symptom: a long run dies at 90% and starts over. Cause: results held in memory. Fix: append-and-fsync per example, resumable by run key.</p>
+<p><strong>Judge drift.</strong> Symptom: judge scores shift after an unrelated change. Cause: the judge model or prompt changed without invalidating cached scores. Fix: include the judge's version and prompt in the run key; keep a human-labelled sample to monitor judge agreement.</p>
+
+<p><strong>Silent truncation.</strong> Symptom: scores fall on long inputs only. Cause: the runner or the model client truncates long prompts to a maximum length without saying so. Fix: record input token counts per example and fail, rather than truncate, when an input exceeds the limit.</p>
+
+<h4>What to measure about the runner itself</h4>
+<p>Throughput (examples per minute) against the configured rate; error and retry rates by error type; time spent waiting on the rate limiter versus calling the model; cost per run; and the fraction of examples reused from cache on resumed runs. For the results: every metric with its interval and n, error counts, per-slice tables, and for comparisons the paired difference with its interval.</p>
+
+<h4>Knobs</h4>
+<p>Workers (≈ rate × latency, with headroom); rate and burst (below the provider limit, leaving room for production traffic); max attempts and backoff base; bootstrap iterations (2,000 is plenty for a 95% interval); which tags to slice by; and whether to fsync per record (safest) or per batch (faster, loses at most a batch on crash).</p>
+
+<h4>The real references</h4>
+<p>Anthropic's research post "A statistical approach to model evaluations" (November 2024) and Evan Miller's paper "Adding error bars to evals" give the statistical method this report implements in miniature — standard errors with every score, clustering, variance reduction, paired differences and power analysis. Open-source frameworks show the engineering shape at scale: the UK AI Security Institute's Inspect structures an evaluation as a task combining a dataset, a solver that produces answers and a scorer, with model-call caching, concurrency controls and eval logs; EleutherAI's lm-evaluation-harness runs standard benchmarks across many models. This runner is the kernel those systems share: concurrency under a rate limit, durable per-example results, and honest uncertainty.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then break it, measure it and extend it. Python 3.12, standard library only. Use the fake model throughout: it makes every number in the report predictable, so when you break something you can say exactly how the report should change before you run it.</p>
+<ol>
+<li>Save the full solution as <code>eval_runner.py</code> and run it. Eight tests pass in a few seconds.</li>
+<li><strong>Break the error accounting.</strong> Make errors score 0 and count them in the means. Rerun the retry test's dataset and compare the exact-match mean with and without the change.</li>
+<li><strong>Break the cache key.</strong> Make <code>run_key</code> ignore the model parameters. Write a test showing a temperature change silently reuses old results.</li>
+<li><strong>Measure the intervals.</strong> Compute Wilson and normal-approximation intervals for 8/10, 10/10, 80/100 and 800/1,000. Then simulate: draw 10,000 samples of n = 20 from a true rate of 0.9 and count how often each interval contains 0.9.</li>
+<li><strong>Measure throughput.</strong> Use a fake model that sleeps 50 ms. Time 200 examples at workers = 1, 5, 20, 50 with a rate limit of 100 per second, and explain where the curve flattens using rate × latency.</li>
+<li><strong>Extend it: paired comparison.</strong> Run two fake models, join the records by id, and report the mean difference with a bootstrap interval and win/loss/tie counts.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Plan it</b>
+<p>You must decide whether a new model is better than the current one on a support-answer benchmark. Current accuracy is about 80%. The product cares about a 3-point improvement. Calls take 4 seconds, the eval key's limit is 30 requests per second, and the judge is a second model call per example with the same latency. How many examples, how many workers, and how long will the run take?</p>
+<details><summary>Answer</summary>
+<p>Unpaired, n ≈ 2 × (1.96 + 0.84)² × 0.8 × 0.2 / 0.03² = 2 × 7.84 × 0.16 / 0.0009 ≈ 2,790 per model. Paired on the same examples needs fewer — perhaps 1,000-1,500 if the models agree on most items — so plan 1,500 examples, run both models on all of them, and analyse paired differences. Calls: 1,500 examples × 2 models × 2 calls (answer + judge) = 6,000 calls. Rate-bound time: 6,000 ÷ 30 = 200 seconds. Workers: rate × latency = 30 × 4 = 120 in flight to reach the limit; use about 120 workers with the shared token bucket. Expect 4-5 minutes with retries. Keep the eval on its own key so production is not starved.</p>
+</details>
+<b>Diagnose it</b>
+<p>A nightly eval shows the production model's accuracy falling from 84% to 79% overnight, with no model or prompt change. The report says n = 812 of 1,000 examples scored. What do you check first?</p>
+<details><summary>Answer</summary>
+<p>188 examples were not scored: check the error counts and types. If the runner counted errors in the denominator or the errors are not random — for example, long inputs timing out more under provider load — the scored subset is biased toward easier or harder examples, and the 5-point drop may be selection, not quality. Compare per-slice scores and the error distribution across slices, and compare the 812 scored examples with the same examples in yesterday's run (a paired comparison on the intersection). Then rerun the errored examples. If the drop persists on a complete, paired comparison, look for silent changes: a provider model update behind the same name, a judge change, or a dataset change (the run key would reveal that).</p>
+</details>
+</section>

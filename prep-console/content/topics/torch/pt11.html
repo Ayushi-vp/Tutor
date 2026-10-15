@@ -1,0 +1,574 @@
+<!-- topic source for torch/pt11; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "pt11",
+  "t": "Distributed training from the API side: torchrun, process groups, DDP and FSDP2",
+  "tag": "Distributed",
+  "sum": "What each distributed PyTorch call does on the wire: torchrun and the environment it sets, init_process_group and collectives, DistributedDataParallel's gradient buckets and overlap (from the VLDB 2020 paper), find_unused_parameters, no_sync, DistributedSampler, and FSDP2's fully_shard with all-gather and reduce-scatter.",
+  "prereq": [
+    [
+      "dl9",
+      "Data parallelism copies the model on every GPU and averages gradients; tensor and pipeline parallelism split the model itself."
+    ],
+    [
+      "gpu8",
+      "All-reduce, all-gather and reduce-scatter are the core collectives; a ring all-reduce moves about 2(n−1)/n times the data per GPU; NVLink is far faster than the network between nodes."
+    ],
+    [
+      "gpu9",
+      "ZeRO and FSDP shard parameters, gradients and optimiser state across data-parallel ranks, gathering parameters only when a layer runs."
+    ],
+    [
+      "pt3",
+      "Backward runs nodes as soon as their inputs are ready, so gradients of the last layers are available first; post-accumulate-grad hooks fire per parameter."
+    ],
+    [
+      "pt5",
+      "DistributedSampler gives each rank a disjoint slice of indices and needs set_epoch; IterableDatasets must shard by rank and worker."
+    ]
+  ],
+  "myths": [
+    [
+      "DDP averages the models' weights after each step.",
+      "DDP never touches weights after construction. It broadcasts rank 0's parameters once at start-up, then all-reduces gradients during backward, so every rank applies the same averaged gradient with an identical optimiser and the replicas stay identical. If they ever diverge — a rank-specific random operation on parameters, a rank that skips a step — nothing pulls them back together."
+    ],
+    [
+      "find_unused_parameters=True is a safe default.",
+      "It makes DDP traverse the autograd graph after every forward pass to find parameters that will not get a gradient, which costs time on every iteration, and the DDP paper notes it is only needed when parts of the model are skipped. With every parameter used each step, leave it False; when only some steps skip parameters, consider static_graph=True or restructuring so all parameters participate."
+    ],
+    [
+      "FSDP is just DDP that uses less memory.",
+      "FSDP changes the communication pattern: instead of one all-reduce of gradients per step, each wrapped unit all-gathers its parameters before forward (and again before backward if resharded) and reduce-scatters gradients afterwards — about 1.5× DDP's communication volume. It saves memory by holding only 1/n of parameters, gradients and optimiser state per GPU, and it depends on wrapping granularity and prefetching to overlap that communication."
+    ],
+    [
+      "Gradient accumulation works the same under DDP.",
+      "Without no_sync(), DDP all-reduces gradients after every micro-batch's backward, multiplying communication by the number of micro-batches. Wrap all but the last micro-batch in model.no_sync() (DDP) or call set_requires_gradient_sync(False) (FSDP2) so the reduction happens once per optimiser step."
+    ],
+    [
+      "Each rank should seed differently so they see different data.",
+      "Data differences come from the DistributedSampler, which splits indices by rank. Model initialisation must be identical (DDP broadcasts rank 0's weights to guarantee it), and dropout and augmentation randomness should differ by rank — so seed the model identically and add the rank only to the seeds that drive per-sample randomness."
+    ],
+    [
+      "If one rank crashes, the others will error out.",
+      "Often they hang: every surviving rank waits inside a collective for a peer that will never arrive. Without timeouts and monitoring, a job can sit idle for hours. Set a process-group timeout, use torchrun's elastic restarts, and watch for ranks stuck in NCCL collectives."
+    ]
+  ],
+  "recap": [
+    "torchrun starts one process per GPU and sets RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR and MASTER_PORT; init_process_group('nccl') reads them and creates the default process group.",
+    "Collectives (all-reduce, all-gather, reduce-scatter, broadcast) must be called by every rank in the group in the same order with matching shapes, or the job hangs.",
+    "DDP broadcasts parameters and buffers once, then registers autograd hooks that copy gradients into buckets (25 MB by default, with a 1 MB first bucket) in reverse parameter order and all-reduce each bucket as soon as it is full, overlapping communication with the rest of backward.",
+    "find_unused_parameters adds a per-iteration graph traversal; no_sync() skips the all-reduce for gradient-accumulation micro-batches; buffers are synced from rank 0 at each forward (forward_sync_buffers, which replaced broadcast_buffers in 2.13).",
+    "DistributedSampler with set_epoch gives each rank a disjoint, epoch-dependent shard; the effective batch is the per-rank batch times the world size.",
+    "FSDP2's fully_shard, applied bottom-up per block and then to the root, stores parameters as DTensors sharded on dim 0, all-gathers each unit before its forward and backward, and reduce-scatters its gradients.",
+    "Per GPU, DDP keeps 16N bytes of training state while FSDP keeps 16N/n plus one gathered unit; FSDP communicates about 1.5× as much, hidden by prefetching.",
+    "Debug distributed jobs by checking that every rank calls collectives in the same order, using timeouts, and logging per-rank step times to find stragglers."
+  ],
+  "glossary": [
+    [
+      "All-gather",
+      "A collective in which each rank contributes a shard and every rank receives the concatenation of all shards."
+    ],
+    [
+      "All-reduce",
+      "A collective in which every rank contributes a tensor and every rank receives the elementwise sum (or average); equals reduce-scatter followed by all-gather."
+    ],
+    [
+      "Bucket (DDP)",
+      "A group of gradients flattened into one buffer and all-reduced in one collective call."
+    ],
+    [
+      "Collective",
+      "A communication operation that all ranks of a process group call together."
+    ],
+    [
+      "DCP",
+      "torch.distributed.checkpoint: sharded, parallel checkpoint saving and resharded loading (pt8)."
+    ],
+    [
+      "DDP",
+      "DistributedDataParallel: a full model replica per rank with gradients all-reduced during backward."
+    ],
+    [
+      "Device mesh",
+      "A logical arrangement of ranks into an n-dimensional grid, used to describe combinations of parallelism (for example data × tensor)."
+    ],
+    [
+      "DTensor",
+      "A tensor subclass describing one logical tensor sharded or replicated across the ranks of a device mesh."
+    ],
+    [
+      "FSDP2",
+      "The fully_shard API: per-parameter sharding with DTensor, unit-by-unit all-gather and reduce-scatter."
+    ],
+    [
+      "HSDP",
+      "Hybrid sharded data parallel: shard within a group (often a node) and replicate across groups, reducing cross-node traffic."
+    ],
+    [
+      "LOCAL_RANK",
+      "The index of a process among those on the same machine, used to choose its GPU."
+    ],
+    [
+      "MFU",
+      "Model FLOPs utilisation: achieved model FLOPs per second divided by the hardware's peak (pt10)."
+    ],
+    [
+      "NCCL",
+      "NVIDIA's collective communication library, the backend for GPU collectives in PyTorch."
+    ],
+    [
+      "no_sync",
+      "A DDP context manager that skips gradient all-reduce, used for all but the last micro-batch of gradient accumulation."
+    ],
+    [
+      "Process group",
+      "A set of ranks that communicate together; the default group contains all ranks."
+    ],
+    [
+      "Rank",
+      "A process's global index in the job, from 0 to world size − 1."
+    ],
+    [
+      "Rate limiter (FSDP)",
+      "A cap on the number of in-flight parameter all-gathers, preventing prefetching from blowing up peak memory."
+    ],
+    [
+      "Reduce-scatter",
+      "A collective in which ranks contribute full tensors and each receives the sum of one shard."
+    ],
+    [
+      "Straggler",
+      "A rank that is slower than the others, making everyone wait at each collective."
+    ],
+    [
+      "TFLOPS",
+      "Trillions of floating-point operations per second, the unit for GPU compute throughput."
+    ],
+    [
+      "torchrun",
+      "PyTorch's launcher that starts and supervises one process per GPU, sets distributed environment variables and supports elastic restarts."
+    ],
+    [
+      "World size",
+      "The total number of processes (usually GPUs) in the job."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What does torchrun do, and what does your script need to call?",
+      "torchrun --nproc_per_node=8 train.py starts eight copies of the script and sets RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR and MASTER_PORT for each. The script calls torch.distributed.init_process_group(backend='nccl'), sets torch.cuda.set_device(LOCAL_RANK), wraps the model, uses a DistributedSampler, and calls destroy_process_group() at the end. For multi-node jobs torchrun also takes --nnodes and a rendezvous endpoint, and can restart failed workers (elastic)."
+    ],
+    [
+      "E",
+      "What does DDP communicate, and when?",
+      "At construction it broadcasts rank 0's parameters and buffers so all replicas start identical. During each backward pass it all-reduces gradients, bucket by bucket, as soon as each bucket's gradients are ready, and divides by world size, so every rank ends backward with the same averaged gradients. Each rank then runs its own identical optimiser step. By default it also syncs buffers from rank 0 at the start of each forward."
+    ],
+    [
+      "E",
+      "What is the effective batch size of a DDP job?",
+      "Per-rank batch × number of ranks × gradient-accumulation steps. Eight GPUs with batch 32 and accumulation 4 make an effective batch of 1,024; the learning rate must be chosen for that, not for 32 (pt6)."
+    ],
+    [
+      "M",
+      "Explain DDP's gradient buckets and why they make training faster.",
+      "DDP assigns parameters to buckets of about 25 MB (the first bucket is 1 MB) in roughly reverse order of model.parameters(), since gradients become ready from the last layer backward. An autograd hook on each parameter copies its gradient into the bucket; when a bucket is full, DDP launches an asynchronous all-reduce for it while backward continues on earlier layers. Bucketing amortises per-call overhead (many small all-reduces are slow), and early launching overlaps communication with computation. The DDP paper reports that bucket size alone can change speed by more than 2×.",
+      "Follow-up: What does gradient_as_bucket_view=True add? — The .grad tensors become views into the bucket buffers, removing a copy and one gradient-sized allocation."
+    ],
+    [
+      "M",
+      "When do you need find_unused_parameters=True, and what does it cost?",
+      "When some parameters receive no gradient in some iterations — a mixture-of-experts layer where an expert gets no tokens, a conditional branch, a frozen head that is still registered. Without it, DDP waits forever for those parameters' buckets to fill and the job hangs or raises an error about parameters not receiving gradients. With it, DDP traverses the autograd graph after each forward to mark unused parameters as ready, which costs time every iteration. static_graph=True can avoid the repeated cost when the set of used parameters is the same every iteration."
+    ],
+    [
+      "M",
+      "How do you do gradient accumulation correctly with DDP and with FSDP2?",
+      "With DDP: for the first k−1 micro-batches run forward and backward inside model.no_sync(), so gradients accumulate locally without communication; run the last micro-batch normally so the all-reduce sums the accumulated gradients once. With FSDP2: call model.set_requires_gradient_sync(False) before the first k−1 backward passes and True before the last. Either way, scale the loss by 1/k (or by tokens across ranks, pt6) and step once."
+    ],
+    [
+      "M",
+      "What do all-reduce, all-gather and reduce-scatter cost per GPU?",
+      "With a ring algorithm over n GPUs and a tensor of S bytes: reduce-scatter and all-gather each send and receive about (n−1)/n × S per GPU; all-reduce (reduce-scatter then all-gather) about 2(n−1)/n × S. For 14 GB of bf16 gradients (a 7B model) on 8 GPUs, an all-reduce moves about 24.5 GB per GPU; at an effective 400 GB/s that is roughly 60 ms, which DDP hides behind backward if the backward takes longer."
+    ],
+    [
+      "M",
+      "Describe what fully_shard does to a model.",
+      "Applied to a module, it converts that module's parameters into DTensors sharded on dim 0 across the mesh, so each rank stores 1/n of them, and installs hooks: before the module's forward, all-gather the full parameters; after forward, free them (reshard_after_forward, default True for non-root modules); before backward, all-gather again; after backward, reduce-scatter the gradients so each rank keeps only its shard's gradient. Call it bottom-up — on each transformer block, then on the root — so each block is one communication group; the optimiser is then built over the sharded parameters and updates only local shards.",
+      "Follow-up: Why not call it only on the root? — Then the whole model is one group: every parameter is gathered at once, so peak memory is the full model and nothing overlaps."
+    ],
+    [
+      "H",
+      "Compare per-GPU memory and communication for a 7B model on 8 GPUs under DDP and FSDP.",
+      "DDP: every GPU holds 16 bytes × 7B = 112 GB of weights, gradients and AdamW state in float32 — it does not fit on 80 GB GPUs. Communication: one all-reduce of gradients, ≈ 2 × 7/8 × gradient size. FSDP (full sharding): 112/8 = 14 GB of state per GPU plus the largest gathered unit (one transformer block, a few hundred MB in bf16) and activations. Communication: all-gather of parameters in forward, again in backward, and a reduce-scatter of gradients — about 3 × 7/8 × parameter size, 1.5× DDP — hidden by prefetching the next unit's all-gather during the current unit's compute.",
+      "Follow-up: When would you use HSDP? — With many nodes and slow inter-node links: shard within a node over fast NVLink and replicate across nodes, so only the gradient all-reduce crosses the network."
+    ],
+    [
+      "H",
+      "A 64-GPU job hangs at step 1,000 with no error. How do you debug it?",
+      "A hang means some rank is waiting in a collective that another rank never called — or never finished. Get stack traces from every rank (py-spy dump, or the flight recorder of collective calls) and look for ranks in different places: a rank that hit an exception, a rank in a data-dependent branch that skips a collective (an if on a rank-specific condition, an empty batch), a rank whose IterableDataset ran out of data first, or a rank calling collectives in a different order (for example only rank 0 doing an all_reduce for logging inside an if). Set a finite timeout in init_process_group so hangs become errors with context, and check hardware (a failing NIC or GPU) if all ranks are in the same collective.",
+      "Follow-up: Why is 'only rank 0 logs a reduced metric' dangerous? — If the reduction is a collective inside if rank == 0, the other ranks never join it and everyone waits forever."
+    ],
+    [
+      "H",
+      "How do you handle a model whose parameters are tied (embedding and head) under FSDP2?",
+      "Tied parameters must belong to one FSDP unit, because a Parameter can only be sharded and gathered once. Apply fully_shard to the blocks, then to the root module that owns both the embedding and the head, so the shared weight is managed by the root's group; or, when the head is computed in chunks, group the final norm and head explicitly. Checkpointing with get_state_dict handles the shared tensor by name, and the conversion to a release format must re-establish the tie (pt8)."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Li et al. — PyTorch Distributed: Experiences on Accelerating Data Parallel Training (VLDB 2020)",
+      "DDP's design: gradient bucketing (25 MB default), overlapping all-reduce with backward, no_sync, find_unused_parameters; near-linear scaling on 256 GPUs and >2× speed differences from bucket size.",
+      "https://arxiv.org/abs/2006.15704"
+    ],
+    [
+      "paper",
+      "Zhao et al. — PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel (VLDB 2023)",
+      "FSDP's sharding, prefetching and rate limiting; DDP-level performance on small models and near-linear TFLOPS scaling up to 512 A100s.",
+      "https://arxiv.org/abs/2304.11277"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.distributed.fsdp.fully_shard",
+      "FSDP2 API: DTensor sharding on dim 0, reshard_after_forward semantics, MixedPrecisionPolicy, set_requires_gradient_sync.",
+      "https://docs.pytorch.org/docs/2.14/distributed.fsdp.fully_shard.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — Distributed Data Parallel design note",
+      "How DDP constructs buckets, registers hooks and overlaps all-reduce with backward.",
+      "https://docs.pytorch.org/docs/2.14/notes/ddp.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torchrun (Elastic Launch)",
+      "Arguments, environment variables set for workers, rendezvous and elastic restarts.",
+      "https://docs.pytorch.org/docs/2.14/elastic/run.html"
+    ],
+    [
+      "docs",
+      "PyTorch tutorials — Getting Started with Fully Sharded Data Parallel (FSDP2)",
+      "Applying fully_shard per block, mixed precision, prefetching and checkpointing with DCP.",
+      "https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Single-GPU training is a loop; multi-GPU training is a distributed system that happens to contain a loop. The step from one to eight GPUs is usually three lines — launch with <code>torchrun</code>, call <code>init_process_group</code>, wrap the model in <code>DistributedDataParallel</code> — and it works, which is exactly why many engineers never learn what those lines do. Then the problems arrive. Eight GPUs train only five times faster than one. A model with a conditional branch hangs forever at the first step. Gradient accumulation makes the job slower per sample than without it. A 7B model will not fit even though "the memory is split across eight GPUs" (with DDP, it is not). A 256-GPU job sits idle for six hours because one rank crashed and the others are waiting politely for it inside a collective.</p>
+<p>The ideas behind data-parallel training — averaging gradients, sharding states — are covered in dl9, gpu8 and gpu9. This lesson is the API side: what each PyTorch call does on the wire, in what order, and how much it costs. The two canonical sources are the papers the PyTorch team wrote about its own systems: "PyTorch Distributed: Experiences on Accelerating Data Parallel Training" (Li et al., VLDB 2020), which explains DDP's gradient buckets, the overlap of communication with backward, and the no_sync and find_unused_parameters options, and reports near-linear scaling on 256 GPUs when configured well; and "PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel" (Zhao et al., VLDB 2023), which does the same for sharding. The current API for sharding, <code>fully_shard</code> (FSDP2), is a redesign built on DTensor; this lesson uses its 2.14 documentation.</p>
+<p>Interviewers ask about distributed training at every senior ML level: "what does DDP do during backward?", "why does this job hang?", "how would you train a 13B model on 16 GPUs?", "where does the time go at 64 GPUs?". Answering well means being able to draw the timeline — which collective runs when, how big it is, and what it overlaps with. By the end of this lesson you will be able to: launch and initialise a job correctly, explain DDP's buckets and hooks with numbers, use no_sync and DistributedSampler correctly, apply fully_shard to a transformer and say what it does in forward and backward, estimate communication and memory for both, and debug the hangs and slowdowns that distributed jobs are known for.</p>
+</section>
+
+<section data-field="primer">
+<p>Picture a team of eight chefs, each with an identical kitchen and an identical copy of a recipe book (the model). Every round, each chef cooks a different batch of dishes (a different slice of the data), tastes the results and writes notes on how to adjust every recipe (the gradients). Before anyone edits their book, the chefs compare notes and agree on the average adjustment (an all-reduce). Then each edits their own book in exactly the same way, so the eight books stay identical. That is <strong>data parallelism</strong>, and DistributedDataParallel (DDP) is PyTorch's implementation of it.</p>
+<p>Two refinements make it fast. The chefs do not wait until all notes are written before comparing: as soon as a page of notes is finished — the last recipes in the book are reviewed first — they compare that page while still writing the next. That is DDP's <strong>bucketing and overlap</strong>. And when the recipe book becomes too big for any one kitchen shelf, each chef keeps only one eighth of the book and borrows the pages they need from colleagues just before cooking each recipe, returning them afterwards. That is <strong>fully sharded data parallelism</strong> (FSDP): less memory per kitchen, more passing of pages.</p>
+<p>All of this needs a way to start the chefs and connect them, and a vocabulary for the comparisons:</p>
+<ul>
+<li><strong>torchrun</strong> starts one process per GPU and tells each its <strong>rank</strong> (its number), its <strong>local rank</strong> (its GPU on that machine) and the <strong>world size</strong> (how many there are).</li>
+<li><strong>init_process_group</strong> connects them into a <strong>process group</strong> using a backend — NCCL for GPUs.</li>
+<li><strong>Collectives</strong> are operations that every rank calls together: <strong>all-reduce</strong> (everyone ends with the sum), <strong>all-gather</strong> (everyone ends with all the pieces), <strong>reduce-scatter</strong> (everyone ends with the sum of one piece), <strong>broadcast</strong> (everyone ends with rank 0's copy).</li>
+</ul>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="DDP timeline: backward computes gradients from the last layer to the first; as each bucket fills, its all-reduce runs on the communication stream, overlapping with the remaining backward; the optimizer step waits for the last bucket">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">One DDP step on one rank (time →)</text>
+    <text x="20" y="56" style="fill:var(--muted)">compute</text>
+    <rect x="100" y="40" width="130" height="26" style="fill:var(--s1);opacity:0.5"/><text x="165" y="58" text-anchor="middle" style="fill:var(--ink)">forward</text>
+    <rect x="230" y="40" width="70" height="26" style="fill:var(--s3);opacity:0.6"/><text x="265" y="58" text-anchor="middle" style="fill:var(--ink)">bwd L12–9</text>
+    <rect x="300" y="40" width="70" height="26" style="fill:var(--s3);opacity:0.5"/><text x="335" y="58" text-anchor="middle" style="fill:var(--ink)">L8–5</text>
+    <rect x="370" y="40" width="70" height="26" style="fill:var(--s3);opacity:0.4"/><text x="405" y="58" text-anchor="middle" style="fill:var(--ink)">L4–1</text>
+    <rect x="510" y="40" width="70" height="26" style="fill:var(--s2);opacity:0.6"/><text x="545" y="58" text-anchor="middle" style="fill:var(--ink)">opt.step</text>
+    <text x="20" y="106" style="fill:var(--muted)">comm</text>
+    <rect x="300" y="90" width="70" height="26" style="fill:var(--accent);opacity:0.6"/><text x="335" y="108" text-anchor="middle" style="fill:var(--ink)">AR bucket 1</text>
+    <rect x="370" y="90" width="70" height="26" style="fill:var(--accent);opacity:0.5"/><text x="405" y="108" text-anchor="middle" style="fill:var(--ink)">AR bucket 2</text>
+    <rect x="440" y="90" width="70" height="26" style="fill:var(--accent);opacity:0.4"/><text x="475" y="108" text-anchor="middle" style="fill:var(--ink)">AR bucket 3</text>
+    <line x1="510" y1="30" x2="510" y2="130" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/>
+    <text x="515" y="128" style="fill:var(--crit)">waits for last bucket</text>
+    <text x="20" y="160" style="fill:var(--ink)">Buckets fill in reverse layer order (last layers' gradients are ready first).</text>
+    <text x="20" y="180" style="fill:var(--ink)">Each full bucket (≈25 MB; the first is 1 MB) starts an all-reduce while backward continues.</text>
+    <text x="20" y="200" style="fill:var(--ink)">Only the last bucket's all-reduce is exposed — after L4–1, nothing is left to overlap with.</text>
+    <text x="20" y="230" style="fill:var(--ink-2)">Too-small buckets: many tiny all-reduces, per-call overhead dominates.</text>
+    <text x="20" y="250" style="fill:var(--ink-2)">Too-large buckets: communication starts late and the exposed tail grows.</text>
+    <text x="20" y="276" style="fill:var(--ink-2)">The DDP paper: bucket size alone can change iteration time by more than 2×.</text>
+  </g>
+</svg>
+<figcaption>DDP's speed comes from overlap: gradient all-reduces run during the backward pass, bucket by bucket, so most communication is hidden behind computation.</figcaption>
+</figure>
+
+<p>For any distributed setup, three questions describe it completely, and they are a good way to structure an interview answer. <strong>What does each GPU hold?</strong> Under DDP, a full copy of weights, gradients and optimiser state; under FSDP, a 1/n slice of each, plus whatever is temporarily gathered. <strong>What is communicated, and how big is it?</strong> Under DDP, one all-reduce of all gradients per optimiser step; under FSDP, all-gathers of parameters and reduce-scatters of gradients, about one and a half times as much. <strong>When does the communication happen, and what does it overlap with?</strong> Under DDP, during backward, bucket by bucket; under FSDP, layer by layer in both forward and backward, prefetched one layer ahead. With those three answers you can estimate memory, step time and scaling for any model and cluster before running anything.</p>
+<p>Where the kitchen analogy breaks: real chefs who disagree can talk it over; ranks cannot. If one rank skips a comparison — takes a different branch, runs out of data, crashes — the others wait for it forever, because a collective only completes when every member has joined. Most distributed bugs are a rank doing something different from its peers.</p>
+<p>If you remember one sentence: <em>every rank runs the same program on different data; DDP keeps identical replicas by all-reducing gradients in buckets during backward, FSDP shards everything and gathers each layer just in time, and every collective must be called by every rank in the same order</em>.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Launching: torchrun and the environment</h4>
+<p>A distributed PyTorch job is N copies of the same script, usually one per GPU. <code>torchrun</code> starts them:</p>
+<pre>torchrun --nproc_per_node=8 train.py --config cfg.yaml                      # one node
+torchrun --nnodes=4 --nproc_per_node=8 --rdzv_backend=c10d \
+         --rdzv_endpoint=node0:29500 train.py                              # four nodes</pre>
+<p>For each process it sets environment variables: <code>RANK</code> (0…31 across all nodes), <code>LOCAL_RANK</code> (0…7 on each node), <code>WORLD_SIZE</code> (32), and the rendezvous address (<code>MASTER_ADDR</code>, <code>MASTER_PORT</code>). It also supervises the workers: if one fails, torchrun can stop the others and restart the group (elastic launch), which together with checkpoints (pt8) turns a crash into a restart instead of a hang.</p>
+<p>The script's side:</p>
+<pre>import os, torch, torch.distributed as dist
+dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))
+rank, world = dist.get_rank(), dist.get_world_size()
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)                  # before any CUDA allocation
+device = torch.device("cuda", local_rank)
+...
+dist.destroy_process_group()</pre>
+<p><code>init_process_group</code> reads the environment, connects all ranks and creates the <strong>default process group</strong>. The backend is NCCL for GPU tensors (Gloo for CPU tensors, as in tests on a laptop). Setting the device by local rank is essential: forgetting it puts all eight processes' tensors on GPU 0, which runs out of memory or, worse, works slowly. The timeout turns a hang in a collective into an error after the given time.</p>
+
+<h4>2. Collectives: the rules</h4>
+<p>The collectives in <code>torch.distributed</code> operate on tensors in place or into output tensors: <code>all_reduce(t)</code> replaces t on every rank with the sum over ranks (or average with <code>ReduceOp.AVG</code>); <code>all_gather_into_tensor(out, t)</code> concatenates every rank's t into out; <code>reduce_scatter_tensor(out, t)</code> sums the inputs and gives each rank one slice; <code>broadcast(t, src=0)</code> copies rank 0's t to everyone. Two rules govern them:</p>
+<ol>
+<li><strong>Every rank in the group must call the same collectives in the same order with compatible shapes.</strong> Collectives are matched by order, not by name. If rank 3 calls an <code>all_reduce</code> that the others skip, rank 3 waits forever, and the next collective the others call pairs with the wrong one.</li>
+<li><strong>Collectives are asynchronous with respect to the CPU on GPU.</strong> They are queued on CUDA streams like kernels; a later use of the result waits for them automatically, and <code>async_op=True</code> returns a handle you can wait on to overlap other work.</li>
+</ol>
+<p>A metric reduction for logging is the standard example: <code>loss_t = loss.detach().clone(); dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)</code> — called on <em>every</em> rank, then printed only on rank 0. Putting the all_reduce inside <code>if rank == 0:</code> hangs the job.</p>
+<p>Costs, per GPU, for a ring algorithm over n ranks and a tensor of S bytes (gpu8): reduce-scatter and all-gather each move about (n−1)/n × S in and out; all-reduce about 2(n−1)/n × S. Within a node, NVLink provides hundreds of GB/s per GPU; across nodes, InfiniBand or Ethernet provides tens of GB/s per GPU — which is why cross-node communication usually dominates.</p>
+
+<h4>3. DistributedDataParallel: construction</h4>
+<pre>model = GPT(cfg).to(device)
+model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])</pre>
+<p>At construction, DDP (following Algorithm 1 in the DDP paper) does three things. It broadcasts rank 0's parameters and buffers to every rank, so all replicas start bit-identical regardless of how each rank initialised them. It assigns parameters to <strong>buckets</strong>: on 2.14 the default bucket capacity is 25 MB (<code>bucket_cap_mb=None</code> resolves to 25), with a smaller first bucket of 1 MB, and parameters are assigned in roughly the reverse order of <code>model.parameters()</code>, because backward produces the last layers' gradients first. And it registers an autograd hook on every parameter that fires when that parameter's gradient is ready.</p>
+<p>The wrapper stores your model as <code>model.module</code>; save <code>model.module.state_dict()</code> to avoid the <code>module.</code> prefix in checkpoints (pt4).</p>
+
+<h4>4. DDP during forward and backward</h4>
+<p>On each forward, DDP by default broadcasts buffers (such as BatchNorm running statistics) from rank 0 so all replicas agree. On 2.14 the flag controlling this is <code>forward_sync_buffers</code> (default None, meaning True); it replaced <code>broadcast_buffers</code>, deprecated in 2.13. Models without buffers that change (most transformers) pay nothing.</p>
+<p>During backward, each parameter's hook copies its gradient into its slot in the bucket. When every gradient in a bucket has arrived, DDP launches an asynchronous all-reduce of the whole bucket on a separate communication stream, then continues; backward keeps computing earlier layers' gradients in parallel. When backward finishes, DDP waits for the remaining all-reduces, divides by world size, and writes the averaged values back to each parameter's <code>.grad</code> (or, with <code>gradient_as_bucket_view=True</code>, the <code>.grad</code> tensors are already views into the buckets, saving a copy and memory). The optimiser step then runs locally and identically on every rank.</p>
+<p>Why buckets? An all-reduce has a fixed overhead per call — launching, synchronising, latency — so 300 separate all-reduces of small gradient tensors are slow. One giant all-reduce of all gradients after backward has no overhead problem but cannot overlap with anything. Buckets of tens of megabytes balance the two. The DDP paper's measurements put a number on it: bucket size alone changed iteration time by more than 2× in their experiments, and with good settings DDP reached near-linear scaling on 256 GPUs.</p>
+<p>A worked example for a 1.3B-parameter model in bf16 autocast with float32 gradients: 5.2 GB of gradients, about 208 buckets of 25 MB. On 8 GPUs in one node, an all-reduce moves 2 × 7/8 × 5.2 ≈ 9.1 GB per GPU; at an effective 300 GB/s that is about 30 ms. If backward takes 200 ms, all but the last bucket's all-reduce (25 MB, well under 1 ms) can hide behind it, and DDP's overhead is nearly zero. Across 4 nodes connected at an effective 40 GB/s per GPU, the same all-reduce takes over 200 ms and can no longer hide — the regime where gradient compression, larger batches per step, or sharded strategies with hierarchical communication become worthwhile.</p>
+
+<h4>5. Unused parameters, static graphs and no_sync</h4>
+<p>DDP's bucket logic assumes every parameter receives a gradient every iteration. If some do not — a mixture-of-experts expert that received no tokens, a branch taken only on some inputs, an auxiliary head used every other step — their buckets never fill, and backward ends waiting for gradients that never come; DDP reports an error about parameters that did not receive gradients (or hangs, depending on timing). <code>find_unused_parameters=True</code> fixes it by traversing the autograd graph after each forward to find parameters that will not be reached and marking them ready. The cost is that traversal on every iteration; the DDP paper describes it and recommends it only when needed. If the set of used parameters is the same every iteration, <code>static_graph=True</code> lets DDP record it once.</p>
+<p>Gradient accumulation (pt6) needs <code>no_sync()</code>, the DDP paper's "skipping synchronization" optimisation:</p>
+<pre>for i, (x, y) in enumerate(loader):
+    last = (i + 1) % k == 0
+    ctx = contextlib.nullcontext() if last else model.no_sync()
+    with ctx:
+        loss = loss_fn(model(x), y) / k
+        loss.backward()                      # no all-reduce unless last
+    if last:
+        opt.step(); opt.zero_grad()</pre>
+<p>Inside <code>no_sync()</code>, the hooks accumulate gradients locally without communicating; the backward of the last micro-batch all-reduces the accumulated sums once. Without it, accumulation over k micro-batches communicates k times as much — the reason "accumulation made DDP slower".</p>
+
+<h4>6. Data: DistributedSampler and per-rank randomness</h4>
+<p>Each rank must see different data. <code>DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True, seed=0)</code> gives each rank every world-th index of a permutation seeded by <code>seed + epoch</code>, which is why <code>sampler.set_epoch(epoch)</code> is required each epoch (pt5) and why the sampler pads to an even split. With an IterableDataset, shard by rank and worker yourself. Randomness has two kinds: parameter initialisation must be the same everywhere (DDP's initial broadcast guarantees this even if seeds differ, but FSDP and manual setups rely on it), while dropout masks and augmentations should differ by rank — seed those with <code>base_seed + rank</code>. The effective batch per optimiser step is per-rank batch × world size × accumulation.</p>
+
+<h4>7. FSDP2: fully_shard</h4>
+<p>DDP replicates everything: weights, gradients and optimiser state, 16 bytes per parameter in float32 with AdamW (pt7), on every GPU. A 7B model needs 112 GB per GPU before activations. Fully sharded data parallelism shards all three across the ranks. In PyTorch 2.14 the API is <code>torch.distributed.fsdp.fully_shard</code> (FSDP2):</p>
+<pre>from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+model = GPT(cfg)                                   # often built on the meta device
+for block in model.blocks:
+    fully_shard(block, mp_policy=mp)               # one communication group per block
+fully_shard(model, mp_policy=mp)                   # root: embeddings, ln_f, tied head
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)   # built AFTER sharding</pre>
+<p>What happens, per the 2.14 docstring. At initialisation, each wrapped module's parameters become <strong>DTensors</strong> sharded on dimension 0 across the mesh: each rank stores 1/n of every parameter, and the optimiser, built over these sharded parameters, keeps state only for the local shard. Before a module's forward, a forward pre-hook <strong>all-gathers</strong> its parameters into full tensors (cast to <code>param_dtype</code>); after forward, a forward hook frees them if <code>reshard_after_forward</code> is True — the default (<code>None</code>) means True for non-root modules and False for the root, because the root is needed again immediately when backward starts. In backward, hooks all-gather again (if resharded), compute gradients, free the full parameters, and <strong>reduce-scatter</strong> the gradients so each rank receives the summed gradient for its own shard (in <code>reduce_dtype</code>). The optimiser step then updates only local shards; no further communication is needed.</p>
+<p>Two rules from the docstring matter in practice. Call <code>fully_shard</code> bottom-up: each call groups the parameters of that module not already grouped by an earlier call on a submodule, and "users generally should not call fully_shard only on the topmost root module", because the whole model would then be one group — gathered all at once, with no memory saving at peak and no overlap. And prefetching: while block i computes, FSDP can issue the all-gather for block i+1 (configurable with <code>set_modules_to_forward_prefetch</code> and its backward counterpart), so communication overlaps compute just as DDP's buckets do.</p>
+<p>Gradient accumulation under FSDP2 uses <code>model.set_requires_gradient_sync(False)</code> for all but the last micro-batch, the counterpart of <code>no_sync</code>; the trade-off is that unsharded gradients are then kept between micro-batches, costing memory.</p>
+
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="FSDP2 per-block lifecycle: sharded parameters are all-gathered before forward, freed after, all-gathered again before backward, and gradients are reduce-scattered after backward">
+  <defs><marker id="pt11-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">One transformer block under fully_shard, on rank r of n</text>
+    <rect x="20" y="40" width="120" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="80" y="58" text-anchor="middle" style="fill:var(--ink)">shard (1/n)</text>
+    <text x="80" y="74" text-anchor="middle" style="fill:var(--muted)">DTensor, dim 0</text>
+    <line x1="140" y1="62" x2="180" y2="62" marker-end="url(#pt11-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="160" y="54" text-anchor="middle" style="fill:var(--accent)">AG</text>
+    <rect x="180" y="40" width="120" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="240" y="58" text-anchor="middle" style="fill:var(--ink)">full params</text>
+    <text x="240" y="74" text-anchor="middle" style="fill:var(--muted)">forward</text>
+    <line x1="300" y1="62" x2="340" y2="62" marker-end="url(#pt11-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="320" y="54" text-anchor="middle" style="fill:var(--muted)">free</text>
+    <rect x="340" y="40" width="120" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="400" y="58" text-anchor="middle" style="fill:var(--ink)">shard again</text>
+    <text x="400" y="74" text-anchor="middle" style="fill:var(--muted)">(reshard)</text>
+    <line x1="400" y1="84" x2="400" y2="124" marker-end="url(#pt11-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="412" y="108" style="fill:var(--accent)">AG (backward)</text>
+    <rect x="340" y="124" width="120" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="400" y="142" text-anchor="middle" style="fill:var(--ink)">full params</text>
+    <text x="400" y="158" text-anchor="middle" style="fill:var(--muted)">backward → full grads</text>
+    <line x1="340" y1="146" x2="300" y2="146" marker-end="url(#pt11-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="320" y="138" text-anchor="middle" style="fill:var(--accent)">RS</text>
+    <rect x="180" y="124" width="120" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="240" y="142" text-anchor="middle" style="fill:var(--ink)">grad shard (1/n)</text>
+    <text x="240" y="158" text-anchor="middle" style="fill:var(--muted)">summed over ranks</text>
+    <line x1="180" y1="146" x2="140" y2="146" marker-end="url(#pt11-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="20" y="124" width="120" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="80" y="142" text-anchor="middle" style="fill:var(--ink)">opt.step on</text>
+    <text x="80" y="158" text-anchor="middle" style="fill:var(--ink)">local shard only</text>
+    <text x="20" y="200" style="fill:var(--ink)">Per step and parameter byte: AG + AG + RS ≈ 3 × (n−1)/n × S, versus DDP's all-reduce ≈ 2 × (n−1)/n × S.</text>
+    <text x="20" y="220" style="fill:var(--ink)">Memory per GPU: 16N/n of state + one gathered block + activations, versus DDP's 16N.</text>
+    <text x="20" y="246" style="fill:var(--ink-2)">AG = all-gather, RS = reduce-scatter. Prefetching issues block i+1's AG while block i computes.</text>
+  </g>
+</svg>
+<figcaption>FSDP trades about 1.5× the communication of DDP for an n-fold reduction in per-GPU training state; per-block wrapping and prefetching hide the extra traffic.</figcaption>
+</figure>
+
+<h4>8. DDP or FSDP: the numbers</h4>
+<p>For a 7B-parameter model on 8 GPUs of 80 GB each, with AdamW and float32 master state:</p>
+<table>
+<thead><tr><th></th><th>DDP</th><th>FSDP2 (full sharding)</th></tr></thead>
+<tr><td>Training state per GPU</td><td>16 × 7B = 112 GB (does not fit)</td><td>112 / 8 = 14 GB</td></tr>
+<tr><td>Extra transient memory</td><td>gradient buckets</td><td>one gathered block in bf16 (≈ 0.4 GB for a 4,096-wide block) plus prefetch</td></tr>
+<tr><td>Communication per step</td><td>all-reduce of gradients ≈ 2 × 7/8 × size</td><td>2 all-gathers of params + 1 reduce-scatter of grads ≈ 3 × 7/8 × size</td></tr>
+<tr><td>When it wins</td><td>models whose state fits on one GPU</td><td>models that do not fit, or to free memory for larger batches</td></tr>
+</table>
+<p>With bf16 parameters and gradients on the wire (<code>param_dtype=bfloat16</code>; a float32 <code>reduce_dtype</code> is safer numerically but doubles the reduce-scatter's size), each all-gather of 7B parameters moves about 12 GB per GPU — around 40 ms on NVLink at an effective 300 GB/s, small next to a multi-second step for a large batch. The FSDP paper reports FSDP matching DDP on models that fit in DDP and scaling near-linearly in TFLOPS up to 512 A100 GPUs for larger models. Across many nodes, <strong>HSDP</strong> — shard within a node, replicate across nodes, using a two-dimensional device mesh — keeps the frequent all-gathers on NVLink and sends only a gradient all-reduce across the network.</p>
+
+<h4>9. Putting it together: a minimal DDP training script</h4>
+<pre>def main():
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(local_rank)
+    rank, world = dist.get_rank(), dist.get_world_size()
+    torch.manual_seed(0)                                   # same init everywhere
+    model = DDP(GPT(cfg).cuda(), device_ids=[local_rank])
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True)
+    loader = DataLoader(ds, batch_size=16, sampler=sampler, num_workers=4, pin_memory=True)
+    for epoch in range(epochs):
+        sampler.set_epoch(epoch)
+        for x, y in loader:
+            x, y = x.cuda(non_blocking=True), y.cuda(non_blocking=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                _, loss = model(x, y)
+            loss.backward()                                # all-reduces overlap here
+            opt.step(); opt.zero_grad(set_to_none=True)
+        if rank == 0:
+            torch.save(model.module.state_dict(), f"ckpt_{epoch}.pt")
+        dist.barrier()                                     # every rank, outside the if
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()</pre>
+<p>Every line answers a failure mode from this lesson: device set by local rank, identical seeds, DDP wrapping before the optimiser, DistributedSampler with set_epoch, non-blocking copies, rank-0-only saving of the unwrapped module, and a barrier called by every rank.</p>
+<h4>10. Mixed precision, evaluation and checkpoints in a distributed job</h4>
+<p>Mixed precision composes with both wrappers but in different places. With DDP you use <code>torch.autocast</code> around the forward as on one GPU (pt7); parameters and gradients stay float32, so the gradient all-reduce moves float32 unless you register a compression hook. With FSDP2, precision is part of the sharding: <code>MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)</code> all-gathers parameters in bf16 (halving that traffic), computes in bf16, and reduce-scatters gradients in float32 for accuracy; the sharded master parameters and optimiser state stay float32. Choosing <code>reduce_dtype=torch.bfloat16</code> halves the reduce-scatter too, at some risk to accuracy when many ranks' gradients are summed.</p>
+<p>Evaluation must be distributed with the same care as training. Either every rank evaluates a disjoint shard and the sums and counts are all-reduced (remembering that DistributedSampler pads, pt5), or rank 0 evaluates alone while the others wait at a barrier — simpler, but under FSDP rank 0 cannot run the model alone, because every forward needs all ranks to all-gather parameters. Checkpoints follow pt8: under DDP, rank 0 saves the unwrapped module; under FSDP, every rank saves its shards with <code>torch.distributed.checkpoint</code> and <code>get_state_dict</code>, and a later job — possibly with a different number of GPUs — reshards on load.</p>
+<h4>11. Beyond data parallelism, from the API side</h4>
+<p>When a single layer's computation or activations are too large, or when data parallelism alone stops scaling because the global batch would become too large, models also split <em>within</em> layers. Tensor parallelism (dl9) splits a linear layer's weight across GPUs: a column-parallel layer gives each rank a slice of the output features, a row-parallel layer a slice of the input features, and pairing them (attention's QKV column-parallel, its output projection row-parallel; the MLP's first layer column-parallel, its second row-parallel) needs only one all-reduce per pair in forward. In PyTorch this is expressed with <code>torch.distributed.tensor.parallel.parallelize_module</code> and styles such as <code>ColwiseParallel</code> and <code>RowwiseParallel</code>, which convert the chosen weights to DTensors with <code>Shard(0)</code> or <code>Shard(1)</code> placements on one dimension of a device mesh. Combined with FSDP on another dimension (<code>init_device_mesh("cuda", (dp, tp))</code>), this is "2-D parallelism": tensor parallelism inside a node over NVLink, where its frequent per-layer all-reduces are cheap, and FSDP across nodes. Pipeline parallelism, which assigns consecutive layers to different GPUs and streams micro-batches through them, has its own API (<code>torch.distributed.pipelining</code>) and is the third axis for the largest models. For interviews, the important skill is placement: put the most communication-hungry parallelism on the fastest links.</p>
+</section>
+
+<section data-field="deep">
+<h4>What DDP's reducer does when graphs differ between ranks</h4>
+<p>DDP's buckets assume all ranks produce gradients in the same order. Within a bucket order is irrelevant, but buckets are all-reduced in the order they become ready on each rank; if different ranks finish buckets in a different order, the collectives mismatch. DDP handles this by launching bucket all-reduces in a fixed order (it waits to launch bucket i until all earlier buckets have launched), and by rebuilding buckets after the first iteration based on the order gradients actually arrived. Data-dependent control flow that changes which parameters get gradients on different ranks in the same step is the dangerous case — the reason for find_unused_parameters, and the reason mixture-of-experts layers often use dedicated expert-parallel communication rather than plain DDP.</p>
+
+<h4>Communication hooks</h4>
+<p>DDP lets you replace the per-bucket all-reduce with your own function through <code>register_comm_hook</code>. Built-in hooks compress gradients to fp16 or bf16 before the all-reduce (halving traffic) or implement PowerSGD low-rank compression (cutting it by orders of magnitude for large matrices at some cost in convergence). They matter when the network, not computation, limits scaling — typically many nodes on Ethernet — and the DDP paper's analysis that "communication is the dominant training latency contributor, and its impact increases with model sizes" is the motivation. Validate any compression by comparing loss curves against uncompressed training.</p>
+
+<h4>DTensor and device meshes: the general mechanism</h4>
+<p>FSDP2 is built on DTensor, which describes one logical tensor laid out over a device mesh with a placement per mesh dimension: <code>Shard(0)</code>, <code>Replicate()</code> or <code>Partial()</code> (pending a reduction). A 2-D mesh of shape (nodes, GPUs per node) with placements (Replicate, Shard(0)) is HSDP; a mesh of (data parallel, tensor parallel) with FSDP on one dimension and tensor parallelism (row- or column-sharded linear layers) on the other is how large models combine sharding with intra-layer parallelism in PyTorch. Because the same object describes all of these, distributed checkpoints (pt8) can reshard between them: DCP reads the placements and offsets and plans the reads.</p>
+
+<h4>Initialising large sharded models</h4>
+<p>A 70B model cannot be built on one GPU and then sharded. The FSDP2 pattern is to construct the model on the meta device (no memory), apply <code>fully_shard</code> to every block and the root (which creates sharded meta DTensors), then call <code>model.to_empty(device="cuda")</code> to allocate only each rank's shards, and run an initialisation function or load a sharded checkpoint with DCP. Initialisation functions must then be shard-aware: a random initialisation must give the same full tensor regardless of sharding (DTensor's random operations handle this by offsetting the RNG per shard), or the model differs from a single-GPU run.</p>
+
+<h4>Overlap and memory in FSDP: prefetching and rate limiting</h4>
+<p>FSDP hides communication by issuing the all-gather for the next unit while the current unit computes, in forward and in backward. Prefetching too eagerly has a cost: every prefetched unit's full parameters occupy memory, and if the CPU races ahead issuing all-gathers, many units can be gathered at once, raising peak memory and fragmenting the allocator. The FSDP paper describes a rate limiter that caps the number of in-flight all-gathers for this reason, and studies how prefetching and wrapping granularity trade memory against overlap. FSDP2 exposes the same decisions explicitly: which modules to prefetch (<code>set_modules_to_forward_prefetch</code>, <code>set_modules_to_backward_prefetch</code>) and whether to reshard after forward. Wrapping granularity matters too: units too small mean many small collectives with high per-call overhead; units too large mean large gathered buffers and coarse overlap. One transformer block per unit is the usual sweet spot.</p>
+<h4>Process groups beyond the default</h4>
+<p>The default process group contains every rank, but collectives can run on subgroups created with <code>dist.new_group(ranks=[...])</code> — or, more conveniently, the groups a device mesh creates for each of its dimensions. HSDP uses one group per node for sharding and one group per GPU index across nodes for replication; tensor parallelism uses a group of the GPUs inside a node. Two rules carry over from the default group and are stricter here: every rank must call <code>new_group</code> with the same arguments in the same order (group creation is itself collective), even ranks that are not members; and every member of a group must call each collective on that group in the same order. Mismatched subgroup collectives are a common source of hangs in hand-written parallel code, which is one reason the device-mesh API, which creates all groups at once, is preferred.</p>
+<h4>Stragglers, and why scaling stops being linear</h4>
+<p>Every synchronous collective runs at the speed of the slowest rank. Small per-rank variations — a slower GPU, a data loader stall on one rank (pt5), thermal throttling, a noisy neighbour on a shared network link — become everyone's waiting time, and with thousands of ranks the expected maximum of many small delays grows. The DDP paper notes that its 256-GPU measurements came from a shared cluster, where such variance is visible. Mitigations: balance data loading so no rank waits on I/O, monitor per-rank step time and remove persistent stragglers, keep collectives large enough to amortise latency, and overlap communication thoroughly so that small delays are absorbed by computation rather than exposed.</p>
+<h4>Why averaging gradients equals training on the big batch</h4>
+<p>DDP's correctness rests on one identity. With a mean-reduced loss, the gradient over a global batch of n·b examples is the average of the n per-rank gradients over b examples each, as long as every rank's batch has the same size and the loss is a mean over examples. That is why DDP divides the all-reduced sum by the world size, and why identical replicas stay identical: each applies the same averaged gradient with the same optimiser state. The identity breaks in exactly the places this track has flagged: unequal per-rank batch sizes (the last batch, uneven shards), token-level losses with different token counts per rank (the accumulation bug of pt6, now across ranks — all-reduce the token count and divide by the global total), and BatchNorm, whose statistics are per rank unless synchronised. Knowing the identity lets you predict which changes keep a distributed run equivalent to a single-GPU run and which do not.</p>
+</section>
+
+<section data-field="prod">
+<h4>Failure mode: the hang</h4>
+<p>Symptom: no progress, no error, GPUs at 0% or stuck at 100% in a spin. Cause: ranks disagree about the next collective — an exception on one rank, a branch that skips a collective on some ranks (logging reductions inside <code>if rank == 0</code>, early exit on an empty batch), uneven data so one rank finishes its epoch first, or different numbers of micro-batches. Tools: a finite <code>timeout</code> in <code>init_process_group</code>; stack dumps from all ranks (py-spy) or PyTorch's NCCL flight recorder, which records recent collectives per rank so mismatches are visible; the environment variable <code>TORCH_DISTRIBUTED_DEBUG=DETAIL</code> while developing, which checks that collectives match across ranks.</p>
+
+<h4>Failure mode: poor scaling</h4>
+<p>Symptom: 8 GPUs give 5× rather than ~7.5×; 64 GPUs give 30×. Diagnose with the profiler (pt12): is the all-reduce exposed after backward (bucket sizes, too little compute per step — increase the per-GPU batch or use accumulation with no_sync), are some ranks waiting on others (stragglers, data loading), is the job crossing a slow network (consider HSDP or gradient compression), or is find_unused_parameters adding a traversal every step? Compute the expected communication time from the formulas in the body and compare with the measured gap.</p>
+
+<h4>Failure mode: replicas that drift apart</h4>
+<p>Symptom: ranks report different losses on the same data, or evaluation differs by which rank runs it. Causes: a parameter updated outside the optimiser on some ranks (a rank-dependent buffer update, an EMA computed differently), a rank that skipped a step (a GradScaler on one rank finding inf when others did not — normally prevented because inf checks are synchronised — or custom logic), non-deterministic kernels compounding over many steps (tiny, usually harmless). Check by computing a checksum of parameters on every rank periodically and all-gathering it.</p>
+
+<h4>Failure mode: OOM only in the distributed job</h4>
+<p>Symptom: the model fits on one GPU but not under DDP or FSDP. Causes: all ranks placing tensors on GPU 0 (missing <code>set_device</code>), DDP's gradient buckets adding a gradient-sized buffer (use <code>gradient_as_bucket_view=True</code>), FSDP wrapped only at the root (the whole model gathered at once), or <code>set_requires_gradient_sync(False)</code> holding unsharded gradients across many micro-batches. Check <code>torch.cuda.max_memory_allocated()</code> per rank and the memory snapshot (pt7).</p>
+
+<h4>What to log in a distributed run</h4>
+<p>Per rank: step time, data-wait time and peak memory; globally: tokens per second and MFU (pt10), the fraction of step time spent in exposed communication (from periodic profiles), and the number of restarts. A rank whose step time is consistently higher than the median by more than a few percent is a straggler worth investigating; a rising exposed-communication fraction as you add nodes says the network is becoming the bottleneck.</p>
+<h4>Failures at scale, and elastic restarts</h4>
+<p>At hundreds or thousands of GPUs, hardware failures are routine rather than exceptional: a GPU with uncorrectable memory errors, a network link that flaps, a node that reboots. Because synchronous data parallelism needs every rank, any single failure stops the job. The operational answer combines several pieces from this track: frequent, asynchronous, sharded checkpoints (pt8) so little work is lost; torchrun's elastic mode or a cluster scheduler that detects the failure, replaces or excludes the bad node, and restarts all ranks from the latest checkpoint; health checks before a job starts (a short all-reduce benchmark that exposes slow links and bad GPUs); and alerting on hangs via collective timeouts rather than waiting for a human to notice a flat loss curve. The time from failure to resumed training — detection, restart, checkpoint load, data-loader warm-up — is itself a metric worth tracking, because at scale it can cost more than the lost work.</p>
+</section>
+
+<section data-field="lab">
+<p>Runs on CPU with the Gloo backend in <code>gpt_env</code> — no GPUs needed — to watch DDP's behaviour with two processes on one machine. About 20 minutes. Save as <code>pt11_lab.py</code> and run <code>python -m torch.distributed.run --nproc_per_node=2 pt11_lab.py</code> (the module form of torchrun).</p>
+<pre>import os, torch, torch.distributed as dist, torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+def main():
+    dist.init_process_group("gloo")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    torch.manual_seed(rank)                        # deliberately different init per rank
+    net = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 2))
+    model = DDP(net)                               # broadcasts rank 0's weights
+    w = model.module[0].weight.detach().clone()
+    allw = [torch.zeros_like(w) for _ in range(world)]
+    dist.all_gather(allw, w)
+    print(rank, "weights identical after DDP init:", torch.equal(allw[0], allw[1]))
+
+    x = torch.randn(4, 8) + rank                   # different data per rank
+    model(x).sum().backward()
+    g = model.module[0].weight.grad.clone()
+    allg = [torch.zeros_like(g) for _ in range(world)]
+    dist.all_gather(allg, g)
+    print(rank, "grads identical after backward:", torch.allclose(allg[0], allg[1]))
+
+    model.zero_grad()
+    with model.no_sync():
+        model(x).sum().backward()                  # local only
+    gl = model.module[0].weight.grad.clone()
+    dist.all_gather(allg, gl)
+    print(rank, "grads identical under no_sync:", torch.allclose(allg[0], allg[1]))
+
+    t = torch.tensor([float(rank + 1)])
+    dist.all_reduce(t)                             # every rank must call this
+    print(rank, "all_reduce sum:", t.item())
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()</pre>
+<ol>
+<li>Both ranks print True for identical weights: DDP broadcast rank 0's parameters despite different seeds.</li>
+<li>Gradients are identical after a normal backward (averaged by DDP) even though each rank saw different data.</li>
+<li>Under <code>no_sync()</code> they differ: no communication happened.</li>
+<li>The all_reduce prints 3.0 on both ranks. Now wrap it in <code>if rank == 0:</code> and run again: the job hangs — stop it with Ctrl+C. That is the classic distributed hang.</li>
+<li><strong>Needs CUDA GPUs:</strong> repeat with the NCCL backend and a GPT block wrapped with <code>fully_shard</code>; print a parameter's type (DTensor) and its local shard shape (dim 0 divided by world size).</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Find the bug: a DDP script that is slow, hangs and saves the wrong thing</b>
+<p>This script trains on 2 nodes × 8 GPUs. Throughput is lower than on one node, one in ten runs hangs near the end of an epoch, and checkpoints cannot be loaded into a plain model. Find the bugs.</p>
+<pre>dist.init_process_group("nccl")
+model = DDP(GPT(cfg).cuda(), find_unused_parameters=True)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+loader = DataLoader(ShardStream(files), batch_size=8)       # IterableDataset, sharded by rank
+for step, (x, y) in enumerate(loader):
+    for micro in range(4):                                   # gradient accumulation
+        _, loss = model(x[micro::4].cuda(), y[micro::4].cuda())
+        (loss / 4).backward()
+    opt.step(); opt.zero_grad()
+    if dist.get_rank() == 0 and step % 100 == 0:
+        dist.all_reduce(loss)
+        print(step, loss.item() / dist.get_world_size())
+torch.save(model.state_dict(), "final.pt")</pre>
+<details><summary>Answer</summary>
+<p><strong>Bug 1 — no device set per rank.</strong> Without <code>torch.cuda.set_device(LOCAL_RANK)</code>, <code>.cuda()</code> puts every process's model on GPU 0 of its node; eight processes share one GPU. Symptom: very low throughput, possible OOM. Fix: set the device from <code>LOCAL_RANK</code> before building the model, and pass <code>device_ids=[local_rank]</code>.</p>
+<p><strong>Bug 2 — find_unused_parameters=True on a model that uses every parameter.</strong> It adds an autograd-graph traversal every iteration for nothing. Fix: remove it (default False).</p>
+<p><strong>Bug 3 — gradient accumulation without no_sync.</strong> Each of the 4 micro-batch backward passes all-reduces all gradients: 4× the communication, much of it across the slow inter-node link — the main reason two nodes are slower than one. Fix: wrap the first three micro-batches in <code>model.no_sync()</code>.</p>
+<p><strong>Bug 4 — a collective inside a rank-0-only branch.</strong> <code>dist.all_reduce(loss)</code> runs only on rank 0, which waits forever for the others. (Every 100 steps it would hang — unless other collectives happen to pair with it, which corrupts both.) Fix: call the all_reduce on every rank on a detached copy, print on rank 0. The "one in ten runs" hang near the epoch end is a second cause: the rank-sharded IterableDataset gives ranks different numbers of batches, so one rank finishes and stops calling DDP's collectives while others wait. Fix by balancing shards or capping steps per epoch so every rank runs the same number of iterations.</p>
+<p><strong>Bug 5 — saving the wrapper from every rank.</strong> <code>model.state_dict()</code> has keys prefixed with <code>module.</code> (so a plain model cannot load it strictly), and all 16 ranks write the same file concurrently, which can corrupt it. Fix: <code>if rank == 0: torch.save(model.module.state_dict(), "final.pt.tmp"); os.replace(...)</code>, followed by <code>dist.barrier()</code> on every rank (pt8).</p>
+</details>
+<b>Estimate: DDP or FSDP for a 13B model?</b>
+<p>You have 16 GPUs with 80 GB each (2 nodes of 8, NVLink inside each node, 50 GB/s per GPU between nodes). Can you train a 13B model with DDP? With FSDP? Estimate the per-step communication for FSDP.</p>
+<details><summary>Answer</summary>
+<p>DDP: 16 bytes × 13B = 208 GB of state per GPU — impossible. FSDP over 16 GPUs: 208/16 = 13 GB per GPU plus a gathered block and activations — fits comfortably. Communication with bf16 on the wire: parameters are 26 GB; each all-gather moves about 15/16 × 26 ≈ 24 GB per GPU, twice per step, plus a reduce-scatter of bf16 gradients ≈ 24 GB: ≈ 73 GB per GPU per step. If those rings cross the 50 GB/s inter-node links, that is about 1.5 s per step of communication to hide. HSDP (shard within each node of 8, replicate across the 2 nodes) needs 26 GB per GPU of state, still fits, keeps the all-gathers on NVLink, and sends only a gradient all-reduce of each rank's shard across nodes — a much better fit for this network.</p>
+</details>
+</section>

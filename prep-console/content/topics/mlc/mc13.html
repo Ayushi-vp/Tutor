@@ -1,0 +1,763 @@
+<!-- topic source for mlc/mc13; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "mc13",
+  "t": "A tiny autograd engine",
+  "tag": "Deep learning",
+  "sum": "A scalar Value class that records the graph and backpropagates in reverse topological order, worked by hand on f = (ab + c)·a (where a's gradient must accumulate to −2), checked against micrograd's own README numbers, then the same engine over NumPy arrays with broadcasting-aware backward, matched to PyTorch, and a fused cross-entropy op that survives logits of 1,000.",
+  "prereq": [
+    [
+      "dl1",
+      "Backpropagation is the chain rule applied in reverse over a computation graph, each node contributing its local derivative."
+    ],
+    [
+      "mc11",
+      "Hand-written backward rules for linear layers and ReLU, and the gradient check that verifies them."
+    ],
+    [
+      "mc10",
+      "The stable log-softmax and the fused cross-entropy gradient (softmax − onehot)/N."
+    ]
+  ],
+  "myths": [
+    [
+      "Each node's backward function should set its inputs' gradients.",
+      "It must add to them. A value used twice (like a in f = (ab + c)·a) receives gradient from both uses, and the total is the sum. With = instead of += the hand example's df/da comes out as 4 or −6 depending on which use runs last, instead of the correct −2."
+    ],
+    [
+      "Any order of calling the backward functions works.",
+      "A node's backward function can only run once its own gradient is complete, which means after every node that consumes it has run. Reverse topological order guarantees that; calling them in creation order or in an arbitrary traversal silently uses partial gradients."
+    ],
+    [
+      "Autograd is symbolic differentiation.",
+      "It never builds a formula for the derivative. It records the operations actually executed on actual numbers, then multiplies local derivatives numerically along that record. That is why it handles loops, branches and data-dependent control flow, and why its cost is a constant factor of the forward pass."
+    ],
+    [
+      "A scalar engine like micrograd is how frameworks work, just bigger.",
+      "The algorithm is the same, but frameworks record one node per tensor operation, not per scalar. A layer that is one matrix multiply is one node with a matrix-shaped backward rule. The scalar engine in this lesson was 371 times slower than the tensor engine on the same 256-row layer, and the gap grows with size."
+    ],
+    [
+      "Broadcasting is free in the backward pass.",
+      "Every broadcast in the forward pass must be undone by a sum in the backward pass: a bias of shape (4,) added to a (3, 4) matrix receives the column sums of the upstream gradient. Forgetting this produces gradients of the wrong shape, or, if shapes happen to match, wrong values."
+    ],
+    [
+      "Composing primitive ops is always as good as a fused op.",
+      "Mathematically yes, numerically no. Cross-entropy composed from exp, sum and log overflows at logits of 1,000 and returns NaN; the fused op subtracts the maximum first and returns the exact answer. Frameworks fuse exactly the operations where composition loses precision."
+    ]
+  ],
+  "recap": [
+    "An autograd engine wraps each number (or array) in an object that remembers its parents and a closure that knows how to push gradient to them.",
+    "Every operation's backward rule multiplies the output's gradient by a local derivative and adds the result into each input's gradient.",
+    "backward() sorts the graph topologically from the output, sets the output's gradient to 1, and calls each node's backward in reverse order, so each node runs after all its consumers.",
+    "Gradients must accumulate with += because a value used in several places receives gradient from each; on the hand example a's gradient is 4 − 6 = −2.",
+    "An iterative topological sort avoids Python's recursion limit on deep graphs, such as a 5,000-step chain.",
+    "The same design over NumPy arrays needs matrix-shaped rules (dA = dOut·Bᵀ for A @ B) and must sum gradients back over broadcast axes.",
+    "The tensor engine matches PyTorch to 10⁻¹² on a two-layer network, and the scalar engine reproduces micrograd's README values 24.7041, 138.8338 and 645.5773.",
+    "Fused operations such as cross-entropy exist because composed primitives can overflow where a single stable op does not."
+  ],
+  "glossary": [
+    [
+      "Autograd",
+      "Automatic differentiation: computing exact derivatives of a program by recording its operations and applying the chain rule to them."
+    ],
+    [
+      "Backward closure",
+      "A small function attached to each node that, given the node's gradient, adds the right amounts to its inputs' gradients."
+    ],
+    [
+      "Broadcasting",
+      "NumPy's rule for combining arrays of different shapes by prepending axes and stretching size-1 axes."
+    ],
+    [
+      "Computation graph",
+      "The directed acyclic graph of operations performed in the forward pass, from inputs to output."
+    ],
+    [
+      "DAG",
+      "Directed acyclic graph: a graph with directed edges and no cycles; computation graphs are DAGs."
+    ],
+    [
+      "Detach (stop-gradient)",
+      "Using a value in the forward pass while blocking gradient from flowing back through it, by turning it into a new leaf."
+    ],
+    [
+      "Dynamic graph",
+      "A graph recorded afresh as the code runs (define-by-run), as in PyTorch and micrograd, rather than declared ahead of time."
+    ],
+    [
+      "Fused operation",
+      "A single node that implements several mathematical steps with one hand-written, numerically careful forward and backward."
+    ],
+    [
+      "Gradient accumulation (in autograd)",
+      "Adding, not assigning, contributions to a node's gradient, because it may feed several later nodes."
+    ],
+    [
+      "JAX",
+      "A Python library that differentiates and compiles NumPy-style functions by tracing them."
+    ],
+    [
+      "Leaf node",
+      "A node created directly (a parameter or input) rather than by an operation; its gradient is what the optimiser reads."
+    ],
+    [
+      "Local derivative",
+      "The derivative of one operation's output with respect to one of its inputs, evaluated at the forward values."
+    ],
+    [
+      "MLP",
+      "Multi-layer perceptron: a stack of linear layers with non-linear activations between them."
+    ],
+    [
+      "Reverse-mode differentiation",
+      "Computing the gradient of one output with respect to many inputs in a single backward sweep."
+    ],
+    [
+      "Straight-through estimator",
+      "Using a non-differentiable function (such as rounding) in the forward pass but treating it as the identity in the backward pass."
+    ],
+    [
+      "Topological order",
+      "An ordering of graph nodes in which every node comes after all the nodes it depends on."
+    ],
+    [
+      "Unbroadcast",
+      "Summing a gradient over the axes that broadcasting added or stretched, to return it to an input's original shape."
+    ],
+    [
+      "zero_grad",
+      "Resetting accumulated gradients to zero before the next backward pass."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What does an autograd engine record during the forward pass?",
+      "For every result, its parent values and the operation that produced it, packaged as a closure that knows the local derivatives. That record is the computation graph; backward walks it in reverse, multiplying local derivatives into each parent's gradient."
+    ],
+    [
+      "E",
+      "Write the backward rules for addition and multiplication.",
+      "For out = a + b: a.grad += out.grad and b.grad += out.grad (addition passes gradient through unchanged). For out = a·b: a.grad += b·out.grad and b.grad += a·out.grad (each input gets the other input times the upstream gradient)."
+    ],
+    [
+      "E",
+      "Why does backward set the output's gradient to 1?",
+      "Because the derivative of the output with respect to itself is 1, and every other gradient is that 1 multiplied by local derivatives along the paths. For a scalar loss, 1 is the seed; for a non-scalar output you must supply the vector to multiply with (a vector-Jacobian product)."
+    ],
+    [
+      "M",
+      "Walk through f = (a·b + c)·a with a = 2, b = −3, c = 10.",
+      "Forward: d = ab = −6, e = d + c = 4, f = e·a = 8. Backward: f.grad = 1; from f = e·a, e.grad = a = 2 and a.grad += e = 4; from e = d + c, d.grad = 2 and c.grad = 2; from d = ab, a.grad += b·2 = −6 (total −2) and b.grad = a·2 = 4. That matches f = a²b + ac, whose derivatives are 2ab + c = −2, a² = 4 and a = 2.",
+      "Follow-up: what does the bug with = instead of += give? — a.grad ends as whichever contribution was written last, 4 or −6, both wrong."
+    ],
+    [
+      "M",
+      "Why reverse topological order?",
+      "A node's gradient is the sum of contributions from every node that consumed it, so it is complete only after all its consumers have run their backward functions. A topological order puts every node after its inputs; reversing it puts every node after its consumers, which is exactly the requirement."
+    ],
+    [
+      "M",
+      "How do you write the topological sort without recursion?",
+      "Use an explicit stack of (node, expanded) pairs: push the output; when popping an unexpanded node, mark it visited, push it back as expanded, then push its unvisited children; when popping an expanded node, append it to the order. This is depth-first post-order without Python's call stack, so a 5,000-deep chain works where recursion (default limit 1,000 frames) would fail."
+    ],
+    [
+      "M",
+      "What changes when the engine works on arrays instead of scalars?",
+      "Each node holds an array and its gradient has the same shape. Backward rules become array rules: for C = A @ B, dA = dC @ Bᵀ and dB = Aᵀ @ dC; for element-wise ops the scalar rule applies element-wise. And broadcasting in the forward pass must be undone by summing over the broadcast axes in the backward pass."
+    ],
+    [
+      "M",
+      "Write unbroadcast and explain it.",
+      "While the gradient has more dimensions than the input's shape, sum over axis 0 (axes broadcasting prepended); then for every axis where the input had size 1 and the gradient does not, sum over it with keepdims. It answers 'how much did each input element contribute in total', just like += for a scalar used several times.",
+      "Follow-up: test case? — a of shape (3, 1) plus b of shape (4,) gives (3, 4); with an upstream gradient of ones, a's gradient is all 4 and b's is all 3."
+    ],
+    [
+      "M",
+      "Why must you zero gradients between training steps?",
+      "Because backward accumulates into .grad. Without zeroing, each step's gradient adds to the previous ones and the optimiser applies an ever-growing sum. Frameworks make zero_grad explicit for the same reason, and the accumulation is also what makes deliberate gradient accumulation over micro-batches possible."
+    ],
+    [
+      "H",
+      "How do real frameworks differ from this engine?",
+      "One node per tensor op with hand-written, often fused, kernels for forward and backward; saved tensors managed carefully (and freed once used) to control memory; version counters to detect in-place modification of saved tensors; support for higher-order gradients by making the backward itself differentiable; device placement; and optional graph capture and compilation (torch.compile) that optimises the recorded graph."
+    ],
+    [
+      "H",
+      "Reverse mode versus forward mode: when is each better?",
+      "Reverse mode computes the gradient of one output with respect to all n inputs in one backward pass, costing a small multiple of the forward pass, which is ideal for a scalar loss and millions of parameters. Forward mode propagates derivatives alongside values and computes the derivative of all outputs with respect to one input direction per pass, ideal when there are few inputs and many outputs (Jacobian-vector products). Training uses reverse mode; some scientific and second-order methods combine both."
+    ],
+    [
+      "H",
+      "Why does PyTorch raise an error if you modify a tensor in place after it was saved for backward?",
+      "Backward rules use forward values (for a·b, the gradient for a needs b's value at forward time). If b is modified in place afterwards, the saved value is wrong and the gradient silently incorrect. PyTorch tracks a version counter per tensor and checks it when backward reads a saved tensor, turning a silent bug into an error."
+    ],
+    [
+      "H",
+      "Where does writing your own autograd function matter in LLM work?",
+      "Custom fused kernels (attention, normalisation, losses) are exposed to the framework as autograd functions with a hand-written forward and backward; activation checkpointing replaces saved tensors with recomputation inside backward; and memory-saving tricks such as chunked cross-entropy (mc10) need a backward that recomputes chunks. All of them depend on the contract implemented here: save what backward needs, accumulate into inputs' gradients, and verify with a gradient check."
+    ]
+  ],
+  "refs": [
+    [
+      "code",
+      "micrograd (Karpathy)",
+      "The reference for this problem: a scalar autograd engine of about 100 lines over a dynamically built DAG, plus a 50-line neural-net library; its README example (g = 24.7041, dg/da = 138.8338, dg/db = 645.5773) is reproduced exactly by this lesson's engine.",
+      "https://github.com/karpathy/micrograd"
+    ],
+    [
+      "docs",
+      "PyTorch: Autograd mechanics",
+      "How PyTorch records the graph, saved tensors, in-place correctness checks and version counters.",
+      "https://docs.pytorch.org/docs/stable/notes/autograd.html"
+    ],
+    [
+      "paper",
+      "Baydin et al. (2015), Automatic differentiation in machine learning: a survey",
+      "Forward versus reverse mode, and how automatic differentiation differs from symbolic and numerical differentiation.",
+      "https://arxiv.org/abs/1502.05767"
+    ],
+    [
+      "video",
+      "Karpathy, The spelled-out intro to neural networks and backpropagation: building micrograd",
+      "A step-by-step build of the scalar engine with derivations.",
+      "https://www.youtube.com/watch?v=VMj-3S1tku0"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>In mc11 you wrote a backward pass by hand: seven lines of matrix calculus for a two-layer network, each derived on paper and checked numerically. That works for a two-layer network. It does not work for a transformer with dozens of layer types, residual connections, attention masks and a loss you are still experimenting with. Every time the model changes, someone would have to re-derive and re-check the backward pass. Autograd engines remove that burden: you write only the forward computation, and the engine works out every gradient automatically and exactly. PyTorch's <code>loss.backward()</code> is one; JAX's <code>grad</code> is another. They are the reason a researcher can try a new architecture in an afternoon.</p>
+<p>"Build a tiny autograd engine" is a popular interview question because it is small enough to finish in an hour and deep enough to show whether you really understand backpropagation. The core is about a hundred lines, as Andrej Karpathy's teaching engine micrograd demonstrates, and almost every line hides a classic bug. If a value is used twice and its backward function assigns instead of adding, its gradient is wrong. If the backward functions run in the wrong order, some of them use gradients that are not finished yet. If the graph is sorted recursively, a long chain of operations crashes with a recursion error. And if the engine is extended to arrays, every broadcast in the forward pass needs a matching sum in the backward pass, which is where most hand-rolled tensor engines go wrong.</p>
+<p>Building one also makes framework behaviour obvious that otherwise seems arbitrary: why you call <code>zero_grad</code>, why modifying a tensor in place sometimes raises an error, why frameworks provide fused operations like cross-entropy instead of letting you compose it from <code>exp</code> and <code>log</code>, and why the backward pass costs about twice the forward pass.</p>
+<p>The lesson works one small expression by hand, a function in which one input is used twice, so its gradient has to be accumulated from two paths. Then it builds a scalar <code>Value</code> class with an iterative topological sort, checks it against the exact numbers printed in micrograd's README, against finite differences and on a 5,000-step chain. Then it rebuilds the engine over NumPy arrays, with matrix-multiply and broadcasting-aware backward rules, and checks a two-layer network's gradients against PyTorch to twelve decimal places. The drill adds a fused cross-entropy operation and shows the composed version producing NaN on logits where the fused one is exact.</p>
+<p>The payoff goes beyond interviews. Once you have built the engine, reading a framework's autograd error messages, deciding where to detach a tensor, writing a custom operation for a fused kernel, or explaining why a training run's memory grows each step all become questions about a mechanism you have implemented yourself, not about a black box.</p>
+</section>
+
+<section data-field="primer">
+<p>Think of a calculation as a little factory line. Raw inputs enter, each machine does one simple thing (add two numbers, multiply them, apply a ReLU), and the final product is the loss. Now suppose the final product comes out one unit too heavy and you want to know how much each raw input is to blame. You could walk backwards along the line: the last machine knows exactly how its output depends on its inputs (that is its <strong>local derivative</strong>), so it can split the blame between them; each of those machines splits its share further, and so on back to the raw inputs. That backwards walk is backpropagation, and an autograd engine is a factory line that writes down, as it runs, which machine fed which, so the walk can be done automatically.</p>
+<p>The engine needs three ingredients. First, a wrapper object for every number, called <code>Value</code> here, that holds the number, a slot for its gradient (starting at zero), and references to the values it was made from. Second, a small function attached to every result, its <strong>backward closure</strong>, that knows the local derivatives of the operation that made it and pushes gradient to its inputs. For multiplication <code>out = a·b</code>, the closure adds <code>b × out.grad</code> to a's gradient and <code>a × out.grad</code> to b's. Third, a <code>backward()</code> method on the final result that visits every node in the right order and calls its closure.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Computation graph for f = (a*b + c)*a with forward values a=2, b=-3, c=10, d=-6, e=4, f=8 and gradients a=-2 (4 from one path, -6 from the other), b=4, c=2, d=2, e=2">
+  <defs><marker id="mc13-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="30" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="75" y="48" text-anchor="middle" style="fill:var(--ink)">a = 2</text>
+    <text x="75" y="66" text-anchor="middle" style="fill:var(--crit)">grad 4 + (−6) = −2</text>
+    <rect x="20" y="104" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="75" y="122" text-anchor="middle" style="fill:var(--ink)">b = −3</text>
+    <text x="75" y="140" text-anchor="middle" style="fill:var(--crit)">grad 4</text>
+    <rect x="20" y="178" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="75" y="196" text-anchor="middle" style="fill:var(--ink)">c = 10</text>
+    <text x="75" y="214" text-anchor="middle" style="fill:var(--crit)">grad 2</text>
+    <rect x="190" y="80" width="100" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="240" y="98" text-anchor="middle" style="fill:var(--ink)">d = a·b = −6</text>
+    <text x="240" y="116" text-anchor="middle" style="fill:var(--crit)">grad 2</text>
+    <rect x="340" y="130" width="100" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="390" y="148" text-anchor="middle" style="fill:var(--ink)">e = d + c = 4</text>
+    <text x="390" y="166" text-anchor="middle" style="fill:var(--crit)">grad 2</text>
+    <rect x="500" y="80" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--ink)"/>
+    <text x="555" y="98" text-anchor="middle" style="fill:var(--ink)">f = e·a = 8</text>
+    <text x="555" y="116" text-anchor="middle" style="fill:var(--crit)">grad 1 (seed)</text>
+    <line x1="130" y1="52" x2="188" y2="92" marker-end="url(#mc13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="130" y1="126" x2="188" y2="108" marker-end="url(#mc13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="290" y1="110" x2="338" y2="142" marker-end="url(#mc13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="130" y1="200" x2="338" y2="160" marker-end="url(#mc13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="440" y1="146" x2="498" y2="112" marker-end="url(#mc13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <path d="M130,40 C300,10 450,20 520,78" marker-end="url(#mc13-arrow)" style="fill:none;stroke:var(--accent);stroke-width:1.8"/>
+    <text x="330" y="22" style="fill:var(--accent)">a is used twice: its gradient sums both paths</text>
+  </g>
+</svg>
+<figcaption>The hand example as a graph. Forward values are on the first line of each box, gradients on the second. a feeds both the multiplication d = a·b and the final f = e·a, so it receives 4 from one path and −6 from the other; the engine must add them.</figcaption>
+</figure>
+<p>A tiny numeric example shows the chain rule doing the work. Suppose <code>y = 3x</code> and <code>L = y²</code>, with <code>x = 2</code>. Forward: <code>y = 6</code>, <code>L = 36</code>. The squaring machine knows its local derivative is <code>2y = 12</code>, so it tells y "each unit you increase raises L by 12". The tripling machine knows its local derivative is 3, so it passes back <code>12 × 3 = 36</code> to x. Check directly: <code>L = 9x²</code>, so <code>dL/dx = 18x = 36</code>. No formula for <code>dL/dx</code> was ever written down; two local derivatives were multiplied in the right order. An autograd engine does nothing more than this, systematically, for every number in the program.</p>
+<p>"The right order" is the subtle part. A value's gradient is complete only when every operation that used it has passed its share back, so the engine must process the graph from the output toward the inputs, never visiting a node before all the nodes that consumed it. Sorting the graph so that every node comes after its inputs (a <strong>topological order</strong>) and then walking that list backwards does exactly this. And because a value can feed several operations, each closure must <em>add</em> to its inputs' gradients rather than overwrite them.</p>
+<p>Where the factory picture breaks: real engines do not wrap individual numbers, they wrap whole arrays, so one "machine" is an entire matrix multiplication with a matrix-shaped backward rule. The algorithm is the same; the bookkeeping for shapes, especially broadcasting, is new, and the second half of the lesson builds it.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The problem as it is usually asked</h4>
+<p>"Implement a minimal reverse-mode autograd engine: a <code>Value</code> class supporting +, ×, power, ReLU (and maybe tanh), with <code>backward()</code> that fills <code>.grad</code> for every value. Use it to train a tiny network." Follow-ups usually extend it to tensors. Clarify: scalars only, or arrays? Which operations? Should it support values used more than once (yes, always)? Does it need higher-order gradients (usually not)? Then outline: the node class with data, grad, parents and a backward closure; one method per operation; a topological sort; a gradient check and a reference comparison.</p>
+
+<h4>2. The maths in plain words</h4>
+<p>The chain rule says: if <code>L</code> depends on <code>y</code> and <code>y</code> depends on <code>x</code>, then <code>dL/dx = dL/dy × dy/dx</code>. If <code>x</code> influences <code>L</code> through several paths (through <code>y₁</code> and through <code>y₂</code>), the contributions add: <code>dL/dx = dL/dy₁ × dy₁/dx + dL/dy₂ × dy₂/dx</code>. That is the whole theory. Reverse mode organises the computation so that each <code>dL/dy</code> is computed once and reused: process nodes from the output backwards, and when a node's <code>dL/d(node)</code> is complete, push <code>dL/d(node) × d(node)/d(input)</code> into each input's running total.</p>
+<p>Each operation therefore needs only its local derivatives, evaluated at the forward values. Addition passes the gradient through unchanged to both inputs. Multiplication sends each input the other input times the upstream gradient. A power <code>xᵏ</code> sends <code>k·x^(k−1)</code> times the gradient. ReLU sends the gradient through if its input was positive and zero otherwise. tanh sends <code>1 − tanh²</code> times the gradient. Subtraction and division need no new rules: <code>a − b = a + (−1)·b</code> and <code>a/b = a·b⁻¹</code>, built from the existing operations, and the engine differentiates them correctly by composition.</p>
+
+<h4>3. The equations</h4>
+<pre>node rules (upstream gradient ḡ = out.grad; each line is "+=", never "=")
+out = a + b      a.grad += ḡ                 b.grad += ḡ
+out = a · b      a.grad += b · ḡ             b.grad += a · ḡ
+out = a^k        a.grad += k · a^(k−1) · ḡ
+out = relu(a)    a.grad += [a &gt; 0] · ḡ
+out = tanh(a)    a.grad += (1 − out²) · ḡ
+
+backward():  order = topological_sort(output)      # every node after its inputs
+             output.grad = 1
+             for node in reversed(order): node._backward()
+
+array versions (shapes in brackets)
+C = A @ B        A.grad += C.grad @ Bᵀ   [n,k]      B.grad += Aᵀ @ C.grad   [k,m]
+out = A + b      A.grad += unbroadcast(ḡ, A.shape)  b.grad += unbroadcast(ḡ, b.shape)
+s = A.sum(axis)  A.grad += broadcast of ḡ back to A.shape (re-inserting the summed axis)</pre>
+<p>The array rules are the scalar rules applied element-wise, plus two shape rules. A matrix product's backward is two matrix products, the ones mc11 derived by hand. And any operation that broadcast an input in the forward pass (adding a bias of shape <code>(4,)</code> to a <code>(3, 4)</code> matrix, say) used each input element several times, so in the backward pass those uses' gradients are summed: that is <code>unbroadcast</code>, the array version of <code>+=</code>.</p>
+
+<h4>4. A worked example by hand</h4>
+<p>Take <code>f = (a·b + c)·a</code> with <code>a = 2</code>, <code>b = −3</code>, <code>c = 10</code>. Name the intermediate results: <code>d = a·b</code>, <code>e = d + c</code>, <code>f = e·a</code>.</p>
+<ul>
+<li><strong>Forward.</strong> <code>d = −6</code>, <code>e = 4</code>, <code>f = 8</code>.</li>
+<li><strong>Topological order.</strong> One valid order is a, b, d, c, e, f: each node after its inputs. Reversed: f, e, c, d, b, a.</li>
+<li><strong>Seed.</strong> <code>f.grad = 1</code>.</li>
+<li><strong>f's closure</strong> (f = e·a): <code>e.grad += a·1 = 2</code>; <code>a.grad += e·1 = 4</code>.</li>
+<li><strong>e's closure</strong> (e = d + c): <code>d.grad += 2</code>; <code>c.grad += 2</code>.</li>
+<li><strong>c</strong> is a leaf; nothing to push.</li>
+<li><strong>d's closure</strong> (d = a·b): <code>a.grad += b·2 = −6</code>, so a's gradient is now <code>4 − 6 = −2</code>; <code>b.grad += a·2 = 4</code>.</li>
+<li><strong>Result.</strong> <code>df/da = −2</code>, <code>df/db = 4</code>, <code>df/dc = 2</code>.</li>
+</ul>
+<p>Check by algebra: <code>f = a²b + ac</code>, so <code>df/da = 2ab + c = −12 + 10 = −2</code>, <code>df/db = a² = 4</code>, <code>df/dc = a = 2</code>. Notice two things. a's gradient came from two places and only the sum is right; with assignment instead of addition, a's gradient would be 4 or −6 depending on which closure ran last. And d's closure had to run after e's, because it needed d's completed gradient; reverse topological order guarantees that. The first block does exactly this calculation with plain Python numbers.</p>
+<pre class="run">import math
+import time
+import numpy as np
+
+# The hand-worked example: f = (a·b + c)·a with a = 2, b = -3, c = 10. Note that a is used twice.
+a, b, c = 2.0, -3.0, 10.0
+d = a * b            # -6
+e = d + c            # 4
+f = e * a            # 8
+assert (d, e, f) == (-6.0, 4.0, 8.0)
+# Backward, in reverse topological order, accumulating into a from both of its uses:
+f_grad = 1.0
+e_grad = a * f_grad              # f = e·a  -&gt; df/de = a = 2
+a_grad = e * f_grad              # ... and df/da (direct use) = e = 4
+d_grad = 1.0 * e_grad            # e = d + c -&gt; 2
+c_grad = 1.0 * e_grad            # 2
+a_grad += b * d_grad             # d = a·b -&gt; += -3·2 = -6, so a_grad = -2
+b_grad = a * d_grad              # 4
+assert (a_grad, b_grad, c_grad) == (-2.0, 4.0, 2.0)
+# Analytic check: f = a²b + ac, so df/da = 2ab + c = -2, df/db = a² = 4, df/dc = a = 2.
+assert (2 * a * b + c, a * a, a) == (a_grad, b_grad, c_grad)</pre>
+
+<h4>5. The scalar engine</h4>
+<pre class="run">class Value:
+    """A scalar that records how it was made, so gradients can flow back through it."""
+
+    def __init__(self, data, _children=(), _op=""):
+        self.data, self.grad = float(data), 0.0
+        self._backward = lambda: None
+        self._prev, self._op = tuple(_children), _op
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data + other.data, (self, other), "+")
+        def _backward():
+            self.grad += out.grad                       # += : a node may feed several others
+            other.grad += out.grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data * other.data, (self, other), "*")
+        def _backward():
+            self.grad += other.data * out.grad
+            other.grad += self.data * out.grad
+        out._backward = _backward
+        return out
+
+    def __pow__(self, k):
+        assert isinstance(k, (int, float)), "only constant powers"
+        out = Value(self.data ** k, (self,), f"**{k}")
+        def _backward():
+            self.grad += k * self.data ** (k - 1) * out.grad
+        out._backward = _backward
+        return out
+
+    def relu(self):
+        out = Value(max(self.data, 0.0), (self,), "relu")
+        def _backward():
+            self.grad += (out.data &gt; 0) * out.grad
+        out._backward = _backward
+        return out
+
+    def tanh(self):
+        t = math.tanh(self.data)
+        out = Value(t, (self,), "tanh")
+        def _backward():
+            self.grad += (1 - t * t) * out.grad
+        out._backward = _backward
+        return out
+
+    def backward(self):
+        # Iterative depth-first topological sort: no recursion limit on deep graphs.
+        topo, seen, stack = [], set(), [(self, False)]
+        while stack:
+            node, done = stack.pop()
+            if done:
+                topo.append(node); continue
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            stack.append((node, True))
+            stack.extend((ch, False) for ch in node._prev if id(ch) not in seen)
+        self.grad = 1.0
+        for node in reversed(topo):                     # every node after all of its consumers
+            node._backward()
+
+    __radd__ = __add__
+    __rmul__ = __mul__
+    def __neg__(self): return self * -1
+    def __sub__(self, other): return self + (-other)
+    def __rsub__(self, other): return other + (-self)
+    def __truediv__(self, other): return self * other ** -1
+    def __rtruediv__(self, other): return other * self ** -1</pre>
+<p><strong>Each operation</strong> computes its result, creates a new <code>Value</code> with the operands as parents, and attaches a closure. The closure captures <code>self</code>, <code>other</code> and <code>out</code>, so when it runs later it can read the forward values and <code>out.grad</code>. Constants are wrapped in <code>Value</code> on the fly so <code>x * 3</code> works, and <code>__radd__</code>/<code>__rmul__</code> make <code>3 * x</code> work too.</p>
+<p><strong>The derived operations</strong> (negation, subtraction, division) are defined in terms of the primitives, so they need no backward rules of their own. Division by <code>other ** -1</code> means the power rule supplies the derivative <code>−1/b²</code> automatically.</p>
+<p><strong>The topological sort</strong> is an iterative depth-first search with an explicit stack of <code>(node, done)</code> pairs. When a node is first popped it is marked visited and pushed back with <code>done = True</code>, followed by its unvisited children; when it is popped with <code>done = True</code>, all its descendants have been appended, so it is appended after them. The result lists every node after its inputs. micrograd uses the same depth-first search written recursively, which is clearer but limited by Python's default recursion limit of 1,000 frames; the test builds a 5,000-step chain to show the iterative version copes.</p>
+<p><strong>backward</strong> seeds the output's gradient with 1 and calls the closures in reverse order. Visited nodes are tracked by <code>id</code>, so the engine does not depend on <code>Value</code> being hashable by value.</p>
+<figure>
+<svg viewBox="0 0 640 200" width="100%" role="img" aria-label="Topological order a, b, d, c, e, f for the hand example and the reversed order f, e, c, d, b, a in which backward closures run; d runs after e so its gradient is complete">
+  <defs><marker id="mc13-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="30" style="fill:var(--ink);font-weight:600">topological order (inputs first)</text>
+    <g>
+      <rect x="20" y="44" width="80" height="32" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="60" y="65" text-anchor="middle" style="fill:var(--ink)">a</text>
+      <rect x="120" y="44" width="80" height="32" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="160" y="65" text-anchor="middle" style="fill:var(--ink)">b</text>
+      <rect x="220" y="44" width="80" height="32" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="260" y="65" text-anchor="middle" style="fill:var(--ink)">d = ab</text>
+      <rect x="320" y="44" width="80" height="32" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="360" y="65" text-anchor="middle" style="fill:var(--ink)">c</text>
+      <rect x="420" y="44" width="80" height="32" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="460" y="65" text-anchor="middle" style="fill:var(--ink)">e = d + c</text>
+      <rect x="520" y="44" width="100" height="32" rx="6" style="fill:var(--surface-2);stroke:var(--ink)"/><text x="570" y="65" text-anchor="middle" style="fill:var(--ink)">f = e·a</text>
+    </g>
+    <line x1="600" y1="92" x2="40" y2="92" marker-end="url(#mc13-arrow2)" style="stroke:var(--crit);stroke-width:1.5;fill:none"/>
+    <text x="320" y="112" text-anchor="middle" style="fill:var(--crit)">backward runs right to left: f, e, c, d, b, a</text>
+    <text x="20" y="146" style="fill:var(--ink-2)">e runs before d, so when d's closure reads d.grad it is complete (2);</text>
+    <text x="20" y="166" style="fill:var(--ink-2)">f and d both push into a, and both have run before anyone needs a.grad.</text>
+    <text x="20" y="190" style="fill:var(--muted)">any order with every node after its inputs works; reversing it puts every node after its consumers</text>
+  </g>
+</svg>
+<figcaption>Why reverse topological order. Each closure reads its own node's gradient, which is complete only after every consumer has pushed into it. In the reversed order, all consumers of a node come before it.</figcaption>
+</figure>
+
+<h4>6. The tensor engine</h4>
+<p>The scalar engine is a teaching tool: it creates one Python object per number and one closure call per arithmetic operation. Real engines make one node per array operation. The <code>Tensor</code> class below is the same design over NumPy arrays.</p>
+<pre class="run">def unbroadcast(grad, shape):
+    """Sum a gradient back down to the shape of an input that was broadcast in the forward pass."""
+    while grad.ndim &gt; len(shape):                       # axes broadcasting prepended
+        grad = grad.sum(axis=0)
+    for axis, size in enumerate(shape):
+        if size == 1 and grad.shape[axis] != 1:         # axes broadcasting stretched
+            grad = grad.sum(axis=axis, keepdims=True)
+    return grad
+
+class Tensor:
+    """The same engine over NumPy arrays: one node per array operation instead of per scalar."""
+
+    def __init__(self, data, _children=(), _op=""):
+        self.data = np.asarray(data, dtype=float)
+        self.grad = np.zeros_like(self.data)
+        self._backward = lambda: None
+        self._prev, self._op = tuple(_children), _op
+
+    @staticmethod
+    def _wrap(x):
+        return x if isinstance(x, Tensor) else Tensor(x)
+
+    def __add__(self, other):
+        other = Tensor._wrap(other)
+        out = Tensor(self.data + other.data, (self, other), "+")
+        def _backward():
+            self.grad += unbroadcast(out.grad, self.data.shape)
+            other.grad += unbroadcast(out.grad, other.data.shape)
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = Tensor._wrap(other)
+        out = Tensor(self.data * other.data, (self, other), "*")
+        def _backward():
+            self.grad += unbroadcast(other.data * out.grad, self.data.shape)
+            other.grad += unbroadcast(self.data * out.grad, other.data.shape)
+        out._backward = _backward
+        return out
+
+    def __matmul__(self, other):
+        out = Tensor(self.data @ other.data, (self, other), "@")
+        def _backward():
+            self.grad += out.grad @ other.data.T          # (N, out) @ (out, in)
+            other.grad += self.data.T @ out.grad          # (in, N) @ (N, out)
+        out._backward = _backward
+        return out
+
+    def relu(self):
+        out = Tensor(np.maximum(self.data, 0), (self,), "relu")
+        def _backward():
+            self.grad += (self.data &gt; 0) * out.grad
+        out._backward = _backward
+        return out
+
+    def exp(self):
+        out = Tensor(np.exp(self.data), (self,), "exp")
+        def _backward():
+            self.grad += out.data * out.grad
+        out._backward = _backward
+        return out
+
+    def log(self):
+        out = Tensor(np.log(self.data), (self,), "log")
+        def _backward():
+            self.grad += out.grad / self.data
+        out._backward = _backward
+        return out
+
+    def sum(self, axis=None, keepdims=False):
+        out = Tensor(self.data.sum(axis=axis, keepdims=keepdims), (self,), "sum")
+        def _backward():
+            g = out.grad
+            if axis is not None and not keepdims:
+                g = np.expand_dims(g, axis)               # put the summed axis back
+            self.grad += np.broadcast_to(g, self.data.shape)
+        out._backward = _backward
+        return out
+
+    def backward(self):
+        topo, seen, stack = [], set(), [(self, False)]
+        while stack:
+            node, done = stack.pop()
+            if done:
+                topo.append(node); continue
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            stack.append((node, True))
+            stack.extend((ch, False) for ch in node._prev if id(ch) not in seen)
+        self.grad = np.ones_like(self.data)
+        for node in reversed(topo):
+            node._backward()
+
+    __radd__ = __add__
+    __rmul__ = __mul__
+    def __neg__(self): return self * -1.0
+    def __sub__(self, other): return self + (-Tensor._wrap(other))</pre>
+<p><strong>Gradients are arrays</strong> of the same shape as the data, initialised to zeros.</p>
+<p><strong>Matrix multiply.</strong> For <code>C = A @ B</code>, the closure adds <code>C.grad @ Bᵀ</code> to A's gradient and <code>Aᵀ @ C.grad</code> to B's: the linear-layer rules from mc11, now attached to an operation instead of written into a model.</p>
+<p><strong>Broadcasting.</strong> <code>+</code> and <code>*</code> may broadcast, so their closures pass each gradient through <code>unbroadcast</code>, which sums over any leading axes broadcasting added and over any axes where the input had size 1 but the output did not. A bias of shape <code>(4,)</code> added to a <code>(16, 4)</code> matrix therefore receives the column sums of the upstream gradient, which is the <code>db = Σ dz</code> rule of mc11, derived automatically.</p>
+<p><strong>Reductions.</strong> <code>sum(axis, keepdims)</code>'s backward re-inserts the summed axis (if it was dropped) and broadcasts the upstream gradient back to the input's shape: every input element contributed once to the sum, so each receives the sum's gradient.</p>
+<p><strong>exp and log</strong> use their own outputs and inputs: <code>d exp(x) = exp(x)</code>, <code>d log(x) = 1/x</code>. With these, log-softmax and cross-entropy can be composed, which the tests do, and which the drill shows is numerically fragile.</p>
+<figure>
+<svg viewBox="0 0 640 210" width="100%" role="img" aria-label="Broadcasting backward: a of shape (3,1) plus b of shape (4,) gives a (3,4) output; with an upstream gradient of ones, a's gradient is 4 for each row and b's is 3 for each column">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">forward: a (3, 1) + b (4,) → out (3, 4)</text>
+    <rect x="20" y="40" width="30" height="90" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="35" y="148" text-anchor="middle" style="fill:var(--s2)">a</text>
+    <text x="65" y="90" style="fill:var(--ink);font-size:16px">+</text>
+    <rect x="85" y="40" width="120" height="30" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="145" y="90" text-anchor="middle" style="fill:var(--s3)">b</text>
+    <text x="220" y="90" style="fill:var(--ink);font-size:16px">=</text>
+    <rect x="245" y="40" width="120" height="90" style="fill:var(--surface-2);stroke:var(--ink)"/>
+    <line x1="245" y1="70" x2="365" y2="70" style="stroke:var(--line-2);fill:none"/>
+    <line x1="245" y1="100" x2="365" y2="100" style="stroke:var(--line-2);fill:none"/>
+    <line x1="275" y1="40" x2="275" y2="130" style="stroke:var(--line-2);fill:none"/>
+    <line x1="305" y1="40" x2="305" y2="130" style="stroke:var(--line-2);fill:none"/>
+    <line x1="335" y1="40" x2="335" y2="130" style="stroke:var(--line-2);fill:none"/>
+    <text x="305" y="148" text-anchor="middle" style="fill:var(--ink)">out</text>
+    <text x="400" y="54" style="fill:var(--ink);font-weight:600">backward with ḡ = ones (3, 4):</text>
+    <text x="400" y="80" style="fill:var(--s2)">a.grad = ḡ summed over axis 1 (keepdims)</text>
+    <text x="400" y="98" style="fill:var(--s2)">       = [[4], [4], [4]]   shape (3, 1)</text>
+    <text x="400" y="124" style="fill:var(--s3)">b.grad = ḡ summed over axis 0</text>
+    <text x="400" y="142" style="fill:var(--s3)">       = [3, 3, 3, 3]      shape (4,)</text>
+    <text x="20" y="186" style="fill:var(--ink-2)">each a[i] was used in 4 outputs and each b[j] in 3: the sums are the array version of +=</text>
+  </g>
+</svg>
+<figcaption>Undoing a broadcast. Every input element that broadcasting copied into several outputs receives the sum of those outputs' gradients, so the gradient returns to the input's own shape.</figcaption>
+</figure>
+
+<h4>Training with the engine</h4>
+<p>Once gradients are automatic, a training loop has the same four steps for any model, and writing them out makes the engine's responsibilities clear. First, zero every parameter's gradient, because backward accumulates. Second, run the forward pass from the parameters and a batch of data to a scalar loss; this records the graph. Third, call <code>loss.backward()</code>, which fills every parameter's <code>.grad</code>. Fourth, update each parameter's data in place (for plain gradient descent, <code>p.data -= lr * p.grad</code>), outside the graph, so the update itself is not recorded. The graph from this step is then discarded, and the next step records a new one. With the tensor engine and the two-layer network from the tests, those four steps are a dozen lines, and changing the architecture (adding a layer, a residual connection, a different loss) changes only the forward pass. That separation, write the forward pass and get the backward pass free, is the whole value of autograd, and it is exactly the workflow of <code>optimizer.zero_grad()</code>, <code>loss.backward()</code> and <code>optimizer.step()</code> in PyTorch.</p>
+<h4>How the same expression looks in PyTorch</h4>
+<p>Every line of the hand example has a PyTorch twin. <code>a = torch.tensor(2.0, requires_grad=True)</code> creates a leaf that records operations, like <code>Value(2.0)</code>. <code>f = (a * b + c) * a</code> builds the same graph, with nodes whose <code>grad_fn</code> attributes (<code>MulBackward0</code>, <code>AddBackward0</code>) play the role of the closures. <code>f.backward()</code> runs the same reverse topological sweep, and <code>a.grad</code> is −2. Differences are about scale and safety rather than the algorithm: PyTorch's nodes operate on tensors, its backward functions are compiled kernels, intermediate results are freed after use, and only leaves with <code>requires_grad=True</code> keep a <code>.grad</code> by default (intermediate nodes' gradients are discarded unless you call <code>retain_grad()</code>), which saves memory that this lesson's engine spends freely.</p>
+<h4>7. Testing it</h4>
+<p>The tests, in order. The scalar engine reproduces the hand example, including a's accumulated −2. It reproduces, to four decimal places, the example in micrograd's README, a deliberately convoluted expression using addition, multiplication, powers, negation, in-place <code>+=</code>, ReLU and division, for which the README states <code>g = 24.7041</code>, <code>dg/da = 138.8338</code> and <code>dg/db = 645.5773</code>. Finite differences on a function with tanh, division and a reused input agree to 10⁻⁸. A 5,000-step multiplication chain backpropagates without a recursion error and gives the exact derivative <code>1.0001^5000</code>. The tensor engine computes a two-layer network's composed cross-entropy loss and all four parameter gradients identically to PyTorch's autograd, to 10⁻¹². The scalar and tensor engines agree on a ReLU layer's weight gradient. Finally, the timing: one forward and backward pass of an 8-unit ReLU layer on 256 rows took 230 ms with scalar nodes and 0.62 ms with array nodes, a factor of 371.</p>
+<pre class="run"># 1. The scalar engine reproduces the hand example, including the accumulation into a.
+A, B, C = Value(2.0), Value(-3.0), Value(10.0)
+F = (A * B + C) * A
+F.backward()
+assert F.data == 8.0 and (A.grad, B.grad, C.grad) == (-2.0, 4.0, 2.0)
+
+# 2. Reference: micrograd's README example prints 24.7041, 138.8338 and 645.5773.
+a, b = Value(-4.0), Value(2.0)
+c = a + b
+d = a * b + b ** 3
+c += c + 1
+c += 1 + c + (-a)
+d += d * 2 + (b + a).relu()
+d += 3 * d + (b - a).relu()
+e = c - d
+f = e ** 2
+g = f / 2.0
+g += 10.0 / f
+g.backward()
+assert (f"{g.data:.4f}", f"{a.grad:.4f}", f"{b.grad:.4f}") == ("24.7041", "138.8338", "645.5773")
+
+# 3. Finite differences on a function with tanh, division and reuse.
+def h(xv, yv):
+    x, y = Value(xv), Value(yv)
+    out = (x * y + x.tanh()) / (y * y + 1) + x * x
+    return out, x, y
+out, x, y = h(0.7, -1.3); out.backward()
+eps = 1e-6
+num_x = (h(0.7 + eps, -1.3)[0].data - h(0.7 - eps, -1.3)[0].data) / (2 * eps)
+num_y = (h(0.7, -1.3 + eps)[0].data - h(0.7, -1.3 - eps)[0].data) / (2 * eps)
+assert abs(num_x - x.grad) &lt; 1e-8 and abs(num_y - y.grad) &lt; 1e-8
+
+# 4. A 5,000-deep chain: a recursive topological sort would hit Python's recursion limit.
+v = Value(1.0); node = v
+for _ in range(5000):
+    node = node * 1.0001
+node.backward()
+assert abs(v.grad - 1.0001 ** 5000) &lt; 1e-9
+
+# 5. The tensor engine on a two-layer MLP with a composed cross-entropy, against PyTorch.
+rng = np.random.default_rng(0)
+Xn, yn = rng.normal(size=(16, 3)), rng.integers(0, 4, 16)
+W1n, b1n, W2n, b2n = rng.normal(size=(3, 8)) * 0.5, np.zeros(8), rng.normal(size=(8, 4)) * 0.5, np.zeros(4)
+onehot = np.eye(4)[yn]
+def tensor_loss(W1, b1, W2, b2):
+    z = (Tensor(Xn) @ W1 + b1).relu() @ W2 + b2                         # (16, 4) logits
+    logp = z - z.exp().sum(axis=1, keepdims=True).log()                  # log-softmax, composed
+    return -(logp * onehot).sum() * (1 / len(yn))
+P = [Tensor(t.copy()) for t in (W1n, b1n, W2n, b2n)]
+L = tensor_loss(*P); L.backward()
+try:
+    import torch
+    T = [torch.tensor(t, requires_grad=True) for t in (W1n, b1n, W2n, b2n)]
+    zt = torch.relu(torch.tensor(Xn) @ T[0] + T[1]) @ T[2] + T[3]
+    lt = torch.nn.functional.cross_entropy(zt, torch.tensor(yn)); lt.backward()
+    assert np.isclose(L.data, lt.item(), atol=1e-12)
+    assert all(np.allclose(p.grad, t.grad.numpy(), atol=1e-12) for p, t in zip(P, T))
+except ImportError:
+    pass
+
+# 6. The scalar engine and the tensor engine agree on a ReLU layer's weight gradient.
+Ws = [[Value(W1n[i, j]) for j in range(8)] for i in range(3)]
+s_scalar = sum((sum((Ws[i][j] * Xn[n, i] for i in range(3)), Value(0.0)).relu()
+                for n in range(len(Xn)) for j in range(8)), Value(0.0))
+s_scalar.backward()
+s_tensor = Tensor(W1n.copy())
+out_t = (Tensor(Xn) @ s_tensor).relu().sum()
+out_t.backward()
+assert np.isclose(s_scalar.data, out_t.data)
+assert np.allclose([[Ws[i][j].grad for j in range(8)] for i in range(3)], s_tensor.grad)
+
+# 7. Timing: scalar nodes vs array nodes for one forward + backward of that hidden layer on 256 rows.
+Xb = rng.normal(size=(256, 3))
+t0 = time.perf_counter()
+Wv = [[Value(W1n[i, j]) for j in range(8)] for i in range(3)]
+sum((sum((Wv[i][j] * Xb[n, i] for i in range(3)), Value(0.0)).relu() for n in range(256) for j in range(8)), Value(0.0)).backward()
+t_scalar = time.perf_counter() - t0
+t0 = time.perf_counter()
+Wt = Tensor(W1n.copy()); (Tensor(Xb) @ Wt).relu().sum().backward()
+t_tensor = time.perf_counter() - t0
+if __name__ == "__main__":
+    print(f"README example: g={g.data:.4f} dg/da={a.grad:.4f} dg/db={b.grad:.4f}")
+    print(f"hidden layer fwd+bwd on 256 rows: scalar {t_scalar*1e3:.0f} ms, tensor {t_tensor*1e3:.2f} ms ({t_scalar/t_tensor:.0f}x)")</pre>
+<p>The README test deserves a comment. Matching someone else's published numbers for an expression you did not design is a much stronger test than your own examples, because it exercises operator combinations you might not think of: right-hand operators (<code>1 + c</code>), in-place addition rebinding a name to a new node (<code>c += ...</code>), and a value (<code>b + a</code>) appearing inside ReLU while its parts appear elsewhere.</p>
+
+<h4>8. Numerical and practical traps</h4>
+<p><strong>Trap 1: assignment instead of accumulation.</strong> <code>self.grad = ...</code> in a closure is correct only if the node has a single consumer. The hand example and the README example both fail with it.</p>
+<p><strong>Trap 2: wrong traversal order.</strong> Running closures in creation order, or breadth-first from the output without a full topological sort, can run a node's closure before all its consumers have contributed. The bug appears only in graphs with shared nodes, which is why simple tests miss it.</p>
+<p><strong>Trap 3: recursion depth.</strong> A recursive topological sort fails beyond about 1,000 levels. Unrolled loops (an RNN over 2,000 steps, a long chain of scalar operations) reach that quickly. Use an explicit stack.</p>
+<p><strong>Trap 4: not zeroing gradients.</strong> Calling <code>backward()</code> twice without resetting <code>.grad</code> adds the second gradient to the first. In a training loop, zero the leaves' gradients before each backward pass.</p>
+<p><strong>Trap 5: shape mistakes in broadcasting.</strong> Without <code>unbroadcast</code>, a bias's gradient has the batch's shape and the update either fails or, with in-place NumPy broadcasting, silently adds the wrong thing.</p>
+<p><strong>Trap 6: composed operations that overflow.</strong> The tensor engine's composed log-softmax computes <code>exp(z)</code> directly, so logits of 1,000 overflow to infinity and the loss becomes NaN. The drill adds a fused cross-entropy op that subtracts the maximum first, the same fix as mc10, which is why frameworks fuse it.</p>
+<p><strong>Trap 7: ReLU at exactly zero.</strong> The engine uses <code>[x &gt; 0]</code>, so a zero input gets gradient 0, the same convention as PyTorch. Finite differences at that point disagree, as in mc11; it is a kink, not a bug.</p>
+<h4>Debugging an autograd engine</h4>
+<p>When an engine gives a wrong gradient, three tools find the cause quickly. First, test each operation alone: build the smallest expression that uses it, with non-trivial values (avoid 0 and 1, which hide multiplication mistakes), and compare with a finite difference. A wrong local derivative shows up immediately. Second, test reuse: an expression where one input appears in two places, such as the hand example, catches assignment-instead-of-accumulation and ordering bugs that single-use expressions never reveal. Third, print the topological order for a small graph and check by eye that every node appears after all of its inputs. For the tensor engine, add a fourth: test every operation with inputs that broadcast in each possible way (a scalar, a row, a column, a full matrix), because the unbroadcast logic is where shape bugs live. With those tests in place, a new operation can be added with confidence in minutes.</p>
+
+<h4>9. Edge cases worth naming</h4>
+<p>Calling <code>backward</code> on a node that does not depend on some leaf leaves that leaf's gradient at zero, which is correct. A value used as both inputs of one operation (<code>x * x</code>) receives two contributions from a single closure, <code>x.grad += x·ḡ</code> twice, giving <code>2x</code>, which is why even a single operation must use <code>+=</code>. Python's <code>sum()</code> starts from the integer 0, so summing <code>Value</code>s works only because <code>__radd__</code> handles <code>0 + Value</code>; the tests pass an explicit <code>Value(0.0)</code> start for clarity. Non-scalar outputs need an explicit seed gradient: <code>Tensor.backward</code> seeds with ones, which computes the gradient of the sum of the outputs.</p>
+
+<h4>10. Complexity</h4>
+<p>The forward pass records one node per operation; the backward pass visits each node once and does work proportional to its local derivative computation, so backward costs a small constant multiple of forward: <code>O(V + E)</code> for V nodes and E edges, plus the arithmetic. Memory is <code>O(V)</code> nodes plus every forward value a closure needs, which is why frameworks free saved tensors as soon as their backward has run. The scalar engine's constant factor is huge (a Python object and a closure call per number); the tensor engine's is one NumPy call per array operation, which is why it was 371 times faster here and why real frameworks go further and fuse many operations into one kernel.</p>
+
+<h4>11. Talking through the design</h4>
+<p>In the interview: describe the node (data, grad, parents, closure); write add, mul and one non-linearity with <code>+=</code>; explain the topological sort and why reverse order; seed with 1; show the reused-variable example; then gradient-check and compare with a reference. Close by naming the two invariants every closure must respect, accumulate with += and give each input a gradient of its own shape, because those are the two lines interviewers most often probe with follow-up questions about reuse and broadcasting. If asked to scale it, move to arrays, matrix-multiply rules and <code>unbroadcast</code>; if asked about frameworks, mention saved tensors, version counters, fused ops and graph compilation.</p>
+</section>
+
+<section data-field="deep">
+<h4>Reverse mode, forward mode and why training uses reverse</h4>
+<p>Automatic differentiation comes in two directions. Forward mode carries, alongside each value, its derivative with respect to one chosen input direction; one forward pass yields the derivative of every output along that direction (a Jacobian-vector product). Reverse mode, implemented here, records the graph and sweeps backward from one output, yielding that output's derivative with respect to every input in one pass (a vector-Jacobian product). A training loss is one scalar depending on millions or billions of parameters, so reverse mode gets the whole gradient for a few times the cost of the forward pass, where forward mode would need one pass per parameter. Baydin and colleagues' survey lays out both and their costs, and explains why automatic differentiation is neither symbolic differentiation (which manipulates formulas and can blow up in size) nor numerical differentiation (which approximates with finite differences and suffers rounding).</p>
+<h4>Define-by-run versus graph capture</h4>
+<p>micrograd and PyTorch's eager mode build the graph as the code runs ("define-by-run"), so Python control flow (loops, conditionals, early exits) just works: the graph is whatever actually executed. The cost is per-operation overhead and no global view for optimisation. Graph-capture systems (JAX's tracing, <code>torch.compile</code>, older static-graph TensorFlow) record the operations once, then optimise the whole graph: fusing element-wise operations into single kernels, planning memory, eliminating redundant work. The autograd logic is the same; what changes is when the graph is known and how much optimisation is possible.</p>
+<h4>Saved tensors, memory and in-place safety</h4>
+<p>Every closure in this lesson keeps references to the values it needs: the multiplication's closure keeps both operands, exp keeps its output, log its input. Those references are why training memory is dominated by activations, and why PyTorch frees a node's saved tensors as soon as its backward has run (unless asked to retain the graph). They also create a correctness hazard: if a saved array is modified in place after the forward pass, backward silently uses the modified value. PyTorch attaches a version counter to every tensor, increments it on in-place operations, and checks it when backward unpacks a saved tensor, raising an error rather than returning a wrong gradient. Activation checkpointing (mc11) deliberately drops some saved tensors and recomputes them inside backward.</p>
+<h4>Higher-order gradients</h4>
+<p>If the backward closures were themselves built from engine operations (instead of raw floats and NumPy), backward would record a graph of its own, and calling backward on a gradient would give second derivatives. That is how frameworks compute Hessian-vector products (useful for second-order optimisers and some meta-learning) and gradient penalties (used in some GAN and regularisation methods). It costs memory, because the backward graph must be kept, which is why it is opt-in (<code>create_graph=True</code> in PyTorch).</p>
+<h4>Custom functions: the contract</h4>
+<p>Frameworks let you add an operation with a hand-written forward and backward (<code>torch.autograd.Function</code> in PyTorch, <code>custom_vjp</code> in JAX). The contract is exactly this lesson's: in forward, compute the output and save what backward needs; in backward, receive the output's gradient and return each input's gradient, shaped like the input, accounting for broadcasting. Fused attention, fused normalisation, chunked cross-entropy and quantisation-aware straight-through estimators are all written this way and verified with <code>torch.autograd.gradcheck</code>, a finite-difference check in float64 on small inputs.</p>
+<h4>Stop-gradient and detaching</h4>
+<p>Sometimes you want a value in the forward pass but no gradient through it. Examples: the target network's predictions in reinforcement learning, an exponential-moving-average teacher in self-supervised learning, a carried hidden state when truncating backpropagation through time, and the straight-through estimator, which uses a non-differentiable rounding in the forward pass but pretends it is the identity in the backward pass (common in quantisation-aware training). In engine terms, detaching creates a new leaf with the same data and no parents, so backward stops there. In the scalar engine that is <code>Value(x.data)</code>; the straight-through estimator is <code>x + Value(round(x.data) − x.data)</code>, whose forward value is the rounded number and whose gradient with respect to x is 1. Knowing how to cut or reroute the graph deliberately is as important as knowing how to build it.</p>
+<h4>The micrograd lineage</h4>
+<p>micrograd's README points to a newer single-file "microgpt" that trains a GPT-2-like transformer in dependency-free Python on an improved engine that stores local gradients at forward time instead of per-operation backward closures. Storing the local derivative (a number per edge) rather than a closure is a classic implementation choice, closer to how tape-based autodiff systems work: the backward sweep becomes a loop that multiplies stored local derivatives into accumulated gradients, with no function call per node. It makes the scalar engine faster without changing the algorithm.</p>
+</section>
+
+<section data-field="prod">
+<h4>Where autograd runs</h4>
+<p>Every deep-learning training run, of course, but also anywhere a gradient of a program is useful: differentiable simulators and renderers, sensitivity analysis in scientific computing, adversarial-example generation, prompt and embedding optimisation, and probing which input tokens most affect an LLM's output (gradient-based attribution). In all of them the engine is a framework's, and the engineer's job is to write forward code that the engine differentiates correctly and efficiently, and occasionally to add custom operations.</p>
+<h4>Failure modes and symptoms</h4>
+<p><strong>Gradients that grow every step.</strong> The optimiser diverges even with a tiny learning rate. Cause: gradients not zeroed between backward calls, so they accumulate across steps. Fix: zero before each backward; check that the gradient norm of the first two steps is similar.</p>
+<p><strong>"Trying to backward through the graph a second time".</strong> Calling backward twice on the same graph after its saved tensors were freed. Usually a bug where part of the previous step's graph is reused (a hidden state carried across batches without detaching). Detach carried state, or retain the graph deliberately.</p>
+<p><strong>In-place modification errors.</strong> PyTorch complains that a variable needed for gradient computation has been modified. Cause: an in-place operation (<code>x += ...</code>, <code>relu_</code>) on a tensor saved for backward. Fix: use the out-of-place version.</p>
+<p><strong>Slow eager loops.</strong> A model written as many tiny operations (a Python loop over sequence positions or over individual heads) spends most of its time in per-node overhead rather than arithmetic, the scalar-engine problem at a larger scale. Fix: express the work as fewer, larger array operations, or compile the graph so small operations are fused.</p>
+<p><strong>Memory growing over time.</strong> A training loop that appends the loss tensor (not its value) to a list keeps every step's whole graph alive. Fix: store <code>loss.item()</code> or a detached copy.</p>
+<p><strong>Parameters that never learn.</strong> Some weights keep their initial values for the whole run. Cause: they are not connected to the loss (a layer computed but not used, a branch skipped by a condition, or a detach in the wrong place), so backward never reaches them and their gradients stay zero or None. Fix: after the first backward pass, list every parameter whose gradient is None or exactly zero and check each one is supposed to be unused.</p>
+<p><strong>Silent wrong gradients in custom ops.</strong> A custom backward with a broadcasting or transpose mistake trains, badly. Fix: gradcheck every custom op in float64 on small, non-square shapes with broadcasting, and compare against a composed reference implementation.</p>
+<h4>Gradients of inputs, not just parameters</h4>
+<p>Autograd can differentiate the loss, or any output, with respect to inputs as easily as with respect to weights. That is used in production for saliency and attribution (which input tokens or pixels most affect a prediction), for adversarial testing (nudge an input in the gradient's direction to find failures), and for optimising continuous prompts or embeddings while the model's weights stay frozen. The mechanics are this lesson's: mark the input as requiring gradient, run forward, backward from the output of interest, read the input's gradient. The usual caveats apply: raw gradients are noisy and saturate, so attribution methods average them (integrated gradients) or combine them with activations.</p>
+<h4>What to monitor</h4>
+<p>Gradient norms per parameter group (and their ratio to weight norms), memory per step (to catch retained graphs), the fraction of parameters with zero or None gradients (to catch disconnected parts of the model, such as a layer accidentally left out of the forward pass), and, for custom operations, gradcheck tests in CI.</p>
+<h4>A cost estimate</h4>
+<p>The scalar engine's 230 ms for 256 × 3 × 8 multiply-adds and ReLUs is about 35 microseconds per scalar operation including graph bookkeeping. A 7-billion-parameter transformer's forward pass for one token is about 14 billion floating-point operations; at that rate a scalar engine would need about five days per token. The tensor engine's per-operation overhead is per array, so its cost is dominated by the arithmetic itself, and a GPU framework with fused kernels runs the same token in milliseconds. The algorithm is identical in all three; the granularity of a node is what changes.</p>
+<h4>The reference for this problem</h4>
+<p>Andrej Karpathy's micrograd is the reference implementation this lesson follows. Its README describes it as "a tiny Autograd engine" that "implements backpropagation (reverse-mode autodiff) over a dynamically built DAG and a small neural networks library on top of it with a PyTorch-like API", both tiny "with about 100 and 50 lines of code respectively", and notes that "the DAG only operates over scalar values, so e.g. we chop up each neuron into all of its individual tiny adds and multiplies". Its engine accumulates gradients with <code>+=</code> in every backward closure, sorts the graph with a depth-first topological sort, seeds the output with gradient 1 and runs closures in reversed order, exactly the design implemented here (with the recursion replaced by an explicit stack). The README's example prints <code>24.7041</code> for the forward value and <code>138.8338</code> and <code>645.5773</code> for the two gradients; this lesson's tests reproduce all three. Its demo trains a two-layer MLP with two 16-node hidden layers as a binary classifier on the moons dataset.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then vary it, break it and time it. Python 3.12 with NumPy; PyTorch only for the optional cross-check.</p>
+<ol>
+<li>Run the four blocks as one script. All assertions pass and it prints the README values and the scalar-versus-tensor timing.</li>
+<li><strong>Vary the inputs.</strong> Work <code>f = (a + b)·(a − c)</code> with <code>a = 3</code>, <code>b = 1</code>, <code>c = 2</code> by hand: forward values, topological order, every gradient. Check with <code>Value</code>.</li>
+<li><strong>Break the accumulation.</strong> Change <code>+=</code> to <code>=</code> in <code>__mul__</code>'s closure and rerun the hand example and the README example. Which numbers change, and why does <code>x * x</code> now give the wrong derivative?</li>
+<li><strong>Break the order.</strong> Replace the topological sort with a breadth-first traversal from the output and rerun the README test. Then make the sort recursive and run the 5,000-step chain.</li>
+<li><strong>Extend it.</strong> Add <code>exp</code>, <code>log</code> and <code>sigmoid</code> to <code>Value</code>, train a tiny logistic regression with it, and compare the gradients with mc2's formula.</li>
+<li><strong>Time it.</strong> Time the scalar and tensor engines on layers of width 8, 32 and 128.</li>
+</ol>
+<p>What to look for: assignment breaks every example with a reused value, the breadth-first order breaks the README example but not simple chains, the recursive sort raises RecursionError, and the scalar engine's time grows with the number of scalar operations while the tensor engine's barely changes. Keep the broken variants: Run each one at least twice with different random inputs. a gradient-check test suite should fail on every one of them, which is a good way to test the tests.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>The tensor engine's composed cross-entropy (exp, sum, log, multiply by one-hot) overflows on large logits. Add a <strong>fused cross-entropy operation</strong> to the engine: a single node whose forward uses the stable log-sum-exp and whose backward is <code>(softmax − onehot)/N</code>. Show the composed version fails at logits of 1,000 and the fused one does not.</p>
+<details><summary>Answer</summary>
+<p>The fused node computes the loss from max-shifted logits, saves the log-probabilities, and in its closure forms <code>exp(logp) − onehot</code>, divides by N and multiplies by the upstream gradient. It is one node instead of five, its backward needs no division by small probabilities, and it never exponentiates a large number.</p>
+<pre class="run">def cross_entropy(logits, targets):
+    """A fused op: forward with log-sum-exp, backward (softmax - onehot) / N in one node."""
+    z = logits.data - logits.data.max(axis=1, keepdims=True)
+    logp = z - np.log(np.exp(z).sum(axis=1, keepdims=True))
+    N = len(targets)
+    out = Tensor(-logp[np.arange(N), targets].mean(), (logits,), "cross_entropy")
+    def _backward():
+        g = np.exp(logp); g[np.arange(N), targets] -= 1
+        logits.grad += g / N * out.grad
+    out._backward = _backward
+    return out
+
+big = Tensor(np.array([[1000.0, 1001.0, 1002.0]]))
+with np.errstate(over="ignore", invalid="ignore"):
+    composed = -((big - big.exp().sum(axis=1, keepdims=True).log()) * np.eye(3)[[0]]).sum()
+assert not np.isfinite(composed.data)                    # exp(1000) overflows: inf - inf = nan
+fused = cross_entropy(big, np.array([0]))
+fused.backward()
+assert np.isclose(fused.data, np.log(1 + np.exp(-1) + np.exp(-2)) + 2)
+assert np.allclose(big.grad.sum(), 0) and np.isfinite(big.grad).all()</pre>
+<p>The composed version computes <code>exp(1000) = inf</code>, then <code>log(inf) = inf</code> and <code>1000 − inf = −inf</code>, and multiplying by the zeros of the one-hot gives <code>0 × −inf = NaN</code>. The fused op returns the exact loss, log(1 + e⁻¹ + e⁻²) + 2, and a finite gradient that sums to zero. This is precisely why frameworks ship <code>cross_entropy</code> as one operation rather than asking users to compose it.</p>
+</details>
+</section>

@@ -1,0 +1,517 @@
+<!-- topic source for db/db10; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "db10",
+  "t": "PostgreSQL vs MySQL (InnoDB) internals: MVCC, vacuum, clustered indexes and replication",
+  "tag": "Internals",
+  "sum": "How the two most popular open-source databases differ underneath: append-only tuples versus in-place updates with undo logs, HOT updates, vacuum, freezing and transaction-id wraparound, purge and history length, heap versus clustered storage, process versus thread connections, physical WAL streaming versus logical binlog replication, read on replicas, and upgrades, all through the lens of Uber's 2016 migration post and what has changed since.",
+  "prereq": [
+    [
+      "db5",
+      "Heap pages, TIDs, B+ trees, TOAST, fill factor and the write amplification of scattered page writes."
+    ],
+    [
+      "db6",
+      "PostgreSQL indexes point to heap TIDs; InnoDB secondary indexes store the primary key; HOT updates skip index maintenance."
+    ],
+    [
+      "db8",
+      "WAL, checkpoints, full-page writes; PostgreSQL's redo-only recovery and InnoDB's redo plus undo logs."
+    ],
+    [
+      "db9",
+      "MVCC with xmin/xmax and snapshots; long transactions hold back cleanup; isolation-level defaults differ by engine."
+    ],
+    [
+      "sc6",
+      "Leader-follower replication, synchronous versus asynchronous commit, and replica lag."
+    ]
+  ],
+  "myths": [
+    [
+      "Uber proved MySQL is better than PostgreSQL.",
+      "Uber's 2016 post described real problems for one workload (heavily indexed tables with frequent updates, cross-country replication, a 9.2-era cluster that was hard to upgrade). Several of those points have since changed: PostgreSQL gained built-in logical replication in version 10 and fast pg_upgrade with --link, and HOT updates already avoided index writes for many updates. The lasting lesson is to understand each engine's write path, not to pick a winner."
+    ],
+    [
+      "PostgreSQL rewrites the whole row on every update, so it is always slower for updates.",
+      "It writes a new row version, but if no indexed column changes and the new version fits on the same page, the update is a HOT update that touches no index at all. Tables with few indexes on frequently updated columns, and a fill factor that leaves room, can update very efficiently. The slow case is an update that touches an indexed column, or a table with many indexes and no free space."
+    ],
+    [
+      "VACUUM is optional maintenance you can skip on a busy system.",
+      "Vacuum reclaims dead row versions, keeps the visibility map current for index-only scans, and freezes old transaction ids. Skip it long enough and tables bloat, queries slow down, and eventually PostgreSQL refuses new write transactions to avoid transaction-id wraparound. Autovacuum must be tuned to keep up, not disabled."
+    ],
+    [
+      "InnoDB has no cleanup problem because it updates in place.",
+      "Old versions live in undo logs, and InnoDB's purge threads must remove them once no transaction can need them. A long-running transaction stops purge, the history list length grows into the millions, undo tablespaces grow, and every read that must walk version chains slows down. It is the same problem as PostgreSQL bloat in a different place."
+    ],
+    [
+      "Read replicas can run any query without affecting anything.",
+      "A PostgreSQL physical standby must replay WAL that may remove row versions a long query on the standby still needs; it either cancels the query after max_standby_streaming_delay (30 s by default) or, with hot_standby_feedback, tells the primary to keep those versions, causing bloat on the primary. MySQL replicas apply logical changes and avoid that conflict, but a long query can still lag behind replication."
+    ],
+    [
+      "More connections means more throughput.",
+      "Both databases do their work on a fixed number of CPU cores; beyond a few times the core count, extra active connections mostly add contention and memory use. PostgreSQL's process-per-connection model makes each connection expensive, so a pooler such as PgBouncer is standard; MySQL's threads are cheaper, but the same contention limits apply."
+    ]
+  ],
+  "recap": [
+    "PostgreSQL stores every row version as an immutable tuple in a heap; an update writes a new tuple, and unless it is a HOT update, every index gets a new entry pointing to it.",
+    "InnoDB updates rows in place inside the primary key's clustered B+ tree, copies old versions to undo logs, and changes only the secondary indexes whose columns changed.",
+    "PostgreSQL's VACUUM removes dead tuples, updates the free space and visibility maps, and freezes old transaction ids; autovacuum triggers per table at 50 rows plus 20% of the table by default.",
+    "Transaction ids are 32-bit, so tuples must be frozen before ids wrap; if freezing falls far behind, PostgreSQL stops assigning new transaction ids, as Sentry experienced in 2015.",
+    "InnoDB's purge removes undo records no longer needed; a long transaction blocks purge and the history list length grows.",
+    "PostgreSQL uses a process per connection and relies partly on the OS page cache; InnoDB uses threads and its own large buffer pool.",
+    "PostgreSQL replicates physically by streaming WAL (byte-identical standbys, same major version) and logically through publications since version 10; MySQL replicates logically through the binary log in row, statement or mixed format.",
+    "Physical replication is simple and complete but verbose and version-locked; logical replication is compact and allows cross-version upgrades but needs primary keys and more care with schema changes.",
+    "Choose by workload: update-heavy tables with many secondary indexes favour InnoDB's design; complex queries, rich types and extensions favour PostgreSQL; both can be operated well with the right tuning."
+  ],
+  "glossary": [
+    [
+      "Autovacuum",
+      "PostgreSQL's background workers that run VACUUM and ANALYZE on tables whose dead-tuple or change counts exceed thresholds."
+    ],
+    [
+      "Binary log (binlog)",
+      "MySQL's log of committed changes used for replication and point-in-time recovery, in statement, row or mixed format."
+    ],
+    [
+      "Bloat",
+      "Space in tables or indexes occupied by dead tuples or empty space, beyond what the live data needs."
+    ],
+    [
+      "CDC (change data capture)",
+      "Reading a database's committed changes, usually from its log, and publishing them to other systems."
+    ],
+    [
+      "Clustered index",
+      "A B+ tree whose leaves hold the table rows themselves; in InnoDB, the primary key."
+    ],
+    [
+      "Dead tuple",
+      "A PostgreSQL row version that no current or future snapshot can see, waiting to be removed by vacuum."
+    ],
+    [
+      "Fillfactor",
+      "The percentage of each page filled on insert; lower values leave room for updated row versions on the same page."
+    ],
+    [
+      "Freezing",
+      "Marking old tuples as visible to all transactions so their transaction ids no longer need comparing, preventing wraparound problems."
+    ],
+    [
+      "GTID",
+      "Global transaction identifier: a unique id MySQL assigns to each committed transaction, simplifying failover and replica positioning."
+    ],
+    [
+      "History list length",
+      "The number of InnoDB undo log units not yet purged; a growing value signals long-running transactions blocking purge."
+    ],
+    [
+      "HOT update",
+      "Heap-only tuple update: the new version is on the same page and no indexed column changed, so no index is touched."
+    ],
+    [
+      "hot_standby_feedback",
+      "A PostgreSQL standby setting that reports its oldest snapshot to the primary so the primary keeps rows the standby still needs."
+    ],
+    [
+      "Logical replication",
+      "Replicating row-level changes (insert, update, delete of rows) rather than physical page changes, allowing different versions or schemas on each side."
+    ],
+    [
+      "MyRocks",
+      "A MySQL storage engine built on RocksDB's LSM tree, used for write-heavy data that compresses well."
+    ],
+    [
+      "pg_upgrade --link",
+      "Upgrading a PostgreSQL major version by hard-linking existing data files instead of copying them, taking minutes."
+    ],
+    [
+      "PgBouncer",
+      "A lightweight connection pooler for PostgreSQL that multiplexes many client connections onto few server connections."
+    ],
+    [
+      "Physical (streaming) replication",
+      "Shipping the WAL so standbys replay the exact page changes and become byte-for-byte copies."
+    ],
+    [
+      "Purge",
+      "InnoDB's background removal of undo records and delete-marked index entries no longer needed by any transaction."
+    ],
+    [
+      "Replication slot",
+      "A PostgreSQL object that makes the primary keep WAL until a consumer has received it."
+    ],
+    [
+      "shared_buffers",
+      "PostgreSQL's own page cache in shared memory; the OS page cache sits underneath it."
+    ],
+    [
+      "Transaction ID wraparound",
+      "The point where 32-bit transaction ids would cycle and old rows would appear to be in the future; prevented by freezing."
+    ],
+    [
+      "Undo log",
+      "InnoDB's store of previous row versions used for rollback and for consistent reads of older snapshots."
+    ],
+    [
+      "VACUUM",
+      "PostgreSQL's command that reclaims dead tuples, updates visibility and free-space maps, and freezes old rows."
+    ],
+    [
+      "Visibility map",
+      "A bitmap marking heap pages whose tuples are all visible to everyone (and all frozen), used by index-only scans and vacuum."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What is the main architectural difference between how PostgreSQL and InnoDB store tables?",
+      "PostgreSQL stores rows in an unordered heap and every index, including the primary key, points to a row version's physical location. InnoDB stores rows inside the primary key's B+ tree (a clustered index), and secondary indexes store the primary key value. That one difference shapes update cost, secondary lookups and replication."
+    ],
+    [
+      "E",
+      "What does VACUUM do in PostgreSQL?",
+      "It removes dead tuple versions that no transaction can see any more and records their space as reusable, updates the visibility map so index-only scans can skip the heap, and freezes old transaction ids to prevent wraparound. Plain VACUUM does not shrink files; VACUUM FULL rewrites the table but locks it exclusively."
+    ],
+    [
+      "E",
+      "Why do PostgreSQL deployments almost always use a connection pooler?",
+      "Each connection is a separate operating-system process with its own memory, and performance degrades well before hundreds of active connections. A pooler such as PgBouncer lets thousands of client connections share a few dozen server connections, usually in transaction mode, where a server connection is lent out only for the duration of a transaction."
+    ],
+    [
+      "M",
+      "Walk through what happens on disk when you update one column in PostgreSQL versus InnoDB.",
+      "PostgreSQL writes a new tuple with the new value, sets the old tuple's xmax, and, unless the update is HOT, adds an entry pointing to the new tuple in every index on the table; all of that is WAL-logged. InnoDB copies the old row to the undo log, updates the row in place in the clustered index, and updates only secondary indexes that include the changed column (delete-marking the old entry and inserting a new one); the redo log covers it all."
+    ],
+    [
+      "M",
+      "What is a HOT update and how do you get more of them?",
+      "A heap-only tuple update stores the new version on the same page and changes no indexed column, so indexes keep pointing to the old tuple, which redirects to the new one; no index writes are needed. Get more by not indexing frequently updated columns, lowering the table's fillfactor (say to 80-90) so pages keep room, and keeping vacuum current so space is reused. pg_stat_user_tables shows n_tup_hot_upd versus n_tup_upd."
+    ],
+    [
+      "M",
+      "Explain transaction ID wraparound and how it is prevented.",
+      "PostgreSQL transaction ids are 32-bit and compared in a circle, so roughly two billion transactions after a tuple was written, its creator would appear to be in the future and the row would vanish. Vacuum freezes tuples older than a threshold, marking them as visible to all. Autovacuum forces an anti-wraparound vacuum when a table's oldest unfrozen id passes autovacuum_freeze_max_age (200 million by default); if freezing still falls behind, the server refuses new transaction ids when fewer than three million remain.",
+      "Follow-up: What blocks freezing? — Anything holding an old snapshot or xmin: long transactions, idle-in-transaction sessions, abandoned replication slots, prepared transactions and standbys with hot_standby_feedback."
+    ],
+    [
+      "M",
+      "Compare PostgreSQL streaming replication with MySQL binlog replication.",
+      "PostgreSQL streams its WAL, which describes physical page changes, so standbys are byte-identical copies, must run the same major version, and get every index and vacuum change in the stream. MySQL replicates committed changes from the binary log, usually in row format (before and after images of changed rows), so replicas apply logical changes to their own storage, can differ in version and indexes, and the stream does not carry secondary-index churn."
+    ],
+    [
+      "M",
+      "Why might a long query on a PostgreSQL read replica be cancelled?",
+      "The standby replays WAL from the primary; if replay must remove row versions (from vacuum on the primary) that the long query's snapshot still needs, the standby waits up to max_standby_streaming_delay (30 s by default) and then cancels the query. Turning on hot_standby_feedback stops the cancellations by making the primary keep those versions, at the cost of bloat on the primary; long analytics often belong on a dedicated replica or a warehouse."
+    ],
+    [
+      "M",
+      "What is the InnoDB history list length and why would it grow?",
+      "It counts undo log records not yet purged. Purge can only remove versions older than the oldest active read view, so a long-running transaction, even an idle one that started a consistent read, stops purge for everything newer. The list grows, undo space grows, and queries that must walk long version chains slow down. Find and end the long transaction; set limits so it cannot recur."
+    ],
+    [
+      "H",
+      "Uber said PostgreSQL's design caused write amplification and replication bandwidth problems. Explain the mechanism and how you would mitigate it on PostgreSQL today.",
+      "With many secondary indexes, a non-HOT update writes a new heap tuple plus one entry per index, each WAL-logged, often with full-page images, and physical replication ships all of it, so a small logical change becomes many physical writes and a verbose cross-region stream. Mitigations: fewer indexes, no indexes on hot-updated columns, fillfactor for HOT, wal_compression, longer checkpoint intervals, and for cross-region copies, logical replication of only the needed tables. If the workload is fundamentally many-index, update-heavy and replicated over thin links, InnoDB's design does fit it better.",
+      "Follow-up: What did Uber get wrong or what changed? — HOT updates already avoided index writes for updates that change no indexed column, built-in logical replication arrived in PostgreSQL 10 in 2017, and pg_upgrade --link upgrades large clusters in minutes, which addresses the upgrade pain."
+    ],
+    [
+      "H",
+      "How do you upgrade a large PostgreSQL major version with minimal downtime?",
+      "Option one: pg_upgrade with --link, which reuses data files via hard links and takes minutes rather than hours, followed by ANALYZE (PostgreSQL 18's pg_upgrade keeps optimizer statistics); downtime is the run itself, and standbys are rebuilt or upgraded with rsync tricks. Option two: logical replication from the old version to a new-version cluster, let it catch up, then switch writes with a brief pause, which keeps downtime to seconds but requires primary keys on replicated tables and care with sequences and schema changes."
+    ],
+    [
+      "H",
+      "Design PostgreSQL settings and schema for a table of LLM conversation state that is updated on every message (about 20 updates per conversation) and read by conversation id.",
+      "Keep few indexes: the primary key on conversation_id and perhaps (user_id, updated_at) for listing, but do not index columns updated on every message such as token totals or last_message_at unless a query needs them, so most updates are HOT. Set fillfactor around 70-80 so new versions fit on the page. Tune autovacuum for this table (lower scale factor, higher cost limit) so dead versions are reclaimed promptly. Put large message bodies in a separate append-only messages table rather than rewriting a growing JSON blob, which would create a large new TOASTed version on every update.",
+      "Follow-up: How would InnoDB handle the same table? — In-place updates with undo; the growing JSON blob would still be rewritten, so the separate messages table is the right design on both."
+    ],
+    [
+      "H",
+      "When would you choose PostgreSQL over MySQL for a new system, and vice versa?",
+      "PostgreSQL when you need rich SQL (window functions, CTEs, lateral joins, full-text search), extensible types and indexes (jsonb with GIN, PostGIS, pgvector), strong constraints including exclusion constraints, transactional DDL, and serializable isolation via SSI. MySQL/InnoDB when the workload is primary-key-centric OLTP with heavy updates on many-indexed tables, very high connection counts, mature cross-version logical replication and an existing MySQL ecosystem of tooling (Vitess, gh-ost). Team expertise and the managed service you will run on often matter more than either list."
+    ]
+  ],
+  "refs": [
+    [
+      "post",
+      "Uber Engineering — Why Uber Engineering Switched from Postgres to MySQL (2016)",
+      "The case: write amplification with many indexes, physical replication bandwidth, a 9.2 replication bug, replica MVCC conflicts, upgrades and connection handling.",
+      "https://www.uber.com/blog/postgres-to-mysql-migration/"
+    ],
+    [
+      "post",
+      "Sentry — Transaction ID Wraparound in Postgres (2015)",
+      "A production outage when wraparound protection stopped writes, and the decision to truncate a huge table to recover.",
+      "https://blog.sentry.io/transaction-id-wraparound-in-postgres/"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Routine Vacuuming",
+      "Dead tuples, the visibility map, freezing, wraparound thresholds and autovacuum.",
+      "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Heap-Only Tuples (HOT)",
+      "When an update can avoid index writes and how pruning reclaims space.",
+      "https://www.postgresql.org/docs/current/storage-hot.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Logical Replication",
+      "Publications, subscriptions, row filters, and using it for upgrades.",
+      "https://www.postgresql.org/docs/current/logical-replication.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Hot Standby",
+      "Query conflicts on standbys, max_standby_streaming_delay and hot_standby_feedback.",
+      "https://www.postgresql.org/docs/current/hot-standby.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Automatic Vacuuming settings",
+      "autovacuum_vacuum_scale_factor (0.2), thresholds and the newer autovacuum_vacuum_max_threshold.",
+      "https://www.postgresql.org/docs/current/runtime-config-vacuum.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>In July 2016, Uber published a long engineering post explaining why it had moved much of its data from PostgreSQL to MySQL. It became one of the most-discussed database articles of the decade, partly because it was unusually concrete. It walked through a tiny table of famous mathematicians with three indexes, updated one man's birth year (al-Khwārizmī's, from 780 to 770), and showed what each database actually wrote to disk. In PostgreSQL: a new copy of the whole row, plus a new entry in the primary key index, plus a new entry in the name index, plus a new entry in the birth-year index, all logged and all shipped to replicas, although only one column of one index had logically changed. In InnoDB: the row changed in place, the old version copied to an undo log, and only the birth-year index touched.</p>
+<p>For Uber's workload at the time, heavily indexed tables updated constantly and replicated from the West Coast to the East Coast over expensive links, that difference turned into real money and real pain. The post listed five problems: inefficient writes, verbose replication, a table corruption bug in their PostgreSQL 9.2 version, conflicts between replica queries and replication, and upgrades that took so many hours they had stopped doing them. The PostgreSQL community replied, pointing out features Uber had not used (such as updates that skip index writes) and noting that several issues were being fixed. Both sides were largely right, and that is what makes the case useful: it shows that two databases offering the same SQL and the same ACID guarantees can behave very differently underneath, and that the differences follow directly from a few design decisions.</p>
+<p>Those decisions are the subject of this lesson. Where does the old version of a row go when you update it: next to the new one (PostgreSQL) or into a separate undo log (InnoDB)? What do indexes point to: a physical location or a primary key? Who cleans up old versions, and what happens if cleanup falls behind? Is a connection a process or a thread? Is replication a stream of physical page changes or of logical row changes? Every one of these choices was already introduced in earlier lessons (db5, db6, db8, db9). Here they come together into two complete systems, compared side by side, with the operational failure modes each one produces, including the transaction-id wraparound that took Sentry's PostgreSQL offline for writes in 2015.</p>
+<p>The goal is not to crown a winner. It is to let you predict, for a given table and workload, what each engine will do, and to answer the interview question that follows every mention of either database: "why that one?"</p>
+</section>
+
+<section data-field="primer">
+<h4>Two ways to keep history</h4>
+<p>Both engines use MVCC (db9): readers see a snapshot, so the database must keep old versions of rows around while anyone might still need them. The fundamental difference is <em>where</em> those old versions live.</p>
+<p>PostgreSQL is like a notebook in which you never erase. To change a line, you strike it through (mark it with the transaction that replaced it) and write the new version somewhere else, often further down the same page. Readers looking at an older snapshot read the struck-through line; newer readers read the new one. Eventually someone has to tidy up the notebook, cutting out lines nobody can need any more: that is <strong>VACUUM</strong>.</p>
+<p>InnoDB is like a whiteboard with a filing cabinet next to it. To change something, you first file a photocopy of the old version in the cabinet (the <strong>undo log</strong>), then rewrite the whiteboard in place. Readers who need the old version go to the cabinet and reconstruct it. Eventually someone has to empty the cabinet of copies nobody needs: that is <strong>purge</strong>.</p>
+<p>The analogy shows the trade at once. PostgreSQL's notebook makes writing a new version simple and rolling back free (just ignore the new line), but every new version has a new location, so anything that points at the row's location, every index, may need updating. InnoDB's whiteboard keeps the row in the same place, so indexes that do not involve the changed column are untouched, but every update pays for a copy into the cabinet, and readers of old versions do extra work. In both, cleanup is mandatory, and anything that makes old versions needed for longer (a long-running transaction) makes the cleanup fall behind.</p>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Updating birth_year in a table with three indexes. PostgreSQL writes a new heap tuple and new entries in all three indexes. InnoDB updates the row in place in the clustered index, writes an undo record, and updates only the birth_year index">
+  <defs><marker id="db10-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">PostgreSQL: UPDATE birth_year (not HOT)</text>
+    <rect x="20" y="32" width="120" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="28" y="50" style="fill:var(--ink-2);font-family:var(--mono)">D: 4 … 780</text>
+    <rect x="20" y="64" width="120" height="26" rx="3" style="fill:var(--s3);fill-opacity:.15;stroke:var(--s3)"/>
+    <text x="28" y="82" style="fill:var(--ink);font-family:var(--mono)">I: 4 … 770  new</text>
+    <rect x="180" y="32" width="110" height="24" rx="3" style="fill:var(--crit);fill-opacity:.1;stroke:var(--crit)"/>
+    <text x="188" y="49" style="fill:var(--ink)">pk: +4→I</text>
+    <rect x="180" y="62" width="110" height="24" rx="3" style="fill:var(--crit);fill-opacity:.1;stroke:var(--crit)"/>
+    <text x="188" y="79" style="fill:var(--ink)">name: +→I</text>
+    <rect x="180" y="92" width="110" height="24" rx="3" style="fill:var(--crit);fill-opacity:.1;stroke:var(--crit)"/>
+    <text x="188" y="109" style="fill:var(--ink)">birth: +770→I</text>
+    <line x1="178" y1="44" x2="142" y2="74" marker-end="url(#db10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="178" y1="74" x2="142" y2="78" marker-end="url(#db10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="178" y1="104" x2="142" y2="82" marker-end="url(#db10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="20" y="140" style="fill:var(--crit)">4 writes + WAL: 1 tuple, 3 index entries</text>
+    <text x="340" y="20" style="fill:var(--ink);font-weight:600">InnoDB: same UPDATE</text>
+    <rect x="340" y="32" width="150" height="26" rx="3" style="fill:var(--s3);fill-opacity:.15;stroke:var(--s3)"/>
+    <text x="348" y="50" style="fill:var(--ink);font-family:var(--mono)">pk 4: … 770 (in place)</text>
+    <rect x="520" y="32" width="100" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="528" y="50" style="fill:var(--ink-2)">undo: 780</text>
+    <line x1="490" y1="45" x2="518" y2="45" marker-end="url(#db10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="340" y="70" width="150" height="24" rx="3" style="fill:var(--good);fill-opacity:.1;stroke:var(--good)"/>
+    <text x="348" y="87" style="fill:var(--ink)">name idx: untouched</text>
+    <rect x="340" y="100" width="150" height="24" rx="3" style="fill:var(--crit);fill-opacity:.1;stroke:var(--crit)"/>
+    <text x="348" y="117" style="fill:var(--ink)">birth idx: 780 → 770</text>
+    <text x="340" y="140" style="fill:var(--good)">row + undo + one index</text>
+    <line x1="20" y1="165" x2="620" y2="165" style="fill:none;stroke:var(--line-2)"/>
+    <text x="20" y="190" style="fill:var(--ink)">If the update changed only an unindexed column and the page had room, PostgreSQL would do a</text>
+    <text x="20" y="208" style="fill:var(--ink)">HOT update: the new tuple on the same page, zero index writes. InnoDB would still write the undo record.</text>
+    <text x="20" y="236" style="fill:var(--muted)">Example from Uber's 2016 post: updating al-Khwārizmī's birth year from 780 to 770 in a table with three indexes.</text>
+  </g>
+</svg>
+<figcaption>The same logical change, two physical write sets. Count the red boxes: the cost difference grows with the number of indexes, and disappears when PostgreSQL can use a HOT update.</figcaption>
+</figure>
+<h4>Four more differences that follow</h4>
+<p>From that core choice and a few others come the differences this lesson works through. <strong>Storage layout</strong>: PostgreSQL tables are unordered heaps; InnoDB tables are B+ trees ordered by primary key. <strong>Cleanup</strong>: PostgreSQL's vacuum scans tables for dead tuples and must also "freeze" old rows because of 32-bit transaction ids; InnoDB's purge walks the undo logs. <strong>Connections</strong>: PostgreSQL starts a process per connection; MySQL runs a thread per connection. <strong>Replication</strong>: PostgreSQL ships its physical WAL by default; MySQL ships a logical binary log of row changes. Each of these has consequences an engineer operating either database meets in the first year.</p>
+<h4>How to read the rest of this lesson</h4>
+<p>For each difference, ask three questions. What does the engine write when a row changes, and how many pages does that touch? What has to be cleaned up later, and what can stop the cleanup? And what crosses the network to a replica? Almost every production story about either database, including Uber's and Sentry's, is an answer to one of those three questions in a particular workload. The worked comparison near the end of the body applies all three to a single sessions table, so you can see how a small schema change moves PostgreSQL from the worst case to the best case for the same logical workload.</p>
+</section>
+
+<section data-field="body">
+<h4>1. PostgreSQL's update path, in detail</h4>
+<p>An <code>UPDATE</code> in PostgreSQL finds the current visible tuple, checks it is not locked by a concurrent writer (db9), writes a <em>new</em> tuple containing the full new row, sets the old tuple's <code>xmax</code> to the updating transaction's id and its <code>t_ctid</code> pointer to the new tuple's location, and WAL-logs both changes. The new tuple has a new physical address (ctid). Every index on the table maps keys to ctids, so in the general case every index must receive a new entry pointing to the new tuple, even indexes on columns whose values did not change, because the old entries point to the old tuple. That is the write amplification Uber described: with a dozen indexes, updating one unindexed-by-most column still adds a dozen index entries, each WAL-logged.</p>
+<p>The exception is the <strong>heap-only tuple</strong> (HOT) update. If no indexed column changes and the new tuple fits on the <em>same</em> page as the old one, PostgreSQL writes the new tuple on that page, links it from the old one, and adds no index entries at all. An index lookup still finds the old tuple's line pointer, and follows the chain within the page to the visible version. Later, when the page is accessed and the old versions are dead, PostgreSQL <em>prunes</em> the chain in place, redirecting the line pointer so the space can be reused without a full vacuum. HOT updates are therefore cheap: one page changed, a small WAL record.</p>
+<p>Two conditions decide whether you get them. First, no indexed column may change; an index on <code>updated_at</code> or <code>last_login</code> disqualifies every update that touches those columns. Second, there must be free space on the page; a table filled to 100% (the default heap fillfactor) has room only after pruning or vacuum frees some. Setting <code>ALTER TABLE … SET (fillfactor = 80)</code> leaves 20% of each page free for new versions. The ratio of HOT updates is visible in <code>pg_stat_user_tables</code> as <code>n_tup_hot_upd</code> versus <code>n_tup_upd</code>, and it is one of the most useful single numbers for an update-heavy PostgreSQL table. The lab's toy model shows the effect: a mix of updates where 70% touch an indexed timestamp produces about 485 page writes in the PostgreSQL model versus 350 in the InnoDB model; drop the index on the timestamp and the PostgreSQL figure falls to under 200, because most updates become HOT.</p>
+
+<h4>2. InnoDB's update path, in detail</h4>
+<p>InnoDB stores the table as the primary key's B+ tree, with full rows in the leaves (a clustered index, db6). An update finds the row by primary key, writes an <strong>undo record</strong> containing the old values of the changed columns (and a pointer to the previous undo record, forming a version chain), then modifies the row <em>in place</em>, storing the updating transaction's id and a pointer to the undo record in hidden row fields. If the new row no longer fits (a longer string), InnoDB may have to reorganise or split the page, but the row keeps its primary key position.</p>
+<p>Secondary indexes store (secondary key, primary key). Because the primary key does not change, only indexes containing a changed column need maintenance: InnoDB delete-marks the old secondary entry and inserts a new one. Indexes on other columns are untouched. A consistent read by an older snapshot finds the current row, sees that its transaction id is too new for the snapshot, and follows the undo chain back to the right version, reconstructing it. Secondary index entries that are delete-marked are checked against the clustered row when needed.</p>
+<p>So InnoDB pays a different set of costs: every update writes an undo record (itself redo-logged), reads of old versions walk undo chains, and secondary index lookups need a second descent through the primary key tree. A random primary key (a UUIDv4) is especially costly because the table itself is the primary key tree, so row inserts scatter across all its leaves (db5).</p>
+
+<h4>3. Cleanup in PostgreSQL: VACUUM and autovacuum</h4>
+<p>Dead tuples (versions whose deleting transaction committed before every running snapshot started) occupy space until <strong>VACUUM</strong> removes them. A plain VACUUM scans the table's pages (skipping those the visibility map marks all-visible), removes dead tuples from heap pages and their entries from indexes, records free space in the <strong>free space map</strong> for future inserts and updates, and sets visibility-map bits for pages that are now all-visible, which is what makes index-only scans skip the heap (db6). It runs alongside normal reads and writes. It does not return space to the operating system except at the end of a table; <code>VACUUM FULL</code> rewrites the table compactly but takes an exclusive lock for the whole rewrite.</p>
+<p><strong>Autovacuum</strong> runs vacuum automatically. A launcher wakes every <code>autovacuum_naptime</code> (one minute) and, for each table, compares the number of dead tuples with a threshold: <code>autovacuum_vacuum_threshold</code> (50) plus <code>autovacuum_vacuum_scale_factor</code> (0.2) times the table's row count, and in PostgreSQL 18 capped by <code>autovacuum_vacuum_max_threshold</code> (100 million). For a 1,000-row table that is 250 dead tuples; for a 100-million-row table it is 20 million, which is why default settings vacuum large tables too rarely and why per-table overrides (<code>ALTER TABLE big SET (autovacuum_vacuum_scale_factor = 0.01)</code>) are standard practice. Autovacuum is also throttled by a cost limit so it does not swamp I/O; on busy servers that throttle often needs raising so vacuum can keep up.</p>
+<p>The <strong>horizon</strong> matters as much as the schedule. Vacuum can only remove tuples dead to <em>every</em> snapshot. The oldest snapshot in the database, whether from a long report, a forgotten <code>BEGIN</code> in a console, an idle-in-transaction connection, a replication slot that a consumer stopped reading, or a standby with <code>hot_standby_feedback</code>, holds the horizon back for all tables. Vacuum then runs and removes nothing, and bloat accumulates everywhere at once. The diagnostic query is the oldest <code>backend_xmin</code> in <code>pg_stat_activity</code> and the oldest <code>xmin</code> or <code>catalog_xmin</code> in <code>pg_replication_slots</code>.</p>
+
+<h4>4. Freezing and transaction-id wraparound</h4>
+<p>PostgreSQL transaction ids are 32 bits, about 4.3 billion values, and they are compared in a circle: for any xid, about two billion ids are "in the past" and two billion "in the future". After roughly two billion more transactions, a row written long ago would suddenly appear to have been created in the future and become invisible. To prevent that, vacuum <strong>freezes</strong> tuples old enough that every transaction can see them, marking them as visible to all regardless of xid. A table's <code>relfrozenxid</code> records the oldest unfrozen xid it may contain, and the database's oldest such value is the distance to danger.</p>
+<p>Normally freezing happens quietly during regular vacuums. When a table's oldest unfrozen xid is older than <code>autovacuum_freeze_max_age</code> (200 million transactions by default), autovacuum runs an aggressive anti-wraparound vacuum on it even if autovacuum is otherwise disabled for that table, and it cannot be cancelled by lock conflicts the way normal autovacuums can. If that still does not keep up, the server emits warnings as the remaining distance shrinks, and, per the documentation, refuses to assign new transaction ids once fewer than three million remain: <code>ERROR: database is not accepting commands that assign new transaction IDs to avoid wraparound data loss</code>. Reads continue; writes stop until a vacuum freezes enough rows.</p>
+<p>A database doing 2,000 write transactions per second consumes 200 million xids in about 28 hours, so on a busy system every large table is due for an anti-wraparound vacuum every day or so, and a multi-terabyte table may take hours to scan. Wraparound outages happen when freezing is blocked (an old snapshot or replication slot holds the horizon) or simply too slow for a huge, rarely vacuumed table. Since PostgreSQL 9.6 the visibility map also records all-frozen pages, so vacuums skip pages already frozen, which made anti-wraparound vacuums of mostly static tables much cheaper.</p>
+
+<h4>5. Cleanup in InnoDB: purge and the history list</h4>
+<p>InnoDB's undo records must be kept as long as any read view (snapshot) might need them. Background <strong>purge</strong> threads remove undo records older than the oldest active read view, and also physically remove secondary index entries that were delete-marked. The amount of unpurged history is reported as the <strong>history list length</strong> in <code>SHOW ENGINE INNODB STATUS</code>. On a healthy server it stays in the thousands. A long-running transaction, including one that merely opened a consistent snapshot at REPEATABLE READ and then sat idle, prevents purge from advancing; the history list grows into the millions, undo tablespaces grow, and queries slow down because reads must walk ever-longer version chains. The fix and prevention are identical to PostgreSQL's horizon problem: find and end long transactions, and bound them with timeouts. InnoDB also has no wraparound hazard of the PostgreSQL kind, because its transaction ids are 48-bit and versions live in undo logs rather than being compared forever on every row.</p>
+
+<h4>6. Storage layout consequences: heap versus clustered</h4>
+<p>Beyond updates, the heap-versus-clustered choice shows up everywhere. <strong>Primary key lookups</strong> are slightly cheaper in InnoDB (one descent ends at the row) and <strong>secondary lookups</strong> slightly cheaper in PostgreSQL (one descent plus one heap fetch, versus two descents). <strong>Range scans on the primary key</strong> read physically adjacent rows in InnoDB, which is excellent if the key is chosen for locality, such as <code>(tenant_id, created_at, id)</code>; in PostgreSQL rows are in insertion order, which is good for time-ordered inserts but has no relationship to any other key. <strong>Primary key choice</strong> matters far more in InnoDB: it is copied into every secondary index and determines where every row is inserted. <strong>Table size</strong> differs too: PostgreSQL's 23-byte tuple header plus line pointer (db5) versus InnoDB's roughly 18 bytes of row overhead (hidden transaction id and roll pointer plus a record header); both add per-row costs that matter for narrow tables.</p>
+
+<h4>7. Connections and memory</h4>
+<p>PostgreSQL forks a separate <strong>operating-system process</strong> for each client connection. Each process has its own private memory (catalog caches, sort and hash memory up to <code>work_mem</code> per operation), and all processes share <code>shared_buffers</code>, PostgreSQL's page cache in shared memory. The documentation suggests about 25% of RAM for shared_buffers as a starting point on a dedicated server, leaving the rest to the operating system's page cache, which PostgreSQL relies on as a second-level cache. The default <code>max_connections</code> is 100, and performance usually degrades well before a few hundred <em>active</em> connections, because of contention on shared structures, snapshot computation that scales with the number of connections, and memory. So PostgreSQL deployments put a pooler such as <strong>PgBouncer</strong> in front: thousands of client connections share a few dozen server connections, typically in transaction mode (a server connection is assigned only for the duration of each transaction, which rules out session-level features such as some prepared-statement uses and session advisory locks).</p>
+<p>MySQL runs a <strong>thread</strong> per connection in one process, with a much cheaper per-connection cost, so thousands of connections are routine; Uber reported running close to 10,000 on some instances. InnoDB manages its own large <strong>buffer pool</strong> (<code>innodb_buffer_pool_size</code>, commonly set to most of the machine's memory on a dedicated server) and usually bypasses the OS page cache for data files (<code>O_DIRECT</code>), so it caches pages exactly once. The same rule about active connections applies, though: throughput peaks at a small multiple of the CPU core count, and beyond that more concurrent queries mean more contention, which is why MySQL also has a thread-pool plugin and why application-side pools are sized modestly (db13).</p>
+
+<h4>8. Replication: physical WAL versus logical binlog</h4>
+<p>PostgreSQL's built-in <strong>streaming replication</strong> sends the WAL (db8) to standbys, which replay it exactly as in crash recovery. The result is a byte-for-byte copy of the primary's data files. It is simple, complete (everything, including indexes, sequences and DDL, is replicated automatically) and fast to apply. Its costs come from being physical: the stream contains every index insertion, every full-page image and every vacuum record, so it is as verbose as the write amplification behind it, which is Uber's replication-bandwidth complaint; standbys must run the same major version, so upgrades cannot use replication; and standbys cannot have different indexes or extra tables.</p>
+<p>MySQL replicates from the <strong>binary log</strong>, a log of committed changes separate from InnoDB's redo log. In <em>statement</em> format it records SQL statements (compact, but non-deterministic statements can produce different results on replicas); in <em>row</em> format, the default since MySQL 5.7, it records before and after images of each changed row; <em>mixed</em> switches between them. Because the stream is logical, replicas apply row changes through their own storage engine and maintain their own indexes, so secondary-index churn never crosses the network, replicas can run a newer version (the standard rolling-upgrade path) and can even have different indexes. <strong>GTIDs</strong> (global transaction identifiers) give each transaction a unique id so replicas can be repointed at a new primary without calculating log positions. The costs: a second log to write and fsync on every commit (InnoDB's redo log and the binlog are coordinated with an internal two-phase commit), and logical replication's classic failure modes, such as replicas silently diverging when a statement-based change behaves differently or when someone writes directly to a replica.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Physical replication ships WAL records for the heap tuple and every index entry to a byte-identical standby; logical replication ships one row change and the replica updates its own indexes">
+  <defs><marker id="db10-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Physical (PostgreSQL streaming)</text>
+    <rect x="20" y="32" width="110" height="60" rx="5" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="75" y="66" text-anchor="middle" style="fill:var(--ink)">primary</text>
+    <rect x="490" y="32" width="130" height="60" rx="5" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="555" y="58" text-anchor="middle" style="fill:var(--ink)">standby</text>
+    <text x="555" y="76" text-anchor="middle" style="fill:var(--muted)">byte-identical, same version</text>
+    <line x1="130" y1="62" x2="488" y2="62" marker-end="url(#db10-r)" style="fill:none;stroke:var(--ink-2)"/>
+    <g style="font-family:var(--mono)">
+      <rect x="150" y="40" width="70" height="18" rx="2" style="fill:var(--crit);fill-opacity:.12;stroke:var(--crit)"/><text x="156" y="53" style="fill:var(--ink)">heap</text>
+      <rect x="225" y="40" width="70" height="18" rx="2" style="fill:var(--crit);fill-opacity:.12;stroke:var(--crit)"/><text x="231" y="53" style="fill:var(--ink)">idx pk</text>
+      <rect x="300" y="40" width="70" height="18" rx="2" style="fill:var(--crit);fill-opacity:.12;stroke:var(--crit)"/><text x="306" y="53" style="fill:var(--ink)">idx name</text>
+      <rect x="375" y="40" width="80" height="18" rx="2" style="fill:var(--crit);fill-opacity:.12;stroke:var(--crit)"/><text x="381" y="53" style="fill:var(--ink)">idx birth</text>
+    </g>
+    <text x="150" y="84" style="fill:var(--ink-2)">+ full-page images, vacuum records</text>
+    <text x="20" y="130" style="fill:var(--ink);font-weight:600">Logical (MySQL row binlog, PostgreSQL publications)</text>
+    <rect x="20" y="142" width="110" height="60" rx="5" style="fill:var(--s3);fill-opacity:.12;stroke:var(--s3)"/>
+    <text x="75" y="176" text-anchor="middle" style="fill:var(--ink)">primary</text>
+    <rect x="490" y="142" width="130" height="60" rx="5" style="fill:var(--s3);fill-opacity:.12;stroke:var(--s3)"/>
+    <text x="555" y="168" text-anchor="middle" style="fill:var(--ink)">replica</text>
+    <text x="555" y="186" text-anchor="middle" style="fill:var(--muted)">own indexes, any version</text>
+    <line x1="130" y1="172" x2="488" y2="172" marker-end="url(#db10-r)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="200" y="150" width="210" height="18" rx="2" style="fill:var(--good);fill-opacity:.12;stroke:var(--good)"/>
+    <text x="206" y="163" style="fill:var(--ink);font-family:var(--mono)">row 4: birth 780 → 770</text>
+    <text x="20" y="225" style="fill:var(--muted)">Physical replicates how the bytes changed; logical replicates what the data change was.</text>
+  </g>
+</svg>
+<figcaption>The physical stream carries the primary's whole write set, including index churn; the logical stream carries one row change and leaves index maintenance to the replica. That asymmetry was the core of Uber's cross-country bandwidth problem.</figcaption>
+</figure>
+<p>PostgreSQL has had <strong>logical replication</strong> built in since version 10 (2017): a <em>publication</em> on the source lists tables, and a <em>subscription</em> on the target receives row-level inserts, updates and deletes decoded from the WAL. It replicates only chosen tables (with row filters and column lists in recent versions), works across major versions (the basis of near-zero-downtime upgrades), and feeds change-data-capture tools. Its limitations: replicated tables need a primary key or replica identity, DDL is not replicated automatically, and sequences need separate handling. In 2016, Uber's options were the pglogical extension; today it is mainline.</p>
+
+<h4>9. Reading on replicas</h4>
+<p>Both systems serve reads from replicas, with different conflicts. On a PostgreSQL physical standby, WAL replay may need to remove row versions (because vacuum removed them on the primary) or take locks (for DDL) that conflict with a query running on the standby. The standby waits up to <code>max_standby_streaming_delay</code> (30 seconds by default) and then cancels the query with a "conflict with recovery" error, which is the "Poor replica MVCC support" Uber described. Turning on <code>hot_standby_feedback</code> makes the standby tell the primary about its oldest snapshot so the primary's vacuum keeps those versions: no more cancellations, but long standby queries now cause bloat on the primary, exactly as a long transaction there would. The usual design is to separate concerns: short OLTP reads on standbys with default settings, long analytical queries on a dedicated standby with feedback and a generous delay, or better, in a warehouse (db12).</p>
+<p>MySQL replicas apply logical row changes through InnoDB like any other transaction, so a long read on the replica uses its own MVCC and does not block replication or get cancelled by it. The trade-off is that the replica does all the index and undo work itself, and a single-threaded apply (older configurations) or a very long query holding locks can make it lag; MySQL's multi-threaded replica applier parallelises transactions that do not conflict.</p>
+
+<h4>10. Upgrades and schema changes</h4>
+<p>Uber's upgrade story, shutting down, running <code>pg_upgrade</code> for hours, then re-copying every replica, reflected the copy mode of pg_upgrade and physical replication's version lock. Today's options are better. <code>pg_upgrade --link</code> hard-links the existing data files into the new cluster instead of copying them, so even multi-terabyte upgrades take minutes, and PostgreSQL 18's pg_upgrade preserves optimizer statistics so the new cluster does not start with blind plans. For downtime of seconds, logical replication into a new-version cluster, followed by a brief write pause and switchover, is the standard method. MySQL's rolling upgrade (upgrade replicas one by one, then fail over) has long been straightforward because its replication is logical.</p>
+<p>Schema changes differ as well. PostgreSQL supports <strong>transactional DDL</strong>: <code>ALTER TABLE</code>, <code>CREATE INDEX</code> and most other DDL can run inside a transaction and roll back atomically, a large convenience for migrations; adding a nullable column or one with a constant default is instant (since version 11), and indexes can be built without blocking writes using <code>CREATE INDEX CONCURRENTLY</code>. MySQL's DDL is not transactional (each statement commits implicitly), but InnoDB supports many online and, since 8.0, instant operations such as adding columns, and large teams use external online schema-change tools (gh-ost, pt-online-schema-change) for the rest. db14 covers zero-downtime migrations on both.</p>
+
+<h4>11. A worked comparison: one workload, two engines</h4>
+<p>Take a concrete table: <code>sessions(session_id PK, user_id, device, created_at, last_seen_at, token_count, state jsonb)</code> with indexes on <code>user_id</code>, <code>(user_id, last_seen_at)</code> and <code>created_at</code>, 50 million rows, updated about 5,000 times a second (each update sets last_seen_at and token_count), and replicated to one standby in another region.</p>
+<p>On PostgreSQL as designed, every update changes <code>last_seen_at</code>, which is indexed, so no update can be HOT: each writes a new heap tuple (with the whole jsonb state, possibly a new TOAST copy if it is large and changed) and four index entries (primary key, user_id, the composite, created_at), WAL-logs them with frequent full-page images, ships all of it cross-region, and leaves a dead tuple and four dead index entries for vacuum. On InnoDB, each update rewrites the row in place, writes an undo record, and updates only the <code>(user_id, last_seen_at)</code> index; the binlog ships one row image.</p>
+<p>The PostgreSQL redesign is small: drop <code>last_seen_at</code> from the composite index if the query "sessions of a user by recency" can use <code>(user_id)</code> plus a sort over a handful of rows, or move <code>last_seen_at</code> and <code>token_count</code> into a narrow <code>session_activity(session_id, last_seen_at, token_count)</code> table with only a primary key. Now nearly all updates are HOT on a narrow table, the wide row with jsonb is rarely rewritten, and WAL volume drops several-fold. Add <code>fillfactor = 80</code> on the narrow table and an autovacuum scale factor around 0.01. This is the general lesson of the Uber debate: PostgreSQL rewards schemas that keep hot, frequently updated columns narrow and unindexed; InnoDB is more forgiving of wide, heavily indexed rows with in-place updates, and less forgiving of random primary keys.</p>
+</section>
+
+<section data-field="deep">
+<h4>What the PostgreSQL community said in reply</h4>
+<p>Responses to the Uber post, from PostgreSQL developers and consultants, made several technical points worth knowing. First, HOT updates (since 8.3, 2008) already avoid index writes when no indexed column changes, so the "every index for every update" claim applied to updates of indexed columns or pages with no free space; the al-Khwārizmī example updated an indexed column. Second, write amplification exists in InnoDB too, in different places: undo records, the doublewrite buffer, the binlog written alongside the redo log, and secondary index updates via delete-mark and insert. Third, the corruption Uber hit was a specific 9.2 bug, already fixed, and logical replication has its own historical class of divergence bugs. Fourth, logical replication and fast upgrades were already on their way. The consensus that emerged is that Uber's workload (very wide use of secondary indexes on update-heavy tables, cross-continental physical replication, very high connection counts, and an older version they could not upgrade) genuinely fit InnoDB's design better, while the general claims did not transfer to every workload. That is a good template for answering "which is better?" in an interview: name the mechanism, then the workload property that makes it matter.</p>
+
+<h4>Index-organised versus heap tables, more formally</h4>
+<p>The two layouts optimise for different pointer stability. In a heap, a row's address changes on every non-HOT update, so indexes point at addresses and must change when addresses do; but addresses are short (6 bytes) and lookups need one tree. In an index-organised table, a row's logical address (its primary key) never changes on updates, so secondary indexes stay valid unless their own columns change; but the logical address may be long and every secondary lookup pays a second tree descent. Databases have explored hybrids. Oracle offers both heap tables and index-organised tables with "guess" physical addresses in secondary indexes; SQL Server lets you choose a clustered index or a heap per table. PostgreSQL's HOT chains are a hybrid of their own: within a page, the line pointer acts as a stable logical address for a chain of versions. Proposals for additional PostgreSQL table access methods, such as undo-based storage, aim to give PostgreSQL in-place updates for tables that need them; the table access method API (since version 12) exists partly to make such engines possible.</p>
+
+<h4>Why 32-bit transaction ids persist</h4>
+<p>Wraparound would disappear with 64-bit transaction ids, and the question of why PostgreSQL has not simply switched comes up often. The xid fields live in every tuple header, so widening them would add 8 bytes per row on disk, about a third more header overhead, and require a full on-disk format change for every existing database. Freezing is the price paid instead. Work has gone into making freezing cheaper (the all-frozen visibility-map bit, more opportunistic freezing in recent versions) and into using 64-bit "epoch plus xid" values internally where the overhead is acceptable. For operators, the practical result is unchanged: monitor <code>age(datfrozenxid)</code> per database and <code>age(relfrozenxid)</code> for the largest tables, and alert long before 2 billion, typically at a few hundred million beyond <code>autovacuum_freeze_max_age</code>.</p>
+
+<h4>Group commit across two logs in MySQL</h4>
+<p>MySQL with binary logging has two durability logs: InnoDB's redo log and the server's binlog, which must agree about which transactions committed, or a crash could leave a transaction committed in InnoDB but absent from the binlog (so replicas never receive it), or the reverse. MySQL coordinates them with an internal two-phase commit: InnoDB prepares the transaction (redo log record flushed), the binlog event is written and flushed, then InnoDB commits. On recovery, prepared transactions are committed if their events are in the binlog and rolled back otherwise. Doing this naively costs two fsyncs per commit; MySQL's binlog group commit batches the flush stages across many transactions, so throughput under concurrency remains high. The settings <code>sync_binlog = 1</code> and <code>innodb_flush_log_at_trx_commit = 1</code> together give full durability; relaxing either (common in older tuning guides) trades crash safety for speed exactly as asynchronous commit does in PostgreSQL (db8).</p>
+
+<h4>Extensions versus storage engines</h4>
+<p>The two projects extend in different directions. MySQL's pluggable storage engine API lets entirely different storage layers sit under the same SQL layer: InnoDB, MyRocks (RocksDB, an LSM tree, used at Meta to cut storage for write-heavy data), and others, with the binlog providing a common replication layer. PostgreSQL extends upward and sideways: new data types, operators, index access methods (GIN, GiST, BRIN, and pgvector's HNSW and IVFFlat), procedural languages, foreign data wrappers and, since version 12, table access methods. For AI workloads this matters directly: pgvector makes PostgreSQL a reasonable vector store alongside relational data (db15), PostGIS covers geospatial work, and the planner treats these index types like any other. MySQL 9 added a vector type, but the ecosystem of index types and extensions is where PostgreSQL has historically been stronger.</p>
+</section>
+
+<section data-field="prod">
+<h4>Sentry's wraparound outage, 2015</h4>
+<p>Sentry, the error-tracking service, published a candid account of an outage caused by transaction-id wraparound protection. Their primary PostgreSQL database processed a very large, continuous stream of writes; autovacuum had been unable to finish freezing one enormous table, a mapping of events to their rollups needed for every event received, and the database reached the point where it stopped accepting writes. The team faced the questions every operator in this situation faces: is the running vacuum resumable, how long will it take, will restarting with more maintenance memory or in single-user mode help or just add downtime? They let the autovacuums finish, which took hours, only to find writes still refused because one relation, the huge mapping table, was not done. Weighing a vacuum of unknown duration against data that was not critical and was recoverable from replicas, they truncated that table, and the system was fully restored five minutes later. Their note from two days afterwards is the most telling detail: a test machine was still running a single-user-mode vacuum of the same data, going on 24 hours.</p>
+<p>The lessons generalise. Monitor xid age per table and database with alerts far ahead of the limit. Make sure autovacuum can keep up on the largest, hottest tables (more workers, higher cost limits, per-table thresholds, and, for append-heavy event tables, partitioning so old partitions are frozen once and then left alone or dropped). Make sure nothing holds the xmin horizon back for long. And design huge, low-value mapping tables so they can be dropped or rebuilt, which is what gave Sentry its fast way out.</p>
+
+<h4>Bloat in practice</h4>
+<p>Symptoms of a PostgreSQL bloat problem: a table or index far larger than its live data (estimated with <code>pgstattuple</code> or the common bloat-estimation queries), sequential scans and index scans reading many more pages than expected, <code>n_dead_tup</code> in <code>pg_stat_user_tables</code> large relative to <code>n_live_tup</code>, and <code>last_autovacuum</code> long ago for a busy table. Causes, in order of frequency: a held-back xmin horizon (long transaction, idle-in-transaction session, stale replication slot, standby feedback), autovacuum thresholds too high for a large table, autovacuum throttled too hard to finish, and update patterns that defeat HOT. Remedies: fix the horizon first, then tune per-table autovacuum, then reclaim space with <code>REINDEX CONCURRENTLY</code> for indexes and an online rewrite tool (such as pg_repack) for tables, since <code>VACUUM FULL</code> takes an exclusive lock.</p>
+
+<h4>InnoDB pathologies</h4>
+<p>The InnoDB equivalents: a growing history list length from long transactions; a buffer pool too small for the working set, visible as a falling hit rate and rising disk reads; random primary keys causing page splits and fragmentation in the clustered index; and replication lag from long-running transactions or a single-threaded applier. Gap-lock contention and deadlocks at REPEATABLE READ (db9) are a frequent surprise for teams coming from PostgreSQL, and some move to READ COMMITTED to reduce them, accepting non-repeatable reads. The MySQL tools are <code>SHOW ENGINE INNODB STATUS</code>, the performance schema and sys schema views, and <code>information_schema.innodb_trx</code> for finding long transactions.</p>
+
+<h4>Connection storms</h4>
+<p>Uber's post mentioned outages caused by application bugs that opened more active or idle-in-transaction connections than intended. This is common to both engines but especially sharp on PostgreSQL. A deploy that doubles the number of application instances, each with a pool of 20, can exceed <code>max_connections</code>, at which point new connections fail outright; even below the limit, hundreds of active backends contend and memory per backend adds up. Defences: a pooler in transaction mode in front of PostgreSQL, application pools sized from the database's capacity rather than the application's (db13), <code>idle_in_transaction_session_timeout</code> and statement timeouts per role, and alerting on connection counts by state.</p>
+
+<h4>Choosing for an AI product</h4>
+<p>For an AI application's operational database (users, conversations, tool state, billing, evaluation results), either engine works, and team familiarity plus the managed service you will use usually decide. Specific features tilt it: if you want vectors next to relational data with transactional consistency, PostgreSQL with pgvector is the common choice; if you expect very wide fan-out of writes with many secondary indexes and want MySQL-ecosystem sharding (Vitess), InnoDB fits. Whichever you choose, the patterns from this lesson apply to AI-shaped data: append-only logs of model calls partitioned by time so old data is dropped rather than vacuumed, narrow hot tables for frequently updated state such as token counters, no indexes on columns that change on every message, and short transactions around model calls so neither vacuum's horizon nor InnoDB's purge is held back by an agent waiting for a model.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> count the page-level writes an UPDATE causes in a simplified PostgreSQL model (new tuple, all indexes unless HOT) and InnoDB model (in place, undo record, only changed indexes), on Uber's style of table with five indexes. This is a toy model for reasoning, not a benchmark; no PostgreSQL or MySQL is needed. Save as <code>db10.py</code>.</p>
+<pre>"""Count page-level writes per UPDATE in a PostgreSQL-style heap vs an InnoDB-style clustered table."""
+import random
+
+INDEXES = {"pk": {"id"}, "name": {"first", "last"}, "birth": {"birth_year"},
+           "signup": {"signup_date"}, "login": {"last_login"}}
+
+def postgres_update(changed, page_has_room):
+    # new tuple version always; HOT if no indexed column changed AND it fits on the same page
+    indexed = set().union(*INDEXES.values())
+    hot = page_has_room and not (changed &amp; indexed)
+    writes = {"heap": 1}
+    if not hot:
+        writes["index entries"] = len(INDEXES)       # every index gets an entry for the new ctid
+    return writes, hot
+
+def innodb_update(changed):
+    writes = {"clustered row (in place)": 1, "undo record": 1}
+    touched = [n for n, cols in INDEXES.items() if n != "pk" and cols &amp; changed]
+    if touched:
+        writes["index entries"] = 2 * len(touched)   # delete-mark old entry + insert new one
+    return writes
+
+random.seed(10)
+workload = ([{"last_login"}] * 70 +       # most updates touch one indexed timestamp
+            [{"bio"}] * 25 +              # some touch an unindexed column
+            [{"birth_year"}] * 5)
+pg_total = inno_total = hot_count = 0
+for changed in workload:
+    w, hot = postgres_update(changed, page_has_room=random.random() &lt; 0.8)
+    pg_total += sum(w.values()); hot_count += hot
+    inno_total += sum(innodb_update(changed).values())
+
+print("one update of last_login (indexed):")
+print("   postgres:", postgres_update({"last_login"}, True)[0])
+print("   innodb  :", innodb_update({"last_login"}))
+print("one update of bio (not indexed), room on page:")
+print("   postgres:", postgres_update({"bio"}, True)[0], "(HOT)")
+print("   innodb  :", innodb_update({"bio"}))
+print(f"100-update mix: postgres {pg_total} writes ({hot_count} HOT), innodb {inno_total} writes")
+INDEXES.pop("login")                       # drop the index on the hot timestamp
+pg2 = sum(sum(postgres_update(c, random.random() &lt; 0.8)[0].values()) for c in workload)
+print(f"after dropping the last_login index: postgres {pg2} writes")</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li>Updating the indexed <code>last_login</code>: PostgreSQL writes a heap tuple and 5 index entries; InnoDB writes the row in place, an undo record and 2 index operations on the one affected index.</li>
+<li>Updating unindexed <code>bio</code> with room on the page: PostgreSQL does a HOT update, a single heap write, cheaper than InnoDB's row plus undo.</li>
+<li>The 100-update mix: about 485 writes for PostgreSQL versus 350 for InnoDB. Dropping the index on <code>last_login</code> cuts PostgreSQL to under 200, because most updates become HOT.</li>
+</ol>
+<p><strong>Try next.</strong> Change <code>page_has_room</code> to always False (fillfactor 100 and no pruning) and see the HOT benefit vanish. Add more indexes and watch the PostgreSQL count grow linearly while InnoDB's barely moves. If you have PostgreSQL available elsewhere, run an update workload and read <code>SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables WHERE relname = 'users'</code>, then drop an index on a frequently updated column and compare; the documentation's HOT page explains what you should see.</p>
+</section>
+
+<section data-field="drill">
+<b>Diagnose: the PostgreSQL that slowed down every afternoon</b>
+<p>A SaaS company's PostgreSQL primary gets steadily slower from late morning until a nightly batch window, then recovers. Observations: table <code>events</code> (2 billion rows) and its indexes keep growing although rows are deleted after 30 days; <code>n_dead_tup</code> on several tables is in the hundreds of millions; <code>pg_stat_activity</code> shows an analytics user with a transaction open since 09:00 running hourly reports in the same session; there is a logical replication slot for a CDC pipeline whose consumer was decommissioned last month; <code>age(datfrozenxid)</code> is 1.1 billion and rising. What is happening, how urgent is it, and what do you do, in order?</p>
+<details><summary>Answer</summary>
+<p><strong>Diagnosis.</strong> Two things hold back the xmin horizon: the analytics session's transaction open since 09:00 (vacuum cannot remove anything that became dead after its snapshot, so bloat builds all day; the nightly batch window presumably ends that session, which is why things recover), and the abandoned logical replication slot, which pins the catalog horizon and, for logical slots, retains WAL indefinitely. Dead tuples accumulate, tables and indexes bloat, scans read more pages, and the cache holds less useful data.</p>
+<p><strong>Urgency.</strong> <code>age(datfrozenxid)</code> at 1.1 billion is serious: it is far past the 200 million anti-wraparound trigger, so freezing has been failing to advance, and at roughly 2 billion the server will stop accepting writes. At the current rate, estimate the days remaining from the daily xid consumption and treat it as an incident now.</p>
+<p><strong>Actions, in order.</strong> (1) Drop the abandoned slot (<code>pg_drop_replication_slot</code>) after confirming its consumer is gone. (2) End the long analytics transaction and fix the client: autocommit for reports, or one transaction per report, plus <code>idle_in_transaction_session_timeout</code> and a statement timeout for that role; move reporting to a replica or warehouse. (3) Let autovacuum (or a manual <code>VACUUM (FREEZE, VERBOSE)</code> on the oldest tables, largest first, with raised <code>maintenance_work_mem</code> and cost limits) advance <code>relfrozenxid</code>; watch <code>age(relfrozenxid)</code> fall. (4) For <code>events</code>, stop deleting rows by date: partition by day or month and drop old partitions, which produces no dead tuples and needs no freezing of soon-to-be-dropped data. (5) Reclaim existing bloat with <code>REINDEX CONCURRENTLY</code> and an online table rewrite. (6) Add alerts: oldest transaction age, replication slot lag and activity, dead-tuple ratios on large tables, and xid age at, say, 500 million.</p>
+</details>
+</section>

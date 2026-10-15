@@ -1,0 +1,413 @@
+<!-- topic source for llm/lm21; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "lm21",
+  "t": "Beyond attention: state-space models and linear attention",
+  "tag": "Architecture",
+  "sum": "Why attention costs O(n²), how linear attention and its kernel trick turn a transformer into an RNN, S4 to Mamba's selective state spaces and parallel scan, Mamba-2's duality with attention, RWKV, and why production models now interleave a few attention layers with many SSM layers.",
+  "prereq": [
+    ["lm2", "Attention scores every query against every key, softmaxes the scores and takes a weighted sum of values; with a causal mask a token only sees itself and earlier tokens."],
+    ["lm3", "A decoder is a stack of blocks, each an attention sub-layer that mixes information across tokens and an MLP that works on each token separately, with residual connections around both."],
+    ["lm5", "During generation every attention layer caches every past token's key and value; the cache grows by 2 × layers × KV heads × head dimension numbers per token and every decode step reads all of it."],
+    ["dl7", "A recurrent network carries a fixed-size hidden state forward one step at a time, h_t = f(h_{t−1}, x_t); classic RNNs cannot be trained in parallel over time and forget long-range information."],
+    ["gpu3", "A forward pass costs about 2 FLOPs per parameter per token for the weight matrix multiplies, plus attention work that grows with the square of the sequence length."],
+    ["gpu7", "FlashAttention computes exact attention in tiles held in on-chip SRAM, so the n × n score matrix never touches HBM; it removes the memory cost of attention but not its quadratic arithmetic."],
+    ["gpu10", "Decode is memory-bound: each step reads all weights plus every active sequence's KV cache, so step time and maximum batch size are set by bytes, not FLOPs."]
+  ],
+  "myths": [
+    ["Linear attention is just a faster approximation of softmax attention that works about as well.", "Linear attention replaces the softmax similarity with a dot product of feature maps, which changes what the layer can do, not only how fast it runs. Its whole past is summed into one fixed d × d matrix, so it cannot sharply pick out one earlier token the way a softmax can. Plain linear attention lost clearly to softmax attention on language modelling; it took gating, decay and better update rules (Mamba, Mamba-2, Gated DeltaNet) to close most of the gap."],
+    ["Mamba can read a million tokens, so it remembers everything in them.", "Mamba's state has a fixed size no matter how long the input is, so it must compress. It is excellent at keeping what it decided was important and dropping the rest, but if a question arrives after the text and asks for a detail it chose to forget, the detail is gone. Jelassi et al. (2024) proved that fixed-state models cannot copy arbitrarily long strings and found pretrained SSMs far behind transformers at copying and phone-book lookup."],
+    ["State-space models are just the old RNNs again.", "They share the fixed-size recurrent state, but differ in the two ways that sank RNNs: the recurrence is linear in the state, so training can run in parallel over the sequence with a scan or as matrix multiplies, and the state is large (thousands of numbers per channel group, against a few hundred in an LSTM) with carefully initialised decays that keep gradients alive over long ranges."],
+    ["An SSM model is faster than a transformer at every length.", "At a few thousand tokens attention is a small share of the work: for a 7B model at 4,096 tokens, the attention-score arithmetic is about 14% of prefill FLOPs, and the MLP and projection matrices dominate either way. The wins appear in long prefills, long-context decode and high-concurrency serving, where the transformer's KV cache dominates memory and bandwidth."],
+    ["A hybrid model has no KV cache.", "Its remaining attention layers still cache every token's keys and values. The saving is proportional: Nemotron-H-8B keeps 4 attention layers out of 52, so its cache is roughly an eighth of a same-width transformer whose every block has attention, and it still grows with context."],
+    ["Sub-quadratic architectures will replace attention outright.", "The evidence so far points the other way: Mamba-2's own ablation found that a pure SSD model and a pure transformer were about equal, and both lost to a mix with about 10% attention layers. Shipping models (Jamba, Nemotron-H, Granite 4.0, Qwen3-Next) keep some full attention for exact retrieval and put the efficient layers everywhere else."]
+  ],
+  "recap": [
+    "Softmax attention compares every token with every earlier token, so prefill arithmetic grows with n² and every decode step must read a KV cache that grows with n; for a 7B model the attention-score work equals the weight work at about 25,000 tokens.",
+    "Linear attention replaces exp(q·k) with a dot product of feature maps φ(q)·φ(k); by associativity the past collapses into a running d × d matrix S = Σ φ(k)vᵀ, so the layer becomes an RNN with constant memory per step.",
+    "A state-space model runs a linear recurrence h_t = Ā h_{t−1} + B̄ x_t, y_t = C h_t, obtained by discretising a continuous system with a step size Δ; S4 made these fast and stable with structured A matrices and a convolution view.",
+    "Fixed (time-invariant) SSMs cannot decide what to keep, which fails on selective copying and associative recall; Mamba makes Δ, B and C functions of the current token, so a small Δ preserves the state and a large Δ overwrites it.",
+    "Making the parameters input-dependent breaks the convolution trick, so Mamba trains with a parallel associative scan over (a, b) pairs, computed in SRAM by a fused kernel, and decodes as an RNN in constant time and memory per token.",
+    "Mamba-2 restricts A to a scalar per head, which makes the SSM exactly a form of masked linear attention (state space duality); its chunked algorithm uses matrix multiplies within chunks and recurrence between them, 2–8× faster than Mamba's scan and with much larger states.",
+    "RWKV is a linear-attention RNN with learned per-channel decays, trained in parallel and decoded recurrently, scaled to 14B parameters; later versions made the decay input-dependent, converging on selectivity.",
+    "Fixed-state models win throughput and constant decoding memory but lose exact recall and in-context copying; adding about 10% attention layers recovers recall, which is why Jamba, Nemotron-H, Granite 4.0 and Qwen3-Next are hybrids.",
+    "In production, check engine support, prefix caching and speculative decoding (which need state snapshots), quantisation of the state, and evaluate on your own retrieval-heavy long-context tasks before betting on the throughput numbers."
+  ],
+  "glossary": [
+    ["Associative scan", "A parallel algorithm for running a sequence of combine steps when the combine operation is associative; it finishes in about log₂ n parallel rounds instead of n sequential ones."],
+    ["Discretisation", "Turning a continuous-time system dh/dt = Ah + Bx into a step-by-step update h_t = Āh_{t−1} + B̄x_t for a chosen step size Δ."],
+    ["Feature map φ", "A function applied to queries and keys in linear attention so that φ(q)·φ(k) stands in for the softmax similarity; it must keep scores non-negative, for example elu(x) + 1."],
+    ["Gated DeltaNet", "A linear-attention layer that combines a learned forget gate with the delta rule, so it can both fade old memories and overwrite the value stored for a key; used in Qwen3-Next."],
+    ["Delta rule", "An update that first reads what the state currently returns for a key and then moves it towards the new value, S ← S + β(v − Sk)kᵀ, instead of only adding kvᵀ."],
+    ["Hybrid model", "A model whose layer stack mixes a few full attention layers with many SSM or linear-attention layers."],
+    ["Induction head", "A pattern, usually in attention, that finds an earlier occurrence of the current token and copies whatever followed it; a basic form of in-context recall."],
+    ["Linear attention", "Attention with the softmax similarity replaced by a dot product of feature maps, computable as a running sum with cost linear in sequence length."],
+    ["Linear time-invariant (LTI)", "A system whose update rule is the same at every step and does not depend on the input; S4 and earlier SSMs are LTI."],
+    ["Mamba", "Gu and Dao's 2023 architecture built from selective SSM blocks with no attention and no separate MLP."],
+    ["Mamba-2", "Dao and Gu's 2024 refinement whose SSM layer (SSD) uses a scalar decay per head, can be computed as chunked matrix multiplies, and supports larger states."],
+    ["Parallel scan", "See associative scan; in Mamba, the way a recurrence with input-dependent coefficients is computed in parallel during training."],
+    ["RWKV", "Receptance Weighted Key Value: an RNN architecture with linear-attention-style token mixing and learned exponential decays, trainable in parallel."],
+    ["S4", "Structured State Space sequence model (Gu, Goel and Ré, 2021): a fixed SSM layer with a structured state matrix, computed as a long convolution in training."],
+    ["Selective SSM", "An SSM whose step size Δ and matrices B and C are computed from the current input, so the layer can choose what to store and what to ignore; Mamba's core layer."],
+    ["Semiseparable matrix", "A lower-triangular matrix whose every block on or below the diagonal has low rank; Mamba-2 shows an SSM's sequence map is exactly such a matrix."],
+    ["State size N", "The number of hidden numbers an SSM keeps per channel; Mamba uses 16, Mamba-2 commonly 64 to 256."],
+    ["State space duality (SSD)", "Mamba-2's result that a scalar-decay SSM can be computed either as a linear recurrence or as a masked, attention-like matrix multiply, with the same output."],
+    ["State-space model (SSM)", "A sequence layer that carries a hidden state forward with a linear update and reads its output from that state."]
+  ],
+  "qa": [
+    ["E", "Why is self-attention O(n²), and which part of a real model actually feels it?", "Every query is compared with every key, so the score matrix has n × n entries per head and the weighted sum of values reads all of them: arithmetic grows with n² in prefill and training. The memory side was removed by FlashAttention, which never stores the matrix, but the arithmetic remains. In decoding, the cost shows up differently: each new token reads the whole KV cache, so step time and cache memory grow linearly with context per sequence.", "Follow-up: At what length does attention dominate a 7B model's prefill? — Attention-score FLOPs are about 4n²·d_model·layers and weight FLOPs about 2·N·n; they are equal at n = N/(2·d_model·layers) ≈ 25,000 tokens for a 6.7B model with 32 layers of width 4,096 (about twice that if causal masking skips half)."],
+    ["E", "What is the kernel trick in linear attention?", "Softmax attention weights value j by exp(q·k_j); linear attention replaces that with φ(q)·φ(k_j) for a feature map φ that keeps values non-negative. Then the output is φ(q)ᵀ Σ_j φ(k_j)v_jᵀ divided by φ(q)ᵀ Σ_j φ(k_j), and because matrix products are associative the sums can be computed once and updated by one outer product per token. The past becomes a fixed d × d matrix, so cost is linear in n and decoding is an RNN with constant memory."],
+    ["E", "In one sentence each, what are S4, Mamba and Mamba-2?", "S4 is a fixed linear state-space layer with a structured state matrix that can be computed as a long convolution, strong on long-range benchmarks but weak on language. Mamba makes the step size and the input and output matrices depend on the current token (selectivity) and trains with a hardware-aware parallel scan. Mamba-2 simplifies the decay to a scalar per head so the layer equals a masked linear attention, which lets it use matrix multiplies and much larger states."],
+    ["M", "Explain Mamba's selection mechanism with a concrete example.", "The discretised update is h_t = exp(ΔA)·h_{t−1} + (1 − exp(ΔA))·x_t in the scalar case with A = −1, and Mamba computes Δ from x_t. For a filler token the model can output Δ = 0.01, so the old state is kept at 0.99 and the input barely enters; for an important token Δ = 3 gives exp(−3) ≈ 0.05, so the state is overwritten by the input. With the sequence 5, 1, 1, 9, 1 and those choices, the state reads 4.75, 4.71, 4.68, 8.79, 8.71: it holds the last important value. A fixed Δ = 1 gives 3.16, 1.80, 1.29, 6.17, 2.90: the 9 is mostly gone one step later.", "Follow-up: Why can't S4 do that? — Its Δ, A, B and C are the same for every token, so its response to an input depends only on how many steps ago it arrived, not on what it was; it can learn 'remember things from 5 steps ago' but not 'remember the coloured tokens'."],
+    ["M", "If Mamba is a recurrence, how is it trained in parallel?", "Each channel's update h_t = a_t h_{t−1} + b_t is linear in h. Represent step t as the pair (a_t, b_t); composing two steps gives (a₂a₁, a₂b₁ + b₂), and that composition is associative, so a parallel scan computes all prefix states in about log₂ n rounds. Mamba's kernel loads the inputs into on-chip SRAM, discretises and scans there, and writes only the outputs to HBM, avoiding materialising the B × L × D × N state tensor; it recomputes the states in the backward pass instead of storing them."],
+    ["M", "What does Mamba-2's 'Transformers are SSMs' result say, and why does it matter for speed?", "If A is a scalar times the identity in each head, the whole sequence map of the SSM can be written as y = (L ∘ CBᵀ)x, where L is a lower-triangular mask holding products of the decays. That is masked linear attention with C as queries, B as keys and x as values. Practically, it lets you compute chunks of 64–256 tokens with dense matrix multiplies on tensor cores and pass only a state between chunks, which the authors report as 2–8× faster than Mamba's scan while allowing states 8× larger or more."],
+    ["M", "What do SSMs and linear-attention models lose compared with attention?", "Exact recall from a long context. Their entire past lives in a fixed-size state, so they must decide at read time what to keep; anything they did not keep cannot be retrieved when a later question needs it. That shows up in copying, phone-book lookup, multi-key needle-in-a-haystack tests and some in-context learning. Attention keeps every token's key and value, so it can look anything up, at the price of memory that grows with context."],
+    ["M", "Why do current open models use hybrids rather than pure SSMs?", "Because the two layer types are complementary. The Mamba-2 paper trained 350M-parameter, 48-layer models on 7B tokens with 0 to 24 attention layers: pure Mamba-2 reached a perplexity of 8.60, a pure Transformer++ 8.68, and about six attention layers (roughly 10%) gave the best result, 8.26. The SSM layers act as cheap general sequence mixers; the few attention layers provide retrieval. NVIDIA's Nemotron-H uses about 8% attention layers, Jamba one attention layer in eight, Granite 4.0 Hybrid about 9:1 Mamba-2 to attention, and Qwen3-Next three Gated DeltaNet layers per gated-attention layer."],
+    ["M", "Compare the decode memory of a 3B transformer and a 3B Mamba at 4K and 128K tokens.", "With Llama 3.2 3B's shape (28 layers, 8 KV heads of dimension 128, 16-bit), the KV cache is 2 × 28 × 8 × 128 × 2 = 112 KiB per token: 448 MiB at 4,096 tokens and 14 GiB at 131,072, per sequence. Mamba-2.8B (64 layers, inner width 5,120, state 16, convolution width 4) holds about 64 × 5,120 × 20 numbers, roughly 12.5 MiB in 16-bit, at any length. At 128K one transformer sequence costs as much memory as about a thousand Mamba sequences.", "Follow-up: Then why is throughput only 4–5× higher, not 1,000×? — Decode still reads all the weights every step and the MLP-like projections still dominate compute; removing the cache lets you raise batch size until those limits bind."],
+    ["H", "Would you put an SSM or hybrid model in production? Walk through the decision.", "Start from the workload: long inputs and many concurrent long generations (summarising long documents, agent loops with large contexts, high-volume batch jobs) are where hybrids pay, through smaller caches and higher batch. Then check what you would lose by evaluating your own tasks, including exact retrieval and copying from context, not just general benchmarks. Then check the stack: does your serving engine support the architecture with prefix caching, speculative decoding, quantisation and your GPU's kernels? Choose a hybrid with real attention layers over a pure SSM, and keep a transformer baseline in the A/B so the throughput gain is measured on your traffic.", "Follow-up: What would make you say no? — Short prompts where attention is a small share of cost, workloads dominated by exact quoting or code editing from long context, or an engine that cannot prefix-cache the model, which can erase the saving if most of your prompt is a shared system prefix."],
+    ["H", "Why is prefix caching harder for SSM layers than for attention?", "An attention layer's cache is per token, so any prefix of it is a valid cache for that prefix: you can cut it at any token boundary and share it. An SSM's state after token t is one fused summary of tokens 1 … t; you cannot recover the state at token t − 100 from it. To share prefixes you must save state snapshots at chosen boundaries (for example every block of a few hundred tokens) and recompute from the nearest snapshot, which costs memory and makes cache hits coarser. Speculative decoding has the same issue in reverse: rejecting drafted tokens means rolling back to a saved state."],
+    ["H", "Linear attention adds kvᵀ to its state for every token. What goes wrong over long sequences, and how do newer designs fix it?", "The state is a sum, so it only grows: old associations are never removed, keys that are not orthogonal interfere, and after many tokens retrieval returns a blur of everything stored. Two fixes: a decay or forget gate, so S ← αS + kvᵀ fades old content (RetNet with a fixed α, Mamba-2 and Gated Linear Attention with input-dependent α); and the delta rule, S ← S + β(v − Sk)kᵀ, which first reads what the state returns for k and replaces it, so a key can be overwritten. Gated DeltaNet combines both and is the linear layer in Qwen3-Next."],
+    ["H", "How would you evaluate a hybrid model before migrating a long-context product to it?", "Measure three things on your own data. Quality: your task metrics plus targeted long-context probes at the lengths you serve, including multi-key retrieval, variable tracking and exact quoting, because those are where fixed-state layers fail first. Efficiency: throughput and p95 latency at your real prompt and output length distribution and concurrency in your actual serving engine, with prefix caching on, since published speed-ups are often measured at long generation lengths and large batch. Operations: quantisation quality, determinism, support for your hardware, and how quickly the engine adopts new versions. Compare against a same-size transformer under the same conditions."]
+  ],
+  "refs": [
+    ["paper", "Mamba: Linear-Time Sequence Modeling with Selective State Spaces", "Gu and Dao, 2023 (v2, May 2024). Selective SSMs, the hardware-aware scan, 5× generation throughput and Mamba-3B matching transformers twice its size.", "https://arxiv.org/abs/2312.00752"],
+    ["paper", "Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality", "Dao and Gu, 2024. Mamba-2, the SSD duality with masked attention, and the hybrid ablation (about 10% attention layers best).", "https://arxiv.org/abs/2405.21060"],
+    ["paper", "Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention", "Katharopoulos et al., 2020. The kernel trick, elu + 1 feature map and the recurrent form.", "https://arxiv.org/abs/2006.16236"],
+    ["paper", "Nemotron-H: A Family of Accurate and Efficient Hybrid Mamba-Transformer Models", "NVIDIA, 2025. The public case: about 8% attention layers, up to 3× faster inference than similar transformers.", "https://arxiv.org/abs/2504.03624"],
+    ["paper", "Repeat After Me: Transformers are Better than State Space Models at Copying", "Jelassi et al., 2024. The theoretical and empirical limit of fixed-state models on copying and retrieval.", "https://arxiv.org/abs/2402.01032"],
+    ["paper", "Efficiently Modeling Long Sequences with Structured State Spaces", "Gu, Goel and Ré, 2021. S4, the first model to solve Long Range Arena Path-X (16,384 steps).", "https://arxiv.org/abs/2111.00396"],
+    ["paper", "RWKV: Reinventing RNNs for the Transformer Era", "Peng et al., 2023. Linear-attention RNN scaled to 14B parameters.", "https://arxiv.org/abs/2305.13048"],
+    ["paper", "Jamba: A Hybrid Transformer-Mamba Language Model", "Lieber et al., 2024. One attention layer per seven Mamba layers plus MoE, 256K context on one 80 GB GPU.", "https://arxiv.org/abs/2403.19887"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A legal-tech team serves a 7B model that reads contracts and answers questions about them. At launch, most contracts are a few thousand tokens and everything is fine. Then customers start uploading entire deal rooms: two hundred pages, 120,000 tokens per request. The prefill for one such request now takes many seconds, and during generation each GPU can hold only a handful of these conversations, because each one's KV cache is several times larger than a short conversation's. Nothing is broken. The architecture is simply doing what it was designed to do: every token is compared with every other token, and every token's keys and values are kept for the whole conversation.</p>
+<p>The team's manager asks the question that senior interviewers now ask directly: "Isn't there an architecture that doesn't have this problem?" There is a whole family of them. Linear attention, state-space models such as S4 and Mamba, RWKV, and the newer gated linear layers all process a sequence with a fixed-size memory that is updated once per token, so their cost grows linearly with length and their decoding memory does not grow at all. They are not curiosities: NVIDIA's Nemotron-H, IBM's Granite 4.0, AI21's Jamba and Alibaba's Qwen3-Next are shipping models built mostly from such layers.</p>
+<p>But none of those shipping models threw attention away completely. Each keeps a small share of ordinary attention layers, about one in eight to one in ten. Understanding why is the real content of this lesson, and it is what separates a strong interview answer from "Mamba is linear, so it's better". A fixed-size memory has to compress, and compression loses exactly the thing attention is best at: looking up an arbitrary detail from far back in the context.</p>
+<p>The lesson starts by measuring where attention's quadratic cost actually bites, in FLOPs and in cache bytes, with real numbers. It then builds linear attention from softmax attention by one substitution and shows by hand how that turns a transformer into a recurrent network. From there it builds state-space models: the continuous system, discretisation, S4's fixed version and why it failed on language, and Mamba's selection mechanism, worked through a five-token example. It explains how a recurrence with input-dependent coefficients is still trained in parallel (the associative scan), how Mamba-2 showed these layers are a kind of masked attention, and where RWKV and gated delta-rule layers fit. It ends with what these models win and lose, why hybrids won, and how to answer "would you use one in production?"</p>
+</section>
+
+<section data-field="primer">
+<h4>Two ways to remember a conversation</h4>
+<p>Imagine two assistants taking part in a long meeting. The first writes down every sentence anyone says, word for word, and before speaking rereads the whole transcript. She never forgets a detail, and she can quote anything exactly, but her notebook grows with the meeting and rereading it takes longer every time. The second keeps a single index card. After each sentence she updates the card: crosses out what no longer matters, adds what does, rewrites a summary line. Her card never grows, and glancing at it takes the same time at minute 5 and minute 500. But if someone at minute 500 asks "what was the exact phone number Priya read out at minute 12?", she may not have it, unless she decided at minute 12 that it was worth keeping.</p>
+<p>The first assistant is attention. The transcript is the KV cache from lm5: every token's key and value, in every layer, kept for the whole sequence. Rereading it is the attention computation: each new token scores itself against every stored key. The second assistant is a recurrent model with a fixed-size state: linear attention, a state-space model, RWKV. The card is the state; updating it is one cheap step per token.</p>
+<h4>Where the analogy holds and where it breaks</h4>
+<p>The analogy captures the trade: exact recall with growing cost against constant cost with lossy memory. Two things about real models are better than the analogy suggests. First, the "card" is large. A Mamba layer's state is tens of thousands of numbers, and a model has dozens of layers, so the state of a whole model is millions of numbers: a very big card. Second, how the card is updated is learned during training, and the newer designs (Mamba onwards) let the update depend on the current token, so the model learns which kinds of tokens deserve space. What the analogy gets right is the limit: whatever size the card is, a long enough input will contain more detail than fits, and a question asked afterwards can only be answered from what was kept.</p>
+<h4>The big picture in four moves</h4>
+<p>First, attention's cost: comparing all pairs of n tokens costs n² work, and keeping every token's keys and values costs memory that grows with n. Second, linear attention: if the similarity between a query and a key were a plain dot product of two transformed vectors instead of an exponential, the sum over the past could be kept as one running matrix, and attention would become a recurrence. Third, state-space models: a separate line of work, starting from control theory, built recurrences that are linear in the state, can be trained in parallel, and keep information over very long ranges; Mamba added the ability to choose what to store. Fourth, hybrids: put mostly fixed-state layers in the stack for speed, and a few attention layers for exact lookup.</p>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Left: attention keeps one key-value entry per past token and the new token reads all of them. Right: a recurrent layer keeps one fixed-size state that is updated once per token and read by the new token.">
+  <defs><marker id="lm21-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="160" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Attention: keep everything</text>
+    <text x="480" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Recurrent state: keep a summary</text>
+    <rect x="30" y="40" width="34" height="30" style="fill:var(--s1);fill-opacity:0.3;stroke:var(--s1)"/>
+    <rect x="68" y="40" width="34" height="30" style="fill:var(--s1);fill-opacity:0.3;stroke:var(--s1)"/>
+    <rect x="106" y="40" width="34" height="30" style="fill:var(--s1);fill-opacity:0.3;stroke:var(--s1)"/>
+    <rect x="144" y="40" width="34" height="30" style="fill:var(--s1);fill-opacity:0.3;stroke:var(--s1)"/>
+    <rect x="182" y="40" width="34" height="30" style="fill:var(--s1);fill-opacity:0.3;stroke:var(--s1)"/>
+    <rect x="220" y="40" width="34" height="30" style="fill:var(--s1);fill-opacity:0.3;stroke:var(--s1)"/>
+    <text x="142" y="88" text-anchor="middle" style="fill:var(--muted)">one K,V entry per past token (grows with n)</text>
+    <rect x="262" y="40" width="34" height="30" style="fill:var(--accent);fill-opacity:0.35;stroke:var(--accent)"/>
+    <text x="279" y="60" text-anchor="middle" style="fill:var(--ink)">new</text>
+    <line x1="270" y1="110" x2="47" y2="74" marker-end="url(#lm21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="273" y1="110" x2="123" y2="74" marker-end="url(#lm21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="276" y1="110" x2="199" y2="74" marker-end="url(#lm21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="279" y1="110" x2="237" y2="74" marker-end="url(#lm21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="160" y="135" text-anchor="middle" style="fill:var(--ink-2)">new query scores all n keys</text>
+    <text x="160" y="170" text-anchor="middle" style="fill:var(--ink)">per decode step: work ∝ n, memory ∝ n</text>
+    <text x="160" y="190" text-anchor="middle" style="fill:var(--ink)">whole sequence: work ∝ n²</text>
+    <text x="160" y="220" text-anchor="middle" style="fill:var(--good)">can look up any past detail exactly</text>
+    <line x1="320" y1="34" x2="320" y2="250" style="stroke:var(--line-2);stroke-dasharray:4 4;fill:none"/>
+    <rect x="400" y="40" width="80" height="60" style="fill:var(--s2);fill-opacity:0.3;stroke:var(--s2)"/>
+    <text x="440" y="66" text-anchor="middle" style="fill:var(--ink)">state h</text>
+    <text x="440" y="84" text-anchor="middle" style="fill:var(--muted)">fixed size</text>
+    <rect x="540" y="55" width="40" height="30" style="fill:var(--accent);fill-opacity:0.35;stroke:var(--accent)"/>
+    <text x="560" y="75" text-anchor="middle" style="fill:var(--ink)">x_t</text>
+    <line x1="538" y1="70" x2="484" y2="70" marker-end="url(#lm21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <path d="M400,60 C360,60 360,90 396,90" marker-end="url(#lm21-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="350" y="112" style="fill:var(--ink-2)">h_t = f(h_{t−1}, x_t)</text>
+    <line x1="440" y1="102" x2="440" y2="130" marker-end="url(#lm21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="440" y="146" text-anchor="middle" style="fill:var(--ink-2)">output y_t read from h_t</text>
+    <text x="480" y="170" text-anchor="middle" style="fill:var(--ink)">per decode step: work and memory constant</text>
+    <text x="480" y="190" text-anchor="middle" style="fill:var(--ink)">whole sequence: work ∝ n</text>
+    <text x="480" y="220" text-anchor="middle" style="fill:var(--crit)">can only recall what it chose to keep</text>
+  </g>
+</svg>
+<figcaption>The whole lesson is this trade. Attention's memory grows with every token and makes every detail retrievable; a recurrent state stays the same size and has to compress, so it is cheap but forgetful.</figcaption>
+</figure>
+<h4>Why this was hard for so long</h4>
+<p>Recurrent networks are old (dl7). They lost to transformers for two reasons: they had to be trained one time step after another, which wastes a GPU, and they forgot long-range information because gradients vanished through many nonlinear steps. Everything in this lesson is a way around those two problems. Linear attention and state-space models keep the update <em>linear in the state</em>, which turns out to be exactly what makes parallel training possible, and they parameterise the update so information can survive for thousands of steps. The remaining problem, what to keep, is where Mamba's "selectivity" comes in.</p>
+<p>A reader who stops here should hold three facts: attention is quadratic in work and linear in decoding memory; the alternatives keep a fixed-size, learned summary and are linear in work and constant in decoding memory; and the summary's size is a hard ceiling on exact recall, which is why production models mix the two.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Where attention's cost actually comes from</h4>
+<p>Take one attention layer with model width d_model and a sequence of n tokens. Computing scores QKᵀ multiplies an n × d matrix by a d × n matrix in every head; across all heads that is n² × d_model multiply-adds. Multiplying the n × n weights by V costs the same again. Counting a multiply-add as 2 FLOPs, the attention-score work per layer is about 4n²·d_model FLOPs. The rest of the layer, the Q, K, V and output projections and the MLP, costs about 2 FLOPs per parameter per token (gpu3), so for the whole model about 2·N·n, linear in n.</p>
+<p>Plug in a 6.7B model shaped like Llama 2 7B: 32 layers, d_model = 4,096. Attention-score FLOPs = 4 × n² × 4,096 × 32 = 524,288 n². Weight FLOPs = 2 × 6.7 × 10⁹ × n.</p>
+<table>
+<thead><tr><th>Prefill length n</th><th>Attention scores</th><th>Weight matmuls</th><th>Attention share</th></tr></thead>
+<tbody>
+<tr><td>4,096</td><td>8.8 TFLOP</td><td>55 TFLOP</td><td>14%</td></tr>
+<tr><td>32,768</td><td>563 TFLOP</td><td>439 TFLOP</td><td>56%</td></tr>
+<tr><td>131,072</td><td>9,007 TFLOP</td><td>1,756 TFLOP</td><td>84%</td></tr>
+</tbody>
+</table>
+<p>The two are equal where 524,288 n² = 1.34 × 10¹⁰ n, at n ≈ 25,600 tokens. A causal kernel can skip the masked half of the score matrix, which roughly doubles that crossover, but the shape is the same: below a few tens of thousands of tokens attention is a minority of the work, and above it attention takes over. So the first honest answer to "is attention too expensive?" is "it depends on the length". At 4K tokens, replacing attention with something linear saves at most about a seventh of the prefill compute.</p>
+<p>Decoding is different. Each new token computes one row of scores against the n cached keys, so its attention work is only linear in n, but it must read the whole KV cache (lm5). For Llama 2 7B that is 512 KiB per token of context: at 100,000 tokens of context, about 49 GiB read from memory for every single generated token of that sequence, far more than the 13.5 GB of weights. Decode is memory-bound (gpu10), so this is the real long-context bill: cache capacity limits how many sequences fit, and cache reads set the time per token. Any architecture that keeps a fixed-size state instead of a cache attacks this directly.</p>
+
+<h4>2. Linear attention: one substitution</h4>
+<p>Write causal softmax attention for one query position i, one head:</p>
+<pre>out_i = Σ_{j≤i} sim(q_i, k_j) · v_j  /  Σ_{j≤i} sim(q_i, k_j),     sim(q, k) = exp(q·k / √d)</pre>
+<p>The exponential is what makes this expensive: exp(q·k) does not factor into "something of q" times "something of k", so for each new query you must revisit every key. Katharopoulos et al. (2020) asked what happens if the similarity is replaced by a dot product of feature maps, sim(q, k) = φ(q)·φ(k), where φ is some function that keeps every entry positive (scores must be non-negative to act as weights). They used φ(x) = elu(x) + 1, which is x + 1 for positive x and eˣ for negative x, always above zero.</p>
+<p>Now the numerator is Σ_j (φ(q_i)·φ(k_j)) v_j. A dot product times a vector can be regrouped, because matrix multiplication is associative: (φ(q)ᵀφ(k)) vᵀ = φ(q)ᵀ (φ(k) vᵀ). So</p>
+<pre>out_i = φ(q_i)ᵀ S_i / φ(q_i)ᵀ z_i,    S_i = Σ_{j≤i} φ(k_j) v_jᵀ   (a d × d_v matrix)
+                                       z_i = Σ_{j≤i} φ(k_j)        (a d-vector)</pre>
+<p>S and z do not depend on the query. They are running sums, so S_i = S_{i−1} + φ(k_i)v_iᵀ: one outer product per token. The query then reads the result with one matrix-vector product. The whole past has been folded into a fixed d × d_v matrix: with d = d_v = 128 that is 16,384 numbers per head, regardless of n. This is the sense of the paper's title, "Transformers are RNNs": the layer is now a recurrent network whose hidden state is (S, z).</p>
+<p><strong>Worked by hand.</strong> Let the feature-mapped keys, values and the third query be (two dimensions, scalar values to keep arithmetic small):</p>
+<table>
+<thead><tr><th>Token</th><th>φ(k)</th><th>v</th></tr></thead>
+<tbody><tr><td>1</td><td>[1, 0]</td><td>2</td></tr><tr><td>2</td><td>[0, 1]</td><td>4</td></tr><tr><td>3</td><td>[1, 1]</td><td>6</td></tr></tbody>
+</table>
+<p>Query at position 3: φ(q₃) = [2, 1]. The quadratic way computes each score: φ(q₃)·φ(k₁) = 2, ·φ(k₂) = 1, ·φ(k₃) = 3; total 6; output (2·2 + 1·4 + 3·6)/6 = 26/6 ≈ 4.33. The linear way first accumulates the state: S₃ = [1,0]·2 + [0,1]·4 + [1,1]·6 = [8, 10], and z₃ = [1,0] + [0,1] + [1,1] = [2, 2]. Then output = φ(q₃)·S₃ / φ(q₃)·z₃ = (2·8 + 1·10)/(2·2 + 1·2) = 26/6. Same answer, but the second way never revisited tokens 1 and 2: it only needed the two running sums.</p>
+<p><strong>What it costs.</strong> The quality. A softmax with large scores can put almost all its weight on one key: if one score is 10 and the rest are 0, exp turns that into a weight of 22,026 against 1 for each other key, a nearly hard lookup. A dot product of positive feature maps cannot be that peaked, and, more fundamentally, every stored association is added into the same matrix S. If keys are not orthogonal, retrieving with one key also returns a bit of every other key's value. With d = 128, at most 128 keys can be perfectly orthogonal; after thousands of tokens the state is a superposition of many associations and retrieval gets blurry. The plain linear transformer was competitive on some tasks and far faster at generation (the paper reports up to 4,000× on very long autoregressive sequences), but it fell clearly behind softmax attention on language modelling. The rest of this lesson is largely the story of fixing that.</p>
+
+<h4>3. State-space models: the continuous system</h4>
+<p>A separate line of work came from signal processing and control theory. A <strong>state-space model</strong> describes a system with an input signal x(t), a hidden state h(t) of N numbers, and an output y(t):</p>
+<pre>dh/dt = A h(t) + B x(t)        y(t) = C h(t)</pre>
+<p>A (N × N) says how the state evolves on its own: negative values mean the state decays back towards zero. B (N × 1) says how the input pushes the state, C (1 × N) how the output reads it. In a neural network this is applied separately to each of D channels of the token vector, each with its own state, so a layer holds D × N state numbers.</p>
+<p>Tokens arrive at discrete steps, so the system is <strong>discretised</strong> with a step size Δ. The standard zero-order-hold rule gives</p>
+<pre>h_t = Ā h_{t−1} + B̄ x_t,    Ā = exp(ΔA),    B̄ = (ΔA)⁻¹(exp(ΔA) − I) · ΔB,    y_t = C h_t</pre>
+<p>In the scalar case with A = −1 and B = 1 this is just Ā = e^{−Δ} and B̄ = 1 − e^{−Δ}: a weighted average between the old state and the new input, with Δ deciding the weights. Δ = 0.1 gives Ā = 0.905, so the state keeps 90% of itself and takes in 10% of the input. Δ = 3 gives Ā = 0.05: the old state is nearly wiped and replaced by the input. Hold on to this; it is the whole idea behind Mamba.</p>
+<p>The recurrence is linear in h. That has a lovely consequence when Ā, B̄ and C are the same at every step (a <strong>linear time-invariant</strong>, LTI, system): unroll it and y_t = Σ_k C Āᵏ B̄ x_{t−k}, which is a convolution of the input with a fixed kernel K = (CB̄, CĀB̄, CĀ²B̄, …). So the same layer can be run as a convolution during training (computed for the whole sequence at once with fast Fourier transforms) and as a recurrence during generation (constant memory per step).</p>
+
+<h4>4. S4: making long memory work</h4>
+<p>Two practical problems stood in the way. A random A forgets everything within a few dozen steps, and computing the kernel K for a long sequence with a general N × N A is expensive. The S4 paper (Gu, Goel and Ré, 2021) fixed both. It initialised A from HiPPO, a construction from earlier work in which the state is the set of coefficients of a running polynomial approximation of the input's whole history, so the state is designed to remember. And it constrained A to a structured form (diagonal plus a low-rank correction) that made computing K cheap and numerically stable. S4 was the first model to solve Path-X in the Long Range Arena benchmark, a task with sequences of 16,384 steps where earlier efficient transformers scored at chance, and it reached 91% on sequential CIFAR-10. Later variants showed a simple diagonal A works nearly as well.</p>
+<p>But S4 and its relatives (H3, Hyena and other long-convolution models) stayed behind transformers on language. The Mamba paper diagnosed why with two synthetic tasks. In <strong>Selective Copying</strong>, a few coloured tokens are scattered among noise tokens at random positions, and the model must output the coloured ones in order. In <strong>Induction Heads</strong>, the model must find an earlier occurrence of the current token and output what followed it, a basic form of in-context recall. An LTI model fails both for the same reason: its response to an input depends only on how many steps ago it arrived, never on what it was. It can learn "remember whatever was 7 steps ago", but not "remember the coloured tokens and ignore the rest", because to do that the update has to depend on the content of the token.</p>
+
+<h4>5. Mamba: let the token choose Δ</h4>
+<p>Mamba's fix (Gu and Dao, 2023) is to make the SSM's parameters functions of the current input. For each token x_t, small linear projections produce that step's Δ_t (through a softplus to keep it positive), B_t and C_t. A stays a learned, input-independent diagonal matrix with negative entries, but since Ā = exp(Δ_t A), the effective decay now changes token by token. The authors call this a <strong>selective SSM</strong> (S6 in the paper).</p>
+<p>Here is what that buys, worked by hand. Use one channel, one state number, A = −1, B = C = 1, so h_t = e^{−Δ_t} h_{t−1} + (1 − e^{−Δ_t}) x_t. The input sequence is 5, 1, 1, 9, 1, and suppose the model has learned to treat 5 and 9 as important (Δ = 3) and the 1s as filler (Δ = 0.01).</p>
+<table>
+<thead><tr><th>t</th><th>x_t</th><th>Δ_t</th><th>Ā = e^{−Δ}</th><th>B̄ = 1 − Ā</th><th>h_t selective</th><th>h_t fixed Δ = 1</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>5</td><td>3</td><td>0.050</td><td>0.950</td><td>4.75</td><td>3.16</td></tr>
+<tr><td>2</td><td>1</td><td>0.01</td><td>0.990</td><td>0.010</td><td>4.71</td><td>1.80</td></tr>
+<tr><td>3</td><td>1</td><td>0.01</td><td>0.990</td><td>0.010</td><td>4.68</td><td>1.29</td></tr>
+<tr><td>4</td><td>9</td><td>3</td><td>0.050</td><td>0.950</td><td>8.79</td><td>6.17</td></tr>
+<tr><td>5</td><td>1</td><td>0.01</td><td>0.990</td><td>0.010</td><td>8.71</td><td>2.90</td></tr>
+</tbody>
+</table>
+<p>The selective version holds the last important value almost unchanged through any number of filler tokens and overwrites it the moment a new important token arrives. The fixed version (Δ = 1 for everything, Ā = 0.37) blends everything together and forgets the 9 within two steps. Δ acts as a learned, per-token gate between "ignore this and keep my memory" and "reset to this". It is closely related to the gates in an LSTM (dl7), and the Mamba paper shows that in the simplest case the selective SSM reduces exactly to a gated RNN update. B_t and C_t being input-dependent adds a second kind of selectivity: which state dimensions a token writes into, and which ones a token reads from, which is what lets the model store several things in different parts of its state.</p>
+<p>On the synthetic tasks, the change is decisive. Swapping S4 for the selective layer solved Selective Copying, and a two-layer Mamba trained on induction heads at length 256 generalised perfectly to sequences of 2²⁰ ≈ 1 million tokens, 4,000× longer than training, while the attention baselines failed beyond about 2× their training length.</p>
+<p><strong>The Mamba block.</strong> Mamba does not use separate attention and MLP sub-layers. Each block projects the input of width D up to E·D (expansion E = 2), splits it into two branches, runs one through a short causal convolution (width 4), a SiLU activation and the selective SSM with state size N = 16, uses the other as a SiLU gate, multiplies the two and projects back down to D. A Mamba model is a stack of these blocks with normalisation and residual connections. On language modelling the paper reports Mamba-3B beating transformers of the same size and matching ones twice its size on downstream evaluations (about 4 points above Pythia-3B on common-sense reasoning and above Pythia-7B), with about 5× the generation throughput of a similar-size transformer.</p>
+
+<h4>6. Training a recurrence in parallel: the scan</h4>
+<p>Selectivity breaks the convolution trick: the kernel K was built from a fixed Ā, and now Ā changes every step. A naive implementation would loop over time, which is exactly what made RNNs slow. Mamba uses the fact that the recurrence is still linear in h.</p>
+<p>Each step is h_t = a_t h_{t−1} + b_t, where a_t = Ā_t and b_t = B̄_t x_t are known before the scan starts, since they depend only on the inputs. Represent step t by the pair (a_t, b_t). Applying step 1 then step 2 to a starting state h gives a₂(a₁h + b₁) + b₂ = (a₂a₁)h + (a₂b₁ + b₂). So two steps compose into one pair:</p>
+<pre>(a₁, b₁) ⊕ (a₂, b₂) = (a₂·a₁,  a₂·b₁ + b₂)</pre>
+<p>This combine operation is associative: (s₁ ⊕ s₂) ⊕ s₃ = s₁ ⊕ (s₂ ⊕ s₃). Any associative operation can be run as a <strong>parallel scan</strong>: combine neighbours in pairs, then pairs of pairs, building a tree, so all n prefix results are ready after about 2 log₂ n parallel rounds instead of n sequential steps.</p>
+<p><strong>Worked by hand</strong> with four steps, all a_t = 0.5 and b = 1, 2, 3, 4, starting from h₀ = 0. Sequentially: h₁ = 1, h₂ = 0.5·1 + 2 = 2.5, h₃ = 0.5·2.5 + 3 = 4.25, h₄ = 0.5·4.25 + 4 = 6.125. With the tree: round 1 combines steps 1–2 into (0.25, 0.5·1 + 2) = (0.25, 2.5) and steps 3–4 into (0.25, 0.5·3 + 4) = (0.25, 5.5), in parallel. Round 2 combines those: (0.25·0.25, 0.25·2.5 + 5.5) = (0.0625, 6.125). The b part is h₄ = 6.125, matching. A second, downward pass of the tree fills in h₂ and h₃ from the partial results.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Parallel scan tree over four steps: round one combines steps one-two and three-four in parallel, round two combines the two results, giving the final state 6.125 in two rounds instead of four.">
+  <defs><marker id="lm21-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">h_t = a_t·h_{t−1} + b_t, as pairs (a, b)</text>
+    <rect x="40" y="40" width="110" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="95" y="62" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">(0.5, 1)</text>
+    <rect x="190" y="40" width="110" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="245" y="62" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">(0.5, 2)</text>
+    <rect x="340" y="40" width="110" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="395" y="62" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">(0.5, 3)</text>
+    <rect x="490" y="40" width="110" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="545" y="62" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">(0.5, 4)</text>
+    <line x1="95" y1="76" x2="160" y2="112" marker-end="url(#lm21-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="245" y1="76" x2="180" y2="112" marker-end="url(#lm21-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="395" y1="76" x2="460" y2="112" marker-end="url(#lm21-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="545" y1="76" x2="480" y2="112" marker-end="url(#lm21-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+    <rect x="100" y="114" width="140" height="34" rx="4" style="fill:var(--s1);fill-opacity:0.25;stroke:var(--s1)"/>
+    <text x="170" y="136" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">(0.25, 2.5)</text>
+    <rect x="400" y="114" width="140" height="34" rx="4" style="fill:var(--s1);fill-opacity:0.25;stroke:var(--s1)"/>
+    <text x="470" y="136" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">(0.25, 5.5)</text>
+    <text x="320" y="136" text-anchor="middle" style="fill:var(--muted)">round 1 (in parallel)</text>
+    <line x1="170" y1="150" x2="305" y2="186" marker-end="url(#lm21-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="470" y1="150" x2="335" y2="186" marker-end="url(#lm21-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+    <rect x="240" y="188" width="160" height="34" rx="4" style="fill:var(--accent);fill-opacity:0.25;stroke:var(--accent)"/>
+    <text x="320" y="210" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">(0.0625, 6.125)</text>
+    <text x="420" y="210" style="fill:var(--muted)">round 2: h₄ = 6.125</text>
+    <text x="20" y="244" style="fill:var(--ink-2)">combine: (a₁, b₁) ⊕ (a₂, b₂) = (a₂a₁, a₂b₁ + b₂) — associative, so the tree is legal</text>
+  </g>
+</svg>
+<figcaption>Because each step is linear in the state, steps can be merged before the state is known. n steps need about log₂ n rounds of merging; a nonlinear RNN update (tanh of a matrix times h) cannot be merged this way, which is why classic RNNs had to run step by step.</figcaption>
+</figure>
+<p><strong>The hardware-aware part.</strong> The expanded state has shape batch × length × D × N, N = 16 times larger than the layer's input and output. Writing it to GPU main memory (HBM) and reading it back would make the layer memory-bound and slow. Mamba's kernel does what FlashAttention does for attention (gpu7): it loads Δ, A, B, C and x from HBM into the fast on-chip SRAM, discretises and scans there, multiplies by C, and writes only the output y back to HBM. In the backward pass it recomputes the states rather than storing them. The paper reports this scan as 20–40× faster than a standard PyTorch implementation and faster than FlashAttention-2 beyond sequence length 2K.</p>
+
+<h4>7. Decoding with Mamba: constant memory</h4>
+<p>At generation time the recurrence is run one token at a time, exactly like an RNN: per layer, keep the SSM state (E·D × N numbers) and the last few inputs for the width-4 convolution, update them with the new token, read the output. Nothing grows. Concretely, Mamba-2.8B has 64 layers and model width 2,560, so inner width 5,120: its per-sequence state is about 64 × 5,120 × (16 + 4) ≈ 6.6 million numbers, about 12.5 MiB in 16-bit, at 10 tokens or 10 million.</p>
+<p>Compare a 3B transformer with Llama 3.2 3B's shape: 28 layers, 8 KV heads of dimension 128. Its cache is 2 × 28 × 8 × 128 × 2 bytes = 112 KiB per token: 448 MiB for a 4,096-token sequence and 14 GiB at 131,072 tokens. At 4K tokens the transformer needs about 36× Mamba's per-sequence memory; at 128K, about 1,150×. The Mamba paper's throughput comparison comes from this: with no cache, the same GPU fits far larger batches, so it reports 4–5× higher generation throughput than a similar-size transformer, and even an untrained Mamba-6.9B out-producing a transformer five times smaller. The gain is not 1,000× because the weights must still be read every step and the per-token projections still do the same arithmetic; removing the cache raises the batch size until those limits bind.</p>
+
+<h4>8. Mamba-2: the SSM is a kind of attention</h4>
+<p>Mamba's scan is fast, but it is not matrix multiplication, and modern GPUs do most of their FLOPs in matrix-multiply units (tensor cores). Mamba-2 (Dao and Gu, 2024, "Transformers are SSMs") found a way to use them. It restricts A further: instead of a diagonal with a separate decay per state dimension, each head has a single scalar decay, A_t = a_t · I. With that restriction, write out what the recurrence produces for the whole sequence:</p>
+<pre>y_i = Σ_{j≤i} C_iᵀ (a_i · a_{i−1} · … · a_{j+1}) B_j x_j   =   Σ_{j≤i} L_ij · (C_i · B_j) · x_j</pre>
+<p>Read it as attention. C_i plays the query, B_j the key, x_j the value, and L_ij = a_i ⋯ a_{j+1} is a mask that is 0 above the diagonal and holds the accumulated decay between positions j and i below it. In matrix form, y = (L ∘ CBᵀ)x: masked linear attention, with no softmax and a decaying mask instead of the plain causal mask. If every a = 1, L is the ordinary causal mask and this is exactly the linear attention of section 2. The paper names this equivalence <strong>state space duality</strong> (SSD) and shows the matrix L ∘ CBᵀ belongs to a known family, semiseparable matrices, whose blocks below the diagonal have rank at most N.</p>
+<p>The duality gives two ways to compute the same layer: the linear recurrence (cheap, sequential) and the quadratic matrix form (n² work, but pure matrix multiplies). Mamba-2's algorithm uses both. It cuts the sequence into chunks of, say, 64–256 tokens. Within each chunk it uses the quadratic form, which is small and runs on tensor cores; between chunks it passes the N-dimensional state with the recurrence. The authors report the layer as 2–8× faster than Mamba's scan while allowing states 8× larger or more with little slowdown; Mamba-2 models typically use N of 64 to 256 instead of 16, and use multiple heads, like multi-head attention.</p>
+<p>The duality also clarified the landscape: linear attention, RetNet (linear attention with a fixed decay), Gated Linear Attention (an input-dependent decay) and Mamba-2 are points in one family, differing in what the decay mask L looks like and how the state is updated.</p>
+
+<h4>9. RWKV and the gated linear-attention family</h4>
+<p>RWKV (Peng et al., 2023; the name is "Receptance Weighted Key Value") came from a different direction, an open community project to build an RNN that trains like a transformer. Its token-mixing step is a linear-attention-style weighted sum of past values, where each channel has a learned exponential decay w so that older tokens count for less, plus a "receptance" gate that controls how much of the result passes through. Because the decay is a fixed exponential per channel, the sum can be computed in parallel for training and as a recurrence for generation. The paper trained models from 169M to 14B parameters on the Pile (330B tokens) and reported performance on par with similarly sized transformers. Later RWKV versions made the decay depend on the input, converging on the same lesson as Mamba: the model must be able to choose, per token, how much to forget.</p>
+<p>The newest layers add the <strong>delta rule</strong>. Plain linear attention only adds: S ← S + vkᵀ (using the orientation where S maps keys to values). If key k was seen before with an old value, the new value is piled on top of it. The delta rule first asks the state what it currently returns for k, v_old = S k, and then corrects it: S ← S + β (v − S k) kᵀ, where β between 0 and 1 is a learned, input-dependent write strength. With β = 1 and a unit-length k, after the update S k = v exactly: the old association has been overwritten rather than blurred. <strong>Gated DeltaNet</strong> adds a forget gate α on top, S ← α S + β(v − αS k)kᵀ, so the layer can both fade everything and surgically replace one association. It is the linear layer in Alibaba's Qwen3-Next.</p>
+
+<h4>10. What fixed-state models win, and what they lose</h4>
+<p>The wins are mechanical and large. Training and prefill work grows linearly with length, so long-document prefill gets cheaper as length grows past the crossover of section 1. Decoding needs constant time and memory per token, so a GPU can hold many more concurrent long generations, and there is no cache to page, evict or offload. Throughput gains of 3–5× for similar quality are typical in the papers, and much more for very long generations.</p>
+<p>The loss is exact recall. Everything the model has read must live in the state, and the state was written before the model knew what would be asked. Jelassi et al. (2024, "Repeat After Me") made this precise: they proved a two-layer transformer can copy strings of length exponential in its size, while any model with a fixed-size latent state cannot copy strings longer than its state can encode; empirically, transformers learned copying far faster and generalised to longer strings, and pretrained transformers dramatically outperformed pretrained SSMs at copying and at a "phone book" task (give a list of names and numbers, then ask for one number). This is the in-context recall that powers few-shot prompting, quoting from documents, code editing ("change this function", which requires reproducing the rest exactly) and needle-in-a-haystack retrieval.</p>
+<p>The loss is also not uniform. Fixed-state models are often good at "gist" over long inputs, at streams where only recent context matters, and at signals like audio and genomics, where Mamba set state-of-the-art results. They struggle when an arbitrary, unpredictable detail must be retrieved exactly.</p>
+
+<h4>11. Hybrids: a few attention layers go a long way</h4>
+<p>If attention provides retrieval and the SSM provides cheap sequence mixing, combine them. The Mamba-2 paper ran the clean experiment: 350M-parameter models with 48 layers, trained on 7B tokens of the Pile, with 0 to 24 of the layers replaced by attention. Validation perplexity was 8.60 for pure Mamba-2, 8.68 for a pure Transformer++ baseline, and best, 8.26, with about six attention layers, near 10% of the stack. At 2.7B parameters trained on 300B tokens, replacing 6 of 64 SSD layers with attention "noticeably" improved over both pure models. The authors' interpretation: SSM layers work well as general sequence-to-sequence maps, and attention layers act as a retrieval mechanism, so the model does not have to compress all of its context into the state.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Three layer stacks drawn as columns of blocks: a transformer with attention in every block, a pure SSM stack, and a hybrid with one attention block in every eight.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="105" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Transformer</text>
+    <text x="320" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Pure SSM</text>
+    <text x="535" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Hybrid (1 in 8)</text>
+    <g>
+      <rect x="40" y="30" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+      <rect x="40" y="50" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+      <rect x="40" y="70" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+      <rect x="40" y="90" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+      <rect x="40" y="110" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+      <rect x="40" y="130" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+      <rect x="40" y="150" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+      <rect x="40" y="170" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+    </g>
+    <g>
+      <rect x="255" y="30" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="255" y="50" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="255" y="70" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="255" y="90" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="255" y="110" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="255" y="130" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="255" y="150" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="255" y="170" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+    </g>
+    <g>
+      <rect x="470" y="30" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="470" y="50" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="470" y="70" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="470" y="90" width="130" height="16" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+      <rect x="470" y="110" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="470" y="130" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="470" y="150" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+      <rect x="470" y="170" width="130" height="16" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+    </g>
+    <text x="105" y="206" text-anchor="middle" style="fill:var(--ink-2)">KV cache in all 8 layers</text>
+    <text x="320" y="206" text-anchor="middle" style="fill:var(--ink-2)">no cache; weak exact recall</text>
+    <text x="535" y="206" text-anchor="middle" style="fill:var(--ink-2)">cache in 1 layer; recall kept</text>
+    <rect x="200" y="214" width="12" height="12" style="fill:var(--s1);fill-opacity:0.45;stroke:var(--s1)"/>
+    <text x="216" y="224" style="fill:var(--muted)">attention block</text>
+    <rect x="330" y="214" width="12" height="12" style="fill:var(--s2);fill-opacity:0.35;stroke:var(--s2)"/>
+    <text x="346" y="224" style="fill:var(--muted)">SSM / linear block</text>
+  </g>
+</svg>
+<figcaption>A hybrid keeps a few attention layers spread through the stack. Its KV cache shrinks by roughly the share of layers that are no longer attention, while those few layers restore the exact lookups a fixed state cannot do.</figcaption>
+</figure>
+<p>Production models converged on this design. Jamba (AI21, 2024) uses one attention layer for every seven Mamba layers, adds mixture-of-experts layers (lm17), and fits a 256K-token context on a single 80 GB GPU. NVIDIA's Nemotron-H (2025) makes about 8% of its layers attention, spread evenly: 4 of 52 layers in the 8B model and 10 of 118 in the 56B, with the rest alternating Mamba-2 and MLP layers. IBM describes Granite 4.0 Hybrid as about nine Mamba-2 layers per attention layer. Qwen3-Next (Alibaba, 2025) repeats a pattern of three Gated DeltaNet layers followed by one gated-attention layer, 48 layers in all.</p>
+
+<h4>12. How to answer "would you use one in production?"</h4>
+<p>A strong answer is conditional and specific. Yes, a hybrid, when the workload has long inputs or long generations at high concurrency, so the KV cache is your bottleneck: long-document analysis, long agent trajectories, batch generation over large corpora. Probably not, or not yet, when prompts are short (attention is then a small share of cost and the gain is small), when the product depends on exact quoting or editing of long inputs, or when your serving engine does not support the architecture with the features you rely on, such as prefix caching for a shared system prompt and speculative decoding. A pure SSM is rarely the right call for a general assistant today; a hybrid with real attention layers usually is the candidate. And whatever the published speed-up, measure it on your traffic in your engine, and evaluate on retrieval-heavy long-context probes, because that is where these models fail first.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why linearity in the state is the whole trick</h4>
+<p>Classic RNNs compute h_t = tanh(W h_{t−1} + U x_t). The tanh and the matrix W applied to h mean two steps cannot be merged into one step of the same form before h is known, so the computation is inherently sequential. Every architecture in this lesson keeps the update linear in h, with all the nonlinearity in how the coefficients are computed from the input. That makes steps composable (the scan), makes the whole sequence map a matrix (the SSD view), and keeps gradients from passing through repeated squashing nonlinearities. The nonlinearity has not vanished; it lives between layers and inside the gates. This is also why these models can still be deep and expressive: each layer is linear in its own state but the stack is not.</p>
+
+<h4>Why A is negative, diagonal and initialised carefully</h4>
+<p>Stability requires the state not to blow up: with Ā = exp(ΔA), entries of A must have negative real parts so |Ā| &lt; 1. Mamba parameterises A as minus the exponential of a learned parameter to guarantee that. Diagonal A makes each state dimension an independent decaying accumulator, so the update is elementwise and cheap. The range of decay rates matters: Initialisations from the diagonal variants of S4 spread A's entries so that different state dimensions forget on different time scales, from a few tokens to thousands, giving the layer multi-scale memory before training even starts. Δ then scales all of them per token. A long-range dependency survives only if some dimension has a decay close to 1 and the model keeps Δ small while the information must persist.</p>
+
+<h4>The state-size trade-off</h4>
+<p>Recall quality rises with state size. Mamba's ablation found that increasing the state size N (up to 16) in the selective SSM improved perplexity by more than 1.0 for about 1% more parameters, while the same increase did little for the non-selective version: a bigger card helps only if you can choose what to write on it. But in Mamba's scan, cost and memory traffic scale with N, which is why N stayed at 16. Mamba-2's chunked matrix-multiply algorithm makes larger N cheap (64 to 256), and that is a real part of its quality gain. The lower bound is still there: a state of S numbers holds a bounded amount of information, and an input with more retrievable detail than that cannot be fully kept.</p>
+
+<h4>The duality, more precisely</h4>
+<p>The SSD view says a Mamba-2 layer and a masked linear-attention layer are the same sequence map when A is scalar per head. Two consequences for engineers. First, any efficient-attention trick that relies on the n × n matrix being structured can be imported, and the chunked algorithm is exactly "quadratic attention inside small blocks, recurrence across blocks", which is the same split FlashAttention-style kernels use for tiling. Second, it shows what an SSM cannot do that softmax attention can: the effective attention matrix has low-rank structure below the diagonal (rank at most N per block), while a softmax attention matrix can be full-rank, which is another way to say that softmax can make independent, sharp choices for every query.</p>
+
+<h4>Why gating plus delta rule beats either alone</h4>
+<p>Decay alone (Mamba-2, RetNet, Gated Linear Attention) can forget, but only by fading everything stored in a head at the same rate. The delta rule alone can overwrite the value for one key, but never clears stale entries for keys that do not come up again. Gated DeltaNet's update does both: α fades the whole memory when context shifts (a new document, a new topic), while β(v − Sk)kᵀ replaces one association precisely. Seen as optimisation, the delta rule is one step of online gradient descent on the loss ½‖Sk − v‖², so the state is literally being trained, token by token, to map keys to values. That framing ("test-time training" or "fast weights") is why these layers are sometimes described as learning in context.</p>
+
+<h4>Where the throughput claims come from, and their small print</h4>
+<p>Published speed-ups are real but conditional. Mamba's 5× figure compares generation throughput with batch sizes chosen to fill the GPU, at prompt and generation lengths where the transformer's cache limits its batch. Nemotron-H's "up to 3×" and its 2.4× more output tokens per second per GPU against Qwen-2.5-72B and Llama-3.1-70B were measured at long input and output lengths (the paper's setting used tens of thousands of tokens of generation). At short prompts and short answers, both kinds of model are limited by reading the weights and the gap shrinks towards zero. When an interviewer quotes a speed-up, ask "at what sequence length and batch?"</p>
+
+<h4>Training at long context still needs care</h4>
+<p>Linear cost does not make long-context training free. Recurrent models that never saw long sequences in training may not use them well; the state's decay rates adapt to training lengths, and extrapolation beyond them is not automatic outside synthetic tasks. Hybrids inherit the positional questions of their attention layers, though some (Jamba, for example) report that the Mamba layers provide enough position information that the attention layers need no explicit positional encoding. In practice, long-context ability still comes from training on long documents, the subject of lm22.</p>
+
+<h4>Distilling transformers into hybrids</h4>
+<p>Because the linear layers resemble attention, a trained transformer can be partly converted: replace some attention layers with linear or SSM layers initialised from the attention weights (keys and queries map to B and C), then distil from the original (lm19). Several groups have done this to get hybrid efficiency without pretraining from scratch. It is cheaper than pretraining, but the converted layers still have a fixed state, so recall-heavy abilities degrade unless enough attention layers are kept.</p>
+</section>
+
+<section data-field="prod">
+<h4>The public case: Nemotron-H (NVIDIA, 2025)</h4>
+<p>NVIDIA built Nemotron-H specifically to cut inference cost for reasoning workloads, where models generate long chains of thought. Its 8B and 56B models replace most self-attention layers with Mamba-2 layers: about 8% of layers remain attention, evenly spread (4 of 52 in the 8B model, 10 of 118 in the 56B), the rest alternate Mamba-2 and MLP layers. The paper reports accuracy better than or on par with similarly sized open transformers (Qwen-2.5-7B/72B, Llama-3.1-8B/70B) and up to 3× faster inference; in its long-generation benchmark, the 56B model produced 2.4× more output tokens per second per GPU than Qwen-2.5-72B and Llama-3.1-70B. It also introduced a pruned and distilled 47B version about 20% faster than the 56B with similar accuracy, and an FP8 training recipe. It is a good model answer to "what does a production hybrid look like?": mostly cheap layers, a few attention layers for retrieval, and a speed claim that depends on long sequences.</p>
+
+<h4>Failure modes in practice</h4>
+<p><strong>Missing engine features.</strong> Attention-model features do not transfer automatically. Prefix caching needs per-token caches that can be cut at any boundary; an SSM state is a fused summary, so engines must save state snapshots at chosen block boundaries and recompute from the nearest one, which makes hits coarser and costs memory. Speculative decoding needs to roll back rejected draft tokens, which for an SSM means restoring a saved state. Support for these in open serving engines arrived later for hybrids than for transformers and differs by engine and version; check the current documentation before planning around them. If your traffic shares a long system prompt, losing prefix caching can erase the throughput gain.</p>
+<p><strong>Silent recall regressions.</strong> A hybrid can match a transformer on general benchmarks and still fail on your specific long-context lookups: quoting a clause verbatim, extracting every date from a contract, editing code without changing the rest. These show up as subtle paraphrases or omissions, not errors. Build evaluation sets that require exact retrieval at your real lengths.</p>
+<p><strong>Numerical sensitivity.</strong> The recurrence multiplies many decay factors; small errors in Δ or A compound over long sequences. State is often kept in higher precision than weights, and aggressive quantisation of the SSM path can hurt more than quantising MLPs. Test quantised variants at long lengths, not just short prompts.</p>
+<p><strong>Kernel and hardware coverage.</strong> Mamba's efficiency depends on fused scan or chunked kernels. On hardware or frameworks without them, the layer falls back to slow implementations and the advantage disappears. This matters for on-device and non-NVIDIA deployments.</p>
+
+<h4>What to measure</h4>
+<p>For a migration decision, compare against a same-size transformer at your real prompt and output length distribution: time to first token, time per output token, maximum concurrent sequences per GPU before latency targets break, and cost per million tokens. On quality, track task metrics plus targeted probes at increasing context lengths (multi-key needle retrieval, variable tracking, verbatim quotation). Watch memory per sequence as context grows: for a hybrid it should grow at roughly the attention-layer share of the transformer's rate, and if it grows faster, something (often a fallback path) is caching more than expected.</p>
+
+<h4>Knobs</h4>
+<p>The main architectural knob is the attention share and placement: published hybrids use between about 1 in 4 (Qwen3-Next) and 1 in 12 (Nemotron-H) attention layers, spread through the stack rather than clustered. State size N trades memory and compute for recall. Some hybrids also use sliding-window attention in some layers to bound cache size further. As a consumer of models, your knobs are choice of model, context limit, batch size and whether to fall back to a transformer for recall-critical requests.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> see the quadratic and linear curves on your own CPU, and confirm that linear attention's recurrent form gives exactly the same output as its quadratic form. About 10 minutes, NumPy only.</p>
+<ol>
+<li>Activate the NumPy environment: <code>C:\ra_projects\how-to-train-your-gpt\gpt_env\Scripts\python.exe</code> (any Python 3.12 with NumPy works).</li>
+<li>Save and run this script as <code>lm21_lab.py</code>:</li>
+</ol>
+<pre>import time, numpy as np
+rng = np.random.default_rng(0)
+d = 64
+phi = lambda x: np.where(x &gt; 0, x + 1.0, np.exp(x))        # elu(x) + 1
+
+def softmax_attn(Q, K, V):                                  # causal, O(n^2)
+    n = Q.shape[0]
+    S = Q @ K.T / np.sqrt(d)
+    S[np.triu_indices(n, 1)] = -np.inf
+    W = np.exp(S - S.max(1, keepdims=True))
+    return (W / W.sum(1, keepdims=True)) @ V
+
+def linear_attn_quadratic(Q, K, V):                         # same maths, n x n form
+    A = np.tril(phi(Q) @ phi(K).T)
+    return (A @ V) / A.sum(1, keepdims=True)
+
+def linear_attn_recurrent(Q, K, V):                         # running state, O(n)
+    S = np.zeros((d, d)); z = np.zeros(d); out = np.empty_like(V)
+    for i, (q, k, v) in enumerate(zip(phi(Q), phi(K), V)):
+        S += np.outer(k, v); z += k
+        out[i] = q @ S / (q @ z)
+    return out
+
+Q, K, V = (rng.standard_normal((512, d)) for _ in range(3))
+print("max diff:", np.abs(linear_attn_quadratic(Q, K, V) - linear_attn_recurrent(Q, K, V)).max())
+
+for n in [512, 1024, 2048, 4096]:       # 8192 needs ~1.5 GB for softmax
+    Q, K, V = (rng.standard_normal((n, d)) for _ in range(3))
+    t = time.perf_counter(); softmax_attn(Q, K, V); ts = time.perf_counter() - t
+    t = time.perf_counter(); linear_attn_recurrent(Q, K, V); tl = time.perf_counter() - t
+    print(f"n={n:5d}  softmax {ts*1e3:8.1f} ms   linear {tl*1e3:8.1f} ms")</pre>
+<p><strong>What to look for.</strong> The max difference should be around 1e-15: the two forms are the same function. In the timing table, each doubling of n should multiply the softmax time by roughly 4 once n is large (quadratic) and the recurrent time by roughly 2 (linear). At small n the Python loop makes linear attention <em>slower</em>, because NumPy's matrix multiply is highly optimised and the loop is not; the crossover length you see is the CPU version of section 1's point that the asymptotic win only matters past some length. Optional: add a decay (<code>S = 0.99*S + np.outer(k, v)</code>) and watch the outputs change; that is the step from linear attention towards Mamba-2.</p>
+</section>
+
+<section data-field="drill">
+<b>Design: pick an architecture for a long-document service</b>
+<p>You run a contract-analysis service. Requests are 60K–120K tokens of contract text plus a question; answers are 300–800 tokens. About 40% of questions ask for verbatim clauses or exact figures. A vendor proposes switching from your 8B transformer to an 8B hybrid with 4 attention layers out of 52, quoting 3× throughput. Your manager asks: switch or not?</p>
+<details><summary>Answer</summary>
+<p>Start from where the cost is. At 100K tokens, the transformer's prefill is dominated by attention arithmetic (well past the ~25K-token crossover for a 7B-class model), and each sequence's KV cache is many GiB, so concurrency per GPU is low. A hybrid with 4 of 52 attention layers cuts the cache by roughly the ratio of attention layers (compared with a transformer that has attention in all its 32 or so blocks, about an eighth) and makes most of prefill linear, so the throughput claim is plausible for this workload, unlike for a chatbot with short prompts.</p>
+<p>The risk is the 40% of verbatim questions: exact retrieval from long context is precisely what fixed-state layers are worst at, and only 4 layers can do exact lookups. So the decision rests on evaluation, not the vendor number. Build a test set from real contracts with exact-clause and exact-figure questions at 60K, 90K and 120K tokens, plus your normal question mix; compare exact-match rates and task scores. Measure throughput and p95 latency in your serving engine with your prompt lengths and with prefix caching configured as you would run it.</p>
+<p>Likely outcomes: if the hybrid matches on exact retrieval within a point or two, switch and bank the saving. If it loses on verbatim questions only, consider routing: hybrid for summaries and reasoning, transformer (or retrieval of the relevant clause first, then a short-context call) for verbatim questions. Either way, keep the transformer as an A/B baseline for a few weeks of real traffic.</p>
+</details>
+</section>

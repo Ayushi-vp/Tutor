@@ -1,0 +1,556 @@
+<!-- topic source for os/os11; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "os11",
+  "t": "I/O: interrupts, DMA, blocking vs non-blocking, select/poll/epoll and io_uring",
+  "tag": "I/O",
+  "sum": "How data moves between devices and programs: device registers, polling versus interrupts, DMA and descriptor rings, the block layer and I/O schedulers, the five I/O models, how select, poll and epoll work inside the kernel and why they scale differently, and how io_uring replaces system calls with shared rings.",
+  "prereq": [
+    [
+      "os1",
+      "Hardware interrupts enter the kernel through handlers registered at boot; every system call costs a mode switch, so batching them matters."
+    ],
+    [
+      "net13",
+      "A socket is a file descriptor with kernel buffers; servers handle many connections with non-blocking sockets and an event loop, using readiness APIs such as epoll."
+    ],
+    [
+      "os10",
+      "File reads and writes normally go through the page cache; O_DIRECT bypasses it and fsync waits for stable storage."
+    ]
+  ],
+  "myths": [
+    [
+      "epoll makes disk file I/O asynchronous.",
+      "epoll reports readiness, and regular files are always considered ready, so epoll returns them immediately and the following read() still blocks if the data is not in the page cache. That is why Node.js (libuv) runs file operations on a thread pool. Truly asynchronous file I/O on Linux needs io_uring (or the older, limited Linux AIO with O_DIRECT)."
+    ],
+    [
+      "Interrupts are always better than polling.",
+      "Interrupts are efficient when events are rare, because the CPU does nothing until a device needs it. At very high event rates, the fixed cost of each interrupt (entering the kernel, saving state, cache disruption) dominates and can starve real work, a condition called receive livelock. High-speed network and storage drivers switch to polling under load (Linux NAPI, NVMe polled queues, io_uring SQPOLL, DPDK)."
+    ],
+    [
+      "Non-blocking I/O and asynchronous I/O are the same thing.",
+      "Non-blocking I/O means a call returns immediately with EAGAIN if it cannot make progress, and the program must ask again later, usually after a readiness notification from epoll. Asynchronous I/O means the program submits an operation and is told later that it has completed, with the data already copied. epoll-based servers use the first model; io_uring and Windows IOCP provide the second."
+    ],
+    [
+      "select is fine as long as you have fewer than 1,024 descriptors.",
+      "The FD_SETSIZE limit is about descriptor numbers, not counts: a program with only 10 sockets will corrupt memory if one of them happens to be fd 1,500 and it uses select. And select and poll still copy and scan the entire set on every call, so their cost grows with the number of watched descriptors even when only one is active. epoll costs are proportional to the number of ready descriptors."
+    ],
+    [
+      "DMA means the CPU is not involved in I/O.",
+      "DMA removes the CPU from copying the bytes, but the CPU still sets up descriptors, programs the device, handles completion interrupts, and often copies data again between kernel and user buffers. At high rates those per-operation costs, not the byte copying, become the bottleneck, which is what interrupt coalescing, batching and zero-copy APIs attack."
+    ]
+  ],
+  "recap": [
+    "The CPU controls devices by reading and writing their registers, through special I/O instructions or, more commonly, memory-mapped addresses.",
+    "With polling, the CPU repeatedly checks a device's status; with interrupts, the device signals the CPU when it needs attention; polling wins at very high event rates and interrupts win when events are sparse.",
+    "DMA lets a device transfer data directly to or from memory; drivers describe transfers in descriptor rings shared with the device and the device interrupts when entries complete.",
+    "The block layer turns file-system requests into device requests, merging and scheduling them; modern NVMe devices have many hardware queues and usually run with no I/O scheduler at all.",
+    "Programs can do I/O in five ways: blocking, non-blocking with retries, multiplexed readiness (select, poll, epoll), signal-driven, and asynchronous completion.",
+    "select and poll pass and scan the whole set of descriptors on every call, so cost grows with the number watched; epoll registers interest once and keeps a ready list filled by callbacks, so each wait costs roughly the number of ready descriptors.",
+    "epoll can be level-triggered (reports while ready) or edge-triggered (reports on changes, so the program must drain until EAGAIN); EPOLLONESHOT and EPOLLEXCLUSIVE help multithreaded servers.",
+    "Readiness APIs do not help regular files, which are always 'ready'; that is why event loops use thread pools for disk I/O.",
+    "io_uring lets programs place requests in a submission ring and collect results from a completion ring in shared memory, batching or even eliminating system calls and supporting files, sockets and many other operations asynchronously.",
+    "In production, watch interrupt distribution, device latency and queue depth, and choose the I/O model by workload: threads for simplicity, epoll for many idle connections, io_uring for maximum throughput."
+  ],
+  "glossary": [
+    [
+      "Asynchronous I/O",
+      "An I/O model in which the program submits an operation and is notified when it has completed, with no blocking and no retrying."
+    ],
+    [
+      "Block layer",
+      "The part of the kernel that sits between file systems and block-device drivers, queueing, merging and dispatching requests."
+    ],
+    [
+      "Completion queue (CQ)",
+      "In io_uring, the ring where the kernel places results of finished operations for the program to read."
+    ],
+    [
+      "Descriptor ring",
+      "A circular array in memory shared by a driver and a device, each entry describing a buffer to send or fill."
+    ],
+    [
+      "Device register",
+      "A small storage location on a device that the CPU reads or writes to control it or check its status."
+    ],
+    [
+      "DMA",
+      "Direct memory access: a device reading or writing main memory itself, without the CPU copying each byte."
+    ],
+    [
+      "EAGAIN / EWOULDBLOCK",
+      "The error a non-blocking call returns when it cannot proceed right now."
+    ],
+    [
+      "Edge-triggered",
+      "An epoll mode that reports a descriptor only when its state changes, so the program must read or write until EAGAIN."
+    ],
+    [
+      "epoll",
+      "Linux's scalable readiness interface: register descriptors once, then wait for a list of those that are ready."
+    ],
+    [
+      "Interrupt",
+      "A hardware signal from a device that makes the CPU run a kernel handler."
+    ],
+    [
+      "Interrupt coalescing",
+      "A device delaying its interrupt until several events have accumulated or a short timer expires, trading latency for lower CPU cost."
+    ],
+    [
+      "I/O scheduler",
+      "A block-layer policy (none, mq-deadline, bfq, kyber) that orders and merges requests before they reach the device."
+    ],
+    [
+      "IOCP",
+      "Windows I/O completion ports: a completion-based asynchronous I/O interface."
+    ],
+    [
+      "IOPS",
+      "I/O operations per second, the usual throughput measure for storage devices."
+    ],
+    [
+      "io_uring",
+      "A Linux interface (since 5.1) for asynchronous I/O through submission and completion rings shared between the program and the kernel."
+    ],
+    [
+      "kqueue",
+      "The BSD and macOS equivalent of epoll, also covering timers, signals and file changes."
+    ],
+    [
+      "Level-triggered",
+      "An epoll mode (the default) that reports a descriptor on every wait as long as it remains ready."
+    ],
+    [
+      "Linux AIO",
+      "The older asynchronous I/O interface (io_submit), useful mainly with O_DIRECT and largely superseded by io_uring."
+    ],
+    [
+      "Memory-mapped I/O (MMIO)",
+      "Controlling a device by reading and writing addresses that map to its registers rather than to RAM."
+    ],
+    [
+      "NAPI",
+      "Linux's network receive design that switches from interrupts to polling while packets keep arriving."
+    ],
+    [
+      "Non-blocking I/O",
+      "Calls that return immediately with EAGAIN instead of waiting when no progress is possible."
+    ],
+    [
+      "NVMe",
+      "A storage protocol for SSDs on PCIe with many parallel submission and completion queues in host memory."
+    ],
+    [
+      "poll / select",
+      "Older readiness calls that take the full set of descriptors on each call and scan it."
+    ],
+    [
+      "Polling",
+      "The CPU repeatedly checking a device or queue for work instead of waiting for an interrupt."
+    ],
+    [
+      "Queue depth",
+      "The number of I/O requests outstanding at a device at once."
+    ],
+    [
+      "Readiness notification",
+      "Being told that an operation on a descriptor can now proceed without blocking, as select, poll and epoll do."
+    ],
+    [
+      "RSS (receive-side scaling)",
+      "A network-card feature that hashes each packet's addresses and ports to choose one of several receive queues, spreading work across CPUs."
+    ],
+    [
+      "SPDK",
+      "Storage Performance Development Kit: user-space NVMe drivers that poll devices directly, bypassing the kernel."
+    ],
+    [
+      "SQPOLL",
+      "An io_uring mode in which a kernel thread polls the submission ring, so the program can submit without any system call."
+    ],
+    [
+      "Submission queue (SQ)",
+      "In io_uring, the ring where the program places request entries for the kernel to execute."
+    ],
+    [
+      "Wait queue",
+      "A kernel list of tasks or callbacks waiting for an event on an object such as a socket."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What is the difference between polling and interrupt-driven I/O?",
+      "With polling, the CPU repeatedly reads a device's status register to see if it is ready, which wastes CPU when the device is slow but has no per-event overhead. With interrupts, the CPU does other work and the device raises an interrupt when it needs attention, which is efficient for infrequent events. Each interrupt has a fixed cost, so at very high event rates systems switch to polling or coalesce interrupts."
+    ],
+    [
+      "E",
+      "What is DMA and why is it needed?",
+      "Direct memory access lets a device transfer data to or from main memory itself. Without it, the CPU would copy every byte through device registers (programmed I/O), which at gigabytes per second would consume whole cores. With DMA the driver gives the device the address and length of a buffer, the device performs the transfer, and it interrupts the CPU when done."
+    ],
+    [
+      "E",
+      "What is the difference between blocking and non-blocking I/O?",
+      "A blocking call waits until it can complete: read on a socket with no data puts the thread to sleep until data arrives. A non-blocking call returns immediately; if it cannot make progress it fails with EAGAIN and the program must try again later, typically after a readiness notification. Non-blocking I/O lets one thread manage many descriptors."
+    ],
+    [
+      "M",
+      "Describe the five I/O models from Stevens' Unix Network Programming.",
+      "Blocking I/O: the call waits for data and for the copy into the user buffer. Non-blocking I/O: the call returns EAGAIN until data is there, so the program polls. I/O multiplexing: the program blocks in select, poll or epoll on many descriptors and then does non-blocking reads on the ready ones. Signal-driven I/O: the kernel sends SIGIO when a descriptor becomes ready. Asynchronous I/O: the program starts the operation and is notified when the data has already been copied. Only the last avoids blocking in the copy step; the first four are synchronous in that sense."
+    ],
+    [
+      "M",
+      "Why does epoll scale better than select and poll?",
+      "select and poll take the whole set of descriptors on every call; the kernel copies it in, checks each descriptor's state and registers the caller on each one's wait queue, then the program scans the result, so every call costs O(n) in the number watched. epoll splits registration from waiting: epoll_ctl adds a descriptor once, attaching a callback to its wait queue; when the descriptor becomes ready the callback adds it to the epoll instance's ready list; epoll_wait just returns entries from that list. The cost per wait is proportional to the number of ready descriptors, which is what matters with ten thousand mostly idle connections.",
+      "Follow-up: Is epoll always faster? — With a handful of descriptors that are all busy, poll can be just as fast, and epoll_ctl calls to change interest add overhead; the advantage is for many descriptors with few active."
+    ],
+    [
+      "M",
+      "Explain level-triggered versus edge-triggered epoll and the bug edge-triggered invites.",
+      "Level-triggered, the default, reports a descriptor on every epoll_wait while it remains readable or writable. Edge-triggered reports it only when its state changes, for example when new data arrives. With edge-triggered mode, if the program reads only part of the available data and goes back to epoll_wait, no new event will come until more data arrives, so the remaining data sits unread and the connection appears to hang. Edge-triggered code must loop reading until EAGAIN, and use non-blocking descriptors."
+    ],
+    [
+      "M",
+      "Why do event-loop runtimes like Node.js use a thread pool for file operations?",
+      "Readiness APIs report regular files as always readable and writable, because the kernel's model is that disk reads complete in bounded time. A read of uncached data still blocks the thread while the disk works, which would stall the whole event loop. So libuv runs file operations, DNS lookups and some other blocking calls on a small thread pool and posts completions back to the loop. io_uring removes the need by offering genuinely asynchronous file operations."
+    ],
+    [
+      "M",
+      "How does a network card deliver packets to the kernel?",
+      "The driver allocates buffers and writes their addresses into a receive descriptor ring in memory. The card DMAs each arriving packet into the next buffer, marks the descriptor done and raises an interrupt (possibly coalesced). The interrupt handler disables further interrupts for that queue and schedules NAPI polling in softirq context, which processes a batch of completed descriptors, hands packets to the network stack, refills the ring with fresh buffers and re-enables interrupts when the ring is empty. Modern cards have many queues, steered by flow hash to different CPUs (receive-side scaling)."
+    ],
+    [
+      "M",
+      "What does the I/O scheduler do, and why do NVMe drives often use none?",
+      "It sits in the block layer between file systems and drivers, merging adjacent requests and reordering them to meet goals: mq-deadline bounds the age of requests, bfq shares bandwidth fairly between processes, kyber targets latency. On spinning disks, ordering requests to reduce seeks mattered hugely. NVMe drives have no seek penalty, many internal parallel channels and up to tens of thousands of hardware queues, so reordering in software mostly adds CPU overhead and latency; the none scheduler passes requests straight to the per-CPU hardware queues."
+    ],
+    [
+      "H",
+      "How does io_uring work, and what makes it faster than epoll plus read?",
+      "The program and kernel share two ring buffers. The program writes submission entries describing operations (read this file at this offset into this buffer, accept on this socket, send this data) into the submission queue and advances its tail; one io_uring_enter call submits many entries and can also wait for completions. The kernel executes them, inline if possible or with internal workers, and posts results to the completion queue, which the program reads from shared memory without system calls. Savings come from batching many operations per system call, doing the I/O and the copy in one step instead of readiness plus read, supporting files and sockets uniformly, and optional modes: SQPOLL, where a kernel thread polls the submission ring so submissions need no system call at all, and registered files and buffers, which avoid per-operation lookups and page pinning.",
+      "Follow-up: Why have some companies disabled io_uring? — It exposes a large, fast-changing kernel attack surface; Google reported in 2023 that most kernel exploits submitted to its bug bounty the previous year targeted io_uring, and restricted it on ChromeOS, Android and its servers. Container runtimes' default seccomp profiles also block it."
+    ],
+    [
+      "H",
+      "What is receive livelock and how do modern kernels avoid it?",
+      "At very high packet rates, a system that takes one interrupt per packet spends all its CPU entering interrupt handlers and queueing packets that it never gets time to process, so throughput collapses to near zero while the CPU is 100% busy. Mogul and Ramakrishnan described it in 1996. The fixes are to stop interrupting under load: Linux's NAPI disables the receive interrupt and polls the ring in batches while packets keep coming, devices coalesce interrupts, and excess packets are dropped early, at the card, rather than after work has been invested in them."
+    ],
+    [
+      "H",
+      "A storage-heavy service shows p99 read latency of 20 ms on NVMe drives that benchmark at 100 µs. How do you investigate?",
+      "First separate device time from queueing: iostat -x shows per-device r_await (average read latency including queueing), aqu-sz (average queue depth) and %util. If await is high with high queue depth, the device or its queue is saturated, perhaps by another workload's writes; check whether reads are stuck behind large writes, garbage collection inside the SSD, or write-back bursts from the page cache. If device latency is fine, the delay is above the block layer: page-cache misses on a cold cache, lock contention in the file system, or a thread pool too small for blocking I/O. biolatency and biosnoop (eBPF) give per-I/O latency histograms and the issuing process; perf or off-CPU profiling shows where threads wait. Typical fixes: isolate write bursts (dirty-page limits, cgroup io.max), increase concurrency to use the device's parallelism, or move to O_DIRECT with io_uring for predictable latency."
+    ],
+    [
+      "H",
+      "Design the I/O layer for a server that must handle 50,000 mostly idle TLS connections and also read from local files to answer requests.",
+      "Use non-blocking sockets with an event loop per core (epoll, or io_uring for sockets as well), with SO_REUSEPORT or a shared listener using EPOLLEXCLUSIVE to spread accepts across loops. Connections are cheap in this model, a few kilobytes of state each plus kernel buffers. File reads must not block a loop: either serve hot files from memory or the page cache and send them with sendfile, or perform file reads through io_uring or a small thread pool with completions posted back to the loop. Bound concurrency for file I/O to the device's useful queue depth, set timeouts on idle connections, and watch event-loop lag as the key health metric."
+    ]
+  ],
+  "refs": [
+    [
+      "book",
+      "Operating Systems: Three Easy Pieces — I/O Devices",
+      "Device registers, polling, interrupts, DMA and the driver stack.",
+      "https://pages.cs.wisc.edu/~remzi/OSTEP/file-devices.pdf"
+    ],
+    [
+      "docs",
+      "epoll(7) man page",
+      "Level- and edge-triggered semantics, EPOLLONESHOT, EPOLLEXCLUSIVE and the pitfalls.",
+      "https://man7.org/linux/man-pages/man7/epoll.7.html"
+    ],
+    [
+      "docs",
+      "io_uring(7) man page",
+      "The io_uring model: submission and completion rings, SQEs and CQEs, polling modes and registered resources.",
+      "https://man7.org/linux/man-pages/man7/io_uring.7.html"
+    ],
+    [
+      "docs",
+      "Linux kernel docs — Multi-Queue Block IO Queueing Mechanism (blk-mq)",
+      "How the block layer maps per-CPU software queues to hardware queues.",
+      "https://docs.kernel.org/block/blk-mq.html"
+    ],
+    [
+      "docs",
+      "Linux kernel docs — Scaling in the Linux Networking Stack",
+      "RSS, RPS, RFS and XPS: spreading packet processing across CPUs.",
+      "https://docs.kernel.org/networking/scaling.html"
+    ],
+    [
+      "paper",
+      "Mogul and Ramakrishnan — Eliminating Receive Livelock in an Interrupt-Driven Kernel",
+      "Why per-packet interrupts collapse under load and how polling fixes it.",
+      "https://www.usenix.org/conference/usenix-1996-annual-technical-conference/eliminating-receive-livelock-interrupt-driven"
+    ],
+    [
+      "post",
+      "Google Security Blog — Learnings from kCTF VRP's 42 Linux kernel exploits submissions",
+      "Why Google restricted io_uring across its products and servers.",
+      "https://security.googleblog.com/2023/06/learnings-from-kctf-vrps-42-linux.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A web server answers a request: it receives bytes from a network card, maybe reads a file from an SSD, and sends bytes back. Each of those devices works on its own schedule, millions of times slower or faster than the CPU's view of time. The network card might deliver a packet now, or in three seconds. The SSD takes 80 microseconds, an eternity of 300,000 CPU cycles. The kernel has to coordinate all of this: tell devices what to do, find out when they are done, move the data to the right place, and wake the right thread, without wasting CPU waiting and without drowning in overhead when events arrive millions of times per second.</p>
+<p>How a program asks for I/O shapes everything about its architecture. A thread per connection that simply blocks is easy to write but costs memory and context switches at scale. An event loop with non-blocking sockets and epoll handles tens of thousands of connections on one thread, as net13 showed, but stalls if anything blocks. io_uring promises asynchronous everything with almost no system calls, and comes with security concerns. Underneath, interrupts and DMA decide how much CPU a gigabyte of traffic costs.</p>
+<p>Interviewers ask about this layer in two ways. Classic OS questions: "polling versus interrupts", "what is DMA", "blocking versus non-blocking versus asynchronous I/O", "how does epoll differ from select". Systems questions: "why is your event loop stalling", "why can't epoll make file reads asynchronous", "what is io_uring and why is it fast", "how would you find where this I/O latency comes from".</p>
+<p>This lesson starts at the hardware (registers, polling, interrupts, DMA and descriptor rings), moves through the block layer and I/O schedulers, lays out the five I/O models, opens up select, poll and epoll to show why their costs differ, and finishes with io_uring and how to diagnose I/O problems in production. It builds on the socket-level view in net13 and the page cache from os8 and os10.</p>
+</section>
+
+<section data-field="primer">
+<h4>A restaurant kitchen and its waiters</h4>
+<p>Think of the CPU as a waiter and the devices as kitchen stations. The waiter could stand at the grill asking "is it ready yet?" every few seconds: that is <strong>polling</strong>, simple and quick to notice when the food is ready, but the waiter serves nobody else while standing there. Or the grill could ring a bell when an order is ready, and the waiter comes when called: that is an <strong>interrupt</strong>, efficient when orders are occasional, but if the bell rings every two seconds the waiter does nothing but run back and forth. And instead of carrying every plate personally, the waiter can leave a list of orders on a board and let kitchen porters carry dishes directly to tables, checking back only when a batch is finished: that is <strong>DMA</strong> with a <strong>descriptor ring</strong>.</p>
+<p>Programs face the same choice one level up. A thread can wait at the counter for its one order (<strong>blocking I/O</strong>). It can keep asking "ready yet?" (<strong>non-blocking I/O</strong> with retries). It can ask a manager "tell me which of my 10,000 orders are ready" (<strong>I/O multiplexing</strong>: select, poll, epoll). Or it can hand over the orders and be told when the food has been delivered to the table (<strong>asynchronous I/O</strong>: io_uring).</p>
+<p>The analogy breaks on speed ratios, which are extreme. An SSD read takes around 100 microseconds; a CPU does hundreds of thousands of operations in that time. A 100 Gb/s network card can deliver over 8 million small packets per second; at that rate even a microsecond of overhead per packet consumes eight cores. Every design in this lesson is about keeping that per-event overhead small.</p>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="The I/O path: application, system call interface, VFS and page cache or socket layer, block layer or network stack, device driver, and the device, with DMA moving data between the device and memory and an interrupt signalling completion">
+  <defs><marker id="os11-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="10" width="420" height="30" rx="4" style="fill:var(--s2);fill-opacity:.15;stroke:var(--s2)"/><text x="230" y="30" text-anchor="middle" style="fill:var(--ink)">application: read(), recv(), epoll_wait(), io_uring rings</text>
+    <rect x="20" y="50" width="420" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="230" y="70" text-anchor="middle" style="fill:var(--ink)">system calls (or shared rings)</text>
+    <rect x="20" y="90" width="200" height="30" rx="4" style="fill:var(--s4);fill-opacity:.15;stroke:var(--s4)"/><text x="120" y="110" text-anchor="middle" style="fill:var(--ink)">VFS + page cache (os10)</text>
+    <rect x="240" y="90" width="200" height="30" rx="4" style="fill:var(--s4);fill-opacity:.15;stroke:var(--s4)"/><text x="340" y="110" text-anchor="middle" style="fill:var(--ink)">sockets (net13)</text>
+    <rect x="20" y="130" width="200" height="30" rx="4" style="fill:var(--s4);fill-opacity:.15;stroke:var(--s4)"/><text x="120" y="150" text-anchor="middle" style="fill:var(--ink)">block layer + scheduler</text>
+    <rect x="240" y="130" width="200" height="30" rx="4" style="fill:var(--s4);fill-opacity:.15;stroke:var(--s4)"/><text x="340" y="150" text-anchor="middle" style="fill:var(--ink)">network stack (TCP/IP)</text>
+    <rect x="20" y="170" width="420" height="30" rx="4" style="fill:var(--s5);fill-opacity:.15;stroke:var(--s5)"/><text x="230" y="190" text-anchor="middle" style="fill:var(--ink)">device drivers: descriptor rings, interrupt handlers</text>
+    <rect x="20" y="215" width="200" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="120" y="236" text-anchor="middle" style="fill:var(--ink)">NVMe SSD</text>
+    <rect x="240" y="215" width="200" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="340" y="236" text-anchor="middle" style="fill:var(--ink)">network card</text>
+    <rect x="500" y="90" width="120" height="110" rx="6" style="fill:var(--accent);fill-opacity:.08;stroke:var(--accent)"/><text x="560" y="140" text-anchor="middle" style="fill:var(--ink)">RAM</text><text x="560" y="158" text-anchor="middle" style="fill:var(--muted)">buffers</text>
+    <line x1="440" y1="232" x2="498" y2="180" marker-end="url(#os11-arr)" style="stroke:var(--accent);fill:none"/>
+    <text x="490" y="232" style="fill:var(--accent)">DMA</text>
+    <path d="M220,232 Q470,260 500,195" style="stroke:var(--accent);fill:none;stroke-dasharray:4 3"/>
+    <line x1="120" y1="215" x2="120" y2="202" marker-end="url(#os11-arr)" style="stroke:var(--crit);fill:none"/>
+    <text x="130" y="211" style="fill:var(--crit)">interrupt</text>
+  </g>
+</svg>
+<figcaption>Storage and network follow parallel paths through the kernel. At the bottom, devices move data to and from memory by DMA and tell the CPU about it with interrupts; at the top, the I/O model decides how your threads wait.</figcaption>
+</figure>
+<h4>Two numbers that drive every design</h4>
+<p>Two quantities explain most I/O design decisions. The first is <strong>latency per operation</strong>: how long one read or one packet takes from request to completion, from tens of nanoseconds for a cached page to roughly 10-100 µs for an NVMe SSD, around 10 ms for a spinning disk, and milliseconds or more across a network. The second is <strong>overhead per operation</strong>: the CPU time spent on bookkeeping around each I/O, such as a system call (os1), an interrupt, a context switch to wake a thread, a copy between buffers. When devices were slow, overhead hardly mattered; a 10 ms disk read dwarfed a 5 µs system call. Today devices are fast enough that overhead is often the larger cost, so modern interfaces are all about doing more per kernel crossing: batching requests, polling instead of interrupting when busy, and handing completions back through shared memory. Keep asking "what is the overhead per operation here, and how is it amortised?" as you read.</p>
+
+</section>
+
+<section data-field="body">
+<h4>1. Talking to a device: registers</h4>
+<p>Every device presents a few <strong>registers</strong>: a status register (busy, ready, error), a command register (what to do), and data or address registers. The CPU reaches them in one of two ways. x86 has special <code>in</code>/<code>out</code> instructions for a separate I/O port space, now used only by legacy devices. Almost everything else uses <strong>memory-mapped I/O</strong> (MMIO): the device's registers appear at physical addresses, and ordinary load and store instructions to those addresses go to the device instead of RAM. The kernel maps those addresses uncached, so every access really reaches the device. Because only the kernel maps them (os7), user programs cannot touch devices directly, which is what makes drivers part of the kernel's protection boundary (os1).</p>
+
+<h4>2. Polling versus interrupts</h4>
+<p>To read a disk block the simple way, a driver writes the command and block number into the device's registers, then waits for completion. Waiting by <strong>polling</strong> means looping on the status register until "ready" appears. If the device takes 100 µs, the CPU wastes 100 µs. Waiting by <strong>interrupt</strong> means the driver puts the requesting thread to sleep and the CPU runs something else; when the device finishes, it raises an interrupt, the handler runs (os1), notes the completion and wakes the thread.</p>
+<p>Which is better depends on timing. An interrupt costs a fixed amount, roughly a microsecond or more including the handler, the context disruption and the eventual wake-up. For slow, infrequent events (a keypress, a disk read on a mostly idle machine) interrupts are clearly better. For very fast devices or very frequent events, the fixed cost dominates: an NVMe read that completes in 10 µs might spend a noticeable share of that on interrupt handling, and a network card receiving millions of packets per second would bury the CPU in interrupts. That is why modern drivers are <strong>hybrid</strong>: interrupt when idle, poll when busy. Two related techniques: <strong>interrupt coalescing</strong>, where the device waits until several completions accumulate or a few microseconds pass before interrupting (tunable on network cards with <code>ethtool -C</code>), and Linux's <strong>NAPI</strong>, where the first packet's interrupt switches the driver into polling mode until the receive ring is empty.</p>
+
+<h4>3. DMA and descriptor rings</h4>
+<p>Moving data byte by byte through registers (<strong>programmed I/O</strong>) would cost the CPU one instruction per word, impossible at gigabytes per second. With <strong>direct memory access</strong>, the device itself reads or writes main memory. The driver's job becomes bookkeeping: tell the device which memory to use, and find out when it is done.</p>
+<p>Fast devices do this with <strong>descriptor rings</strong>: circular arrays in memory, shared between driver and device, each entry describing one buffer (physical address and length) plus status flags. For a network card receiving packets:</p>
+<ol>
+<li>The driver allocates, say, 1,024 packet buffers and writes their addresses into the receive ring, then tells the card (by writing a "tail" register) that those entries are available.</li>
+<li>Each arriving packet is DMA'd by the card into the next available buffer; the card writes the packet length into the descriptor and sets its "done" flag.</li>
+<li>The card raises an interrupt (or the driver is already polling). The driver walks the ring from where it left off, hands each completed buffer to the network stack, puts fresh buffers in those slots, and advances the tail register.</li>
+</ol>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="A receive descriptor ring with eight slots. The card fills slots at the head with arriving packets and marks them done; the driver consumes done slots, refills them with empty buffers and advances the tail">
+  <defs><marker id="os11-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="60" y="80" width="60" height="44" style="fill:var(--s3);fill-opacity:.3;stroke:var(--line-2)"/><text x="90" y="100" text-anchor="middle" style="fill:var(--ink)">done</text><text x="90" y="116" text-anchor="middle" style="fill:var(--muted)">pkt</text>
+    <rect x="120" y="80" width="60" height="44" style="fill:var(--s3);fill-opacity:.3;stroke:var(--line-2)"/><text x="150" y="100" text-anchor="middle" style="fill:var(--ink)">done</text><text x="150" y="116" text-anchor="middle" style="fill:var(--muted)">pkt</text>
+    <rect x="180" y="80" width="60" height="44" style="fill:var(--s3);fill-opacity:.3;stroke:var(--line-2)"/><text x="210" y="100" text-anchor="middle" style="fill:var(--ink)">done</text><text x="210" y="116" text-anchor="middle" style="fill:var(--muted)">pkt</text>
+    <rect x="240" y="80" width="60" height="44" style="fill:var(--surface);stroke:var(--line-2)"/><text x="270" y="100" text-anchor="middle" style="fill:var(--ink)">empty</text><text x="270" y="116" text-anchor="middle" style="fill:var(--muted)">buf</text>
+    <rect x="300" y="80" width="60" height="44" style="fill:var(--surface);stroke:var(--line-2)"/><text x="330" y="100" text-anchor="middle" style="fill:var(--ink)">empty</text><text x="330" y="116" text-anchor="middle" style="fill:var(--muted)">buf</text>
+    <rect x="360" y="80" width="60" height="44" style="fill:var(--surface);stroke:var(--line-2)"/><text x="390" y="100" text-anchor="middle" style="fill:var(--ink)">empty</text><text x="390" y="116" text-anchor="middle" style="fill:var(--muted)">buf</text>
+    <rect x="420" y="80" width="60" height="44" style="fill:var(--surface-2);stroke:var(--line-2);stroke-dasharray:3 3"/><text x="450" y="100" text-anchor="middle" style="fill:var(--muted)">not yet</text><text x="450" y="116" text-anchor="middle" style="fill:var(--muted)">given</text>
+    <rect x="480" y="80" width="60" height="44" style="fill:var(--surface-2);stroke:var(--line-2);stroke-dasharray:3 3"/><text x="510" y="100" text-anchor="middle" style="fill:var(--muted)">not yet</text><text x="510" y="116" text-anchor="middle" style="fill:var(--muted)">given</text>
+    <path d="M540,124 Q560,190 320,190 Q70,190 60,128" marker-end="url(#os11-arr2)" style="stroke:var(--line-2);fill:none;stroke-dasharray:4 4"/>
+    <text x="320" y="208" text-anchor="middle" style="fill:var(--muted)">the ring wraps around</text>
+    <line x1="90" y1="40" x2="90" y2="76" marker-end="url(#os11-arr2)" style="stroke:var(--s2);fill:none"/><text x="90" y="32" text-anchor="middle" style="fill:var(--s2)">driver reads here</text>
+    <line x1="270" y1="40" x2="270" y2="76" marker-end="url(#os11-arr2)" style="stroke:var(--accent);fill:none"/><text x="270" y="32" text-anchor="middle" style="fill:var(--accent)">card DMAs next packet here</text>
+    <line x1="450" y1="40" x2="450" y2="76" marker-end="url(#os11-arr2)" style="stroke:var(--s5);fill:none"/><text x="470" y="32" text-anchor="middle" style="fill:var(--s5)">tail: driver refills up to here</text>
+  </g>
+</svg>
+<figcaption>The ring is a producer-consumer buffer (os5) between two processors, the card and the CPU, with no locks: each side only advances its own index. If the driver falls behind and the card runs out of empty slots, packets are dropped at the card, the earliest and cheapest place to drop them.</figcaption>
+</figure>
+<p>Storage works the same way. An NVMe SSD uses <strong>submission queues</strong> and <strong>completion queues</strong> in host memory: the driver writes a command (read 8 blocks at LBA 1,234,567 into these pages) into a submission queue and rings a doorbell register; the drive executes it, DMAs the data, posts an entry to the completion queue and interrupts. NVMe allows up to 65,535 queue pairs, so Linux gives each CPU its own, and CPUs never contend with each other to issue I/O. Keep this picture in mind: io_uring, later in the lesson, applies exactly this design to the boundary between programs and the kernel.</p>
+
+<h4>4. The block layer and I/O schedulers</h4>
+<p>Between file systems and storage drivers sits the <strong>block layer</strong>. A file system submits requests ("read these sectors into these pages"); the block layer may <strong>merge</strong> adjacent requests into one larger one, <strong>schedule</strong> them, apply cgroup I/O limits (os13) and accounting, and dispatch them to the driver. Since Linux 5.0 the block layer is fully multi-queue (<strong>blk-mq</strong>): per-CPU software queues map onto however many hardware queues the device has.</p>
+<p>On spinning disks, ordering mattered enormously: a seek costs several milliseconds, so serving requests in disk order rather than arrival order (the "elevator" algorithm) multiplied throughput. Modern Linux offers a few schedulers, set per device in <code>/sys/block/&lt;dev&gt;/queue/scheduler</code>:</p>
+<table>
+<thead><tr><th>Scheduler</th><th>Idea</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>none</code></td><td>Pass requests straight through</td><td>NVMe and fast SSDs (usual default)</td></tr>
+<tr><td><code>mq-deadline</code></td><td>Sort for locality but guarantee each request a deadline; prefer reads</td><td>SATA SSDs and HDDs (common default)</td></tr>
+<tr><td><code>bfq</code></td><td>Fair share of bandwidth per process or cgroup</td><td>Desktops, slow devices, mixed interactive loads</td></tr>
+<tr><td><code>kyber</code></td><td>Throttle queue depth to meet latency targets</td><td>Fast devices where tail latency matters</td></tr>
+</tbody>
+</table>
+<p>For NVMe the answer is usually <code>none</code>: there is no seek to optimise, the drive schedules internally across its flash channels, and the most valuable thing the kernel can do is stay out of the way.</p>
+
+<h4>5. The five ways a program can wait</h4>
+<p>Every input operation has two phases: <em>waiting for data to be ready</em> (a packet to arrive, a disk block to be read) and <em>copying it</em> from the kernel into the program's buffer. Richard Stevens' classic <em>Unix Network Programming</em> classifies I/O models by how a program experiences those phases:</p>
+<table>
+<thead><tr><th>Model</th><th>Waiting for data</th><th>Copying</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Blocking</td><td>Thread sleeps in the call</td><td>Inside the same call</td><td><code>read()</code> on a blocking socket</td></tr>
+<tr><td>Non-blocking</td><td>Call returns <code>EAGAIN</code>; program retries</td><td>Inside the successful call</td><td><code>O_NONBLOCK</code> + retry loop</td></tr>
+<tr><td>Multiplexing</td><td>Thread sleeps in select/poll/epoll for many fds</td><td>Separate read on each ready fd</td><td>Nginx, Redis, asyncio, Node.js</td></tr>
+<tr><td>Signal-driven</td><td>Kernel sends SIGIO when ready</td><td>Separate read</td><td>Rare today</td></tr>
+<tr><td>Asynchronous</td><td>Program submits and continues</td><td>Done by the kernel; program told on completion</td><td>io_uring, Windows IOCP</td></tr>
+</tbody>
+</table>
+<p>The first four are <em>readiness</em>-based: the kernel tells you when you <em>can</em> do the operation, and you then do it yourself. The last is <em>completion</em>-based: the kernel tells you when it <em>has done</em> it. net13 traced how servers use each; here we look inside the kernel to see why their costs differ.</p>
+
+<h4>6. Inside select and poll</h4>
+<p><code>select(nfds, readfds, writefds, exceptfds, timeout)</code> takes bitmaps of descriptor numbers. On every call, the kernel copies the bitmaps in, and for each descriptor up to <code>nfds</code>: checks whether it is ready, and if not, adds the calling thread to that descriptor's <strong>wait queue</strong> (the list the kernel wakes when that socket gets data). If none is ready, the thread sleeps; when any wakes it, the kernel scans all descriptors again, removes the thread from every wait queue, writes back the bitmaps, and returns. The program then scans the bitmaps to find which are set. <code>poll()</code> replaces the fixed-size bitmaps with an array of <code>{fd, events, revents}</code> structures, removing select's limit of descriptor numbers below <code>FD_SETSIZE</code> (1,024), but does the same work.</p>
+<p>So every call costs O(n) in the number of watched descriptors, regardless of how many are active. A server with 10,000 connections, of which 10 are active at any moment, does 10,000 checks to find 10. That was the heart of the C10K problem (net13).</p>
+
+<h4>7. Inside epoll</h4>
+<p>epoll separates the two jobs that select repeats on every call. <code>epoll_create1()</code> makes an epoll instance, itself a file descriptor, holding an <strong>interest list</strong> (a red-black tree of registered descriptors) and a <strong>ready list</strong>. <code>epoll_ctl(ADD, fd, events)</code> registers a descriptor once: the kernel inserts it into the tree and attaches a small <strong>callback</strong> to the descriptor's wait queue. From then on:</p>
+<ol>
+<li>When data arrives on the socket, the network stack wakes the socket's wait queue as usual, which runs epoll's callback.</li>
+<li>The callback appends that descriptor to the epoll instance's ready list (if not already there) and wakes any thread sleeping in <code>epoll_wait</code>.</li>
+<li><code>epoll_wait()</code> copies up to <code>maxevents</code> entries from the ready list to the program and returns. If the list is empty, it sleeps.</li>
+</ol>
+<figure>
+<svg viewBox="0 0 640 240" width="100%" role="img" aria-label="Comparison. select and poll pass all 10,000 descriptors in on every call and the kernel scans them all. epoll registers descriptors once in an interest tree; readiness callbacks add only active descriptors to a ready list, and epoll_wait returns just those">
+  <defs><marker id="os11-arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="150" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">select / poll: every call</text>
+    <rect x="30" y="35" width="240" height="30" rx="4" style="fill:var(--s2);fill-opacity:.15;stroke:var(--s2)"/><text x="150" y="55" text-anchor="middle" style="fill:var(--ink)">pass all 10,000 fds in</text>
+    <rect x="30" y="80" width="240" height="30" rx="4" style="fill:var(--crit);fill-opacity:.1;stroke:var(--crit)"/><text x="150" y="100" text-anchor="middle" style="fill:var(--ink)">kernel checks all 10,000</text>
+    <rect x="30" y="125" width="240" height="30" rx="4" style="fill:var(--s2);fill-opacity:.15;stroke:var(--s2)"/><text x="150" y="145" text-anchor="middle" style="fill:var(--ink)">program scans 10,000 results</text>
+    <text x="150" y="180" text-anchor="middle" style="fill:var(--crit)">cost per call ∝ watched fds</text>
+    <line x1="150" y1="65" x2="150" y2="78" marker-end="url(#os11-arr3)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="150" y1="110" x2="150" y2="123" marker-end="url(#os11-arr3)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="320" y1="10" x2="320" y2="230" style="stroke:var(--line-2);fill:none"/>
+    <text x="480" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">epoll</text>
+    <rect x="350" y="35" width="130" height="50" rx="4" style="fill:var(--s4);fill-opacity:.15;stroke:var(--s4)"/><text x="415" y="55" text-anchor="middle" style="fill:var(--ink)">interest tree</text><text x="415" y="72" text-anchor="middle" style="fill:var(--muted)">10,000 fds, once</text>
+    <rect x="500" y="35" width="120" height="50" rx="4" style="fill:var(--accent);fill-opacity:.12;stroke:var(--accent)"/><text x="560" y="55" text-anchor="middle" style="fill:var(--ink)">ready list</text><text x="560" y="72" text-anchor="middle" style="fill:var(--muted)">10 fds</text>
+    <rect x="350" y="120" width="130" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="415" y="138" text-anchor="middle" style="fill:var(--ink)">socket gets data</text><text x="415" y="153" text-anchor="middle" style="fill:var(--muted)">wait-queue callback</text>
+    <line x1="480" y1="135" x2="545" y2="88" marker-end="url(#os11-arr3)" style="stroke:var(--accent);fill:none"/>
+    <rect x="500" y="170" width="120" height="30" rx="4" style="fill:var(--s2);fill-opacity:.15;stroke:var(--s2)"/><text x="560" y="190" text-anchor="middle" style="fill:var(--ink)">epoll_wait → 10</text>
+    <line x1="560" y1="85" x2="560" y2="168" marker-end="url(#os11-arr3)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="480" y="222" text-anchor="middle" style="fill:var(--good)">cost per call ∝ ready fds</text>
+  </g>
+</svg>
+<figcaption>select and poll rediscover the whole world on every call; epoll keeps a standing subscription and is told about changes as they happen. With mostly idle connections, that is the difference between scanning 10,000 descriptors and handing back 10.</figcaption>
+</figure>
+<p><strong>Level- versus edge-triggered.</strong> In the default level-triggered mode, a descriptor that remains readable stays on the ready list and is reported on every <code>epoll_wait</code>. With <code>EPOLLET</code> (edge-triggered), it is reported only when new data arrives; if the program reads half the data and waits again, it will not hear about this descriptor until <em>more</em> data comes, and the remaining bytes sit unread. Edge-triggered code must therefore use non-blocking descriptors and read (or write) until <code>EAGAIN</code>. net13 discusses when each fits; two more flags matter for multithreaded servers. <code>EPOLLONESHOT</code> disables a descriptor after one event until it is re-armed, so two threads never handle the same connection at once. <code>EPOLLEXCLUSIVE</code> (Linux 4.5) wakes only one of several epoll instances waiting on the same descriptor, avoiding the thundering herd (os5) on a shared listening socket.</p>
+<p>macOS and the BSDs have <strong>kqueue</strong>, which plays the same role as epoll and also covers timers, signals, process exits and file changes in one interface. Windows takes the completion route with <strong>I/O completion ports</strong>.</p>
+
+<h4>8. The hole in readiness: regular files</h4>
+<p>Readiness APIs work for sockets, pipes and terminals, whose "not ready" state can last forever. Regular files are different: the kernel considers them always ready, because a disk read completes in bounded time. So epoll reports a file descriptor as readable immediately, and the following <code>read()</code> still blocks the thread while the disk fetches uncached data, freezing the entire event loop for 100 µs to tens of milliseconds. This is why libuv (Node.js) uses a thread pool for file system calls, why Python's asyncio offers <code>run_in_executor</code> and <code>asyncio.to_thread</code> for file work, and why nginx has thread pools for file reads. The older Linux AIO interface (<code>io_submit</code>) offered asynchronous file I/O, but only reliably with <code>O_DIRECT</code>, and it could still block in surprising places, so it saw little use outside databases. That gap is a major reason io_uring was created.</p>
+
+<h4>9. io_uring: I/O through shared rings</h4>
+<p>io_uring, added in Linux 5.1 (2019) by Jens Axboe, gives programs the same structure NVMe gives drivers. Setting up an instance with <code>io_uring_setup()</code> creates two ring buffers in memory shared between the program and the kernel:</p>
+<ul>
+<li>A <strong>submission queue</strong> (SQ): the program writes <em>submission queue entries</em> (SQEs), each describing one operation: opcode (read, write, accept, connect, send, recv, openat, fsync, timeout, and dozens more), file descriptor, buffer address, length, offset, and a 64-bit <code>user_data</code> tag to match results.</li>
+<li>A <strong>completion queue</strong> (CQ): the kernel writes <em>completion queue entries</em> (CQEs), each with the <code>user_data</code> tag and a result (bytes transferred or a negative error).</li>
+</ul>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="io_uring: the application writes requests into the submission ring and calls io_uring_enter once for a batch; the kernel executes them and writes results into the completion ring, which the application reads from shared memory">
+  <defs><marker id="os11-arr4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="20" width="160" height="170" rx="6" style="fill:var(--s2);fill-opacity:.1;stroke:var(--s2)"/>
+    <text x="100" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">application</text>
+    <text x="100" y="70" text-anchor="middle" style="fill:var(--ink-2)">fill 32 SQEs:</text>
+    <text x="100" y="88" text-anchor="middle" style="fill:var(--ink-2)">read, recv, send...</text>
+    <text x="100" y="118" text-anchor="middle" style="fill:var(--ink-2)">one io_uring_enter()</text>
+    <text x="100" y="150" text-anchor="middle" style="fill:var(--ink-2)">read CQEs from</text>
+    <text x="100" y="168" text-anchor="middle" style="fill:var(--ink-2)">memory, no syscall</text>
+    <rect x="240" y="30" width="170" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="325" y="52" text-anchor="middle" style="fill:var(--ink)">submission ring (SQ)</text><text x="325" y="70" text-anchor="middle" style="fill:var(--muted)">app writes tail</text>
+    <rect x="240" y="130" width="170" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="325" y="152" text-anchor="middle" style="fill:var(--ink)">completion ring (CQ)</text><text x="325" y="170" text-anchor="middle" style="fill:var(--muted)">kernel writes tail</text>
+    <rect x="470" y="20" width="150" height="170" rx="6" style="fill:var(--s4);fill-opacity:.1;stroke:var(--s4)"/>
+    <text x="545" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">kernel</text>
+    <text x="545" y="80" text-anchor="middle" style="fill:var(--ink-2)">consume SQEs</text>
+    <text x="545" y="100" text-anchor="middle" style="fill:var(--ink-2)">run inline or in</text>
+    <text x="545" y="118" text-anchor="middle" style="fill:var(--ink-2)">async workers</text>
+    <text x="545" y="150" text-anchor="middle" style="fill:var(--ink-2)">post CQEs</text>
+    <line x1="180" y1="55" x2="238" y2="55" marker-end="url(#os11-arr4)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="410" y1="55" x2="468" y2="80" marker-end="url(#os11-arr4)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="468" y1="150" x2="412" y2="155" marker-end="url(#os11-arr4)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="238" y1="155" x2="182" y2="155" marker-end="url(#os11-arr4)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="325" y="110" text-anchor="middle" style="fill:var(--accent)">shared memory (mmap)</text>
+    <text x="320" y="212" text-anchor="middle" style="fill:var(--muted)">with SQPOLL, a kernel thread watches the SQ and even the submit syscall disappears</text>
+  </g>
+</svg>
+<figcaption>The rings are the same producer-consumer structure as a network card's descriptor ring, now between your program and the kernel. Thirty-two operations can be submitted and reaped with one system call, or none.</figcaption>
+</figure>
+<p>The flow: the program fills several SQEs, advances the SQ tail, and calls <code>io_uring_enter()</code> once to submit them all (optionally also waiting for some number of completions). The kernel executes each operation, completing it inline if it can (data already in the page cache, a socket with data waiting) or handing it to internal async workers or poll-based retry if it would block, and posts CQEs. The program reads CQEs straight from shared memory and advances the CQ head; no system call is needed to collect results.</p>
+<p>Where the speed comes from: <strong>batching</strong> (one kernel entry for many operations, which matters more since Meltdown mitigations made each entry dearer, os1); <strong>completion semantics</strong> (one step does the wait and the copy, instead of epoll_wait followed by read); <strong>uniformity</strong> (files, sockets, timers and file-system operations all asynchronous through one interface); and optional modes that remove more overhead. <strong>SQPOLL</strong> runs a kernel thread that polls the submission ring, so a busy program submits work just by writing to memory. <strong>Registered files and buffers</strong> pre-register descriptors and pin memory once, avoiding per-operation lookups and page pinning. <strong>Linked SQEs</strong> chain operations (read then write, with a timeout) so they run in order without returning to user space. Most programs use it through <code>liburing</code> or runtime support (Rust's tokio-uring and glommio, Java's Netty incubator transport, databases such as ScyllaDB and TigerBeetle, and io_uring use for some file operations in libuv, and an optional io_uring method in PostgreSQL 18's new asynchronous I/O).</p>
+<p>The caveat is security. io_uring exposes a large, fast-moving kernel surface that bypasses some of the usual syscall-filtering points. In 2023 Google reported that most of the kernel exploits submitted to its kernel bug bounty in the previous year targeted io_uring, and it disabled or restricted io_uring on ChromeOS, Android apps and its production servers; Docker's default seccomp profile blocks the io_uring system calls too. A sysctl (<code>kernel.io_uring_disabled</code>, Linux 6.6) lets administrators turn it off or limit it to a group.</p>
+</section>
+
+<section data-field="deep">
+<h4>Receive livelock and why polling came back</h4>
+<p>In 1996, Mogul and Ramakrishnan showed that interrupt-driven kernels collapse under packet floods: each packet's interrupt preempts whatever is processing earlier packets, so at high enough rates the CPU spends all its time acknowledging packets it never finishes processing, and useful throughput falls to zero while the CPU is 100% busy. The fix is to bound the work done in interrupt context and switch to polling under load, processing a budget of packets per poll and dropping excess input early. Linux's NAPI (2001) implements exactly this: the first packet's interrupt disables further receive interrupts on that queue and schedules a poll in softirq context; the poll processes up to a budget (64 packets per device by default) per round and only re-enables interrupts when the ring is empty. Busy polling (<code>SO_BUSY_POLL</code>) lets a latency-sensitive socket reader spin on the device queue directly for a few microseconds, trading CPU for lower latency.</p>
+<h4>Spreading interrupts and packet processing across CPUs</h4>
+<p>A single queue and a single interrupt would serialise all network processing on one CPU. Modern cards have many receive queues and use <strong>receive-side scaling</strong> (RSS): a hash of each packet's addresses and ports picks the queue, so all packets of one connection land on the same queue and CPU (preserving order and cache locality) while different connections spread out. Each queue has its own interrupt (MSI-X), which can be pinned to a CPU via <code>/proc/irq/&lt;n&gt;/smp_affinity</code>, usually managed by <code>irqbalance</code>. Software equivalents (RPS, RFS) do the spreading in the kernel for cards with fewer queues, and RFS steers packets to the CPU where the consuming thread runs. Getting this wrong shows up as one CPU at 100% in softirq (<code>si</code> in <code>top</code>) while others idle.</p>
+<h4>Avoiding copies: zero-copy paths</h4>
+<p>A classic file-serving path copies data twice: disk to page cache by DMA, page cache to a user buffer by <code>read()</code>, user buffer to socket buffer by <code>write()</code>, then DMA to the card. <code>sendfile()</code> lets the kernel send page-cache pages to a socket directly, skipping the user-space copies, which is how nginx and Kafka serve static data efficiently. <code>splice()</code> moves data between a pipe and another descriptor by passing page references. <code>MSG_ZEROCOPY</code> lets <code>send()</code> transmit from user pages without copying, notifying the program via the error queue when the pages can be reused; it pays off only for large sends because of the bookkeeping. kTLS moves TLS encryption into the kernel (or the card) so even encrypted traffic can use sendfile. io_uring adds registered buffers and zero-copy send and receive paths for the same reasons.</p>
+<h4>Polled storage I/O</h4>
+<p>NVMe devices can complete reads in under 10 µs, comparable to the cost of an interrupt plus a context switch to wake the waiting thread. For such devices Linux supports <strong>polled I/O</strong>: the submitting thread (or an io_uring instance created with <code>IORING_SETUP_IOPOLL</code>) spins on the completion queue instead of sleeping, so completions are noticed within nanoseconds. It burns a core per polling context, so it is used where latency or IOPS per core matter more than CPU efficiency, such as storage engines and benchmarks; SPDK takes the extreme route of a user-space NVMe driver that polls with no kernel involvement at all.</p>
+<h4>Who wakes whom: the cost of a wake-up</h4>
+<p>Even with perfect devices, a blocking read on an idle thread involves a chain of hand-offs: the interrupt handler records completion, the kernel marks the sleeping thread runnable, the scheduler eventually runs it on some CPU (maybe a different one, with cold caches), and only then does the program see its data. Each step adds microseconds of latency and jitter, and at high rates the wake-ups themselves become a large share of CPU. That is the deeper reason event loops and io_uring batch completions, why NAPI and polled I/O spin while busy, and why latency-critical systems pin the consuming thread to the CPU that handles the device's interrupts.</p>
+<h4>Why asynchronous file I/O took so long on Linux</h4>
+<p>File I/O can block in many places beyond the device: page-cache misses, metadata reads to find the blocks, journal waits, memory allocation, locks inside the file system. Making all of those asynchronous inside the kernel is a huge change, which is why Linux AIO only worked for O_DIRECT on some file systems and quietly blocked otherwise. io_uring took a pragmatic approach: try the operation non-blockingly inline, and if it would block, hand it to a pool of kernel worker threads (io-wq) that perform it synchronously, so the program never blocks. Later versions reduced the use of workers by adding non-blocking paths in file systems and block layers. The design shows a recurring systems pattern: when you cannot make an operation asynchronous at the bottom, move the blocking onto threads you control.</p>
+</section>
+
+<section data-field="prod">
+<h4>Looking at interrupts</h4>
+<p><code>/proc/interrupts</code> shows, per CPU, how many interrupts each device line has raised; watching it with <code>watch -d</code> reveals which CPUs handle network and storage interrupts. <code>mpstat -P ALL 1</code> and <code>top</code> (press 1) show per-CPU <code>%irq</code> and <code>%soft</code>. A single CPU saturated with softirq work while others idle means interrupts and packet processing are not spread: check that the card has multiple queues (<code>ethtool -l</code>), that RSS is enabled, and that irqbalance or manual affinity distributes queue interrupts. <code>ksoftirqd/N</code> running hot means softirq work has overflowed into its fallback thread on CPU N. For latency-critical applications, a common pattern is to keep interrupts off the cores running the application's threads (or deliberately on the same core, to keep data cache-hot); measure both.</p>
+<h4>Storage latency, queue depth and utilisation</h4>
+<p><code>iostat -x 1</code> is the first tool: per device, <code>r/s</code> and <code>w/s</code> (IOPS), <code>rkB/s</code> and <code>wkB/s</code> (throughput), <code>r_await</code> and <code>w_await</code> (average latency including time queued), <code>aqu-sz</code> (average number of requests in flight) and <code>%util</code>. <code>%util</code> is misleading for SSDs and NVMe: it measures the share of time at least one request was in flight, so a device that can serve 64 requests in parallel can show 100% while far from saturated; use latency and IOPS against the device's specification instead. For distributions, the eBPF tools <code>biolatency</code> (histogram of block I/O latency) and <code>biosnoop</code> (each I/O with process, size and latency) show tail behaviour and who causes it. Cloud block volumes add their own limits: provisioned IOPS and throughput caps and burst credits, which produce sudden latency cliffs when exhausted.</p>
+<h4>Event-loop stalls</h4>
+<p>In epoll-based servers (Node.js, Python asyncio, Netty, Redis), the canonical I/O incident is a blocked loop: one handler does a synchronous file read, a DNS lookup, a CPU-heavy parse or a blocking database call, and every other connection on that loop waits. Measure <strong>event-loop lag</strong> (schedule a timer and measure how late it fires; Node's <code>monitorEventLoopDelay</code>, asyncio's debug mode which logs callbacks slower than 100 ms). Fixes: move blocking work to thread pools or io_uring, split CPU work into worker processes, and make sure file access in the request path is either cached in memory or asynchronous. Redis, single-threaded by design, documents its own version: avoid slow commands (<code>KEYS</code>, large <code>SMEMBERS</code>) that block all clients.</p>
+<h4>Choosing an I/O model</h4>
+<p>For most services the choice is about developer time, not microseconds. A thread or virtual thread per request with blocking calls is simplest and fine up to thousands of concurrent requests. An event loop (epoll via your runtime) is the standard for tens of thousands of mostly idle connections. io_uring pays off for storage-heavy engines, very high request rates per core, or when file I/O must be asynchronous; check that your kernel, container runtime's seccomp profile and security policy allow it before depending on it. Whatever the model, bound concurrency to what the devices can usefully absorb: more in-flight I/O than the device's internal parallelism only adds queueing latency.</p>
+<h4>Writes that look like reads</h4>
+<p>A frequent surprise: read latency spikes on a database volume every few seconds, and the cause is writes. Large write-back bursts from the page cache (os10), journal commits or an SSD's internal garbage collection occupy the device and reads queue behind them. Signs are periodic <code>w/s</code> bursts aligned with <code>r_await</code> spikes. Remedies: smoother write-back (lower dirty thresholds), separating write-heavy data (logs, WAL) onto another device, I/O cgroup limits on bulk writers, and leaving free space on SSDs so garbage collection has room.</p>
+</section>
+
+<section data-field="lab">
+<p>Measure why epoll scales and select/poll do not. Linux or WSL, Python 3.</p>
+<ol>
+<li>Save as <code>mux.py</code>:
+<pre>import os, select, time, resource
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 20000), hard))
+
+def bench(n, rounds=200):
+    pipes = [os.pipe() for _ in range(n)]
+    reads = [r for r, w in pipes]
+    os.write(pipes[-1][1], b"x")              # exactly one ready fd
+    p = select.poll()
+    for r in reads: p.register(r, select.POLLIN)
+    ep = select.epoll()
+    for r in reads: ep.register(r, select.EPOLLIN)
+    t = time.perf_counter()
+    for _ in range(rounds): assert len(p.poll(0)) == 1
+    t_poll = (time.perf_counter() - t) / rounds * 1e6
+    t = time.perf_counter()
+    for _ in range(rounds): assert len(ep.poll(0)) == 1
+    t_ep = (time.perf_counter() - t) / rounds * 1e6
+    print(f"{n:6} fds: poll {t_poll:8.1f} µs/call   epoll {t_ep:6.1f} µs/call")
+    ep.close()
+    for r, w in pipes: os.close(r); os.close(w)
+
+for n in (10, 100, 1000, 5000):
+    bench(n)</pre></li>
+<li>Run <code>python3 mux.py</code>. If it fails with "Too many open files", run <code>ulimit -n 20000</code> first (each pipe uses two descriptors).</li>
+<li>Edge versus level: in a Python shell, create a pipe, register its read end with <code>select.EPOLLIN | select.EPOLLET</code>, write 10 bytes, call <code>ep.poll(0)</code> twice; then read 5 bytes and poll again; then write 1 more byte and poll.</li>
+</ol>
+<p><strong>What to look for.</strong> With one ready descriptor in every case, <code>poll</code>'s time per call grows roughly in proportion to the number of descriptors (the kernel checks every one and Python builds the full list), from a few microseconds at 10 to hundreds at 5,000, while <code>epoll</code> stays nearly flat, since it only returns the ready list. That flat line is why event-driven servers can hold tens of thousands of idle connections. In step 3, edge-triggered epoll reports the pipe on the first poll after the write but not on the second, and not after the partial read, even though 5 bytes are still waiting; only the new write produces another event. That is the "must drain until EAGAIN" rule in action.</p>
+</section>
+
+<section data-field="drill">
+<b>Diagnose: the API that freezes when the log disk is slow</b>
+<p>A Python asyncio API service handles about 3,000 requests per second on one event loop per process. Every request appends an audit line to a local file with a plain <code>open(...).write()</code> call inside the coroutine. Normally p99 latency is 15 ms. Several times a day, p99 jumps to 2-3 seconds for a minute, across all endpoints, including health checks; CPU drops during these periods. The incidents coincide with a nightly-style log compression job that runs at random times on the same disk, and <code>iostat</code> then shows <code>w_await</code> on that disk above 500 ms. Explain the mechanism, why epoll does not prevent it, and fix it.</p>
+<details><summary>Answer</summary>
+<p><strong>Mechanism.</strong> The audit write is a synchronous file operation executed on the event-loop thread. Usually it is fast: <code>write()</code> copies into the page cache and returns in microseconds (os10). But when the compression job floods the disk with writes, dirty memory rises past the dirty limits and the kernel throttles writers: <code>write()</code> calls block until write-back catches up, and with <code>w_await</code> above 500 ms that can mean hundreds of milliseconds per call. Opening the file each time can also block on metadata and journal waits. While the loop thread is blocked, no other coroutine runs: health checks, other endpoints and already-arrived responses all wait. CPU drops because the only thread is asleep in the kernel.</p>
+<p><strong>Why epoll does not help.</strong> asyncio's event loop uses epoll to know when <em>sockets</em> are ready. File descriptors for regular files are always reported ready, and asyncio does not route ordinary file writes through the selector at all; a <code>write()</code> to a file is just a blocking system call made directly by the coroutine. Readiness-based multiplexing has no way to make it non-blocking.</p>
+<p><strong>Fix.</strong> Take file I/O off the loop. Simplest: push audit lines onto an <code>asyncio.Queue</code> (bounded) and have one background writer thread (or <code>asyncio.to_thread</code> worker) drain it, keeping the file open and writing in batches; if the queue fills because the disk is slow, decide explicitly whether to drop lines (count them) or apply backpressure. Alternatively log to stdout and let the platform's agent handle files, or use an io_uring-based async file library. Separately, isolate the compression job: run it under an I/O cgroup limit (<code>io.max</code>) or with <code>ionice -c3</code>, and consider lower dirty-memory thresholds so writers are not throttled in large bursts. Add an event-loop-lag metric and alert so the next blocking call is caught before users notice.</p>
+</details>
+</section>

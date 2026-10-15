@@ -1,0 +1,497 @@
+<!-- topic source for dataeng/de12; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "de12",
+  "t": "Training-data pipelines: point-in-time label joins, dataset versioning, sampling and stratification, dedup at scale, sharded datasets and streaming tokenisation for LLM pre-training",
+  "tag": "ML data",
+  "sum": "How raw tables become a correct, reproducible and fast training set: point-in-time feature and label joins at billions of rows (and three ways to implement them), availability time versus event time, dataset versioning, negative downsampling with calibration correction and stratified, hash-based sampling, exact and MinHash dedup at scale with FineWeb's surprising result, sharded formats (WebDataset, MDS, token binaries) sized for many GPUs, deterministic shuffling and resumption, and streaming tokenisation and sequence packing for LLM pre-training.",
+  "prereq": [
+    [
+      "de10",
+      "A training set is a spine of (entity, prediction time) rows joined backwards to features and forwards to labels; SCD2 history and as-of joins make the past answerable."
+    ],
+    [
+      "hd8",
+      "A feature store keeps one feature definition for training (point-in-time) and serving (latest value); availability time is the honest clock."
+    ],
+    [
+      "rec9",
+      "Log-and-wait: log features at serving time and join labels when they arrive; label delay and negative sampling need bookkeeping."
+    ],
+    [
+      "ev11",
+      "Exact dedup by hashing, near-dup detection with shingles, MinHash signatures and banding into candidate pairs."
+    ],
+    [
+      "de6",
+      "Distributed joins shuffle by key; skew and range conditions make joins expensive; bucketing avoids shuffles."
+    ],
+    [
+      "ml9",
+      "Random splits leak across time and across entities; time-based and grouped splits estimate production performance honestly."
+    ]
+  ],
+  "myths": [
+    [
+      "Point-in-time correctness just means filtering features by event time.",
+      "It means using only information that was available at prediction time. A feature computed from events up to 14:00 but written to the feature table at 16:00 was not available to a 15:00 prediction. Training joins must use the time each feature value became available, not only the time of the events it summarises, or offline metrics will be better than production can deliver."
+    ],
+    [
+      "Downsampling negatives only changes training speed.",
+      "It changes the class prior the model learns. A click model trained with 1 in 10 negatives kept will predict probabilities roughly ten times too high in odds terms. Rankings may be unaffected, but anything that uses calibrated probabilities — bidding, thresholds, expected-value calculations — must correct for the sampling rate or weight the kept negatives."
+    ],
+    [
+      "Global deduplication is always better than per-source deduplication.",
+      "FineWeb's ablations found the opposite for web crawls: deduplicating all 96 Common Crawl snapshots together removed up to 90% of old snapshots and left data of worse quality than what it removed, while deduplicating each snapshot independently matched a strong baseline. What survives aggressive global dedup can be the low-quality residue."
+    ],
+    [
+      "A shuffled DataLoader means the data is well shuffled.",
+      "With streaming shard formats, shuffling happens at two levels — the order of shards and a buffer of samples within them. A small buffer over shards that were written in sorted order (by time, by source, by label) yields batches dominated by one source or period. Shuffle quality depends on how shards were written, the buffer size and the shuffle algorithm."
+    ],
+    [
+      "Pre-tokenising LLM data is always better than tokenising on the fly.",
+      "Pre-tokenising makes training input cheap and deterministic but freezes the tokenizer and the mixture: changing either means re-tokenising trillions of tokens. Tokenising on the fly keeps flexibility at the cost of CPU on the training nodes and harder exact resumption. Large runs usually pre-tokenise; research on mixtures and tokenizers often streams."
+    ]
+  ],
+  "recap": [
+    "A training-data pipeline produces an immutable, versioned dataset whose every row uses only information available at its prediction time, with labels from a closed window after it.",
+    "Point-in-time joins at scale are implemented as range joins, as a union-sort-and-carry-forward with window functions, or as per-key merge-asof inside bucketed partitions; the last scales best.",
+    "The honest clock is availability time — when a feature value could have been read — not event time; logging served features avoids the question entirely for new features.",
+    "Reproducibility needs pinned input snapshots, code and config versions, seeds, and a manifest of output shards with checksums; materialise training sets rather than recomputing them from mutable views.",
+    "Negative downsampling at rate r changes the learned odds by a factor of 1/r; correct probabilities with p = p′r / (p′r + 1 − p′) or weight kept negatives by 1/r.",
+    "Sampling should be deterministic (hash-based), stratified where rare segments matter, and split by time and by entity so no entity or future leaks across train and test.",
+    "Exact dedup hashes normalised content and groups by hash; near-dup dedup computes MinHash signatures, bands them into buckets, and clusters candidate pairs — FineWeb used 5-grams, 112 hashes in 14 bands of 8, targeting 75% similarity, per snapshot.",
+    "Large training sets are stored as shards — tar files (WebDataset), MDS files (64 MiB by default in MosaicML Streaming), Parquet, or flat token binaries — sized so that every node and worker reads many shards with large sequential reads.",
+    "Shuffling combines shard-order shuffling with an in-memory sample buffer; deterministic shuffles keyed by a seed and epoch allow exact resumption after failure, even with a different number of nodes in some systems.",
+    "For LLM pre-training, documents are tokenised, separated by end-of-sequence tokens and packed into fixed-length sequences; token IDs fit in 2 bytes for vocabularies under 65,536 and need 4 bytes for larger ones such as Llama 3's 128,256."
+  ],
+  "glossary": [
+    [
+      "Availability time",
+      "The time at which a feature value was actually computed and readable by the serving system, as opposed to the event time of the data it summarises."
+    ],
+    [
+      "Banding (LSH)",
+      "Splitting a MinHash signature into b bands of r values and bucketing documents that share any band exactly, so likely-similar pairs become candidates without comparing all pairs."
+    ],
+    [
+      "Calibration correction",
+      "Adjusting predicted probabilities after training on a resampled class distribution so they reflect the true base rate."
+    ],
+    [
+      "Canonical nodes",
+      "In MosaicML Streaming, a fixed logical number of nodes that defines the sample order, so a run can resume deterministically on a different physical node count."
+    ],
+    [
+      "Dataset manifest",
+      "A file listing the shards of a dataset with their sizes, checksums and sample counts, plus the inputs and code that produced them."
+    ],
+    [
+      "Deterministic resumption",
+      "Restarting training from a checkpoint and continuing with exactly the samples that would have come next, without repeats or skips."
+    ],
+    [
+      "Document packing",
+      "Concatenating tokenised documents, separated by end-of-sequence tokens, and cutting the stream into fixed-length training sequences so no padding is wasted."
+    ],
+    [
+      "DVC",
+      "Data Version Control: an open-source tool that versions large data files alongside Git by storing pointers in the repository and the data in object storage."
+    ],
+    [
+      "EOS token",
+      "End-of-sequence token: a special token marking a document boundary in a packed stream."
+    ],
+    [
+      "ETL",
+      "Extract, transform, load: moving data from sources through transformations into a target store (de1)."
+    ],
+    [
+      "Group split",
+      "A train/validation/test split in which all rows of one entity (user, session, document cluster) go to the same split."
+    ],
+    [
+      "Hash-based sampling",
+      "Selecting rows with a deterministic rule on a hash of a stable key, e.g. hash(user_id) mod 100 &lt; 10, so the same rows are chosen every time."
+    ],
+    [
+      "MDS",
+      "MosaicML Data Shard format used by the Streaming library: sample files with an index, designed for streaming from object storage with deterministic shuffling."
+    ],
+    [
+      "MinHash",
+      "A signature of a document's set of shingles such that the probability two signatures agree in a position equals the Jaccard similarity of the sets."
+    ],
+    [
+      "Negative downsampling",
+      "Keeping only a fraction of negative examples (e.g. non-clicks) to reduce dataset size and class imbalance."
+    ],
+    [
+      "Point-in-time join",
+      "Joining each training example to feature values as they were available at its prediction time, and to labels observed after it."
+    ],
+    [
+      "POSIX tar",
+      "The standard Unix archive format that concatenates files with headers; WebDataset shards are tar files so they can be streamed sequentially."
+    ],
+    [
+      "Shard",
+      "One file in a dataset split into many files, sized for efficient sequential reading and parallel assignment to workers."
+    ],
+    [
+      "Shuffle buffer",
+      "An in-memory pool of samples from which a streaming loader draws randomly, mixing samples from several shards."
+    ],
+    [
+      "Stratified sampling",
+      "Sampling separately within strata (segments, classes) at chosen rates so that each stratum is represented as intended."
+    ],
+    [
+      "Token binary",
+      "A flat file of token IDs (e.g. uint16 or uint32) with an index of document offsets, read with memory mapping during training."
+    ],
+    [
+      "Tokenizer",
+      "The component that maps text to integer token IDs from a fixed vocabulary, e.g. byte-pair encoding."
+    ],
+    [
+      "WebDataset",
+      "A format and library that stores training samples as files in sequentially numbered tar shards, grouped by a shared basename."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What makes a training dataset point-in-time correct?",
+      "Every feature on a training row uses only information that was available at that row's prediction time, and the label uses only outcomes observed after it within a fixed, closed window. Practically: build a spine of (entity, prediction time), join feature values by availability time with an as-of join, join labels forwards, and drop rows whose label window has not closed. Anything else lets the future leak into training."
+    ],
+    [
+      "E",
+      "Why version training datasets, and what goes into a version?",
+      "To reproduce a model, explain its behaviour, compare it with a successor and satisfy audits, you must be able to rebuild or reread exactly the data it saw. A version records the snapshot IDs of every input table, the code and configuration of the build, random seeds, the time range and filters, and a manifest of the output shards with checksums and row counts. The output should be materialised and immutable, not a view over mutable tables."
+    ],
+    [
+      "E",
+      "Why store training data as many shards rather than one big file or a table?",
+      "Training reads in parallel from many nodes and data-loader workers; shards give each worker its own files to read sequentially in large chunks, allow shard-level shuffling, and make progress and resumption trackable per shard. A single file serialises reads, and a table read through a query engine adds overhead and is hard to shuffle cheaply. Shard sizes of tens to hundreds of megabytes balance per-file overhead against granularity."
+    ],
+    [
+      "M",
+      "How do you implement a point-in-time join of 5 billion impressions with a feature table that has many timestamped versions per user?",
+      "Avoid a naive range join, which compares each impression with every version of its user. Bucket or repartition both sides by user ID so each task holds one user range, then sort by time within each partition and run a merge-asof: walk impressions and feature versions together and attach the latest version with availability time at or before each impression. In SQL engines without merge-asof, union the two inputs with a type column, sort by user and time, and use last-value-ignore-nulls window functions to carry the latest feature forward. Keep the feature side narrow (only the columns needed) and check skew on heavy users.",
+      "Follow-up: How do you validate the join? — Assert every attached feature's availability time is ≤ the impression time, the output row count equals the impression count, and compare a sample with logged online values."
+    ],
+    [
+      "M",
+      "You downsample negatives to 5% for a click model. How do you get calibrated probabilities?",
+      "Keeping negatives at rate r = 0.05 multiplies the odds the model learns by 1/r = 20. Correct each prediction p′ with p = p′r / (p′r + 1 − p′). For example a model output of 0.5 corresponds to 0.05 / (0.05 + 0.5) ≈ 0.091. Alternatively train with weight 1/r = 20 on kept negatives so the loss matches the full distribution; then outputs are calibrated directly, at the cost of higher-variance gradients. Check calibration on an unsampled validation set either way.",
+      "Follow-up: Does downsampling hurt ranking metrics? — Usually little if enough negatives remain, because the correction is monotonic; but rare hard negatives may be lost, so some teams keep all negatives from important segments (stratified downsampling)."
+    ],
+    [
+      "M",
+      "How do you deduplicate a 10-billion-document corpus for near-duplicates?",
+      "Normalise text, compute shingles (for example word 5-grams) and a MinHash signature per document (say 112 hashes), split it into bands (14 bands of 8), and emit (band index, band hash, document ID) records. Group by band key — a distributed shuffle — so documents sharing any band become candidate pairs, verify candidates if needed, and find connected components of the candidate graph; keep one document per component. The work is a few signature computations per document plus one large shuffle; the main risks are giant buckets from boilerplate (cap or drop them) and transitive chaining in connected components."
+    ],
+    [
+      "M",
+      "What did FineWeb find about global versus per-snapshot deduplication?",
+      "Deduplicating all 96 Common Crawl snapshots against each other removed up to 90% of the oldest snapshots, and models trained on a sample of the globally deduplicated data barely beat non-deduplicated data. Training on the 10% kept from an old snapshot was worse than training on the 90% removed — the survivors were disproportionately ads, keyword lists and badly formatted text. Deduplicating each snapshot independently gave about 20 trillion tokens and matched the RefinedWeb baseline. The lesson: dedup changes the composition of what remains, so evaluate it with downstream ablations, not by duplicate counts alone."
+    ],
+    [
+      "M",
+      "How does a streaming data loader shuffle data that is far too large for memory?",
+      "In two levels: shuffle the order in which shards are read (per epoch, seeded), assign shards to nodes and workers, and within each worker keep a shuffle buffer of samples from several shards and draw randomly from it. Quality depends on the buffer size relative to shard size and on how shards were written — shards written in random order make even small buffers good; shards sorted by source or time need large buffers or interleaving. Libraries such as MosaicML Streaming implement block-wise shuffles over canonical node partitions so the order is deterministic and resumable."
+    ],
+    [
+      "M",
+      "How should you split data for a model that predicts user behaviour, and why?",
+      "By time first: train on an earlier period and validate and test on later ones, with a gap at least as long as the label window so no label straddles the boundary — that mirrors how the model will be used. Then by entity where it matters: if the model must generalise to new users, put each user wholly in one split by hashing the user ID. Random row splits leak future information and let the model memorise users, so they overstate performance.",
+      "Follow-up: When is a random split acceptable? — When rows are genuinely independent and stationary, which is rare for behavioural data; even then, a time split is a cheap sanity check."
+    ],
+    [
+      "H",
+      "Design the data pipeline for pre-training a 7B-parameter LLM on 2 trillion tokens from web, code and books, for a 512-GPU cluster.",
+      "Ingest and clean each source (extraction, language ID, quality filters), deduplicate exactly and with MinHash per source or per crawl snapshot, decontaminate against evaluation sets, and record per-document provenance. Tokenise with a frozen tokenizer and write per-source token binaries (uint32 if the vocabulary exceeds 65,535) in shards of a few hundred megabytes with an index of document offsets — about 8 TB at 4 bytes per token. Mix sources by sampling shards with target weights, pack documents with EOS separators into fixed sequences, and stream them with a deterministic, seeded order per epoch so a restart resumes exactly. Throughput check: if each GPU processes about 3,000 tokens per second, 512 GPUs need about 1.5 million tokens per second, about 6 MB/s of token data — trivial for storage, so focus on per-node locality, caching and avoiding stalls at restart.",
+      "Follow-up: How would you change the mixture mid-run? — If the loader samples per source from separate shard streams with weights, changing weights at a checkpoint is a config change; if sources were pre-mixed into shards, it requires rewriting shards."
+    ],
+    [
+      "H",
+      "A ranking model's offline AUC is 0.82 but the online A/B test suggests it performs like a 0.76 model. The training pipeline uses point-in-time joins on event time. What would you investigate?",
+      "Availability versus event time: features computed by daily batch from events up to midnight but published at 04:00, so a 02:00 prediction in training sees features it could not have had online. Feature freshness online versus offline: online features may lag more than assumed. Label leakage through features computed with knowledge of outcomes (counts that include the clicked event itself). Duplicates or sampling differences between training and online traffic. And training/serving skew in feature code. The cleanest check is to compare logged online feature values with the offline joined values for the same requests.",
+      "Follow-up: How do you fix availability time in the pipeline? — Store a created_at or available_at timestamp on every feature row and join on it, or shift batch features by their publication delay; for new features, log them at serving and train on logs."
+    ],
+    [
+      "H",
+      "Training jobs on 256 GPUs stall for several seconds every few minutes, and GPU utilisation is 70%. You suspect the data pipeline. How do you find and fix it?",
+      "Measure per-step data wait time on each rank and correlate stalls with shard boundaries, worker restarts and cache misses. Typical causes: workers opening new shards from object storage with high first-byte latency (prefetch more shards, larger shards, local caching), CPU-heavy decoding or tokenisation on too few workers (more workers, pre-tokenise, move decoding to GPUs), imbalanced shard assignment so some ranks run dry at epoch boundaries, and synchronised behaviour where all ranks fetch at once. Fix by prefetching ahead of consumption, sizing shards so each worker has several in flight, and checking that throughput exceeds GPU consumption with margin under realistic storage latency."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale",
+      "Penedo et al. (Hugging Face), 2024 — 15 trillion tokens from 96 Common Crawl snapshots, MinHash settings, and the global-versus-per-snapshot deduplication ablation.",
+      "https://arxiv.org/abs/2406.17557"
+    ],
+    [
+      "docs",
+      "MosaicML Streaming: shuffling",
+      "MDS shards, canonical nodes, the py1e shuffle and shuffle block sizes, deterministic resumption.",
+      "https://docs.mosaicml.com/projects/streaming/en/stable/dataset_configuration/shuffling.html"
+    ],
+    [
+      "code",
+      "WebDataset README",
+      "Tar-shard format, brace-notation shard lists, shard and buffer shuffling, splitting by node and worker.",
+      "https://raw.githubusercontent.com/webdataset/webdataset/main/README.md"
+    ],
+    [
+      "paper",
+      "Practical Lessons from Predicting Clicks on Ads at Facebook",
+      "He et al., ADKDD 2014 — data volume versus accuracy, negative downsampling (best at 0.025 in their study) and the calibration correction formula.",
+      "https://quinonero.net/Publications/predicting-clicks-facebook.pdf"
+    ],
+    [
+      "docs",
+      "pandas.merge_asof",
+      "The as-of join operator: match each row to the most recent row by key and time.",
+      "https://pandas.pydata.org/docs/reference/api/pandas.merge_asof.html"
+    ],
+    [
+      "code",
+      "nanoGPT: data preparation",
+      "A minimal example of tokenising a corpus into uint16 binary files read with memory mapping.",
+      "https://raw.githubusercontent.com/karpathy/nanoGPT/master/data/openwebtext/prepare.py"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team spends three months improving a recommendation model. Offline, every iteration is better: the final version beats production by four points of AUC. Online, it loses. After a long investigation, the cause turns out to be the training data, not the model. User features were joined to impressions by event time, but the feature pipeline ran nightly and published at 04:00, so an impression at 01:00 in the training set saw a feature value that, in production, would not exist for three more hours. The model had learned to lean on the freshest features, which in production were always staler than in training. Months of offline gains were measuring a leak.</p>
+<p>A second team trains a language model. Halfway through a three-week run on 512 GPUs, a node fails; the job restarts from a checkpoint, but the data loader starts its shards from the beginning of the epoch. A few hundred billion tokens are seen twice, a few hundred billion never. Nobody notices until evaluation shows odd memorisation of certain documents. A third team discovers that its fine-tuning set contains near-duplicates of its evaluation set — the benchmark score was partly recall.</p>
+<p>These are failures of the <em>training-data pipeline</em> — the last stage between the lakehouse and the GPU. It has requirements no other consumer has. It must be <strong>temporally correct</strong> at the level of individual rows, because a model will exploit any leak. It must be <strong>reproducible</strong>, because models are compared, audited and debugged against the exact data they saw. It must have the <strong>right distribution</strong> — sampled, stratified, deduplicated and decontaminated on purpose. And it must be <strong>fast and resumable</strong>: a 512-GPU job costs thousands of dollars an hour, so the data loader must never be the bottleneck and must restart exactly where it stopped.</p>
+<p>This lesson builds such a pipeline step by step: point-in-time joins at billions of rows and the subtle difference between event time and availability time; dataset versioning; negative downsampling with calibration correction, stratified and hash-based sampling, and honest splits; exact and near-duplicate removal at scale, with FineWeb's surprising finding that more deduplication can make data worse; sharded formats and how to size them for a GPU cluster; deterministic shuffling and resumption; and streaming tokenisation and sequence packing for LLM pre-training.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a printing press for exams</h4>
+<p>Think of a national exam board producing millions of exam papers. The questions must be drawn only from material taught before the exam date — no question about next term's syllabus (point-in-time correctness). Every printed paper must be traceable: which question bank version, which printing run, which settings (versioning). The mix of easy and hard questions, and of topics, is chosen deliberately, and if hard questions are under-represented on purpose to save paper, the marking scheme must account for it (sampling and calibration). The same question must not appear twice in one paper, and no question may be a copy of one in the published practice papers that students memorised (deduplication and decontamination). And the papers are printed in numbered bundles, shipped to thousands of exam halls, each hall receiving a different, random-looking but recorded set of bundles; if a delivery truck breaks down, the board knows exactly which bundles each hall still needs (sharding, shuffling and resumption).</p>
+<p>A training-data pipeline does all of these things for a model instead of a student. The analogy's lesson is that each step is a separate, checkable stage with its own failure mode, and the expensive failures — a leaked question, a duplicated bundle, a lost delivery — are the ones that are invisible until the results come in.</p>
+<p>Where the analogy breaks: exam boards print once; training sets are rebuilt often, by code, from tables that change underneath. So the pipeline must be automated and deterministic, and every stage must leave enough metadata behind that a dataset can be rebuilt or audited months later.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Training-data pipeline: lakehouse tables feed a point-in-time join on a spine, then sampling and splits, dedup and decontamination, then writing versioned shards with a manifest, read by a streaming loader on GPU nodes">
+  <defs><marker id="de12-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="70" width="95" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="57" y="95" text-anchor="middle" style="fill:var(--ink)">Lakehouse</text><text x="57" y="112" text-anchor="middle" style="fill:var(--ink-2)">snapshots</text>
+    <rect x="125" y="70" width="95" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="172" y="95" text-anchor="middle" style="fill:var(--ink)">PIT join</text><text x="172" y="112" text-anchor="middle" style="fill:var(--ink-2)">spine + labels</text>
+    <rect x="240" y="70" width="95" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="287" y="95" text-anchor="middle" style="fill:var(--ink)">Sample,</text><text x="287" y="112" text-anchor="middle" style="fill:var(--ink)">split</text>
+    <rect x="355" y="70" width="95" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--s4)"/><text x="402" y="95" text-anchor="middle" style="fill:var(--ink)">Dedup,</text><text x="402" y="112" text-anchor="middle" style="fill:var(--ink)">decontam.</text>
+    <rect x="470" y="70" width="80" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--s5)"/><text x="510" y="95" text-anchor="middle" style="fill:var(--ink)">Shards +</text><text x="510" y="112" text-anchor="middle" style="fill:var(--ink)">manifest</text>
+    <rect x="570" y="70" width="60" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="600" y="95" text-anchor="middle" style="fill:var(--ink)">GPU</text><text x="600" y="112" text-anchor="middle" style="fill:var(--ink)">loader</text>
+    <line x1="105" y1="100" x2="123" y2="100" marker-end="url(#de12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="220" y1="100" x2="238" y2="100" marker-end="url(#de12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="335" y1="100" x2="353" y2="100" marker-end="url(#de12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="450" y1="100" x2="468" y2="100" marker-end="url(#de12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="550" y1="100" x2="568" y2="100" marker-end="url(#de12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="57" y="155" text-anchor="middle" style="fill:var(--accent)">pinned IDs</text>
+    <text x="172" y="155" text-anchor="middle" style="fill:var(--accent)">availability</text><text x="172" y="171" text-anchor="middle" style="fill:var(--accent)">time ≤ t</text>
+    <text x="287" y="155" text-anchor="middle" style="fill:var(--accent)">hash-based,</text><text x="287" y="171" text-anchor="middle" style="fill:var(--accent)">by time/entity</text>
+    <text x="402" y="155" text-anchor="middle" style="fill:var(--accent)">MinHash</text><text x="402" y="171" text-anchor="middle" style="fill:var(--accent)">per source</text>
+    <text x="510" y="155" text-anchor="middle" style="fill:var(--accent)">checksums</text>
+    <text x="600" y="155" text-anchor="middle" style="fill:var(--accent)">seeded,</text><text x="600" y="171" text-anchor="middle" style="fill:var(--accent)">resumable</text>
+    <text x="320" y="214" text-anchor="middle" style="fill:var(--ink-2)">each stage is deterministic given its inputs and config, so the whole dataset can be rebuilt bit-for-bit</text>
+  </g>
+</svg>
+<figcaption>The stages of a training-data pipeline, with the property each must guarantee written underneath. A failure at any stage — a leak, a non-deterministic sample, an unrecorded input — makes everything after it unreproducible.</figcaption>
+</figure>
+<p>The rest of the lesson follows the figure from left to right, and it helps to know in advance which property each stage protects. The joins protect <em>temporal correctness</em>: no row may know anything from after its prediction time. Versioning protects <em>reproducibility</em>: the same version must always mean the same bytes. Sampling and splits protect the <em>distribution</em>: the model should learn from, and be evaluated on, the traffic it will face. Deduplication and decontamination protect <em>honesty</em>: no example should count more than intended, and no test item should leak into training. Sharding and the loader protect <em>throughput and continuity</em>: GPUs should never wait, and a crash should never duplicate or skip data.</p>
+<p>A useful habit is to ask, for any training-data pipeline you are shown in an interview or a design review, "which of these five properties does each stage guarantee, and how would I know if it broke?" Most real incidents turn out to be a stage that silently stopped guaranteeing its property — a join that started using event time, a sample that stopped being deterministic, a loader that lost its position — while every job kept reporting success.</p>
+</section>
+
+<section data-field="body">
+<h4>1. What the pipeline promises the trainer</h4>
+<p>Before mechanics, fix the contract between a training-data pipeline and a training job. The pipeline delivers a dataset that is: <strong>correct</strong> (point-in-time, deduplicated, decontaminated, with the intended distribution); <strong>immutable and versioned</strong> (the same version always contains the same bytes); <strong>described</strong> (a manifest of shards, row counts, schema, and how it was built); and <strong>servable at speed</strong> (sharded so that many workers can read in parallel, in a deterministic order that survives restarts). The training job promises in turn to record which dataset version, seed and sample positions it used. Everything below implements one of these promises.</p>
+
+<h4>2. Point-in-time joins at scale</h4>
+<p>de10 defined the spine and the point-in-time join on small data. At production scale — 5 billion impressions a week, feature tables with tens of versions per user — the implementation decides whether the join takes 20 minutes or 20 hours.</p>
+<p><strong>The naive range join.</strong> <code>JOIN features f ON f.user_id = i.user_id AND f.available_at &lt;= i.ts AND i.ts &lt; f.next_available_at</code>. Engines execute this as an equi-join on <code>user_id</code> followed by a filter on the range, so every impression of a user is first paired with every version of that user's features. A user with 2,000 impressions and 300 feature versions generates 600,000 intermediate pairs to keep 2,000 rows; heavy users dominate the cost and skew the job (de6). It is correct, and it is the slowest option.</p>
+<p><strong>Union, sort and carry forward.</strong> Stack impressions and feature versions into one table with a type column, sort by <code>(user_id, time, type)</code> so a feature version at the same instant as an impression sorts first, and use a window function to carry the latest feature values forward: <code>LAST_VALUE(f.x, TRUE) OVER (PARTITION BY user_id ORDER BY time ROWS UNBOUNDED PRECEDING)</code> (the second argument ignoring nulls), then keep only impression rows. Cost: one shuffle and one sort of both inputs together, linear in their combined size. Works in any SQL engine with window functions.</p>
+<p><strong>Bucketed merge-asof.</strong> Partition (or pre-bucket, de3) both sides by <code>user_id</code> into the same partitions, sort each partition by time, and run a merge-asof inside each partition: one pass that walks impressions and feature versions together, attaching the latest version whose availability time is ≤ the impression time. This is what feature stores do internally, and it is available as <code>merge_asof</code> in pandas per partition (Spark's <code>applyInPandas</code> or <code>mapInArrow</code>), or as native as-of joins in engines that have them. With both sides pre-bucketed, there is no shuffle at all; each task streams its bucket.</p>
+<p>Sizes for a weekly build: 5 billion impressions at 40 bytes of keys and timestamps is 200 GB; user feature versions, 200 million users × 7 daily versions × 2 KB of features is 2.8 TB — the feature side dominates, so project only the features the model uses (perhaps 300 bytes, 420 GB). With 2,000 buckets, each task merges about 100 MB of impressions with 210 MB of features in one sorted pass. A naive range join on the same data, for a heavy user with 20,000 impressions and 7 versions, does 140,000 comparisons for that user alone — fine — but with hourly feature versions (168 per week) and bot users with millions of impressions, it explodes; the carry-forward and merge-asof forms do not.</p>
+
+<h4>3. Event time versus availability time</h4>
+<p>The most common leak in production training pipelines is subtle. A feature "purchases in the last 7 days" for day D is computed by a batch job from events up to the end of D and published at 04:00 on D+1. Its <em>event time</em> horizon is D 23:59:59; its <em>availability time</em> is D+1 04:00. A prediction at D+1 02:00 in production used the value for D−1 (published at D 04:00), because D's value did not exist yet. A training join on event time ("latest feature with horizon ≤ prediction time") attaches D's value — two hours fresher than production ever has — and the model learns to rely on freshness it will never get.</p>
+<p>The fix is to record, for every feature row, when it became available (the publish or commit time — table-format commit timestamps are a good source, de4), and join on that. Streaming features have the same issue at smaller scale: a value computed from events up to 12:00:00 is written to the online store at 12:00:40 after watermark delay (de9). And the cleanest fix, for any feature that already exists in production, is <strong>log and wait</strong> (rec9): log the exact feature values served with each request, and train on the logs, so training sees precisely what serving saw. Availability-time joins are then needed only for backfilling new features over periods before they were logged.</p>
+
+<h4>4. Labels at scale</h4>
+<p>Labels are joined forward in time, and their own mechanics matter. For each spine row with prediction time t and label window W, the label is computed from outcome events in (t, t + W]: a click within 30 minutes, a purchase within 7 days, a chargeback within 90 days. Implementation mirrors the feature join — union-sort-and-scan forward or a bucketed merge — with an extra rule: a spine row is only emitted once its window has closed relative to the outcome data's completeness (the latest fully loaded outcome partition). Chargeback-style labels that arrive weeks late need the outcome's arrival time recorded too (de10), so a training set built "as of" date B counts only outcomes that had arrived by B. Measure the label's maturity curve — the fraction of eventual positives observed after 1, 7, 30 and 90 days — to choose W and the exclusion window.</p>
+
+<h4>5. Versioning and reproducibility</h4>
+<p>A training dataset version should be enough to rebuild the data bit for bit, or at least to reread exactly what a model saw. The minimum record:</p>
+<ul>
+<li>The <strong>snapshot ID</strong> (or version) of every input table at build time — Iceberg snapshot IDs or Delta versions (de4).</li>
+<li>The <strong>code version</strong> (commit hash) and full configuration: time range, filters, spine definition, feature list, label window, sampling rates, seeds.</li>
+<li>A <strong>manifest</strong> of the output: every shard's path, size, row count and checksum; the schema; summary statistics (label rate, row counts per split, null rates of key features).</li>
+<li><strong>Retention</strong> that matches the model's audit needs. Input snapshots expire (Iceberg's default expiry age is 5 days, de4), so either tag the input snapshots with matching retention or — usually simpler and cheaper — keep the materialised training set itself, which is far smaller than its inputs.</li>
+</ul>
+<p>Materialise, do not recompute. A training set defined as a SQL view over current tables changes whenever any input changes: late data, corrections, backfills (de4's drill). Writing the result once, as immutable shards with a manifest, turns "the data the model saw" into an object you can point at. Tools such as lakeFS or DVC version files in object storage with Git-like semantics; table-format tags do the same for tables; a simple convention — an immutable path per version plus a manifest file — is enough for many teams.</p>
+
+<h4>6. Sampling, stratification and splits</h4>
+<p><strong>Negative downsampling.</strong> Click and fraud data are heavily imbalanced: perhaps 1 click per 100 impressions. Keeping all negatives wastes compute on easy examples; keeping a fraction r of negatives (say 5%) cuts the dataset roughly twentyfold. But it changes the prior: the model learns odds that are 1/r times too high. Facebook's 2014 ads paper ("Practical Lessons from Predicting Clicks on Ads at Facebook") gives the correction for a model trained on downsampled data: if the model predicts p′, the calibrated probability is <code>p = p′ / (p′ + (1 − p′) / r)</code>, equivalently <code>p′r / (p′r + 1 − p′)</code>. Worked: r = 0.05 and a prediction of 0.5 give 0.05 / (0.05 + 0.5) ≈ 0.091; a prediction of 0.2 gives 0.01 / (0.01 + 0.8) ≈ 0.0123. The alternative is to weight each kept negative by 1/r in the loss, which keeps outputs calibrated without post-correction, at the cost of noisier gradients. Either way, measure calibration on an unsampled validation set. The same paper reports that, for its boosted-tree click models, training on only 10% of the data cost about 1% in normalised entropy, and that among negative downsampling rates of 0.1, 0.01, 0.001 and 0.0001 the best performance came at 0.025 — evidence that downsampling is a tuning knob with an optimum, not just a cost saving.</p>
+<p><strong>Deterministic, hash-based sampling.</strong> <code>rand() &lt; 0.05</code> picks different rows on every rebuild, breaking reproducibility, and different rows on different partitions after a retry. Use a hash of a stable key: keep a negative if <code>hash(impression_id, "neg-sample-v1") mod 10,000 &lt; 500</code>. The same rows are chosen every time, across engines, and changing the salt string ("v2") draws a new, equally reproducible sample. Sample by entity when the model should see whole entities (all of a sampled user's rows): <code>hash(user_id) mod 100 &lt; 10</code>.</p>
+<p><strong>Stratification.</strong> Uniform sampling under-represents rare but important segments — new users, small countries, rare item categories. Stratified sampling sets rates per stratum (keep all impressions from new users, 5% of negatives from established ones) and records the rate per row so weights or corrections can be applied per stratum.</p>
+<p><strong>Splits that match production.</strong> ml9 covered why: random splits leak future information and leak entities across train and test. Training pipelines should produce <strong>time-based splits</strong> (train on weeks 1–10, validate on week 11, test on week 12, with a gap at least as long as the label window between them so labels do not straddle) and <strong>group splits</strong> where entities recur (all rows of a user, or all near-duplicate documents of a cluster, in the same split). Assign splits by hashing the group key, so the assignment is stable across rebuilds.</p>
+
+<h4>7. Deduplication at scale</h4>
+<p>Duplicates in training data waste compute, over-weight repeated content, encourage memorisation and — when they cross into evaluation sets — inflate scores. ev11 worked MinHash by hand; here is how it runs on billions of documents.</p>
+<p><strong>Exact duplicates.</strong> Normalise each document (Unicode normalisation, whitespace, perhaps lowercase), hash it (a 64- or 128-bit hash), and group by hash — a single shuffle on the hash, keeping one document per group. For tabular training rows, exact duplicates usually mean pipeline bugs (double loads, exploding joins) and should be caught by uniqueness tests on the grain key (de11) rather than removed silently.</p>
+<p><strong>Near duplicates with MinHash and LSH.</strong> For each document: extract shingles (word n-grams), compute a MinHash signature of k values (each the minimum of a different hash function over the shingles), and split it into b bands of r values (k = b × r). Two documents with Jaccard similarity s share at least one band with probability 1 − (1 − s<sup>r</sup>)<sup>b</sup>. FineWeb's settings make this concrete: 5-grams, 112 hash functions in 14 bands of 8, targeting documents at least 75% similar. At s = 0.75: s<sup>8</sup> ≈ 0.100, so the chance of sharing a given band is 0.1 and of sharing at least one of 14 is 1 − 0.9<sup>14</sup> ≈ 0.77; at s = 0.5: 0.5<sup>8</sup> ≈ 0.0039 and 1 − (1 − 0.0039)<sup>14</sup> ≈ 0.053; at s = 0.9: 0.9<sup>8</sup> ≈ 0.43 and nearly 1. The banding makes the decision sharply threshold-like around the target.</p>
+<p>The distributed job: (1) map each document to 14 records <code>(band_index, band_hash, doc_id)</code>; (2) shuffle by <code>(band_index, band_hash)</code> so documents sharing a band meet; (3) within each bucket, emit candidate pairs (or link every member to the bucket's first member, which is linear in bucket size); (4) find <strong>connected components</strong> of the candidate graph — iteratively with union-find in a distributed algorithm — and (5) keep one document per component. Volumes: 10 billion documents × 14 band records × ~24 bytes ≈ 3.4 TB of shuffle — large but routine. Two practical hazards: enormous buckets caused by boilerplate shared by millions of pages (cookie banners, templates), which should be capped or handled by removing boilerplate before hashing; and transitive chaining, where A~B and B~C link A and C even if they are dissimilar, which slightly over-removes.</p>
+<p><strong>Where to dedup is a quality decision.</strong> FineWeb (Penedo et al., 2024) ran exactly this experiment, described in the case below: deduplicating across all crawl snapshots removed far more data and produced a worse model than deduplicating each snapshot independently. Dedup is not just cleaning; it reshapes the distribution, and its scope should be chosen by downstream ablations.</p>
+<p><strong>Decontamination.</strong> The same machinery, run between training data and evaluation sets (n-gram overlap or MinHash against benchmark items), removes training documents that contain test material, so evaluation measures generalisation rather than recall (ev11).</p>
+
+<h4>8. Sharded datasets for large-scale training</h4>
+<p>A training job on N nodes, each with several data-loader workers per GPU, wants every worker reading large sequential chunks from its own files, with no coordination, no small random reads from object storage, and a cheap way to shuffle. That is what <strong>shards</strong> provide: the dataset split into many files of moderate size, each read start to finish by one worker.</p>
+<p>Common formats:</p>
+<ul>
+<li><strong>WebDataset</strong>: each shard is a POSIX tar file; files making up one sample share a basename (<code>000123.jpg</code>, <code>000123.json</code>); shards are numbered and listed in brace notation (<code>train-{000000..012345}.tar</code>). Readers stream tar files sequentially, so any storage that supports streaming reads works.</li>
+<li><strong>MDS</strong> (MosaicML Streaming): sample shards plus an index file, designed for streaming from object storage with local caching, deterministic shuffling and resumption; the writer's default shard size limit is 1 &lt;&lt; 26 bytes (64 MiB).</li>
+<li><strong>Parquet shards</strong>: natural for tabular training data; row groups give sub-file granularity (de2).</li>
+<li><strong>Token binaries</strong> for LLMs: a flat array of token IDs per shard with an index of document offsets, memory-mapped by the loader (section 10).</li>
+<li><strong>TFRecord</strong> and similar record-oriented formats in the TensorFlow ecosystem.</li>
+</ul>
+<p>Sizing shards: big enough that per-file overhead (open latency of tens of milliseconds on object storage, metadata) is negligible and reads are sequential; small enough that there are many more shards than workers, so shards can be shuffled and balanced, and that a partially read shard at a restart is not a large waste. Worked: a 10 TB image dataset on 64 nodes × 8 GPUs × 4 workers = 2,048 workers. With 64 MiB shards there are about 150,000 shards — about 73 per worker per epoch — good shuffle granularity, and each shard takes well under a second to read at 100 MB/s. With 10 GB shards there would be 1,000 shards — fewer than workers — and some workers would sit idle.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Shards are shuffled per epoch with a seed and assigned to nodes and workers; each worker reads shards sequentially into a shuffle buffer from which batches are drawn">
+  <defs><marker id="de12-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Shards (seed + epoch → permutation)</text>
+    <g style="font-family:var(--mono)">
+      <rect x="20" y="30" width="50" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="45" y="48" text-anchor="middle" style="fill:var(--ink)">s17</text>
+      <rect x="75" y="30" width="50" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="100" y="48" text-anchor="middle" style="fill:var(--ink)">s03</text>
+      <rect x="130" y="30" width="50" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="155" y="48" text-anchor="middle" style="fill:var(--ink)">s88</text>
+      <rect x="185" y="30" width="50" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s4)"/><text x="210" y="48" text-anchor="middle" style="fill:var(--ink)">s41</text>
+      <rect x="240" y="30" width="50" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="265" y="48" text-anchor="middle" style="fill:var(--ink)">s09</text>
+      <rect x="295" y="30" width="50" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="320" y="48" text-anchor="middle" style="fill:var(--ink)">s62</text>
+    </g>
+    <text x="360" y="48" style="fill:var(--ink-2)">… ~150,000 shards × 64 MiB</text>
+    <rect x="20" y="90" width="280" height="60" rx="6" style="fill:none;stroke:var(--line-2)"/>
+    <text x="30" y="108" style="fill:var(--ink)">node 0 · worker 0</text>
+    <text x="30" y="128" style="fill:var(--ink-2);font-family:var(--mono)">reads s17, s41, … in turn</text>
+    <text x="30" y="144" style="fill:var(--ink-2)">(split by node, then by worker)</text>
+    <rect x="340" y="90" width="280" height="60" rx="6" style="fill:none;stroke:var(--line-2)"/>
+    <text x="350" y="108" style="fill:var(--ink)">node 0 · worker 1</text>
+    <text x="350" y="128" style="fill:var(--ink-2);font-family:var(--mono)">reads s03, s09, …</text>
+    <line x1="45" y1="56" x2="100" y2="88" marker-end="url(#de12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="100" y1="56" x2="420" y2="88" marker-end="url(#de12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="20" y="175" width="280" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="160" y="200" text-anchor="middle" style="fill:var(--ink)">shuffle buffer: samples from ~10+ shards</text>
+    <line x1="160" y1="150" x2="160" y2="173" marker-end="url(#de12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="320" y="240" text-anchor="middle" style="fill:var(--ink-2)">order = f(seed, epoch, sample position): a restart at step k recomputes the same order and skips exactly k batches</text>
+  </g>
+</svg>
+<figcaption>Two-level shuffling for streaming datasets. A seeded permutation decides shard order each epoch; shards are divided among nodes and workers; each worker mixes samples from several shards in a buffer. Because the order is a pure function of seed, epoch and position, a restarted job can reconstruct exactly where it was.</figcaption>
+</figure>
+
+<h4>9. Shuffling and deterministic resumption</h4>
+<p>Gradient descent assumes batches are roughly independent samples of the data. If shards were written in a sorted order — by date, by source, by label — and the loader reads shards sequentially, batches are dominated by one date or source at a time, which slows or biases training. Streaming loaders therefore shuffle at two levels: the <strong>order of shards</strong> (a seeded permutation per epoch) and the <strong>order of samples</strong> within a worker, via a <strong>shuffle buffer</strong> that holds samples from several shards and draws randomly. WebDataset exposes both as pipeline stages (<code>shuffle</code> over shard URLs and over samples, with buffers of about a thousand samples suggested as a starting point). Shuffle quality depends on the buffer size relative to shard size and, more than anything, on how shards were written: shuffling rows <em>before</em> writing shards (a global shuffle at build time) makes even a modest loader buffer sufficient.</p>
+<p>MosaicML Streaming makes shuffling deterministic and elastic. Samples are partitioned across a fixed number of <strong>canonical nodes</strong> (by default the number of physical nodes at the start), and its default shuffle algorithm, <code>py1e</code>, spreads each shard's samples over a range of at most <code>shuffle_block_size</code> samples (default <code>max(4,000,000 / num_canonical_nodes, 1 &lt;&lt; 18)</code>), with all randomness derived from a seed (default 9176). The docs recommend a shuffle block at least ten times the number of samples in a shard for good quality. Because the order is a function of the seed, epoch and canonical layout, a job can resume mid-epoch exactly — and on a different number of physical nodes — by recomputing the order and skipping the samples already consumed.</p>
+<p>Deterministic resumption is worth insisting on. Without it, a restart either replays from the start of the epoch (duplicating up to a full epoch of samples — a real problem when training on the data only once, as in LLM pre-training) or starts fresh shards (skipping data). The loader's state to checkpoint is small: the seed, the epoch and the number of samples consumed per rank.</p>
+
+<h4>10. Streaming tokenisation and packing for LLM pre-training</h4>
+<p>LLM pre-training data is text at enormous scale — FineWeb alone is 15 trillion tokens — and the model consumes fixed-length sequences of token IDs. Between the two sit tokenisation and packing.</p>
+<p><strong>Tokenisation</strong> maps text to integer IDs with a fixed vocabulary (byte-pair encoding and its variants). Two strategies exist. <em>Pre-tokenise</em>: run the tokenizer once in a distributed batch job and write token IDs to binary shards; training then reads integers with no CPU cost, deterministically. <em>Tokenise on the fly</em>: stream text and tokenise in data-loader workers; this keeps the tokenizer and the mixture flexible but costs CPU on training nodes and makes exact resumption harder, because token counts per document are not known in advance. Large production runs usually pre-tokenise; mixture and tokenizer research often streams.</p>
+<p><strong>Storage width.</strong> GPT-2's vocabulary of 50,257 fits in an unsigned 16-bit integer (maximum 65,535), so nanoGPT's preparation script writes <code>uint16</code> binaries. Llama 3's vocabulary of 128,256 does not; it needs 4 bytes per token (or a 17-bit packing scheme). Storage for 15 trillion tokens: 30 TB at 2 bytes, 60 TB at 4 bytes — before any replication.</p>
+<p><strong>Packing.</strong> Documents have arbitrary lengths; sequences have a fixed length L (say 8,192). Padding each document to L would waste most of the compute on short documents. Instead, concatenate tokenised documents into one stream, separated by an <strong>end-of-sequence (EOS)</strong> token, and cut the stream into consecutive chunks of L tokens. A sequence then contains several documents, and a long document spans several sequences. Two refinements: attention masks that prevent tokens attending across document boundaries within a packed sequence (supported by recent attention kernels via per-document position information), and position IDs that restart at each document. Whether cross-document attention matters is an empirical question; the bookkeeping cost is small.</p>
+
+<figure>
+<svg viewBox="0 0 640 200" width="100%" role="img" aria-label="Packing: three documents of 5,000, 2,000 and 4,000 tokens concatenated with EOS tokens and cut into sequences of 8,192 tokens, with documents spanning sequence boundaries">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Token stream (EOS between documents)</text>
+    <rect x="20" y="34" width="250" height="30" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="145" y="54" text-anchor="middle" style="fill:var(--ink)">doc A · 5,000</text>
+    <rect x="270" y="34" width="8" height="30" style="fill:var(--accent)"/>
+    <rect x="278" y="34" width="100" height="30" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="328" y="54" text-anchor="middle" style="fill:var(--ink)">doc B · 2,000</text>
+    <rect x="378" y="34" width="8" height="30" style="fill:var(--accent)"/>
+    <rect x="386" y="34" width="200" height="30" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="486" y="54" text-anchor="middle" style="fill:var(--ink)">doc C · 4,000</text>
+    <rect x="586" y="34" width="8" height="30" style="fill:var(--accent)"/>
+    <text x="604" y="54" style="fill:var(--ink-2)">…</text>
+    <line x1="430" y1="28" x2="430" y2="130" style="fill:none;stroke:var(--crit);stroke-width:2;stroke-dasharray:5 3"/>
+    <text x="430" y="144" text-anchor="middle" style="fill:var(--crit)">cut at 8,192</text>
+    <rect x="20" y="90" width="410" height="26" rx="3" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="225" y="108" text-anchor="middle" style="fill:var(--ink)">sequence 1: A (5,000) + EOS + B (2,000) + EOS + C[0:1,190]</text>
+    <rect x="430" y="90" width="190" height="26" rx="3" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="525" y="108" text-anchor="middle" style="fill:var(--ink)">seq 2: C[1,190:] + …</text>
+    <text x="320" y="176" text-anchor="middle" style="fill:var(--ink-2)">no padding wasted; per-document masks optionally stop attention crossing EOS</text>
+  </g>
+</svg>
+<figcaption>Sequence packing. Documents are joined with EOS tokens and the stream is cut every 8,192 tokens, so every position is a real token. Document C is split across two sequences — acceptable for pre-training, and the reason a per-document attention mask and position reset are worth considering.</figcaption>
+</figure>
+
+<p><strong>Mixtures.</strong> A pre-training corpus combines sources — web, code, books, papers, multilingual text — with target proportions that differ from their raw sizes. Writing each source to its own shard streams and sampling between streams by weight at load time keeps mixtures adjustable (and lets them change during training, as in curriculum or annealing phases); pre-mixing sources into the same shards freezes the mixture.</p>
+<p><strong>Throughput check.</strong> Token data is compact, so bandwidth is rarely the constraint. A 512-GPU run where each GPU processes about 3,000 tokens per second consumes about 1.5 million tokens per second — 3 MB/s at 2 bytes per token, 6 MB/s at 4. Images and video are another matter: 2,048 workers each needing 50 images per second at 150 KB is about 15 GB/s from storage, which requires local caching, large sequential reads and enough decode CPU. Always compute the loader's required throughput and compare it with storage and CPU capacity before blaming the GPUs.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why the feature store's join is a sort, not a lookup</h4>
+<p>A training-set join looks like many lookups — for each example, find the feature value valid at its time — and a naive implementation issues them one by one against a key-value store. At billions of examples, random lookups are hopeless; the efficient algorithm turns the problem into sorting. Sort examples and feature versions by (key, time) and a single merge pass resolves every lookup sequentially. This is why point-in-time joins are implemented as bucketed sort-merge in batch engines, why pre-bucketing both sides by entity pays off for repeated builds, and why incremental builds (only new spine rows, joined against feature versions after the last build's horizon plus each key's last version before it) are possible. It is also the deep reason feature stores separate an offline store (columnar, sorted, historical) from an online store (key-value, latest only): the access patterns are sorting and lookup, and no single storage layout serves both.</p>
+
+<h4>Sampling changes what the model is optimising</h4>
+<p>Every sampling decision is an implicit reweighting of the loss. Negative downsampling reweights classes; stratified sampling reweights segments; capping examples per user (common to stop power users dominating) reweights users; deduplication reweights content by removing repeats. Some of these are intended (you do not want bots to dominate), some are accidental. The principled view: decide the distribution you want the model to be good on — usually production traffic, sometimes a balanced view of users — and treat every sampling choice as importance sampling relative to it, recording rates per row so weights can be applied in the loss or in evaluation. Evaluate on data sampled like production, not like the training set.</p>
+
+<h4>Deduplication interacts with quality and memorisation</h4>
+<p>Research on language models found that training data with many repeated sequences increases memorisation and that deduplication improves efficiency (Lee et al. 2021, ev11's case). FineWeb's ablation adds the caution that what deduplication leaves behind can be worse than what it removes, because content repeated across many crawls is disproportionately popular, well-maintained pages, while content unique to an old crawl is disproportionately junk. Two practical consequences: choose dedup scope (per snapshot, per source, global) by ablation, and apply quality filters as well as dedup rather than assuming dedup implies quality. A related subtlety is that exact duplicates are sometimes signal — a frequently re-shared article is popular for a reason — so some pipelines downweight rather than remove.</p>
+
+<h4>Data loaders are distributed systems with failure modes</h4>
+<p>At thousands of workers, the loader shows the same pathologies as any distributed system (cl6's deep section made the same point). Synchronised behaviour causes thundering herds: every rank finishing an epoch at once and fetching new shards at once. Long-tail latency from object storage makes the slowest worker gate the step, because synchronous data-parallel training waits for every rank. Imbalanced shard assignment leaves some ranks with less data at the end of an epoch. Remedies borrowed from systems design: prefetch with a deep queue, local caches of upcoming shards, randomised or staggered fetches, balanced assignment by sample count rather than shard count, and observability — per-rank data wait time is the metric that tells you whether the GPUs are starved.</p>
+
+<h4>The tokenizer is part of the data contract</h4>
+<p>Pre-tokenised datasets bind the data to a tokenizer version: vocabulary, normalisation rules, special-token IDs. A mismatch — training with one tokenizer's IDs and serving with another's — produces a model that sees gibberish, and subtler mismatches (a changed normalisation rule, a different EOS ID) produce subtle degradation. Treat the tokenizer as a versioned artefact recorded in the dataset manifest, checksum its files, and validate at training start that the dataset's tokenizer version equals the one the model configuration expects. The same applies to image preprocessing (resize, crop, normalisation constants) and to feature normalisation statistics in tabular models.</p>
+<h4>Incremental builds versus full rebuilds</h4>
+<p>Rebuilding eight weeks of training data every week re-does seven weeks of identical work. Incremental builds append only the newest week's spine rows, joined against feature versions as of their own times, and keep earlier weeks' materialised rows — which is correct only if nothing upstream changed for those weeks. Late labels, feature backfills (de7) and bug fixes all change history, so incremental pipelines need a rule for when to rebuild: track the input snapshot IDs each week's rows were built from, and rebuild a week whenever any of its inputs changed for its time range. That turns a training set into an incremental materialised view with explicit invalidation — cheaper to maintain, and still reproducible because each week's provenance is recorded.</p>
+</section>
+
+<section data-field="prod">
+<h4>How training-data pipelines fail</h4>
+<p><strong>Temporal leakage.</strong> Event-time joins where availability time was needed; features computed with outcome information; labels whose windows were open at build time. Symptoms: offline metrics far better than online; online performance improving as the model ages (because live data catches up). Defences: availability-time joins, logged features, leakage tests (every feature timestamp ≤ prediction time), and comparing offline-joined values with logged online values.</p>
+<p><strong>Unreproducible datasets.</strong> Training sets built from views over mutable tables; random sampling without fixed seeds; inputs expired. Symptoms: cannot rebuild the data for a model under investigation; "same" pipeline gives different row counts. Defences: pinned snapshots, hash-based sampling, materialised versions with manifests.</p>
+<p><strong>Distribution surprises.</strong> Downsampling without calibration correction (probabilities systematically too high); a stratum accidentally dropped by a join; duplicates inflating some entities. Defences: summary statistics in the manifest compared with previous versions (label rate, counts per segment), calibration checks on unsampled validation data.</p>
+<p><strong>Contamination.</strong> Evaluation items present in training data, often via near-duplicates or scraped copies. Symptoms: implausibly high benchmark scores; memorised answers. Defences: decontamination with n-gram or MinHash matching against all evaluation sets before each training run.</p>
+<p><strong>Loader starvation and bad resumption.</strong> GPUs waiting on data; duplicated or skipped samples after restarts. Symptoms: GPU utilisation dips at shard boundaries; per-rank data wait times; loss spikes after restarts. Defences: prefetching and caching, throughput tests before large runs, deterministic loaders with checkpointed state, and verifying after a test restart that the sample sequence continues exactly.</p>
+
+<h4>What to watch</h4>
+<p>For each dataset version: row counts per split and stratum, label rate, feature null rates and distributions versus the previous version, duplicate rate, contamination hits, and build time. For each training run: per-rank data wait time per step, samples per second versus target, cache hit rate, and the loader state at each checkpoint.</p>
+
+<h4>The case: FineWeb's deduplication ablations (2024)</h4>
+<p>"The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale" by Guilherme Penedo and colleagues at Hugging Face (arXiv, June 2024, revised October 2024) describes building a 15-trillion-token pre-training corpus from 96 Common Crawl snapshots, and — unusually — publishes the ablations behind each pipeline decision, including a 1.3-trillion-token educational subset, FineWeb-Edu, that improved knowledge and reasoning benchmarks.</p>
+<p>The deduplication study is the part every data engineer should know. The team used MinHash deduplication, which scales across many CPU nodes, with each document's word 5-grams and 112 hash functions split into 14 buckets of 8 hashes, targeting documents at least 75% similar. Their first approach was global: deduplicate across all 96 snapshots iteratively, starting with the most recent snapshot and moving to older ones, each deduplicated against everything already kept. For the oldest snapshots this removed as much as 90% of the data. Yet models trained on a 350-billion-token random sample of the globally deduplicated dataset showed little improvement over a model trained on non-deduplicated data and scored well below the RefinedWeb baseline.</p>
+<p>To understand why, they took one old snapshot (2013-48) and trained two models: one on the roughly 31 billion tokens that global deduplication had kept, and one on 171 billion tokens obtained by deduplicating, within that snapshot alone, the roughly 460 billion tokens that global deduplication had removed. The model trained on the <em>removed</em> data did better. Visual inspection confirmed that the kept 10% contained more ads, incoherent keyword lists and badly formatted text: content that appears in only one old crawl is disproportionately low quality, while good pages recur across crawls and were therefore "duplicates". The alternative — deduplicating each snapshot independently with the same parameters — produced about 20 trillion tokens and, sampled across all snapshots, matched RefinedWeb's performance; FineWeb's released pipeline uses per-snapshot deduplication followed by further filtering.</p>
+<p>The lessons generalise beyond LLMs. Every stage of a training-data pipeline changes the distribution the model learns from; obvious-seeming steps (more dedup is better) can backfire; and the only reliable judge is a downstream ablation — train small models on variants of the data and compare. That makes training-data pipelines experimental systems as much as ETL: they need versioning, cheap rebuilds and recorded configurations precisely so such ablations can be run and trusted.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> pack a toy corpus into fixed-length token sequences, write uint16 shards with an index, and read them back in a seeded, resumable order. Uses NumPy from <code>gpt_env</code>; about 15 minutes.</p>
+<ol>
+<li>Make a corpus of 2,000 "documents": random strings of 50–3,000 characters. Tokenise byte-level: <code>np.frombuffer(text.encode(), dtype=np.uint8).astype(np.uint16)</code>, and use 256 as the EOS ID (so IDs fit in uint16).</li>
+<li>Concatenate all documents with EOS between them into one stream. Cut it into sequences of L = 1,024 tokens; drop the remainder. Count how many sequences contain at least one EOS and how many documents span two sequences.</li>
+<li>Write the sequences into shards of 64 sequences each (<code>arr.tofile("shard-00007.bin")</code>) and a <code>manifest.json</code> with each shard's file name, sequence count and SHA-256 checksum.</li>
+<li>Write a reader: given <code>seed</code> and <code>epoch</code>, compute a permutation of all (shard, row) positions with <code>np.random.default_rng(seed + epoch).permutation(n)</code>, read sequences with <code>np.memmap</code>, and yield batches of 8.</li>
+<li>Resume test: read 37 batches, "crash", create a new reader with the same seed and epoch, skip 37 × 8 positions, and read 5 more batches. Compare with batches 38–42 of an uninterrupted run.</li>
+</ol>
+<p><strong>What to look for.</strong> Packing should waste no positions except the final remainder, and many documents should cross sequence boundaries — the reason for per-document masks. Each shard is exactly 64 × 1,024 × 2 bytes = 131,072 bytes, and the checksums let you verify a copy. The resumed batches must be identical to the uninterrupted ones: the order is a pure function of seed, epoch and position, so the only state worth checkpointing is the number of samples consumed.</p>
+</section>
+
+<section data-field="drill">
+<p><b>Design: a weekly training set for an ads click model</b></p>
+<p>An ads team retrains weekly on the last 8 weeks of impressions: 2 billion impressions a week, a 1.2% click rate, clicks attributed within 1 hour. Features: user features from a daily batch job published at 05:00 UTC (200 features), ad features updated hourly by a streaming job, and request-context features logged with each impression. The model's predicted probabilities are used in auction bidding, so calibration matters. Training runs on 64 GPUs that consume about 400,000 examples per second in total. Design the training-data pipeline: joins, labels, sampling, splits, versioning, format and loader.</p>
+<details><summary>Answer</summary>
+<p><strong>Spine and labels.</strong> Spine = impressions (impression ID, user, ad, timestamp, logged context). Label = a click attributed to the impression within 1 hour; build each week once the attribution window and the click pipeline's completeness for that week have closed (exclude the last 2 hours plus any click-ingestion lag).</p>
+<p><strong>Features.</strong> Context features come from the impression log itself (what serving saw). Ad features: logged at serving if possible; otherwise an availability-time as-of join to the hourly stream's versions, using each version's write time. User features: as-of join on availability time — an impression at 02:00 on day D uses the snapshot published at 05:00 on D−1 (covering data to the end of D−2), never the one published on D. Implement both joins as bucketed merge-asof: bucket impressions and feature versions by user ID (and by ad ID for the ad join) into the same bucket counts, sorted by time.</p>
+<p><strong>Sampling.</strong> 16 billion impressions over 8 weeks with 1.2% positives: keep all clicks (~190 million) and 10% of non-clicks via <code>hash(impression_id, "neg-v3") mod 1000 &lt; 100</code> (~1.58 billion), about 1.77 billion rows. Record r = 0.1 per row; either weight negatives by 10 in the loss or correct predictions with p = 0.1p′ / (0.1p′ + 1 − p′) before bidding, and verify calibration on an unsampled validation week.</p>
+<p><strong>Splits.</strong> Train on weeks 1–7, validate on week 8 (unsampled, or sampled with weights), with no user-level leakage concerns beyond time because the model is evaluated on future traffic — the time split is what matters.</p>
+<p><strong>Versioning.</strong> Pin snapshot IDs of the impression, click and feature tables; record code commit, sampling salt and rates; write Parquet shards (or MDS) of about 128 MB with a manifest of checksums and per-shard counts; keep the materialised version for as long as models trained on it are in production plus the audit period.</p>
+<p><strong>Loader.</strong> 1.77 billion rows at ~1 KB each is ~1.8 TB, about 14,000 shards of 128 MB — about 220 per GPU per epoch. Rows are globally shuffled before sharding, so a modest buffer suffices. Throughput: 400,000 examples/s × 1 KB = 400 MB/s across 64 GPUs — achievable from object storage with prefetching and a few workers per GPU; cache shards on local NVMe for multi-epoch runs. Use a seeded, deterministic order and checkpoint samples consumed per rank so restarts resume exactly.</p>
+</details>
+</section>

@@ -1,0 +1,691 @@
+<!-- topic source for hld/hd13; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "hd13",
+  "t": "Design an LLM gateway",
+  "tag": "LLMOps",
+  "sum": "One API in front of every model provider for 400 applications: routing by cost, quality and latency, fallback that never double-bills, token-bucket rate limits and dollar budgets per tenant, exact and semantic caching with the wrong-answer maths, PII redaction and guardrails in the path, and metering and audit.",
+  "prereq": [
+    [
+      "hd1",
+      "A self-hosted inference platform serves open-weight models with continuous batching, per-tenant scheduling and prefix caching; it is one of the backends a gateway routes to."
+    ],
+    [
+      "hd12",
+      "Every LLM call is traced with OpenTelemetry GenAI attributes, evaluated offline and online by versioned judges, and gated per release."
+    ],
+    [
+      "ae2",
+      "An LLM bill is input and output tokens times a price sheet; cached input is billed at a fraction of the base price; output tokens cost several times more than input."
+    ],
+    [
+      "ag13",
+      "Routing easy work to small models, caching and parallelism are the main cost and latency levers for agents and LLM features."
+    ],
+    [
+      "cd12",
+      "A distributed rate limiter keeps counters in a shared store, updates them atomically, and must choose what to do when that store is slow or down."
+    ],
+    [
+      "ld4",
+      "A resilient LLM client retries with backoff and jitter, opens a circuit breaker on repeated failures, and falls back to another model."
+    ],
+    [
+      "in3",
+      "A distributed cache trades freshness for speed; keys, TTLs and invalidation decide whether it serves correct data."
+    ],
+    [
+      "ae5",
+      "Personal data spreads into logs, caches and prompts; redact before it leaves your control and design retention and erasure up front."
+    ],
+    [
+      "lm18",
+      "Prompt injection and jailbreaks are inputs that make the model ignore its instructions; guardrails are classifiers and rules around the model, not inside it."
+    ]
+  ],
+  "myths": [
+    [
+      "A gateway is just a reverse proxy with API keys.",
+      "A reverse proxy forwards bytes. An LLM gateway has to understand tokens: it estimates and reserves tokens before a request runs, reconciles them after, translates between provider APIs, streams responses while checking them, prices every attempt and decides whether a failure can be retried without charging anyone twice. Almost every hard requirement is about tokens and money, which a generic proxy cannot see."
+    ],
+    [
+      "Semantic caching is free money: similar questions get the same answer.",
+      "Two questions with cosine similarity 0.93 can need different answers (\"cancel my order\" versus \"cancel my subscription\"). Every semantic hit is a bet that the cached answer is right for a new question. The bet pays only when the false-hit rate is below the call cost divided by the cost of a wrong answer, which for most applications means a very high threshold, few hits and an explicit opt-in."
+    ],
+    [
+      "Retrying on another provider is always safe.",
+      "It is safe only before the first token has reached the client and only if the first attempt is cancelled. A timed-out request may still be running at the first provider and be billed there; a mid-stream failure cannot be retried invisibly because the user has already seen half an answer. Fallback needs an idempotency key, cancellation, a retry budget and a rule about where in the stream switching is allowed."
+    ],
+    [
+      "Rate limits by requests per minute are enough.",
+      "One request can carry 200 tokens or 200,000. Providers limit input and output tokens per minute, and cost is proportional to tokens, so a fair tenant limit must be in tokens, with a reservation for output that is not yet known, and a dollar budget on top."
+    ],
+    [
+      "Routing to the cheapest model is a cost decision.",
+      "It is a quality decision with a cost consequence. A router that sends 70% of traffic to a small model saves about 63% of the bill in this lesson's numbers, but only an evaluation per application and slice can say whether those 70% were answered as well. Routers need the same offline gates and online monitoring as any model release."
+    ],
+    [
+      "Put every safety check in the gateway.",
+      "A gateway sees one request at a time and adds latency to every call. Checks that need application context (is this user allowed to see this document, should this agent call a refund tool) belong in the application or agent platform; the gateway owns the checks that are the same for everyone: data-class routing, PII redaction, generic input and output classifiers, budgets and audit."
+    ]
+  ],
+  "recap": [
+    "An LLM gateway is one API in front of many providers and self-hosted models; it owns the concerns that are the same for every application: identity, routing, fallback, rate limits and budgets, caching, PII redaction, generic guardrails, metering and audit.",
+    "At 20 million requests a day with 2,500 input and 350 output tokens each, sending everything to a large model at the assumed prices costs about $7.6 million a month; routing 70% to a small model cuts that to about $2.8 million, if evaluation shows quality holds.",
+    "The gateway's own overhead is budgeted at about 50 ms at p99 before the first upstream byte, which forces parallel checks and local state, because provider time to first token is already hundreds of milliseconds.",
+    "Tenant rate limits are token buckets in tokens, not requests: the gateway reserves input plus an output estimate on admission, refunds the unused part on completion, and answers 429 with a retry-after equal to the deficit divided by the refill rate.",
+    "Dollar budgets sit above token buckets and are enforced hierarchically from organisation to team to application to end user, with a cost reservation before the call and reconciliation after it.",
+    "Fallback is allowed only before the first token has been streamed, cancels the first attempt, carries an idempotency key, and is limited by a retry budget; the tenant is charged for the delivered answer and failover waste is booked to the platform.",
+    "A secondary provider must have contracted headroom for the traffic it may inherit; when it does not, priority tiers decide which tenants fail over and which degrade.",
+    "Exact caching is safe when the key includes tenant, model version, all parameters and every input; semantic caching pays only when the false-hit rate is below call cost divided by wrong-answer cost, so it is opt-in per application with a measured threshold.",
+    "PII is replaced by typed placeholders before data leaves for an external provider, the mapping lives only for the request, and data classes restrict which providers a tenant's traffic may reach.",
+    "The gateway is evaluated on availability above any single provider, overhead latency, reconciliation against provider invoices, router quality per application, semantic-cache false-hit rate and PII leak rate."
+  ],
+  "glossary": [
+    [
+      "Alias",
+      "A stable model name an application asks for, such as chat-default, which the gateway maps to a specific provider and pinned model version."
+    ],
+    [
+      "Circuit breaker",
+      "A switch that stops sending requests to a backend after repeated failures, then lets a few test requests through after a cool-down to see if it recovered."
+    ],
+    [
+      "Cosine similarity",
+      "A measure of how closely two embedding vectors point in the same direction, from −1 to 1; semantic caches treat high similarity as \"same question\"."
+    ],
+    [
+      "Data class",
+      "A label on a tenant or request (public, internal, confidential, regulated) that limits which providers and regions its data may be sent to."
+    ],
+    [
+      "Embedding",
+      "A vector of numbers produced by a model so that texts with similar meaning have nearby vectors."
+    ],
+    [
+      "Exact cache",
+      "A cache that returns a stored response only when the full request, after normalisation, is byte-for-byte identical to a previous one."
+    ],
+    [
+      "Failover waste",
+      "Provider cost spent on attempts that did not produce the delivered answer, such as a timed-out first attempt before a fallback."
+    ],
+    [
+      "Fallback",
+      "Sending a failed or slow request to a different deployment or provider."
+    ],
+    [
+      "False hit",
+      "A semantic-cache hit whose stored answer is wrong for the new question."
+    ],
+    [
+      "Hedged request",
+      "Sending a second copy of a slow request to another backend and using whichever answers first; it buys tail latency with extra cost."
+    ],
+    [
+      "Idempotency key",
+      "A client-supplied identifier for one logical request, so retries of it are recognised and never processed or charged twice."
+    ],
+    [
+      "ITPM / OTPM",
+      "Input and output tokens per minute: the units in which providers and this gateway express rate limits."
+    ],
+    [
+      "Lease",
+      "A chunk of a tenant's token budget that one gateway node takes from the shared store and spends locally, to avoid a round trip per request."
+    ],
+    [
+      "Metering",
+      "Recording the tokens and computed cost of every attempt and every delivered response, for budgets, chargeback and reconciliation."
+    ],
+    [
+      "p99",
+      "The 99th percentile: the value that 99% of measurements are below; one request in a hundred is slower."
+    ],
+    [
+      "PII",
+      "Personally identifiable information: data that identifies a person directly (a name, an email) or in combination with other data."
+    ],
+    [
+      "Prompt caching",
+      "A provider or serving-engine feature that reuses the processed form of a repeated prompt prefix, billing it at a reduced rate and cutting time to first token."
+    ],
+    [
+      "Reconciliation",
+      "Comparing the gateway's own metered cost with the providers' invoices and usage exports to find drift or missing records."
+    ],
+    [
+      "Retry budget",
+      "A cap on retries as a fraction of normal traffic, so retries cannot multiply load on a struggling backend."
+    ],
+    [
+      "Semantic cache",
+      "A cache that returns a stored answer when a new prompt's embedding is close enough to a previous prompt's embedding."
+    ],
+    [
+      "SSE",
+      "Server-sent events: the HTTP streaming format most LLM APIs use to send tokens as they are generated."
+    ],
+    [
+      "Tenant",
+      "A customer of the gateway with its own keys, limits and bill; here a team or application, possibly with its own end users."
+    ],
+    [
+      "Token bucket",
+      "A rate limiter holding up to a capacity of tokens, refilled at a steady rate; a request is admitted if enough tokens are in the bucket and removes them."
+    ],
+    [
+      "TTFT",
+      "Time to first token: how long from sending a request until the first output token arrives; the latency users feel in a streaming interface."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why does a company put a gateway in front of LLM providers instead of letting each team call providers directly?",
+      "Because every team would otherwise rebuild the same things badly: key management, retries and fallback, rate limits, cost tracking, PII handling and audit. A gateway gives one place to switch providers or model versions, enforce data rules, see total spend and capacity, and negotiate provider limits. The cost is a shared dependency on the request path, so it must be more available than any single provider and add little latency."
+    ],
+    [
+      "E",
+      "Why are tenant rate limits expressed in tokens rather than requests?",
+      "Because cost, provider limits and load are all proportional to tokens, and one request can carry a hundred or a hundred thousand of them. Providers limit input and output tokens per minute, so the gateway must too, or one tenant with huge prompts can exhaust the shared provider quota while staying under a request limit."
+    ],
+    [
+      "E",
+      "What should an exact-cache key contain?",
+      "The tenant, the resolved model and its pinned version, every generation parameter (temperature, max tokens, tools, response format), the full normalised message list including the system prompt, and the version of any retrieved context. Leaving any one out returns a response produced under different conditions. Caching is also restricted to deterministic or low-temperature requests the application marked cacheable."
+    ],
+    [
+      "M",
+      "Walk through a token-bucket admission for a request with 6,000 input tokens and max_tokens 4,000, when the app's p99 output is 800.",
+      "The gateway counts input tokens (or estimates them from characters if the tokenizer is not local) and reserves input plus an output estimate: here 6,000 + min(4,000, 1.5 × 800) = 7,200 tokens. If the tenant's bucket has at least that, it is decremented atomically and the request proceeds; otherwise the gateway returns 429 with retry-after equal to the deficit divided by the refill rate. When the response finishes with, say, 500 output tokens, 700 are refunded. If output exceeds the estimate, the overshoot is charged afterwards and the bucket may go briefly negative.",
+      "Follow-up: Why not reserve max_tokens? — Applications set it high for safety; reserving 4,000 when 500 are used would cut effective throughput several times and starve bursts."
+    ],
+    [
+      "M",
+      "How do you make fallback not double-bill?",
+      "Give each logical request an idempotency key, record every upstream attempt with its own usage, and charge the tenant only for the attempt that produced the delivered answer; cost of abandoned attempts is booked as failover waste. Cancel the first attempt when falling back so it stops generating, and only fall back before the first token reaches the client; after that, return an error event with partial usage instead. A client retry with the same key returns the stored result or joins the in-flight request.",
+      "Follow-up: Is a cancelled attempt free? — Not necessarily: a provider may bill the input it already processed. That is why waste is measured from usage data and reconciled with invoices, not assumed to be zero."
+    ],
+    [
+      "M",
+      "Estimate the monthly bill for 20 million requests a day at 2,500 input and 350 output tokens, and what routing changes.",
+      "At an assumed $3 and $15 per million input and output tokens for a large model, one request costs $0.0075 + $0.00525 = $0.01275, so 20 million a day is about $255,000 a day or $7.6 million a month. A small model at a tenth of the price costs $0.001275 per request. Routing 70% to it gives a blended $0.0047 per request, about $94,000 a day or $2.8 million a month, a 63% saving, which is worth building a router and an evaluation for."
+    ],
+    [
+      "M",
+      "When is semantic caching worth it?",
+      "When the expected saving per hit, the call cost plus any latency value, exceeds the expected harm, the false-hit rate times the cost of a wrong answer. In this lesson's FAQ example a small-model call costs $0.0013 and a wrong answer $0.05, so the break-even false-hit rate is 2.6%: a threshold of 0.95 with 1.2% false hits pays, 0.92 with 4% does not. It must be opt-in per application, scoped to the tenant, limited to single-turn requests without user-specific context, and invalidated when the model, prompt or knowledge changes.",
+      "Follow-up: How do you measure the false-hit rate? — Sample semantic hits, run the new question through the model, and have a validated judge or human compare the fresh answer with the cached one; report it per application and threshold."
+    ],
+    [
+      "M",
+      "Where do you put PII redaction, and how does reversible redaction work?",
+      "In the gateway, before data leaves for any external provider, for tenants whose data class requires it. Detectors (patterns for emails, phone and card numbers, plus a named-entity model) replace values with typed placeholders such as [EMAIL_1]; the mapping is kept in request memory only; after the response, placeholders are substituted back so the user sees real values. It fails when the model rewrites or splits placeholders, and detection recall is never perfect, so data classes also restrict which providers may see the data at all."
+    ],
+    [
+      "M",
+      "A provider is slow but not failing: TTFT p99 has gone from 1.2 s to 6 s. What does the gateway do?",
+      "Its latency-aware routing tracks a moving average and percentile of TTFT per deployment and shifts weight away from the slow one; a per-request TTFT timeout (say 3 s for interactive traffic) triggers fallback before the first token; and for small, cheap interactive requests it may hedge after the p95 delay. Batch traffic stays on the slow provider because it is latency-tolerant, which also preserves the secondary provider's headroom for interactive traffic."
+    ],
+    [
+      "H",
+      "Provider A, carrying 60% of traffic, goes down at peak. Walk through what happens and what you designed in advance.",
+      "Circuit breakers on A open after a few failures and requests fall back to B, but at 700 requests a second with 2,500 input tokens, A's share is about 63 million input tokens a minute. If B is contracted at 80 million with its own 40% share (42 million) in normal use, only 38 million of headroom exists, so about 60% of A's traffic can move. In advance you decide who moves: interactive tiers first, batch deferred, low-priority apps degraded to a self-hosted model or given 503 with retry-after. Retry budgets stop clients and the gateway multiplying load, and B's token buckets are enforced by the gateway so B does not start returning 429 to everyone.",
+      "Follow-up: Why not just retry until A is back? — Retries without a budget turn an outage into a storm: every failed request becomes three or four, the gateway's connection pools fill, and healthy traffic to B starts timing out too."
+    ],
+    [
+      "H",
+      "Design the distributed token-bucket enforcement for 700 requests a second across 12 gateway nodes.",
+      "Store each tenant's bucket in a sharded in-memory store and update it with one atomic script per request (read, refill by elapsed time, check, decrement): about 1,400 operations a second at peak including refunds, which one shard handles easily. For hot tenants or lower latency, nodes take leases (for example 5% of capacity) and admit locally, renewing when half spent; overshoot is bounded by nodes times lease size. If the store is unreachable, nodes fall back to local buckets at capacity divided by node count, failing open for rate but closed for hard dollar budgets of risky tenants."
+    ],
+    [
+      "H",
+      "How would you evaluate a learned router before turning it on?",
+      "Treat it as a model release. Offline, run each application's golden set through both models, label which items the small model handles acceptably with the validated judges from the evaluation platform, and plot quality against share routed to the small model for each threshold; pick the threshold per application where quality is non-inferior to all-large within a margin. Online, A/B the router against the current policy with cost per request as the goal and judged quality, thumbs-down and retry rates as guardrails, per slice. Re-validate whenever either model changes, because the router learned the gap between two specific models."
+    ],
+    [
+      "H",
+      "What fails open and what fails closed in a gateway?",
+      "It depends on what the check protects. Rate limiting fails open to local approximate limits, because blocking all traffic when the limit store is down is worse than brief overuse. Dollar budgets fail closed for tenants with hard caps and open for internal teams with soft budgets. Data-class routing and PII redaction for regulated tenants fail closed: no request leaves without them. Generic output classifiers may fail open for low-risk internal apps and closed for consumer-facing ones. The decision is per check and per tenant tier, written down before the incident."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "LiteLLM: Router, load balancing and routing strategies",
+      "Open-source gateway: simple-shuffle default, latency-, least-busy-, cost- and usage-based routing, retries, cooldowns (allowed_fails 3, cooldown_time 5 s by default) and per-deployment rpm/tpm.",
+      "https://docs.litellm.ai/docs/routing"
+    ],
+    [
+      "docs",
+      "LiteLLM: Budgets and rate limits",
+      "max_budget and budget_duration per key, team, user and customer; tpm_limit and rpm_limit; budget reservation before a call; the errors returned when a budget is exceeded.",
+      "https://docs.litellm.ai/docs/proxy/users"
+    ],
+    [
+      "docs",
+      "LiteLLM: Semantic caching",
+      "Redis, Valkey and Qdrant semantic caches with a similarity_threshold (0.8 in the examples) and an embedding model; cache scope by key by default.",
+      "https://docs.litellm.ai/docs/proxy/caching_semantic"
+    ],
+    [
+      "docs",
+      "Claude API: Rate limits",
+      "First-party example of provider limits: requests, input and output tokens per minute enforced with a token bucket, cache reads not counted toward input limits for most models, 429 with retry-after.",
+      "https://platform.claude.com/docs/en/api/rate-limits"
+    ],
+    [
+      "paper",
+      "RouteLLM: Learning to Route LLMs with Preference Data",
+      "Ong et al., 2024: routers trained on preference data choose between a strong and a weak model, reporting cost reductions of more than 2× in some cases without lowering response quality.",
+      "https://arxiv.org/abs/2406.18665"
+    ],
+    [
+      "paper",
+      "FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance",
+      "Chen, Zaharia and Zou, 2023: LLM cascades and routing; the abstract reports matching GPT-4 with up to 98% cost reduction on their tasks.",
+      "https://arxiv.org/abs/2305.05176"
+    ],
+    [
+      "post",
+      "Introducing the Message Batches API",
+      "Anthropic: asynchronous batch processing at a 50% discount, completed within 24 hours; the reason gateways route latency-tolerant traffic to batch endpoints.",
+      "https://www.anthropic.com/news/message-batches-api"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A company has 400 applications that call language models. The support assistant uses one provider's large model; the code-review bot uses another provider; the document summariser runs on the company's own open-weight model cluster; a hundred small features (classify this ticket, draft this reply, extract these fields) use whatever their authors tried first. Every team holds its own API keys, writes its own retry loop, and finds out what it spent when finance forwards the invoice.</p>
+<p>Then the predictable week arrives. On Monday, one provider has a two-hour partial outage; the twelve teams that wrote fallback code survive, the others page their on-call engineers. On Tuesday, a batch job written by an intern sends 40,000 requests in ten minutes, exhausts the company's shared rate limit with that provider, and the customer-facing support assistant starts returning errors because it shares the same organisation quota. On Wednesday, the security team discovers that customer email addresses and order numbers have been sent to a provider that the legal team never approved for personal data. On Thursday, finance asks why the bill went up 40% and which team caused it; nobody can say. On Friday, a provider announces a model retirement, and 60 applications must change a hard-coded model name.</p>
+<p>Each of these is the same missing piece: a <strong>gateway</strong>, one service that every model call goes through, which knows who is calling, what they are allowed to send where, how much they may spend, which providers are healthy and how much capacity remains with each. The senior design question is to build it: a single API in front of many providers that routes by cost, quality and latency; falls back on failure without charging anyone twice; enforces per-tenant rate limits and budgets in tokens and dollars; caches what is safe to cache; redacts personal data and runs generic guardrails in the path; and meters and audits everything, while adding only tens of milliseconds to calls that already take seconds.</p>
+<p>The lesson follows the interview: requirements with latency, cost and safety targets; estimates by hand for traffic, tokens, cost, concurrency and the gateway's own overhead; the API; the high-level design; deep dives on routing and fallback, token-bucket budgets, and caching (exact and semantic, with the wrong-answer maths); the evaluation plan; failure modes; and what changes at ten times the scale. The real case is LiteLLM, an open-source gateway whose documentation shows how these ideas are configured in practice, alongside a provider's own published rate-limit rules.</p>
+</section>
+
+<section data-field="primer">
+<h4>What a gateway does</h4>
+<p>An <strong>LLM gateway</strong> is a service that sits between applications and model providers. Applications send it requests in one format, with one kind of credential; the gateway decides which provider and model will serve each request, sends it, streams the answer back, and records what happened. The providers might be external APIs, cloud-hosted versions of the same models, or the company's own self-hosted inference platform (the one designed in hd1). From an application's point of view there is one endpoint and a handful of model names; from finance's point of view there is one bill broken down by team; from security's point of view there is one place where data rules are enforced.</p>
+<h4>The mental model: an airline booking desk in front of many airlines</h4>
+<p>Think of a corporate travel desk. Employees do not book flights with airlines directly. They tell the desk where they need to go and when; the desk knows company policy (economy for flights under six hours, approved airlines only for certain countries), each department's travel budget, which airlines are on strike today, and which fares are cheapest for the quality required. When a flight is cancelled, the desk rebooks on another airline, and the department is charged once, for the trip it took, not for both tickets. At the end of the month the desk produces one report of who spent what.</p>
+<p>The gateway is that desk. <strong>Routing</strong> is choosing the airline and fare class. <strong>Fallback</strong> is rebooking on cancellation. <strong>Rate limits and budgets</strong> are each department's allowance. <strong>Data-class rules</strong> are "approved airlines only for this destination". <strong>Caching</strong> is noticing that someone already asked the identical question this morning. <strong>Metering and audit</strong> are the monthly report and the record of every booking.</p>
+<p>The analogy breaks in two useful places. First, a flight is either booked or not, while an LLM response is produced over seconds, token by token, and reaches the user while it is still being generated; once half an answer has been shown, you cannot quietly swap in another provider's answer. Second, airlines are interchangeable for getting from A to B, but models are not interchangeable for answering a question: a cheaper model is a different product whose quality must be measured, not assumed.</p>
+<figure>
+<svg viewBox="0 0 640 320" width="100%" role="img" aria-label="Gateway architecture. Applications send requests to a stateless gateway fleet. Inside the request path: authenticate tenant, policy and data class, token-bucket admission, exact cache, PII redaction, semantic cache and input guardrail in parallel, router, upstream adapters with circuit breakers. Upstreams: provider A, provider B, cloud-hosted models, self-hosted platform. Shared state: Redis for buckets and exact cache, vector index for semantic cache, config store for routes and prices. Metering events go to Kafka, then a ledger, budgets, dashboards and audit store.">
+<defs><marker id="hd13-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="10" y="40" width="90" height="120" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="55" y="80" text-anchor="middle" style="fill:var(--ink)">400 apps</text>
+<text x="55" y="98" text-anchor="middle" style="fill:var(--muted)">one API</text>
+<text x="55" y="114" text-anchor="middle" style="fill:var(--muted)">one key each</text>
+<rect x="120" y="20" width="300" height="200" rx="8" style="fill:none;stroke:var(--accent);stroke-dasharray:5 3"/>
+<text x="270" y="36" text-anchor="middle" style="fill:var(--accent);font-weight:600">Gateway fleet (stateless)</text>
+<rect x="132" y="46" width="132" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="198" y="63" text-anchor="middle" style="fill:var(--ink)">auth · tenant</text>
+<rect x="276" y="46" width="132" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="342" y="63" text-anchor="middle" style="fill:var(--ink)">policy · data class</text>
+<rect x="132" y="80" width="132" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="198" y="97" text-anchor="middle" style="fill:var(--ink)">token bucket</text>
+<rect x="276" y="80" width="132" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="342" y="97" text-anchor="middle" style="fill:var(--ink)">exact cache</text>
+<rect x="132" y="114" width="132" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--crit)"/><text x="198" y="131" text-anchor="middle" style="fill:var(--ink)">PII redaction</text>
+<rect x="276" y="114" width="132" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="342" y="131" text-anchor="middle" style="fill:var(--ink)">semantic ∥ guardrail</text>
+<rect x="132" y="148" width="276" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="270" y="165" text-anchor="middle" style="fill:var(--ink)">router: cost · quality · latency · health</text>
+<rect x="132" y="182" width="276" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="270" y="199" text-anchor="middle" style="fill:var(--ink)">adapters · circuit breakers · streaming</text>
+<line x1="100" y1="100" x2="130" y2="100" marker-end="url(#hd13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<rect x="460" y="20" width="170" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--s4)"/><text x="545" y="42" text-anchor="middle" style="fill:var(--ink)">Provider A (API)</text>
+<rect x="460" y="62" width="170" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--s4)"/><text x="545" y="84" text-anchor="middle" style="fill:var(--ink)">Provider B (API)</text>
+<rect x="460" y="104" width="170" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--s5)"/><text x="545" y="126" text-anchor="middle" style="fill:var(--ink)">Cloud-hosted models</text>
+<rect x="460" y="146" width="170" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--s6)"/><text x="545" y="168" text-anchor="middle" style="fill:var(--ink)">Self-hosted (hd1)</text>
+<line x1="408" y1="195" x2="458" y2="40" marker-end="url(#hd13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="408" y1="195" x2="458" y2="80" marker-end="url(#hd13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="408" y1="195" x2="458" y2="122" marker-end="url(#hd13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="408" y1="195" x2="458" y2="164" marker-end="url(#hd13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<rect x="120" y="240" width="140" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="190" y="260" text-anchor="middle" style="fill:var(--ink)">Redis: buckets, cache</text>
+<rect x="270" y="240" width="150" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="345" y="260" text-anchor="middle" style="fill:var(--ink)">Vector index · config</text>
+<rect x="440" y="240" width="190" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="535" y="260" text-anchor="middle" style="fill:var(--ink)">Kafka → ledger · audit</text>
+<line x1="198" y1="220" x2="198" y2="238" style="stroke:var(--ink-2);fill:none;stroke-dasharray:3 3"/>
+<line x1="342" y1="220" x2="342" y2="238" style="stroke:var(--ink-2);fill:none;stroke-dasharray:3 3"/>
+<path d="M420,210 L535,210 L535,238" marker-end="url(#hd13-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<text x="320" y="300" text-anchor="middle" style="fill:var(--muted)">Every step on the left adds latency to every call; shared state lives outside the fleet.</text>
+</g>
+</svg>
+<figcaption>The gateway is a pipeline of small decisions, each cheap on its own. Notice that the state they need (token buckets, cache entries, routes and prices, the metering ledger) sits outside the stateless fleet, so any node can serve any request, and that metering flows asynchronously so it never adds latency.</figcaption>
+</figure>
+<h4>Three things that make it different from an ordinary API gateway</h4>
+<p>First, <strong>the unit is the token, not the request</strong>. A <strong>token</strong> is the piece of text a model reads and writes, roughly three quarters of an English word. Cost, provider limits and load are all proportional to tokens, and the number of output tokens is not known until the response is finished. Rate limiting, budgets and cost accounting must therefore estimate before and reconcile after.</p>
+<p>Second, <strong>responses stream</strong>. Most LLM APIs send output with <strong>server-sent events</strong> (SSE), a long-lived HTTP response that delivers tokens as they are generated, so users see the answer forming. A single request can hold a connection for 30 seconds, which changes how many connections the gateway must hold open, and it limits when a failure can be hidden by switching providers.</p>
+<p>Third, <strong>the backends differ in quality, not just speed</strong>. Two web servers behind a load balancer return the same page. Two models return different answers. Every routing rule, fallback and cache is a choice about which answer the user gets, so the gateway is connected to the evaluation platform (hd12) the way a load balancer never needs to be.</p>
+<p>A reader who stops here has the shape: a stateless fleet that authenticates, applies policy, admits by tokens, checks caches, redacts, routes and streams, with shared state for limits and caches, an asynchronous metering pipeline, and quality decisions that are measured rather than assumed.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–17</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">17–23</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">23–47</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">47–55</span><span class="ck-t">Eval &amp; failures</span></div><div class="ck"><span class="ck-m">55–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> One API for chat-style generation, embeddings and batch jobs, in a single request format, with streaming. Model <strong>aliases</strong> (stable names such as <code>chat-default</code> or <code>extract-small</code>) that the gateway maps to a provider and a pinned model version, so a provider's retirement is one configuration change. Routing by policy, cost, latency and health; fallback across deployments and providers; per-tenant API keys, rate limits in tokens per minute, and dollar budgets per period, arranged in a hierarchy (organisation, team, application, end user). Exact caching and opt-in semantic caching. PII redaction and data-class routing. Generic input and output guardrails. Metering of every attempt, chargeback per team, an audit log, and traces in the evaluation platform's format. Out of scope, said aloud: serving the models (hd1), agent orchestration and tool execution (hd7), and application-specific permission checks (au12).</p>
+<p><strong>Latency targets.</strong> Gateway overhead before the first upstream byte at most 15 ms at p50 and 50 ms at <strong>p99</strong> (the 99th percentile: one request in a hundred is slower). Streaming adds no buffering beyond the output-guardrail window. Cache hits served in under 30 ms.</p>
+<p><strong>Availability.</strong> 99.95% for the gateway itself, measured as requests that get either a model answer or a correct, deliberate error (a 429 for an exhausted budget is a correct answer). Effective availability of answers should exceed any single provider's, which is the point of fallback.</p>
+<p><strong>Cost targets.</strong> Gateway infrastructure under 1% of the model spend it carries. Metered cost within 1% of provider invoices each month. No tenant charged twice for one logical request.</p>
+<p><strong>Safety and compliance targets.</strong> No request of a confidential or regulated data class reaches a provider not approved for that class: zero tolerance, fail closed. PII redaction recall at least 98% on the labelled test set for formatted identifiers. Every call auditable: who, which application, which model, which data class, when, at what cost.</p>
+<p><strong>Quality targets.</strong> Any routing policy, alias change or cache threshold change passes the same offline evaluation gate as a model change (hd12), and the semantic-cache false-hit rate stays below each application's declared limit.</p>
+<p><strong>Clarifying questions.</strong> "Is this internal (teams are tenants) or external (we resell to customers)?" "Which providers and regions are approved for which data classes?" "Do applications need streaming, tool calls and structured output through the gateway?" "Is there a self-hosted platform we must prefer for cost or privacy?" "Who owns the decision that a cheaper model is good enough?"</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p><strong>Traffic.</strong> 400 applications send <strong>20 million requests a day</strong>: about 230 a second on average and, with a daytime peak three times the average, about 700 a second. A typical request carries 2,500 input tokens (system prompt, conversation, retrieved passages) and produces 350 output tokens. That is 50 billion input and 7 billion output tokens a day.</p>
+<p><strong>Cost without routing.</strong> Assume a large model priced at $3 per million input tokens and $15 per million output tokens (illustrative round numbers, not any one provider's list). One request costs 2,500 × $3/10⁶ + 350 × $15/10⁶ = $0.0075 + $0.00525 = <strong>$0.01275</strong>. Twenty million a day is about $255,000 a day, <strong>$7.6 million a month</strong>.</p>
+<p><strong>Cost with routing.</strong> Assume a small model at a tenth of the price: $0.001275 per request. If evaluation shows that 70% of requests are answered acceptably by the small model, the blended cost is 0.3 × $0.01275 + 0.7 × $0.001275 = $0.0047 per request, about $94,000 a day, <strong>$2.8 million a month</strong>, a 63% saving. Provider prompt caching cuts the input side further: if 60% of input tokens are a repeated system prompt read from the provider's cache at a tenth of the input price, input cost falls by about half. These two levers dwarf everything else the gateway does for cost, which tells you where the design effort belongs.</p>
+<p><strong>Concurrency.</strong> Little's law (concurrent requests = arrival rate × time in system) with 700 requests a second and an average streamed duration of 8 seconds gives <strong>about 5,600 open streams</strong> at peak, each with a client connection and an upstream connection. An asynchronous gateway process holds thousands of idle-ish connections cheaply; with a conservative 1,000 streams per 4-vCPU pod, 6 pods carry the peak, and spreading across three availability zones with room to lose one gives about 12 pods. The gateway's compute cost is a rounding error next to the model bill; its connection count and its p99 overhead are the real constraints.</p>
+<p><strong>Shared-state operations.</strong> Each request does about four operations on the shared in-memory store: bucket reservation, bucket refund, budget check and exact-cache lookup. At peak that is about 2,800 operations a second, trivial for one Redis shard (which handles tens of thousands), but a round trip of about 1 ms each, so they must be pipelined or overlapped to stay inside the overhead budget.</p>
+<p><strong>Semantic cache.</strong> Only requests an application has marked cacheable are eligible: single-turn, low-temperature, no tools, no user-specific context. Suppose 30% of traffic, 6 million requests a day. Each needs one embedding (a vector of, say, 768 numbers) and a nearest-neighbour search. Keeping 24 hours of entries at 768 dimensions in 16-bit floats is 6 million × 768 × 2 bytes ≈ 9 GB of vectors, plus the stored answers: a modest vector index, partitioned by tenant. Embedding 70 requests a second on average is a fraction of one small GPU or a CPU pool.</p>
+<p><strong>Metering and audit.</strong> One event per attempt and per delivered response, about 1 KB each with tenant, alias, resolved model, tokens by type, cost, latency, status and data class: roughly 25 million events and 25 GB a day before compression. Kept 13 months for chargeback and audit in a columnar store, this is a few terabytes. Prompt and response content is not stored by the gateway by default; it goes to the evaluation platform's content store under that platform's opt-in and redaction rules (hd12).</p>
+<p><strong>The insight to say out loud.</strong> The gateway is a small, cheap service sitting in front of a very expensive one. Its value is measured in percentage points of a multi-million-dollar bill and in outages avoided; its risk is that it is on every request path, so its overhead and its availability matter more than its own cost.</p>
+
+<h4>3 · The request path and its latency budget</h4>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Latency budget for the gateway's overhead before the first upstream byte at p99: authenticate 1 ms, policy and data class 1 ms, token-bucket reservation and budget check 4 ms, exact cache 2 ms, PII redaction 12 ms, semantic cache and input guardrail in parallel 25 ms, routing 1 ms, upstream connection 3 ms: about 49 ms. Then provider time to first token 400 ms p50, up to 1,500 ms p99, then streaming with an output guardrail window of about 150 ms.">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="20" style="fill:var(--ink);font-weight:600">Gateway overhead at p99 (scale: 1 ms = 10 px)</text>
+<rect x="20" y="34" width="10" height="34" style="fill:var(--s1)"/>
+<rect x="30" y="34" width="10" height="34" style="fill:var(--s2)"/>
+<rect x="40" y="34" width="40" height="34" style="fill:var(--s3)"/>
+<rect x="80" y="34" width="20" height="34" style="fill:var(--s4)"/>
+<rect x="100" y="34" width="120" height="34" style="fill:var(--crit)"/>
+<rect x="220" y="34" width="250" height="34" style="fill:var(--s5)"/>
+<rect x="470" y="34" width="10" height="34" style="fill:var(--s6)"/>
+<rect x="480" y="34" width="30" height="34" style="fill:var(--accent)"/>
+<text x="25" y="86" text-anchor="middle" style="fill:var(--ink-2)">auth</text>
+<text x="60" y="102" text-anchor="middle" style="fill:var(--ink-2)">bucket 4</text>
+<text x="90" y="86" text-anchor="middle" style="fill:var(--ink-2)">cache 2</text>
+<text x="160" y="86" text-anchor="middle" style="fill:var(--ink-2)">PII redaction 12</text>
+<text x="345" y="86" text-anchor="middle" style="fill:var(--ink-2)">semantic cache ∥ input guardrail 25</text>
+<text x="495" y="102" text-anchor="middle" style="fill:var(--ink-2)">connect 3</text>
+<text x="560" y="56" style="fill:var(--ink);font-weight:600">≈ 49 ms</text>
+<text x="20" y="140" style="fill:var(--ink);font-weight:600">Then the provider (scale: 1 ms = 0.3 px)</text>
+<rect x="20" y="152" width="15" height="28" style="fill:var(--accent)"/>
+<rect x="35" y="152" width="120" height="28" style="fill:var(--s4)"/>
+<rect x="155" y="152" width="330" height="28" style="fill:var(--s4);opacity:0.45"/>
+<rect x="485" y="152" width="45" height="28" style="fill:var(--s3)"/>
+<text x="95" y="198" text-anchor="middle" style="fill:var(--ink-2)">TTFT p50 400 ms</text>
+<text x="320" y="198" text-anchor="middle" style="fill:var(--ink-2)">… p99 up to 1,500 ms</text>
+<text x="508" y="214" text-anchor="middle" style="fill:var(--ink-2)">output guard 150</text>
+</g>
+</svg>
+<figcaption>The gateway's 50 ms is small next to the provider's time to first token, but it is paid on every request including cache hits, and it is mostly two items: redaction and the parallel semantic-cache and guardrail step. That is why those two run only for tenants and applications that need them, and why the semantic cache and the input guardrail run side by side rather than in sequence.</figcaption>
+</figure>
+<p>Walk one request. A support application sends a chat request with its key. The gateway resolves the key to a tenant from a local cache refreshed every few seconds (1 ms), loads the tenant's policy (data class "internal", allowed providers A, B and self-hosted; alias <code>chat-default</code> routes to the small model unless the router escalates). It counts input tokens and reserves tokens in the tenant's bucket and cost against its budget in one pipelined round trip (4 ms at p99). It hashes the normalised request and checks the exact cache (2 ms, miss). Because the application handles customer messages, the PII redactor replaces an email address and an order number with placeholders (12 ms at p99 for 2,500 tokens on CPU with a small named-entity model). The application is not semantic-cache eligible, so only the input guardrail runs, a small classifier that scores prompt injection and policy violations (25 ms at p99 on a shared GPU pool). The router picks provider A's small model on its healthiest deployment, the adapter translates the request into A's format and sends it over a pooled connection. About 49 ms have passed. Provider A's first token arrives 400 ms later. As tokens stream, the output guardrail checks them in windows of about one sentence, holding back roughly 150 ms of text so it can stop the stream before a violating sentence reaches the user. When the stream ends, the gateway refunds unused reserved tokens, restores placeholders to real values in the text the user sees (the restore happens per chunk, as tokens pass), emits a metering event, and closes the trace span.</p>
+
+<h4>4 · API</h4>
+<pre>POST /v1/chat/completions                  # one request format for every provider
+Authorization: Bearer gw_live_...          # gateway key -&gt; tenant, app, data class
+Idempotency-Key: 6f1c...                   # one logical request; retries reuse it
+{ "model": "chat-default",                 # an alias, never a provider model id
+  "messages": [...], "tools": [...], "stream": true,
+  "max_tokens": 1024, "temperature": 0.2,
+  "metadata": { "end_user": "u_93a1", "feature": "order_help" },
+  "gateway": { "cache": "exact", "priority": "interactive",
+               "fallback": true, "max_cost_usd": 0.05 } }
+
+-&gt; SSE stream of deltas, then a final event:
+{ "usage": { "input_tokens": 2510, "cache_read_input_tokens": 1800,
+             "output_tokens": 342 },
+  "gateway": { "resolved_model": "provA/small-2026-08", "attempts": 1,
+               "cache": "miss", "cost_usd": 0.00094, "request_id": "..." } }
+
+POST /v1/embeddings      POST /v1/batches   (latency-tolerant, routed to batch endpoints)
+GET  /v1/usage?team=...&amp;from=...            (metering, chargeback)
+429 { "error": "tenant_token_rate", "retry_after_ms": 800 }
+402 { "error": "budget_exhausted", "scope": "team/support", "resets": "2026-11-01" }</pre>
+<p>Three choices matter. Applications name <strong>aliases</strong>, so changing the model behind an alias is a gateway change gated by evaluation, not 60 code changes. The final event reports the <strong>resolved model and attempts</strong>, so applications and the evaluation platform know what actually answered. And budget exhaustion is a distinct error from rate limiting: a 429 means "wait and retry", a budget error means "retrying will not help until someone raises the budget", the same distinction Anthropic's API draws between its rate-limit 429 (with a <code>retry-after</code> header) and its spend-cap response (without one).</p>
+
+<h4>5 · Data model</h4>
+<p><strong>Configuration</strong> (a versioned store, cached in every node): tenants in a hierarchy with keys, data class, rate limits per model class in input and output tokens per minute, budgets per period, allowed providers and regions; aliases mapping to an ordered list of deployments with weights, fallbacks and routing policy; deployments with provider, model version, region, contracted limits and health thresholds; a <strong>price table</strong> versioned by date, so historical cost can be recomputed. <strong>Hot state</strong> (in-memory store): token buckets per tenant and per provider deployment, budget counters, circuit-breaker state, the exact cache. <strong>Semantic cache</strong>: per-tenant vector partitions with entries (embedding, normalised prompt hash, answer, model version, prompt version, knowledge version, created time). <strong>Ledger</strong> (append-only, columnar): one row per attempt (request ID, attempt number, deployment, tokens by type, provider cost, outcome) and one per delivered response (tenant chain, alias, resolved model, charged cost, cache status, latency, data class). <strong>Audit log</strong>: who changed which configuration when, and the per-call ledger rows, retained per policy.</p>
+
+<h4>6 · High-level design</h4>
+<p><strong>The request path</strong> is the stateless fleet of the primer diagram, behind a regional load balancer. Each node holds configuration in memory (pushed on change, so a routing change takes effect in seconds without a deploy), a connection pool per upstream deployment, local circuit breakers and latency statistics, and short-lived leases of token budget. <strong>Upstream adapters</strong> translate the gateway's request format to each provider's (message shapes, tool-call formats, streaming event types, error codes) and back; features that only one provider has, such as explicit prompt-cache breakpoints, pass through in a provider-specific extension field rather than being forced into the common format. <strong>Side services</strong> on the path are kept few and fast: the PII detector and the guardrail classifiers run as separate scaled services so a slow model there does not block the gateway's event loop, and the embedding service feeds the semantic cache. <strong>Off the path</strong>: metering events go to Kafka, then to the ledger, the budget aggregator, dashboards and the audit store; spans go to the evaluation and observability platform (hd12); a reconciler compares the ledger with providers' usage exports daily; and a <strong>control plane</strong> holds configuration, its change history and approvals (an alias change requires a passing evaluation run).</p>
+
+<h4>7 · Deep dive: routing and fallback</h4>
+<p><strong>Routing is three decisions.</strong> The first is <em>which model class</em> a request needs: the large model or the small one. Policies range from static (the application chose an alias that always means the small model) through rules (requests tagged "extraction" with short inputs go small) to a <strong>learned router</strong>, a small classifier that reads the request and predicts whether the small model's answer will be acceptable, with a threshold that trades cost for quality. RouteLLM trained such routers on human preference data and reported cost reductions of more than 2× in some settings without lowering quality; FrugalGPT studied cascades, where a cheap model answers first and a scorer decides whether to escalate, at the price of extra latency on escalated requests. The second decision is <em>which provider</em> serves that class, from those the tenant's data class allows. The third is <em>which deployment</em> (region, endpoint, self-hosted pool) is healthiest right now.</p>
+<p><strong>Health-aware selection.</strong> Each node tracks, per deployment, an exponentially weighted moving average of time to first token and error rate, and in-flight requests. Weights shift away from deployments whose latency rises; a <strong>circuit breaker</strong> (ld4) opens after a burst of failures, sending no traffic for a cool-down, then lets a few probes through. LiteLLM's router shows the same moving parts as configuration: routing strategies (simple shuffle by weight, the default; latency-based; least-busy; cost-based; usage-based, which its docs advise against in production because of the extra latency of tracking usage in Redis), and cooldowns that by default remove a deployment after 3 failures for 5 seconds.</p>
+<p><strong>Fallback, and the rule that makes it safe.</strong> A request may be sent again elsewhere only <em>before its first token has been sent to the client</em>. Before that point, a failure (connection error, 5xx, 429 from the provider, a time-to-first-token timeout) is invisible to the user, and the gateway can try the next deployment in the alias's list. After that point, the user has seen part of an answer; another model would produce a different continuation, so the gateway ends the stream with an error event that includes partial usage, and the application decides whether to retry the whole request.</p>
+<p><strong>Not double-billing.</strong> There are two different bills. The <em>company's bill from providers</em> includes every attempt that reached a provider: a first attempt that timed out at 3 seconds may still have been processed and billed. The <em>tenant's internal charge</em> should cover one logical request. The design keeps them apart. Each logical request carries an <strong>idempotency key</strong> (from the client header, or generated). Each attempt is a ledger row with its own usage, taken from the provider's response or, for abandoned attempts, estimated and later corrected from the provider's usage export. The tenant is charged for the attempt that produced the delivered answer; the others are booked as <strong>failover waste</strong>, a platform cost with its own dashboard. When the gateway gives up on an attempt it closes the upstream connection, which for streaming requests generally stops generation, so waste is mostly input processing rather than a full answer. And if the client itself retries with the same idempotency key, the gateway returns the stored completed response (for non-streaming calls, kept for ten minutes) or attaches the client to the in-flight stream, rather than starting again.</p>
+<p><strong>Retry budgets.</strong> Retries are limited to about 10% of each deployment's normal traffic over a sliding window. Without a budget, an outage multiplies load: every failing request becomes three or four, connection pools fill, and healthy traffic times out too. With one, once the budget is spent, requests fail fast to the next deployment or with a clear error.</p>
+<p><strong>Failover capacity is a contract, not a hope.</strong> Work the numbers. Provider A carries 60% of traffic. At the 700-request peak with 2,500 input tokens, that is 420 requests and 1.05 million input tokens a second: <strong>63 million input tokens a minute</strong>. Provider B is contracted at 80 million input tokens a minute and normally carries its own 40% share, 42 million, leaving 38 million of headroom. Only about 60% of A's traffic can move. If the gateway sends it all, B starts returning 429s to everyone, including the tenants that were already on B. So the design decides in advance: interactive priority tiers fail over first, batch traffic is deferred (it was going to batch endpoints anyway), some applications degrade to the self-hosted model, and the remainder receive a 503 with retry-after. The gateway enforces B's limits with its own per-deployment token buckets, so it, not B, decides who waits.</p>
+<p><strong>Hedging for the tail.</strong> A <strong>hedged request</strong> sends a second copy to another deployment if the first has not produced a token by the p95 delay, and uses whichever answers first, cancelling the other. It cuts tail latency but pays for two prefills on the hedged fraction. At a p95 trigger, about 5% of requests are hedged, raising input cost by up to 5%; worthwhile for short, cheap interactive calls such as autocomplete, not for 20,000-token prompts.</p>
+
+<h4>8 · Deep dive: token buckets and budgets per tenant</h4>
+<p>A <strong>token bucket</strong> holds up to a capacity of tokens and is refilled at a steady rate; a request is admitted if the bucket holds enough and removes what it uses. It allows bursts up to the capacity while holding the long-run rate to the refill rate. Anthropic's API documents that its own rate limits use exactly this algorithm, with capacity continuously replenished rather than reset each minute, and that limits are in requests, input tokens and output tokens per minute. The gateway applies the same idea one level down: per tenant, per model class.</p>
+<p><strong>The problem: output is unknown at admission.</strong> When a request arrives, its input tokens can be counted (or estimated from its length), but its output tokens are not known until it finishes. Reserving <code>max_tokens</code> is safe but wasteful: applications set it high, and a 4,000-token reservation for a 400-token answer cuts usable throughput tenfold. The gateway reserves input plus an <em>estimate</em> of output, taken as the smaller of <code>max_tokens</code> and 1.5 times the application's recent p99 output length, then <strong>reconciles</strong> when the response finishes: unused reservation is refunded; overshoot is charged afterwards, letting the bucket go briefly negative so the next request waits. LiteLLM's budget enforcement does the same with money: it estimates a request's maximum cost and rejects it if that reservation would exceed the budget.</p>
+<p><strong>A worked trace.</strong> The support tenant has a limit of 600,000 tokens per minute: a refill rate of 10,000 tokens a second, with a capacity of 100,000 (ten seconds of burst).</p>
+<table>
+<thead><tr><th>Time</th><th>Event</th><th>Bucket</th></tr></thead>
+<tbody>
+<tr><td>0.0 s</td><td>Start, full</td><td>100,000</td></tr>
+<tr><td>0.0 s</td><td>Request 1: 6,000 input, estimate 1,200 output → reserve 7,200</td><td>92,800</td></tr>
+<tr><td>2.0 s</td><td>Refill 2 s × 10,000 (capped at capacity)</td><td>100,000</td></tr>
+<tr><td>2.0 s</td><td>Request 1 finishes with 500 output → refund 700 (capped)</td><td>100,000</td></tr>
+<tr><td>2.1 s</td><td>A batch script sends 20 requests of 8,000 tokens at once; 12 admitted (96,000)</td><td>5,000</td></tr>
+<tr><td>2.1 s</td><td>Request 13 needs 8,000; deficit 3,000 → 429, retry-after 0.3 s</td><td>5,000</td></tr>
+</tbody>
+</table>
+<p>The retry-after value is the deficit divided by the refill rate: 3,000 / 10,000 per second = 0.3 seconds. A well-behaved client waits exactly that long; the remaining requests trickle in at the refill rate. The burst was absorbed up to the capacity and then smoothed, and the interactive tenant on the same provider was never affected, because its bucket is separate and the provider-level bucket in the gateway had headroom.</p>
+<p><strong>The hierarchy.</strong> Limits nest: an organisation has a total, divided among teams, divided among applications, with optional per-end-user limits for applications that serve the public (so one abusive user cannot spend the application's whole allowance). A request must pass every level. Above token rates sit <strong>dollar budgets</strong> per period: soft alerts at 80%, a hard stop at 100% for tenants that asked for one, and an override path for incidents. Cost is computed from tokens by type (uncached input, cache writes, cache reads, output) and the versioned price table, so the budget reflects provider discounts such as prompt caching.</p>
+<p><strong>Distributed enforcement.</strong> Twelve gateway nodes share each tenant's bucket. The simple design keeps buckets in a sharded in-memory store and updates each with a single atomic script (read the level and last refill time, add refill for the elapsed time, check, subtract, write back), so two nodes cannot both spend the same tokens. At 2,800 operations a second this is easy, but it puts a round trip on every request. Two refinements: pipeline the bucket and budget operations into one round trip, and for hot tenants use <strong>leases</strong>, where a node takes a slice (say 5% of capacity) and admits locally until it is half spent. The overshoot is bounded by nodes × lease: 12 × 5,000 tokens = 60,000 tokens, a little over six seconds of this tenant's refill, an acceptable error for a rate limit and not for a hard legal budget, so hard budgets use small leases. If the store becomes unreachable, nodes fall back to local buckets at capacity divided by the number of nodes, failing open for rate limits rather than blocking all traffic.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Bucket level over 12 seconds for a tenant with capacity 100,000 and refill 10,000 per second. Level starts at 100,000, drops to 92,800 at 0 s, refills to 100,000 at 2 s, drops to 5,000 at 2.1 s when a burst of 12 requests is admitted; rejected requests get retry-after; level climbs at 10,000 per second, with admitted requests every 0.8 seconds keeping it near zero until the burst is drained at about 8 s, then refills to full by about 18 s.">
+<defs><marker id="hd13-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<line x1="60" y1="180" x2="620" y2="180" style="stroke:var(--line-2);fill:none"/>
+<line x1="60" y1="30" x2="60" y2="180" style="stroke:var(--line-2);fill:none"/>
+<text x="54" y="44" text-anchor="end" style="fill:var(--muted)">100k</text>
+<text x="54" y="183" text-anchor="end" style="fill:var(--muted)">0</text>
+<line x1="60" y1="40" x2="620" y2="40" style="stroke:var(--line-2);fill:none;stroke-dasharray:2 4"/>
+<text x="340" y="200" text-anchor="middle" style="fill:var(--muted)">seconds →  (0 … 12)</text>
+<path d="M60,40 L60,50 L105,40 L107,40 L107,173 L125,166 L125,173 L143,166 L143,173 L161,166 L161,173 L179,166 L179,173 L197,166 L197,173 L215,166 L215,173 L233,166 L233,173 L251,166 L251,173 L269,166 L620,40" style="stroke:var(--accent);stroke-width:2;fill:none"/>
+<text x="110" y="70" style="fill:var(--ink-2)">burst of 20: 12 admitted</text>
+<text x="160" y="150" style="fill:var(--crit)">8 rejected → retry-after, admitted as refill allows</text>
+<text x="420" y="110" style="fill:var(--ink-2)">refill 10,000/s</text>
+<line x1="270" y1="166" x2="270" y2="186" style="stroke:var(--line-2);fill:none"/>
+</g>
+</svg>
+<figcaption>A token bucket turns a burst into a queue at the refill rate. Notice that the capacity, not the per-minute limit, decides how big a burst gets through at once, and that the 429s carry a precise retry-after, so a well-written client is admitted on its first retry instead of hammering the gateway.</figcaption>
+</figure>
+<p><strong>Priority and the provider's own buckets.</strong> The gateway also keeps one bucket per provider deployment, sized slightly below the contracted limit, because the provider's limits are organisation-wide and the gateway is the only component that sees the total. Admission checks both the tenant bucket and the deployment bucket. When the deployment bucket is short, interactive requests are admitted before batch ones (a strict priority between two queues, with a small guaranteed share for batch so it is never starved forever), and latency-tolerant work is moved to the provider's batch endpoints, where Anthropic, for example, charges 50% less and completes within 24 hours.</p>
+
+<h4>9 · Deep dive: caching, exact and semantic</h4>
+<p><strong>Three caches, different owners.</strong> <em>Provider prompt caching</em> reuses the processed form of a repeated prompt prefix inside the provider (or inside the self-hosted engine's prefix cache, hd1): the answer is still computed fresh, so it cannot be wrong, and it cuts input cost and time to first token. The gateway helps it by keeping requests with the same prefix on the same deployment (cache affinity) and by placing stable content first. <em>Exact response caching</em> in the gateway returns a stored answer for a byte-identical request. <em>Semantic caching</em> returns a stored answer for a request that merely means something similar. Only the last can return a wrong answer to a different question, which is what this deep dive is about.</p>
+<p><strong>The exact cache key.</strong> A hash of: tenant; resolved model and pinned version; every parameter (temperature, max tokens, tools and their schemas, response format, stop sequences); the full normalised message list including the system prompt; and versions of anything the prompt was built from (knowledge-base or index version). Only requests the application marked cacheable, with low temperature, are eligible. Including the tenant prevents one tenant's answers being served to another and closes a timing side channel (a fast response would reveal that another tenant asked the same thing). With the key complete, an exact hit is as correct as the original answer was. Hit rates are modest, a few per cent on interactive traffic and more on repetitive batch jobs (re-running a classifier over unchanged documents), and that is fine: every hit is free and safe.</p>
+<p><strong>The semantic cache and its bet.</strong> A semantic cache embeds the new prompt, finds the nearest stored prompt by <strong>cosine similarity</strong> (how closely two embedding vectors point the same way, from −1 to 1), and if it exceeds a threshold returns the stored answer. LiteLLM supports Redis, Valkey and Qdrant semantic caches configured with a <code>similarity_threshold</code> (its examples use 0.8) and an embedding model, scoped by key by default. The problem is that embedding similarity measures topic, not answer-equivalence: "how do I cancel my order" and "how do I cancel my subscription" are close neighbours with different answers. Every semantic hit is a bet. Call a hit whose answer is wrong for the new question a <strong>false hit</strong>.</p>
+<p><strong>The break-even rule.</strong> A hit saves the call cost <em>c</em> (plus some latency). A false hit costs the harm of a wrong answer <em>h</em>: a confused user, a support contact, a wrong action. With false-hit rate <em>p</em>, a hit is worth it when <em>c</em> > <em>p</em> × <em>h</em>, so the <strong>break-even false-hit rate</strong> is <em>p</em>* = <em>c</em> / <em>h</em>. Measure <em>p</em> by sampling hits, running the new question through the model and judging whether the cached answer is acceptable for it. Suppose an FAQ (frequently asked questions) application on the small model, where a call costs $0.0013 and a wrong answer is estimated at $0.05 (a share of users who contact support):</p>
+<table>
+<thead><tr><th>Threshold</th><th>Semantic hit rate</th><th>False-hit rate</th><th>Pays? (p* = 2.6%)</th></tr></thead>
+<tbody>
+<tr><td>0.97</td><td>9%</td><td>0.5%</td><td>Yes</td></tr>
+<tr><td>0.95</td><td>15%</td><td>1.2%</td><td>Yes</td></tr>
+<tr><td>0.92</td><td>24%</td><td>4%</td><td>No</td></tr>
+<tr><td>0.90</td><td>30%</td><td>7%</td><td>No</td></tr>
+</tbody>
+</table>
+<p>(The hit and false-hit rates are illustrative of the shape such a measurement takes; each application must measure its own.) At 0.95, per million eligible requests, 150,000 hits save about $195 and cost 1,800 wrong answers × $0.05 = $90: a modest net gain. At 0.90 the extra hits are net losses. Now take a large-model application where a call costs $0.0128 but a wrong answer about a refund policy is estimated at $5 (a complaint, a goodwill credit): <em>p</em>* = 0.26%, below even the strictest row. Semantic caching is wrong for it at any threshold.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Chart of semantic cache threshold on the x-axis from 0.90 to 0.97. Hit rate falls from 30% to 9%. False-hit rate falls from 7% to 0.5%. A horizontal line at 2.6% marks the break-even false-hit rate for the FAQ app; thresholds of 0.95 and above are below it and pay; a second line at 0.26% for the refund app is below every point.">
+<g style="font-family:var(--sans);font-size:12px">
+<line x1="70" y1="190" x2="600" y2="190" style="stroke:var(--line-2);fill:none"/>
+<line x1="70" y1="20" x2="70" y2="190" style="stroke:var(--line-2);fill:none"/>
+<text x="64" y="194" text-anchor="end" style="fill:var(--muted)">0%</text>
+<text x="64" y="108" text-anchor="end" style="fill:var(--muted)">15%</text>
+<text x="64" y="26" text-anchor="end" style="fill:var(--muted)">30%</text>
+<text x="100" y="208" text-anchor="middle" style="fill:var(--muted)">0.90</text>
+<text x="250" y="208" text-anchor="middle" style="fill:var(--muted)">0.92</text>
+<text x="475" y="208" text-anchor="middle" style="fill:var(--muted)">0.95</text>
+<text x="565" y="208" text-anchor="middle" style="fill:var(--muted)">0.97</text>
+<text x="335" y="225" text-anchor="middle" style="fill:var(--muted)">similarity threshold →</text>
+<path d="M100,25 L250,58 L475,107 L565,140" style="stroke:var(--s1);stroke-width:2;fill:none"/>
+<text x="110" y="20" style="fill:var(--s1)">hit rate</text>
+<path d="M100,152 L250,168 L475,183 L565,187" style="stroke:var(--crit);stroke-width:2;fill:none"/>
+<text x="110" y="146" style="fill:var(--crit)">false-hit rate</text>
+<line x1="70" y1="176" x2="600" y2="176" style="stroke:var(--good);fill:none;stroke-dasharray:5 3"/>
+<text x="596" y="172" text-anchor="end" style="fill:var(--good)">break-even 2.6% (FAQ)</text>
+<line x1="70" y1="188.5" x2="600" y2="188.5" style="stroke:var(--accent);fill:none;stroke-dasharray:2 2"/>
+<text x="330" y="186" style="fill:var(--accent)">0.26% (refund app)</text>
+</g>
+</svg>
+<figcaption>Raising the threshold cuts hits and false hits together, but not at the same rate. The application's own cost of a wrong answer draws the horizontal line; only thresholds whose false-hit rate sits below it are worth running, and for high-stakes applications that line sits below every useful threshold.</figcaption>
+</figure>
+<p><strong>Making it safe enough.</strong> Semantic caching is opt-in per application, with a declared cost of a wrong answer and a threshold chosen from a measured curve. Eligibility is narrow: single-turn, no user-specific context (an answer that mentions the user's own order must never be shared), no tools, low temperature. Entries are partitioned by tenant and keyed additionally by model, prompt and knowledge versions, so a policy change invalidates them; entries expire within hours to days. Some teams add a cheap verifier (a small model asked "does this cached answer answer this question?") on hits between two thresholds, trading a little cost for a lower false-hit rate. And the eligible fraction bounds the prize: 30% eligible traffic × (exact 6% + semantic 15%) ≈ 6% of all requests, about $170,000 a month at the blended price, real money but a fraction of what routing and prompt caching deliver.</p>
+
+<h4>10 · PII redaction and data-class routing in the path</h4>
+<p>Every tenant has a <strong>data class</strong>: public, internal, confidential or regulated. Each provider deployment is approved for some classes and regions (for example under a contract with zero data retention). The router's candidate list is filtered by class before any other consideration, and the filter fails closed: if no approved deployment is healthy, the request fails rather than going elsewhere.</p>
+<p>For tenants whose class requires it, the redactor replaces personal data with typed placeholders before the request leaves: pattern detectors for formatted identifiers (emails, phone numbers, card numbers, national IDs) plus a named-entity model for names and addresses. "Refund order 88123 for jane@example.com" becomes "Refund order [ORDER_1] for [EMAIL_1]". The mapping lives in the request's memory only; as response tokens stream back, placeholders are replaced with the real values before they reach the user. This <strong>reversible redaction</strong> fails in known ways: the model may rewrite a placeholder ("[EMAIL 1]"), split it across stream chunks (the restorer must buffer a partial placeholder), or need the real value to do the task (a name's spelling). Detector recall is never perfect, which is why the class filter, not redaction alone, is the main protection for regulated data.</p>
+
+<h4>11 · Evaluation plan</h4>
+<p><strong>Offline.</strong> For the router: each application's golden set (hd12) run through both model classes, judged by validated evaluators, giving a curve of quality against share routed small; the threshold is chosen per application where quality is non-inferior to all-large within the application's margin. For aliases: any change of the model behind an alias passes the same paired regression gate as a prompt change. For the semantic cache: hit and false-hit rates per threshold on a labelled sample of real request pairs. For redaction: recall and precision on a labelled set of real prompts per data type.</p>
+<p><strong>Online.</strong> Routing policies are A/B tested with the request (or the conversation) as the unit: primary metric cost per request; guardrail metrics judged quality on a sample, thumbs-down rate, retry and regenerate rates, and escalation rate, per application and slice. Semantic-cache rollouts are A/B tested too, because a false hit's harm shows up in downstream behaviour (re-asks, contacts) the offline label may miss.</p>
+<p><strong>Guardrail metrics for the gateway itself.</strong> Overhead p50 and p99; availability of answers versus each provider's; fallback success rate and failover waste as a share of spend; ledger versus invoice difference (target under 1%); duplicate charges per million requests (target zero); 429 rate per tenant (too high means limits are wrong); data-class violations (target zero, alert on one); redaction recall on a weekly fresh sample.</p>
+
+<h4>12 · Failure modes and trade-offs</h4>
+<table>
+<thead><tr><th>Failure</th><th>Symptom</th><th>Defence</th></tr></thead>
+<tbody>
+<tr><td>Provider outage at peak</td><td>Errors on A, then 429s on B</td><td>Circuit breakers, retry budget, contracted failover headroom, priority tiers</td></tr>
+<tr><td>Retry storm</td><td>Traffic to upstreams multiplies; pools exhausted</td><td>Retry budget per deployment; fail fast once spent; clients honour retry-after</td></tr>
+<tr><td>Shared store down</td><td>Bucket checks time out</td><td>Local fallback buckets; fail open for rate, closed for hard budgets</td></tr>
+<tr><td>Stale cached answers</td><td>Old policy quoted after a change</td><td>Knowledge and prompt versions in the key; flush on publish</td></tr>
+<tr><td>Silent model change</td><td>Quality shifts with no deploy</td><td>Pin versions behind aliases; alert on resolved-model changes</td></tr>
+<tr><td>Price table error</td><td>Budgets and chargeback wrong</td><td>Versioned prices, daily reconciliation with invoices</td></tr>
+<tr><td>Gateway itself slow</td><td>All applications' latency rises</td><td>Per-step overhead metrics, side services with timeouts, bypass for health checks</td></tr>
+</tbody>
+</table>
+<p>The trade-offs to name: centralisation (one place for policy) against a shared dependency on every call; strict budgets against availability during incidents; semantic-cache savings against wrong answers; redaction against task quality; hedging's tail latency against its cost; and a common API against providers' distinctive features, which is why the adapter passes extensions through instead of flattening everything.</p>
+
+<h4>13 · What changes at 10× scale</h4>
+<p>At 200 million requests a day (7,000 a second at peak, about 56,000 open streams), the fleet grows to about 100 pods and the design changes in three places. <strong>Cells</strong>: the gateway is split into regional cells, each with its own fleet, store and connection pools, and tenants are assigned to cells, so one bad cell does not take down everyone and buckets stay local. <strong>Leases everywhere</strong>: per-request round trips to a shared store become the bottleneck, so nodes admit from leases and the store sees lease renewals, with overshoot bounded and reported. <strong>Capacity as a portfolio</strong>: the model bill is now large enough to buy reserved or provisioned throughput from providers and to run a larger self-hosted share (hd1), and the router becomes a capacity planner, filling committed capacity first (it is paid for whether used or not) and spilling to on-demand. Metering moves from one Kafka topic to a partitioned stream with pre-aggregation, and the reconciler runs hourly.</p>
+</section>
+
+<section data-field="deep">
+<h4>Streaming through a gateway is a protocol, not a pipe</h4>
+<p>A naive gateway reads the provider's stream and writes it to the client. A correct one must also count tokens as they pass (for metering if the stream is cut), run the output guardrail on windows of text, restore PII placeholders that may straddle chunk boundaries, translate one provider's event types into the common format (tool-call deltas are the hardest, because providers split arguments differently), and apply backpressure: if the client reads slowly, the gateway must not buffer an unbounded amount of a fast provider's output in memory. Each of these holds back a little text, and they must share one buffer rather than each adding its own delay. When the client disconnects, the gateway must cancel the upstream immediately, or the company pays for answers nobody reads.</p>
+<h4>Output guardrails on a stream</h4>
+<p>A classifier that judges a complete answer cannot run until the answer is finished, which defeats streaming. The usual compromise checks text in windows (a sentence or about 50 tokens) and holds back one window, so a violating sentence can be stopped before it is shown; the user sees text about 150 ms behind generation. The weakness is context: a harmful instruction can be spread over several innocent-looking windows. So streaming checks are a first line, and high-risk applications either run a full-answer check before showing anything (accepting the latency) or add a post-hoc check that retracts and reports. The decision is per application, which is why guardrail configuration hangs off the alias and tenant, not the gateway globally.</p>
+<h4>Learned routers drift when their models change</h4>
+<p>A router learns the gap between two specific models: which requests the small one fails. When either model is upgraded, the gap moves. A new small model that is better at extraction makes the router too conservative (sending work to the large model unnecessarily); a new large model makes nothing change in cost but the comparison baseline moves. The router is therefore versioned with the pair of models it was trained on, re-evaluated on every alias change, and monitored online by the share of traffic it escalates and by quality on each side of its decision. A sudden change in the escalation share is the cheapest early signal that something upstream changed.</p>
+<h4>Cache affinity versus load balancing</h4>
+<p>Provider-side and self-hosted prefix caches only help if requests sharing a prefix land where the prefix is cached. Pure load balancing spreads them evenly and destroys hit rates; pure affinity (hash the prefix to one deployment) creates hot spots when one application's prompt dominates. The middle path is bounded-load consistent hashing: route by prefix hash to a preferred deployment unless it is above, say, 1.25 times the average load, then spill to the next. For a self-hosted engine (hd1) this can halve time to first token for long shared system prompts; for external providers whose caching is per organisation and model, affinity matters less, but placing stable content first in the prompt still does.</p>
+<h4>Fail-open and fail-closed is a table, not a setting</h4>
+<p>Every check in the path needs an explicit answer to "what if this dependency is down?". Rate limiting fails open to local approximations, because rejecting all traffic is worse than brief overuse. Hard dollar budgets fail closed for external customers and open for internal teams. Data-class routing and redaction for regulated tenants fail closed. Input guardrails fail open for internal tools and closed for consumer products. Writing this table down per tenant tier, and testing it by deliberately failing each dependency in a staging cell, is what separates a gateway that degrades gracefully from one that turns a guardrail-service blip into a company-wide outage.</p>
+<h4>Metering correctness is an accounting problem</h4>
+<p>Metering events are produced asynchronously, can be lost or duplicated in transit, and arrive out of order. The ledger therefore keys rows by (request ID, attempt number), makes writes idempotent, and computes budgets from the ledger rather than from a counter that might double-count a replayed event. The real-time budget counter in the in-memory store is an approximation for admission; the ledger is the truth, reconciled daily against providers' usage exports. A persistent gap between the two (for example 3% more spend at a provider than in the ledger) usually means attempts that bypass the gateway, abandoned requests not recorded, or a price-table error, and each has a different fix.</p>
+<h4>Multi-provider tool calling is the leakiest abstraction</h4>
+<p>A common format for plain chat is easy; tools are not. Providers differ in how tool schemas are declared, whether several tool calls may be returned at once, how arguments stream, and how results are passed back. An application that relies on parallel tool calls from one provider can break silently when fallback sends it to a provider that serialises them. The defence is to declare per alias which capabilities it guarantees (tools, parallel tools, structured output, image input) and to allow fallback only to deployments with the same capability set, verified by contract tests that run every adapter against recorded conversations.</p>
+</section>
+
+<section data-field="prod">
+<h4>How it fails in practice</h4>
+<p><strong>The failover that took down the healthy provider.</strong> Provider A starts returning errors at peak. Every gateway node opens its breaker within seconds and sends A's traffic to B. B's organisation-wide token limit is exceeded within a minute; B returns 429 to everything, including the interactive tenants that always ran on B. The fix was twofold: per-deployment token buckets in the gateway, sized below B's contract, so the gateway rather than B decides who gets the headroom; and priority tiers, so interactive traffic fails over and batch traffic waits.</p>
+<p><strong>The cache that quoted last month's policy.</strong> A support application had semantic caching on; the refund window changed from 30 to 14 days. For two days, users asking about refunds received cached answers quoting 30 days. The cache key had the model and prompt versions but not the knowledge-base version. Now every entry carries the index version, and publishing a policy document flushes the affected tenant's partition.</p>
+<p><strong>The leaked key.</strong> An application's gateway key was committed to a public repository and used to run thousands of large-model requests overnight. The hard daily budget stopped spend at the application's limit; without the gateway, the provider key would have run until the organisation's spend cap. Keys are now scoped per application and environment, and an anomaly alert fires on spend per hour above five times the trailing average.</p>
+<p><strong>The silent version change.</strong> An alias pointed at a provider's floating model name; the provider moved the name to a new version, and an extraction application's field accuracy dropped by 4 points. The response's reported model changed at the same moment, visible in the ledger. Aliases now point only at pinned versions, and a resolved-model change on any alias triggers an alert.</p>
+<h4>What to monitor</h4>
+<p>Per deployment: request rate, error rate by type, 429s from the provider, time to first token and total latency percentiles, breaker state, tokens per minute against contract. Per tenant: tokens and cost against limits and budgets, 429s and budget rejections, cache hit rates, fallback share. Gateway health: overhead per step at p50 and p99, open streams per node, event-loop lag, side-service timeouts. Money: spend by team, failover waste, ledger-to-invoice gap. Safety: data-class rejections, redaction counts by type, guardrail block rates.</p>
+<h4>Knobs people tune</h4>
+<p>Routing weights and router thresholds per application; time-to-first-token timeouts per priority; retry budget share; breaker failure count and cool-down; bucket capacity and refill per tenant; output-estimate multiplier; lease size; semantic-cache threshold and expiry time per application; guardrail window size; priority shares between interactive and batch.</p>
+<h4>The real case: LiteLLM and a provider's own limits</h4>
+<p>LiteLLM is an open-source gateway (a proxy server and a Python router) whose documentation, checked on 8 October 2026, maps closely onto this design. Its router offers routing strategies by name: <code>simple-shuffle</code> (the default, weighted random honouring per-deployment rpm and tpm), latency-based, least-busy, cost-based and usage-based routing, the last of which the docs advise against in production because tracking usage in Redis adds latency. Failing deployments are put into cooldown: by default after 3 allowed failures, for 5 seconds, triggered by 429s, by failure rates above 50% in the current minute, and by some client errors. Budgets are set with <code>max_budget</code> and <code>budget_duration</code> on keys, teams, users and end customers, with token and request rate limits alongside, and the docs describe budget reservation, estimating a request's maximum cost before sending it and rejecting it if the reservation would exceed the budget. Semantic caches on Redis, Valkey or Qdrant take a <code>similarity_threshold</code> (0.8 in the examples) and an embedding model, scoped by key unless configured otherwise. What the documentation cannot give you is the threshold for your application or the failover headroom for your providers: those are measurements and contracts.</p>
+<p>The other half of the case is a provider's published rules, because the gateway must fit inside them. Anthropic's rate-limit documentation states that its API uses the token bucket algorithm, with capacity continuously replenished rather than reset at intervals; that limits are measured in requests, input tokens and output tokens per minute per model class; that for most models cache-read input tokens do not count toward the input-token limit; and that exceeding a limit returns 429 with a retry-after header, while hitting a spend cap returns a 429 without one. A gateway that mirrors these units and signals, and that keeps its own buckets slightly inside them, never surprises the applications behind it.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> simulate a gateway's admission and routing for three tenants and two providers: token buckets with reservation and refund, a router with circuit breakers, an outage on provider A, fallback before first token, and a ledger that separates the tenant's charge from failover waste. Then compute the semantic-cache break-even for two applications. Python 3.12, standard library only.</p>
+<ol>
+<li>Save as <code>gateway_sim.py</code> and run <code>python gateway_sim.py</code>.</li>
+<li>Read the per-tenant table: admitted, rejected with 429, and charged dollars. The batch tenant is rejected most because its bursts exceed its bucket.</li>
+<li>Read the provider table: during the outage window A's breaker opens and B carries the load; waste is A's spend on failed attempts. Charged plus waste should equal total provider spend.</li>
+<li>Set <code>B_LIMIT_TPS</code> lower (for example 60,000) and re-run: fallbacks start failing with 503 because B's deployment bucket is empty, the failover-capacity problem from the lesson.</li>
+<li>In the cache block, change the cost of a wrong answer and see which thresholds pay.</li>
+</ol>
+<pre>"""LLM gateway simulator: token buckets, breakers, fallback, ledger. Python 3.12, stdlib only."""
+import random
+from dataclasses import dataclass, field
+
+rng = random.Random(7)
+PRICE = {"A": (3.0, 15.0), "B": (3.5, 14.0)}     # $ per million input, output tokens (assumed)
+B_LIMIT_TPS = 150_000                           # provider B deployment bucket refill, tokens/s
+SECONDS, OUTAGE = 120, (40, 70)                 # provider A fails between these seconds
+
+@dataclass
+class Bucket:
+    cap: float; rate: float; level: float = None; t: float = 0.0
+    def __post_init__(self): self.level = self.cap
+    def take(self, now, n):
+        self.level = min(self.cap, self.level + (now - self.t) * self.rate); self.t = now
+        if self.level &gt;= n: self.level -= n; return 0.0
+        return (n - self.level) / self.rate        # retry-after seconds
+    def refund(self, n): self.level = min(self.cap, self.level + n)
+
+@dataclass
+class Breaker:
+    fails: int = 0; open_until: float = -1
+    def ok(self, now): return now &gt;= self.open_until
+    def record(self, now, success):
+        self.fails = 0 if success else self.fails + 1
+        if self.fails &gt;= 3: self.open_until, self.fails = now + 5, 0   # 3 fails -&gt; 5 s cooldown
+
+tenants = {  # name: (rate tokens/s, capacity, requests/s, input tokens, p99 output)
+    "support": (40_000, 200_000, 8, 2_500, 400),
+    "coding":  (60_000, 300_000, 6, 6_000, 700),
+    "batch":   (30_000, 60_000, 10, 4_000, 300)}
+tb = {n: Bucket(cap, rate) for n, (rate, cap, *_ ) in tenants.items()}
+dep = {"A": Bucket(400_000, 200_000), "B": Bucket(B_LIMIT_TPS * 2, B_LIMIT_TPS)}
+brk = {"A": Breaker(), "B": Breaker()}
+stats = {n: {"ok": 0, "429": 0, "503": 0, "charged": 0.0} for n in tenants}
+spend = {"A": 0.0, "B": 0.0}; waste = 0.0
+
+def cost(p, i, o): return (i * PRICE[p][0] + o * PRICE[p][1]) / 1e6
+
+for step in range(SECONDS * 10):                 # 100 ms ticks
+    now = step / 10
+    for name, (_, _, rps, inp, p99) in tenants.items():
+        for _ in range(sum(rng.random() &lt; rps / 100 for _ in range(10))):
+            est = inp + int(1.5 * p99)
+            if tb[name].take(now, est) &gt; 0: stats[name]["429"] += 1; continue
+            out = int(rng.expovariate(1 / (p99 / 3)))
+            delivered = False
+            for p in ("A", "B"):                  # fallback order; only before first token
+                if not brk[p].ok(now) or dep[p].take(now, est) &gt; 0: continue
+                fails = p == "A" and OUTAGE[0] &lt;= now &lt; OUTAGE[1] and rng.random() &lt; 0.8
+                if fails:                         # input was processed, then error: waste
+                    w = cost(p, inp, 0); spend[p] += w; waste += w
+                    brk[p].record(now, False); dep[p].refund(est - inp); continue
+                c = cost(p, inp, out); spend[p] += c; stats[name]["charged"] += c
+                brk[p].record(now, True); dep[p].refund(max(0, est - inp - out))
+                delivered = True; break
+            tb[name].refund(max(0, est - inp - out) if delivered else est)
+            stats[name]["ok" if delivered else "503"] += 1
+
+print(f"{'tenant':8} {'ok':&gt;6} {'429':&gt;6} {'503':&gt;6} {'charged $':&gt;10}")
+for n, s in stats.items(): print(f"{n:8} {s['ok']:6} {s['429']:6} {s['503']:6} {s['charged']:10.2f}")
+charged = sum(s["charged"] for s in stats.values())
+print(f"\nprovider spend A ${spend['A']:.2f}  B ${spend['B']:.2f}  total ${sum(spend.values()):.2f}")
+print(f"charged to tenants ${charged:.2f} + failover waste ${waste:.2f} = ${charged + waste:.2f}")
+
+print("\nSemantic cache break-even (p* = call cost / wrong-answer cost)")
+curve = [(0.97, 0.09, 0.005), (0.95, 0.15, 0.012), (0.92, 0.24, 0.04), (0.90, 0.30, 0.07)]
+for app, call, wrong in [("faq-small", 0.0013, 0.05), ("refund-large", 0.0128, 5.0)]:
+    print(f"{app}: p* = {call / wrong:.2%}")
+    for th, hit, fh in curve:
+        net = 1e6 * hit * (call - fh * wrong)
+        print(f"  threshold {th}: hits {hit:.0%}, false hits {fh:.1%}, net per 1M eligible ${net:,.0f}")</pre>
+<p><strong>What to look for:</strong> 429s concentrated on the bursty tenant while the others are unaffected; during the outage, A's breaker cycling open and closed (each probe that fails adds waste) while B carries the traffic; charged plus waste exactly equal to total provider spend, which is the no-double-billing invariant; and in the cache block, a positive net only for the FAQ application at the two strictest thresholds.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>Your gateway carries 700 requests a second at peak, averaging 2,500 input tokens. Provider A carries 60% and B 40%. B's contract allows 80 million input tokens a minute. Provider A goes down. (a) How many input tokens a minute does A's traffic need? (b) How much of it can B absorb? (c) Interactive traffic is 55% of A's share and batch 45%. What do you do with each?</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> A carries 0.6 × 700 = 420 requests a second × 2,500 = 1.05 million input tokens a second, <strong>63 million a minute</strong>.</p>
+<p><strong>(b)</strong> B already carries 0.4 × 700 × 2,500 × 60 = 42 million a minute (if its traffic shape matches), leaving 38 million of headroom; keep about 10% in reserve for bursts, so about 34 million, roughly <strong>54% of A's traffic</strong>. The point is that headroom, not B's total limit, decides.</p>
+<p><strong>(c)</strong> Interactive traffic is 0.55 × 63 = 35 million a minute, which just about fits the 34 million of usable headroom: fail it over, with the per-deployment bucket on B enforcing the limit so that any excess gets a 503 with retry-after rather than pushing B into 429s for everyone. Batch traffic (28 million a minute) goes to a queue or the providers' batch endpoints and is retried when A recovers; where some applications can use the self-hosted model, route them there. Afterwards, negotiate failover headroom into B's contract, or move enough steady traffic to the self-hosted platform that the remaining A share fits.</p>
+</details>
+<b>Diagnose it</b>
+<p>Finance reports that provider B's invoice for last month is 6% higher than the gateway ledger says the company spent at B. Nothing else looks wrong. What are the likely causes, in what order do you check them, and what do you change?</p>
+<details><summary>Answer</summary>
+<p><strong>Check traffic that bypasses the gateway first.</strong> Compare B's usage export by API key with the gateway's keys: an old provider key still used directly by a team or a script is the most common cause, and the fix is to revoke direct keys. <strong>Then abandoned attempts.</strong> If the ledger records only delivered responses, or records abandoned attempts at an estimated zero cost, the input processed before timeouts and cancellations is missing; compare the gap's timing with failover and timeout events. <strong>Then pricing.</strong> Check the price table version against the invoice line items: a price change, a cache-write premium or a long-context surcharge not in the table produces a steady percentage gap. <strong>Then lost events.</strong> Compare request counts in B's export with ledger attempt counts per hour; gaps clustered in time point to a metering pipeline outage. Afterwards: reconcile daily rather than monthly, alert on a gap above 1%, record every attempt with usage from the provider's response or usage export, and make the ledger's write path idempotent so replays cannot hide losses.</p>
+</details>
+</section>

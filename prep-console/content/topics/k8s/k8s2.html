@@ -1,0 +1,422 @@
+<!-- topic source for k8s/k8s2; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "k8s2",
+  "t": "Docker images: layers, union file systems, build cache and multi-stage builds",
+  "tag": "Images",
+  "sum": "How a Dockerfile becomes stacked layers, how OverlayFS merges them at run time, why deleting a file in a later step never shrinks an image, how the build cache decides what to rebuild (and why one changed line can redo everything after it), and how multi-stage builds and BuildKit keep builds small and fast.",
+  "prereq": [
+    ["k8s1", "An OCI image is a manifest listing a JSON config and an ordered list of layer tarballs, each named by the SHA-256 digest of its bytes; the runtime stacks the unpacked layers under a per-container writable layer."],
+    ["os13", "OverlayFS shows read-only lower directories and a writable upper directory as one merged tree; writing a lower file copies it up, and deleting one leaves a whiteout."],
+    ["swe9", "Continuous integration builds and tests every change, and a build-once artefact is promoted unchanged through environments."]
+  ],
+  "myths": [
+    ["Deleting a file in a later Dockerfile step makes the image smaller.", "Each RUN, COPY and ADD step adds a layer recording only what changed. A later <code>rm</code> adds a whiteout entry that hides the file, but the earlier layer still contains every byte and is still downloaded. To keep a file out of the image, create and delete it in the same RUN step, use a cache or secret mount, or do the work in a separate build stage."],
+    ["The build cache notices when a package repository has new versions.", "For a RUN step the cache key is the command text plus the parent layer. <code>RUN apt-get update &amp;&amp; apt-get install -y curl</code> is reused for months, with whatever package versions were current when it first ran. Rebuild with <code>--pull --no-cache</code> on a schedule, or pin versions, if you want fresh packages."],
+    ["Touching a file (changing its modification time) busts the COPY cache.", "BuildKit computes the COPY/ADD cache key from file contents and metadata such as permissions, and the docs state that modification time is not taken into account. Changing the bytes, the mode, or adding or removing a file in the copied set does invalidate it."],
+    ["More layers make a container slower.", "Layer count barely affects run-time speed: OverlayFS looks up a path through the lower directories once and caches the result, and a few dozen layers is normal (distroless Python images have over forty). What matters is total bytes pulled and unpacked, and how well layers are shared and cached. Squashing everything into one layer usually makes things worse because nothing can be reused."],
+    ["Multi-stage builds are about making images small.", "Small images are the most visible benefit, but multi-stage builds also keep compilers, source code and build secrets out of the runtime image (reducing attack surface), let BuildKit build independent stages in parallel and skip stages the target does not need, and let one Dockerfile produce test, debug and production targets."],
+    ["The cache key for a layer is the layer's digest.", "They are different things. The cache key is computed from the inputs (parent, instruction, file checksums). The layer digest is the hash of the output tar's bytes, which include file timestamps. Two builds of the same inputs on different machines can hit the same cache key logic yet produce layers with different digests unless the build is made reproducible (k8s3)."]
+  ],
+  "recap": [
+    "Each RUN, COPY or ADD instruction runs on top of the previous step's file system and produces a layer: a tar of the files it added or changed, plus whiteout entries for files it deleted; other instructions only change the image config.",
+    "At run time OverlayFS stacks the unpacked layers as read-only lower directories under a writable upper directory, so a lookup finds the topmost copy of a file, a write copies the whole file up first, and a delete creates a whiteout.",
+    "Because layers only add, a file created in one step and deleted in another is still shipped in full, which is how both bloated images and leaked secrets happen.",
+    "The build cache reuses a step if its parent is cached and its cache key matches: the command string for RUN, and file contents and metadata (not modification time) for COPY and ADD.",
+    "A cache miss invalidates every later step, so Dockerfiles copy dependency manifests and install dependencies before copying frequently changing source code, and use .dockerignore to keep irrelevant files out of the build context.",
+    "BuildKit, the default builder since Docker Engine 23.0, turns a Dockerfile into a dependency graph, builds independent stages in parallel, skips stages the target does not need, and adds cache, secret and bind mounts for RUN.",
+    "A multi-stage build compiles or installs in a heavy builder stage and copies only the results into a small final stage with COPY --from, so compilers, headers and source never reach production.",
+    "Ephemeral CI runners have no local cache, so builds export and import cache through a registry or the CI's cache service with --cache-to and --cache-from; mode=max also exports intermediate stages."
+  ],
+  "glossary": [
+    ["BuildKit", "Docker's build engine, the default since Docker Engine 23.0. It converts a Dockerfile into a graph of build steps, runs independent ones in parallel and manages the build cache."],
+    ["build context", "The set of files sent to the builder for COPY and ADD to use, usually the directory given to docker build, minus anything matched by .dockerignore."],
+    ["build stage", "A section of a Dockerfile that starts with FROM. Stages can be named (FROM … AS build) and later stages can copy files from earlier ones."],
+    ["cache key", "The value the builder computes from a step's inputs to decide whether a stored result can be reused instead of running the step."],
+    ["cache mount", "A directory mounted into a RUN step (RUN --mount=type=cache) that persists between builds but is never part of the image, used for package-manager caches."],
+    ["copy-up", "What OverlayFS does when a container writes to a file that exists only in a lower layer: it copies the whole file into the writable layer first, then applies the write."],
+    [".dockerignore", "A file listing patterns of paths to exclude from the build context, like .gitignore for builds."],
+    ["layer", "A tar archive of the file-system changes made by one build step: added and modified files in full, and whiteout entries for deletions."],
+    ["lowerdir / upperdir", "The read-only directories (image layers) and the single writable directory that OverlayFS merges into one view."],
+    ["multi-stage build", "A Dockerfile with several FROM stages where only the final stage becomes the image, and earlier stages are used to compile or prepare files that are copied in."],
+    ["opaque directory", "A directory marked in an upper layer so that the contents of the same directory in lower layers are hidden entirely, used when a step deletes and recreates a directory."],
+    ["secret mount", "A file mounted into a single RUN step (RUN --mount=type=secret) that is never written into any layer or the cache key."],
+    ["snapshot", "An unpacked layer stored on disk as a directory, ready to be used as a lower directory in an overlay mount."],
+    ["whiteout", "A special entry (a file named .wh.&lt;name&gt; in the layer tar) that marks a file from a lower layer as deleted."]
+  ],
+  "qa": [
+    ["E", "What is an image layer, and which Dockerfile instructions create one?", "A layer is a tar archive of the file-system changes made by one build step: the files it added or modified, in full, plus whiteout entries for files it removed. RUN, COPY and ADD create layers. Instructions like ENV, WORKDIR, EXPOSE, USER, CMD and ENTRYPOINT only change the image config, which is why docker history shows them as 0 B."],
+    ["E", "Why doesn't RUN rm -rf /tmp/big in a later step make the image smaller?", "Layers only add. The earlier layer still contains /tmp/big, and the later one adds a whiteout that hides it in the merged view. Every pull still downloads both. Delete in the same RUN step that created the file, or do the work in a separate build stage."],
+    ["E", "How does Docker decide whether to reuse a cached step?", "It walks the Dockerfile in order. A step is reused if its parent step was reused and a cached result exists with the same cache key: for RUN, the exact command string; for COPY and ADD, a checksum of the copied files' contents and metadata, not their modification times; build arguments used by the step also count. The first miss forces every later step to run again."],
+    ["M", "A one-line code change makes your CI rebuild all Python dependencies, taking 6 minutes. Why, and how do you fix it?", "The Dockerfile probably does COPY . . before RUN pip install, so any source change changes the COPY checksum, which invalidates the install step and everything after it. Copy only requirements.txt (or the lock file) first, install, then copy the source. Add a .dockerignore so .git, caches and test outputs do not invalidate the COPY, and use a pip cache mount so even a real dependency change reuses downloaded wheels.", "Follow-up: CI runners are ephemeral; the reorder didn't help there. Why? — There is no local cache on a fresh runner. Export and import the cache with --cache-to/--cache-from to a registry or the CI cache, with mode=max if intermediate stages matter."],
+    ["M", "Explain a multi-stage build with an example.", "A Dockerfile has several FROM stages. A builder stage starts from a full image with compilers, installs build dependencies and compiles, for example creating a Python virtual environment with native extensions in /opt/venv. The final stage starts from a slim base and runs COPY --from=builder /opt/venv /opt/venv. Only the final stage becomes the image, so gcc, headers and source stay out. For a Go service the final stage can be a static distroless or scratch image of a few megabytes.", "Follow-up: What decides which stages actually get built? — With BuildKit, only stages the target depends on, so a test stage is skipped unless you build with --target test."],
+    ["M", "How does OverlayFS handle writes to a large file from the image, and why does that matter?", "The first write to a file that lives in a lower layer copies the whole file into the container's writable layer, then modifies it. A one-byte write to a 2 GB file in the image therefore copies 2 GB, stalls the write, and doubles disk use. Databases and anything write-heavy should keep data on a volume, which bypasses the overlay entirely."],
+    ["M", "What are cache mounts and secret mounts, and when would you use each?", "Both are BuildKit RUN options that mount something only for that step. A cache mount (type=cache) persists a directory like ~/.cache/pip across builds without putting it in a layer, so dependency installs are faster. A secret mount (type=secret) exposes a credential as a file during one step without writing it to any layer or the cache key. Use secret mounts for private package-index tokens instead of ARG or ENV, which are recorded in the image history."],
+    ["M", "Why should apt-get update and apt-get install be in the same RUN instruction?", "If they are separate, the update step is cached by its command text and never re-run, so a later change to the install line runs against a stale package index and can fail with 404s or install old versions. Combined, any change to the package list re-runs the update too. Clean up the apt lists in the same step so they do not persist in the layer."],
+    ["M", "What is the difference between --cache-to mode=min and mode=max?", "mode=min, the default, exports cache only for the layers that end up in the final image. mode=max exports every intermediate step from every stage, including builder stages, so a later CI run can reuse an expensive compile stage that never appears in the final image. max costs more storage and upload time."],
+    ["H", "A team deletes an API key file in a later RUN step and believes the image is safe to publish. Is it?", "No. The key is still in the earlier layer's tar, and anyone who pulls the image can extract that layer with docker save or by fetching the blob from the registry. The 2023 RWTH Aachen study found secrets in about 8.5% of 337,171 images examined, mostly through mistakes like this. Revoke the key, rebuild with a secret mount, and remove the old image and tags from the registry.", "Follow-up: Is ARG safe for secrets? — No. Build arguments used in RUN steps are visible in the image history and can be recorded in provenance; use --secret."],
+    ["H", "Two CI machines build the same commit and push images with different digests. Why, and does it matter?", "Layer tars include file modification times, and installers write timestamps, byte-compiled caches and random data, so the bytes differ even when the logical content is the same. The cache logic and the layer digest are separate: cache keys depend on inputs, digests on output bytes. It matters for verifying builds and for supply-chain checks: reproducible builds (SOURCE_DATE_EPOCH, rewrite-timestamp, pinned inputs) let a second party rebuild and get the same digest.", "Follow-up: What does SOURCE_DATE_EPOCH do in BuildKit? — It sets the timestamps recorded in the image config and, with rewrite-timestamp=true on the output, clamps file timestamps in layers to that value."],
+    ["H", "Design a fast container build for a monorepo with ten services sharing a base library.", "Use one base stage that installs shared system packages and the shared library, then a stage per service that copies only that service's dependency manifests and installs them, then its source. Build with BuildKit so independent service stages run in parallel, with cache mounts for package managers and a registry cache in mode=max shared by all CI runners. Narrow each service's build context, or use bind mounts, so unrelated changes do not invalidate its COPY steps, and use COPY --link so final layers can be rebased when the base image changes.", "Follow-up: How would you know the cache is working? — Track per-step cache hit rate and build duration in CI; BuildKit marks reused steps CACHED in its output, and a sudden fall in hits usually means an early step started changing on every build."]
+  ],
+  "refs": [
+    ["docs", "Docker docs — Build cache invalidation", "The exact rules: RUN by command string, COPY/ADD by file checksum without mtime, secrets excluded, one miss invalidates the rest.", "https://docs.docker.com/build/cache/invalidation/"],
+    ["docs", "Docker docs — Optimize cache usage in builds", "Layer ordering, .dockerignore, cache and bind mounts, and external cache with --cache-to/--cache-from.", "https://docs.docker.com/build/cache/optimize/"],
+    ["docs", "Docker docs — Multi-stage builds", "FROM … AS, COPY --from, --target, and how BuildKit skips unneeded stages.", "https://docs.docker.com/build/building/multi-stage/"],
+    ["paper", "Dahlmanns et al. — Secrets Revealed in Container Images (ASIA CCS 2023)", "Internet-wide study: 8.5% of 337,171 images contained secrets such as private keys and API tokens.", "https://arxiv.org/abs/2307.03958"],
+    ["docs", "Linux kernel docs — Overlay Filesystem", "Lower and upper directories, copy-up, whiteouts, opaque directories and redirect_dir.", "https://docs.kernel.org/filesystems/overlayfs.html"],
+    ["docs", "OCI Image Spec — Image Layer Filesystem Changeset", "How layers encode additions, modifications and deletions (whiteouts, opaque whiteouts).", "https://github.com/opencontainers/image-spec/blob/main/layer.md"],
+    ["docs", "Docker docs — Cache storage backends", "Registry, GitHub Actions, local and S3 cache exporters and the min/max modes.", "https://docs.docker.com/build/cache/backends/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team's Python service lives in a Dockerfile that someone wrote on their first day with containers. It starts <code>FROM python:3.12</code>, copies the whole repository, runs <code>pip install -r requirements.txt</code>, and sets a command. It works. Then the costs start to show.</p>
+<p>Every pull request takes nine minutes in CI, six of them reinstalling the same 80 dependencies, even when the change is a typo in a log message. The image is 1.6 GB; pushing it from CI takes a minute, and when the cluster scales out at 9 a.m., each new node spends forty seconds pulling it before the service can start. A security scanner reports 400 known vulnerabilities, most in packages like compilers and image libraries that the running service never uses. And one day an engineer notices that an old <code>.env</code> file with a database password was copied in by <code>COPY . .</code>, removed two lines later with <code>RUN rm .env</code>, and is still sitting in the published image for anyone to extract.</p>
+<p>None of these problems is about the application. They all come from not knowing how a Dockerfile turns into an image: that each step produces a layer that only ever adds; that layers are stacked by a union file system at run time; that the builder reuses a step only if everything before it is unchanged; and that a build can have several stages, only one of which ships.</p>
+<p>This lesson works through those mechanisms in order. It starts with what a single build step produces, then how OverlayFS combines layers when a container runs, then why deletion never shrinks an image. It then opens up the build cache and traces exactly which steps rerun when one line of code changes, introduces BuildKit's graph model and its mounts, and finishes with multi-stage builds and how to keep the cache alive on throwaway CI machines. By the end, each of the four problems above has an obvious fix, and you can predict a build's behaviour before you run it.</p>
+</section>
+
+<section data-field="primer">
+<h4>Transparent sheets on a projector</h4>
+<p>Think of an old overhead projector and a stack of transparent sheets. The bottom sheet has a map printed on it. The next sheet adds roads. The next adds town names. The projected image is what you see looking down through the whole stack. If you want to "remove" a town from the picture, you cannot scratch it off the lower sheet, because that sheet is shared and locked. You can only add a new sheet on top with a white patch covering it. The town is invisible on screen, but the lower sheet still has it, and anyone handed the stack can lift the patch.</p>
+<p>An image works the same way. Each build step that touches files produces a new sheet — a <strong>layer</strong> — that records only what that step changed. When a container starts, the layers are stacked in order and the container sees the merged result through a union file system called <strong>OverlayFS</strong>. A fresh, empty, writable sheet goes on top for the container's own changes. Deleting a file from a lower layer means adding a "whiteout" patch on a higher one.</p>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="OverlayFS: three read-only image layers and a writable container layer merge into one view; a whiteout hides a file and copy-up moves a modified file into the writable layer">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">What the container sees (merged)</text>
+    <rect x="20" y="28" width="600" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="40" y="50" style="fill:var(--ink);font-family:var(--mono)">/etc/app.conf (v2)   /app/main.py   /usr/lib/libssl.so   /bin/sh</text>
+    <rect x="20" y="86" width="600" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="30" y="80" style="fill:var(--muted)">upperdir: container writable layer</text>
+    <text x="40" y="108" style="fill:var(--ink);font-family:var(--mono)">/etc/app.conf (v2, copied up then edited)</text>
+    <rect x="20" y="144" width="600" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="30" y="138" style="fill:var(--muted)">lowerdirs: read-only image layers, top to bottom</text>
+    <text x="40" y="164" style="fill:var(--ink-2);font-family:var(--mono)">L3: /app/main.py   .wh.secret.env (whiteout)</text>
+    <rect x="20" y="180" width="600" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="40" y="200" style="fill:var(--ink-2);font-family:var(--mono)">L2: /etc/app.conf (v1)   /secret.env  &#8592; still here, still shipped</text>
+    <rect x="20" y="216" width="600" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="40" y="236" style="fill:var(--ink-2);font-family:var(--mono)">L1: /bin/sh   /usr/lib/libssl.so   (base image)</text>
+    <text x="20" y="264" style="fill:var(--crit)">The merged view hides /secret.env, but layer L2 still contains it.</text>
+  </g>
+</svg>
+<figcaption>Read the stack from the top: each path resolves to its highest copy. The writable layer holds the container's edits; the whiteout in L3 hides /secret.env, yet L2 still carries its bytes to every machine that pulls the image.</figcaption>
+</figure>
+<h4>The build side: a recipe with memoised steps</h4>
+<p>Building is like following a recipe where you keep the result of every step in the fridge. Next time, if the first five steps of the recipe and their ingredients are unchanged, you take step five's result out of the fridge and continue from there. The moment one step differs — a new ingredient, a changed instruction — that step and every step after it must be done fresh, because each depends on the result before it. That is the <strong>build cache</strong>, and its "everything after the first change reruns" rule is the reason the order of lines in a Dockerfile matters so much.</p>
+<h4>Several kitchens, one dish</h4>
+<p>Finally, a build can use several kitchens. A <strong>multi-stage build</strong> prepares ingredients in a messy workshop full of tools (a builder stage with compilers), then carries only the finished parts into a clean, small kitchen (the final stage). Only the final kitchen ships. The tools never leave the workshop.</p>
+<h4>The four mechanisms, in one paragraph each</h4>
+<p>Everything in this lesson follows from four facts. <em>Layers only add</em>: a build step records what it changed, never what an earlier step "really" contained, so nothing can be removed from a published image after the fact. <em>Lookup is top-down</em>: when a container reads a path, the highest layer holding that path wins, and a whiteout counts as "not here". <em>The cache is a chain</em>: a step is reused only if every step before it was reused and its own inputs match. And <em>stages are independent</em>: a build may run many stages, but an image is assembled only from the one you ship. If you can say these four sentences and explain each with an example, you understand Docker images better than most people who use them daily.</p>
+<p>Where the analogies break: a sheet is not a picture but a tar file of whole files, so changing one byte of a 100 MB file puts all 100 MB in a new layer; and the cache does not compare results, only inputs, so it happily serves a stale result when something outside the Dockerfile — a package repository — has changed.</p>
+</section>
+
+<section data-field="body">
+<h4>1. From a Dockerfile to an image</h4>
+<p>A <strong>Dockerfile</strong> is a list of instructions. Take this small one for a Flask app:</p>
+<pre>FROM python:3.12-slim
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+USER 10001
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]</pre>
+<p>The instructions fall into two kinds. <strong>File-system instructions</strong> — <code>RUN</code>, <code>COPY</code> and <code>ADD</code> — change files and each produce a new layer. <strong>Metadata instructions</strong> — <code>ENV</code>, <code>WORKDIR</code>, <code>USER</code>, <code>EXPOSE</code>, <code>LABEL</code>, <code>CMD</code>, <code>ENTRYPOINT</code> — only edit the image config (the JSON document from k8s1) and add no layer. (<code>WORKDIR</code> creates the directory if it is missing, which BuildKit records cheaply.) <code>FROM</code> picks the starting point: the base image's layers and config.</p>
+<p>So this image is the base's layers plus three new ones: the copied <code>requirements.txt</code> (a few hundred bytes), the installed packages (say 40 MB), and the application source. <code>docker history</code> shows one row per instruction, with <code>0B</code> for metadata-only ones:</p>
+<pre>IMAGE      CREATED BY                                      SIZE
+&lt;id&gt;       CMD ["gunicorn" "-b" "0.0.0.0:8000" "app:app"]  0B
+&lt;id&gt;       USER 10001                                      0B
+&lt;id&gt;       COPY . . # buildkit                             184kB
+&lt;id&gt;       RUN pip install --no-cache-dir -r requiremen…   41.2MB
+&lt;id&gt;       COPY requirements.txt . # buildkit              312B
+&lt;id&gt;       ENV PYTHONUNBUFFERED=1                          0B
+&lt;id&gt;       WORKDIR /app                                    0B
+…          (base image rows)</pre>
+
+<h4>2. How one build step becomes a layer</h4>
+<p>For a <code>RUN</code> step the builder does exactly what <code>docker run</code> does, with one twist. It mounts the file system produced so far (all earlier layers) as read-only lower directories, puts an empty writable upper directory on top, and runs the command inside a container. When the command exits, everything the command changed is sitting in that upper directory. The builder turns the upper directory into a <strong>changeset</strong>:</p>
+<ul>
+<li>A file that was <strong>added or modified</strong> is stored in full. There are no binary diffs: change one byte of a 100 MB file and the new layer carries the whole 100 MB file again.</li>
+<li>A file that was <strong>deleted</strong> is stored as a <strong>whiteout</strong>: an empty entry named <code>.wh.&lt;name&gt;</code> in the same directory. When layers are stacked, the whiteout hides the file from lower layers.</li>
+<li>A directory that was deleted and recreated is marked <strong>opaque</strong> with an entry named <code>.wh..wh..opq</code>, meaning "ignore this directory's contents in all lower layers".</li>
+<li>Changed permissions or ownership also count as a modification, so <code>RUN chown -R app /app</code> on a 500 MB directory copies all 500 MB into a new layer. (<code>COPY --chown=app</code> sets ownership as the files arrive instead.)</li>
+</ul>
+<p>The changeset is written as a tar archive, compressed (gzip by default; zstd is supported), and hashed. The hash of the compressed bytes is the layer's digest in the manifest; the hash of the uncompressed tar is its <code>diff_id</code> in the config (k8s1). <code>COPY</code> and <code>ADD</code> work the same way, except the "command" is placing files from the build context.</p>
+
+<h4>3. How layers are combined at run time</h4>
+<p>When a container starts, its root file system is an OverlayFS mount. The <strong>lowerdir</strong> option lists the unpacked image layers from top to bottom, separated by colons; <strong>upperdir</strong> is the container's empty writable directory; <strong>workdir</strong> is a scratch directory OverlayFS needs for atomic operations; and the mount point shows the merged view. os13 introduced the rules; here they are with consequences.</p>
+<ul>
+<li><strong>Lookup.</strong> To open <code>/etc/app.conf</code>, the kernel checks the upper directory, then each lower directory from the top down, and uses the first copy it finds. A whiteout in a higher layer stops the search: the file "does not exist". Lookups are cached in the kernel's directory-entry cache, so the number of layers costs almost nothing after the first access.</li>
+<li><strong>Reads</strong> of a file that is only in a lower layer go straight to that layer's file. All containers from the same image share those files, on disk and in the page cache: a hundred containers from one image read <code>libpython3.12.so</code> from one cached copy.</li>
+<li><strong>The first write</strong> to a lower file triggers <strong>copy-up</strong>: the whole file is copied to the upper directory, then the write is applied there. For small config files that is invisible. For a 2 GB SQLite database baked into the image, the first one-byte write copies 2 GB, blocks the writer while it does, and doubles the disk used.</li>
+<li><strong>Deletes</strong> of a lower file create a whiteout in the upper directory, so the merged view hides it.</li>
+<li><strong>Renaming a directory</strong> that lives in a lower layer either fails with <code>EXDEV</code> ("cross-device link"), which careful programs handle by copying, or, with the <code>redirect_dir</code> feature enabled, is recorded as a redirect. Some old tools break on this, a niche but real source of surprises.</li>
+</ul>
+<p>The practical rule follows directly: <strong>anything a container writes heavily — databases, caches, uploads, logs written to files — belongs on a volume</strong>, which is a plain directory or block device mounted into the container that bypasses the overlay completely (k8s4, k8s9). The writable layer is for small, disposable changes.</p>
+
+<h4>4. Why deleting never shrinks an image</h4>
+<p>Put sections 2 and 3 together and the bloated-image trap becomes obvious. Consider:</p>
+<pre>RUN curl -fsSLo /tmp/sdk.tar.gz https://example.com/sdk-1.4.tar.gz   # layer A: +300 MB
+RUN tar -xzf /tmp/sdk.tar.gz -C /opt                                  # layer B: +700 MB
+RUN /opt/sdk/build-tool --out /usr/local/bin/tool                     # layer C: +20 MB
+RUN rm -rf /tmp/sdk.tar.gz /opt/sdk                                   # layer D: whiteouts, ~0 MB</pre>
+<p>The merged view at the end contains only the 20 MB tool. The image contains layers A, B, C and D: about 1,020 MB, every byte of which is downloaded by every pull. Layer D did nothing but add two whiteout entries.</p>
+<p>There are three fixes, in order of preference:</p>
+<ol>
+<li><strong>Do it in another stage</strong> and copy only the result into the final stage (section 7). Nothing from the builder's layers reaches the image.</li>
+<li><strong>Do it in one RUN step</strong>: <code>RUN curl … &amp;&amp; tar … &amp;&amp; build-tool … &amp;&amp; rm -rf /tmp/sdk.tar.gz /opt/sdk</code>. The upper directory at the end of that step only contains the tool, so the layer is 20 MB. The cost is caching granularity: any change reruns the whole chain.</li>
+<li><strong>Use a mount</strong> so the large files never enter the file system the layer is made from: a cache mount for downloads, a bind mount from another stage, or a secret mount for credentials (section 6).</li>
+</ol>
+<p>The same mechanism leaks secrets. <code>COPY . .</code> that sweeps in <code>.env</code> or <code>id_rsa</code>, followed by <code>RUN rm .env</code>, ships the secret inside a layer. Anyone with pull access can run <code>docker save</code>, unpack the tar, and read each layer. The prod section has the numbers on how often this happens in public images.</p>
+
+<h4>5. The build cache, precisely</h4>
+<p>Building from scratch every time would be slow, so the builder stores the result of every step and reuses it when it can. The rule, from the Docker documentation, is that the builder walks the instructions in order and, for each one, looks for a cached result whose <strong>cache key</strong> matches. If none matches, the cache is invalidated and that step and <em>all subsequent steps</em> run again. The key is built from:</p>
+<ul>
+<li>the <strong>parent</strong>: the cache key of the previous step (so a miss propagates to everything after it);</li>
+<li>the <strong>instruction text</strong>: for <code>RUN</code>, the exact command string. The builder does not look at what the command would do; <code>RUN apt-get update</code> with the same text is a hit forever;</li>
+<li>for <code>COPY</code> and <code>ADD</code>, a <strong>checksum of the files</strong> being copied: their contents and metadata such as permissions. The docs state explicitly that modification time is not part of it, so <code>touch</code> does not bust the cache, but any content change, mode change, or file added to or removed from the copied set does;</li>
+<li><strong>build arguments</strong> (<code>ARG</code>) whose values are used by the step, and the base image's digest for <code>FROM</code>;</li>
+<li>but <em>not</em> the contents of secret mounts: changing a secret's value does not invalidate the cache (its ID and mount path do count).</li>
+</ul>
+<p>Now trace a one-line change through two versions of a Dockerfile. The app has 80 dependencies; installing them takes 180 s; copying source takes 1 s.</p>
+<table>
+<thead><tr><th>Step</th><th>Version A (copy everything first)</th><th>After editing app.py</th><th>Version B (manifest first)</th><th>After editing app.py</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>FROM python:3.12-slim</td><td>CACHED</td><td>FROM python:3.12-slim</td><td>CACHED</td></tr>
+<tr><td>2</td><td>WORKDIR /app</td><td>CACHED</td><td>WORKDIR /app</td><td>CACHED</td></tr>
+<tr><td>3</td><td>COPY . .</td><td><strong>MISS</strong> (app.py changed)</td><td>COPY requirements.txt .</td><td>CACHED (file unchanged)</td></tr>
+<tr><td>4</td><td>RUN pip install -r requirements.txt</td><td><strong>MISS</strong> (parent changed): 180 s</td><td>RUN pip install -r requirements.txt</td><td>CACHED</td></tr>
+<tr><td>5</td><td>CMD …</td><td>MISS (trivial)</td><td>COPY . .</td><td><strong>MISS</strong>: 1 s</td></tr>
+</tbody>
+</table>
+<p>Same files, same commands, different order: version A rebuilds in about three minutes, version B in about a second. The general principle is to <strong>order steps from least to most frequently changing</strong>: base image, system packages, language dependencies (keyed on the lock file only), then source code.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Cache chains for two Dockerfile orders: in version A a source change invalidates the dependency install; in version B only the final copy reruns">
+  <defs><marker id="k8s2-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">A: COPY . . before install</text>
+    <text x="20" y="130" style="fill:var(--ink);font-weight:600">B: requirements first</text>
+    <rect x="20" y="34" width="110" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="75" y="58" text-anchor="middle" style="fill:var(--ink)">FROM, WORKDIR</text>
+    <rect x="160" y="34" width="110" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="215" y="58" text-anchor="middle" style="fill:var(--ink)">COPY . .</text>
+    <rect x="300" y="34" width="150" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="375" y="52" text-anchor="middle" style="fill:var(--ink)">RUN pip install</text>
+    <text x="375" y="67" text-anchor="middle" style="fill:var(--crit)">180 s again</text>
+    <rect x="480" y="34" width="110" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="535" y="58" text-anchor="middle" style="fill:var(--ink)">CMD</text>
+    <line x1="130" y1="54" x2="158" y2="54" marker-end="url(#k8s2-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="270" y1="54" x2="298" y2="54" marker-end="url(#k8s2-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="450" y1="54" x2="478" y2="54" marker-end="url(#k8s2-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="215" y="92" text-anchor="middle" style="fill:var(--muted)">app.py changed</text>
+    <text x="215" y="108" text-anchor="middle" style="fill:var(--muted)">→ first miss</text>
+    <rect x="20" y="144" width="110" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="75" y="168" text-anchor="middle" style="fill:var(--ink)">FROM, WORKDIR</text>
+    <rect x="160" y="144" width="130" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="225" y="168" text-anchor="middle" style="fill:var(--ink)">COPY requirements</text>
+    <rect x="320" y="144" width="130" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="385" y="168" text-anchor="middle" style="fill:var(--ink)">RUN pip install</text>
+    <rect x="480" y="144" width="110" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="535" y="162" text-anchor="middle" style="fill:var(--ink)">COPY . .</text>
+    <text x="535" y="177" text-anchor="middle" style="fill:var(--crit)">1 s</text>
+    <line x1="130" y1="164" x2="158" y2="164" marker-end="url(#k8s2-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="290" y1="164" x2="318" y2="164" marker-end="url(#k8s2-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="450" y1="164" x2="478" y2="164" marker-end="url(#k8s2-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="20" y="215" style="fill:var(--muted)">green = cache hit, red = rerun. A miss turns everything to its right red.</text>
+  </g>
+</svg>
+<figcaption>The cache is a chain, not a set: a miss at one step forces every later step to run. Moving the volatile COPY to the end confines the damage to one cheap step.</figcaption>
+</figure>
+<p>Two more details make or break this in practice. First, the <strong>build context</strong> — the directory sent to the builder — includes everything not excluded by <strong>.dockerignore</strong>. Without one, <code>COPY . .</code> includes <code>.git/</code>, whose contents change on every commit, plus local virtual environments, caches and test output; the COPY misses even when no source file changed, and secrets like <code>.env</code> get swept in. A good <code>.dockerignore</code> lists <code>.git</code>, <code>.venv</code>, <code>__pycache__</code>, <code>*.pyc</code>, <code>.env</code>, <code>node_modules</code>, build outputs and test reports.</p>
+<p>Second, because <code>RUN</code> is keyed on text only, a cached step can be <strong>stale</strong>. <code>RUN apt-get update &amp;&amp; apt-get install -y curl</code> stays cached with whatever versions existed the day it first ran, including ones with known vulnerabilities. Teams rebuild on a schedule with <code>docker build --pull --no-cache</code> (fresh base image, no cache) or pin versions so the text changes when they want an update. And <code>apt-get update</code> must share a RUN with <code>install</code>: on its own line it is cached forever, and a later install line runs against an old package index.</p>
+
+<h4>6. BuildKit: builds as a graph</h4>
+<p><strong>BuildKit</strong> has been Docker's default builder since Docker Engine 23.0 (2023). Instead of executing instructions one by one, it converts the Dockerfile into a graph of operations, where each node is a step and edges are "needs the output of". That changes three things.</p>
+<p><strong>Parallelism and pruning.</strong> Stages that do not depend on each other run concurrently, and stages the requested target does not need are skipped entirely. A Dockerfile with <code>test</code>, <code>lint</code> and <code>prod</code> stages builds only <code>prod</code>'s dependencies when you build the default target.</p>
+<p><strong>Content-based cache.</strong> Cache keys are computed from the inputs as in section 5, and results are stored by content, so they can be exported to and imported from remote storage (section 8).</p>
+<p><strong>RUN mounts.</strong> A <code>RUN</code> step can mount things that are available while it runs and never become part of the layer:</p>
+<pre># syntax=docker/dockerfile:1
+# pip's download cache survives between builds but is not in the image
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+# a private index token, available only to this step, never stored
+RUN --mount=type=secret,id=pip_token \
+    PIP_INDEX_URL="https://__token__:$(cat /run/secrets/pip_token)@pypi.example.com/simple" \
+    pip install -r requirements.txt
+
+# use source files without copying them into a layer
+RUN --mount=type=bind,target=/src,source=. \
+    make -C /src dist OUT=/out</pre>
+<p>The secret is supplied at build time with <code>docker build --secret id=pip_token,src=token.txt .</code>. Compare that with <code>ARG PIP_TOKEN</code>: build arguments used in RUN steps appear in the image history (<code>docker history --no-trunc</code>), which is why secrets must never go through <code>ARG</code> or <code>ENV</code>. One gotcha with cache mounts for apt: Debian-based images ship a <code>docker-clean</code> configuration that deletes downloaded packages after each install, so an apt cache mount stays empty unless that file is removed, as Docker's docs show.</p>
+
+<h4>7. Multi-stage builds</h4>
+<p>A <strong>multi-stage build</strong> has several <code>FROM</code> lines. Each starts a new <strong>stage</strong> with its own base; stages can be named with <code>AS</code>; a later stage can copy files out of an earlier one with <code>COPY --from=&lt;stage&gt;</code>; and only the last stage (or the one named with <code>--target</code>) becomes the image. Here is the Flask app rebuilt that way, for a dependency list that includes a package with a C extension that must be compiled:</p>
+<pre># syntax=docker/dockerfile:1
+FROM python:3.12 AS builder                 # full image: gcc, headers, ~1.1 GB unpacked
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+FROM python:3.12-slim AS runtime            # ~132 MB unpacked, no compiler
+RUN useradd --uid 10001 --no-create-home app
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+WORKDIR /app
+COPY . .
+USER app
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]</pre>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Multi-stage build: a large builder stage produces a virtual environment that is copied into a small runtime stage; only the runtime stage is shipped">
+  <defs><marker id="k8s2-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="20" width="260" height="190" rx="8" style="fill:none;stroke:var(--line-2);stroke-dasharray:5 4"/>
+    <text x="150" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">builder (discarded)</text>
+    <rect x="40" y="54" width="220" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="150" y="72" text-anchor="middle" style="fill:var(--ink-2)">python:3.12 — 1,132 MB</text>
+    <rect x="40" y="88" width="220" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="150" y="106" text-anchor="middle" style="fill:var(--ink-2)">gcc, headers, pip caches</text>
+    <rect x="40" y="122" width="220" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="150" y="140" text-anchor="middle" style="fill:var(--ink)">/opt/venv — 60 MB</text>
+    <rect x="360" y="20" width="260" height="190" rx="8" style="fill:none;stroke:var(--good);stroke-width:1.5"/>
+    <text x="490" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">runtime (shipped)</text>
+    <rect x="380" y="54" width="220" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="490" y="72" text-anchor="middle" style="fill:var(--ink-2)">python:3.12-slim — 132 MB</text>
+    <rect x="380" y="88" width="220" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="490" y="106" text-anchor="middle" style="fill:var(--ink)">/opt/venv — 60 MB</text>
+    <rect x="380" y="122" width="220" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="490" y="140" text-anchor="middle" style="fill:var(--ink-2)">app source — 0.2 MB</text>
+    <line x1="260" y1="136" x2="378" y2="102" marker-end="url(#k8s2-arrow2)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+    <text x="320" y="110" text-anchor="middle" style="fill:var(--accent);font-family:var(--mono)">COPY --from</text>
+    <text x="150" y="190" text-anchor="middle" style="fill:var(--muted)">never pushed, never pulled</text>
+    <text x="490" y="190" text-anchor="middle" style="fill:var(--ink)">≈ 192 MB unpacked</text>
+  </g>
+</svg>
+<figcaption>Only the arrow crosses the boundary: the runtime image gets the built virtual environment and nothing else from the 1.1 GB builder. Sizes are unpacked, amd64, measured from the registry in October 2026; the 60 MB venv is illustrative.</figcaption>
+</figure>
+<p>The numbers: <code>python:3.12</code> (amd64) is 411 MB compressed and about 1,132 MB unpacked; <code>python:3.12-slim</code> is 46 MB compressed and about 132 MB unpacked. The single-stage image built on the full base would be well over 1.2 GB; the multi-stage one is about 190 MB, and it contains no compiler for an attacker to use and far fewer packages for a scanner to flag. k8s3 takes the same app further down, to distroless.</p>
+<p>The trick that makes copying a virtual environment work is that both stages use the same Python version at the same path (<code>/usr/local/bin/python3.12</code> in both official images), so the venv's interpreter links and compiled extensions stay valid. Copying a venv between different base images (Debian to Alpine, which uses a different C library) breaks it.</p>
+<p>Multi-stage builds are also how one Dockerfile serves several purposes. A <code>test</code> stage can extend the builder with test dependencies and run the suite; <code>docker build --target test .</code> builds just that, and BuildKit skips the runtime stage. A <code>debug</code> stage can add a shell and tools on top of the runtime stage for troubleshooting. Stages can even copy from external images: <code>COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /bin/uv</code> pulls a single binary out of another image without inheriting anything else.</p>
+
+<h4>8. Keeping the cache in CI</h4>
+<p>All of the above assumes the cache from the previous build is still on the machine. On a developer laptop it is. On CI, runners are often fresh virtual machines for every job, so every build starts cold and the careful ordering buys nothing. BuildKit solves this by exporting cache to external storage and importing it next time:</p>
+<pre>docker buildx build \
+  --cache-from type=registry,ref=registry.example.com/app:buildcache \
+  --cache-to   type=registry,ref=registry.example.com/app:buildcache,mode=max \
+  -t registry.example.com/app:1.8.3 --push .</pre>
+<p>The <code>registry</code> backend stores cache as a special image; there are also backends for GitHub Actions' cache service (<code>type=gha</code>), S3, Azure Blob and a local directory. The <code>mode</code> matters for multi-stage builds. With <code>mode=min</code>, the default, only the layers of the final image are exported, so the expensive builder stage — exactly the one you want cached — is missing next time. <code>mode=max</code> exports every step of every stage, at the cost of more upload and storage.</p>
+<p>A build on a fresh runner then imports the cache metadata, finds that steps 1-4 have matching keys, downloads only the layers it needs (or none, if they are only needed as parents), and runs from the first real change. A typical result is that a nine-minute cold build becomes a one-minute warm one, which is worth more to a team than almost any other CI optimisation.</p>
+
+<h4>9. Reading an image's layers yourself</h4>
+<p>You do not have to guess what a build produced. <code>docker history --no-trunc &lt;image&gt;</code> lists each step with its size, and the zero-byte rows confirm which instructions only touched the config. <code>docker save &lt;image&gt; -o img.tar</code> writes the image as an OCI layout: unpack it and you find <code>index.json</code>, the manifest and config as JSON blobs, and one tar per layer under <code>blobs/sha256/</code>; <code>tar -tvf</code> on a layer shows exactly which files it adds, and entries named <code>.wh.*</code> are its deletions. Tools such as <code>dive</code> present the same information interactively, with the bytes each layer wastes on files later overwritten or deleted. Two minutes with these tools on your own images usually finds the biggest win: a forgotten build cache, a test fixture, a duplicated directory from a late <code>chown</code>, or a credential that should never have been there.</p>
+</section>
+
+<section data-field="deep">
+<h4>Cache keys and layer digests are different things</h4>
+<p>The build cache is keyed on inputs: parent key, instruction, file checksums. The image is identified by outputs: the digest of each layer's bytes. These come apart because a tar file records modification times, owners and ordering, and because commands like <code>pip install</code> write timestamps, compiled bytecode and sometimes random values into files. Rebuild the same commit on a clean machine and you get layers with identical content but different digests, so registries store them twice, nodes pull them again, and nobody can check that a published image really came from a given commit. Reproducible builds close the gap: BuildKit honours <code>SOURCE_DATE_EPOCH</code> for the config's timestamps and, with <code>rewrite-timestamp=true</code> on the image exporter, clamps file times inside layers; pinned base digests and locked dependencies remove the remaining variation. k8s3 and k8s5 build on this.</p>
+<h4>COPY --link and rebasing</h4>
+<p>Normally a layer's changeset is computed against its parent, so a new base image forces every later layer to be rebuilt and re-pushed even when the copied files are identical. <code>COPY --link</code> creates the layer independently of what is below it — the files are placed into an empty directory and the layer is simply stacked. BuildKit can then reuse it when the base changes, and with the right exporter settings a registry can reuse the blob without re-uploading it. The cost is that <code>--link</code> cannot follow symlinks in the destination path or rely on files from earlier layers, which is why it is opt-in. It is most valuable for the final "copy the app" steps on top of frequently patched base images.</p>
+<h4>Why squashing usually loses</h4>
+<p>Collapsing an image into a single layer looks attractive: no hidden deleted files, one blob. But it destroys sharing: the base OS layer that a hundred services and every node already have is now embedded in each service's unique blob, so every pull downloads it again, and every code change produces a new full-size blob. The right fix for hidden files is to not create them (stages, single-RUN cleanups, mounts), keeping a small number of well-ordered layers whose lower ones change rarely.</p>
+<h4>Layer depth and overlay limits</h4>
+<p>OverlayFS has a practical limit on how many lower directories one mount can stack, because the mount options must fit in a single page and lookups walk the stack. Docker refuses images that are too deep with a "max depth exceeded" error, a limit in the low hundreds of layers. Ordinary images never approach it; it bites generated images (one layer per file) and long chains of images built on images built on images. Distroless images show the other side: over forty small layers is perfectly normal and costs nothing measurable at run time.</p>
+<h4>ADD, remote sources and pinning</h4>
+<p><code>ADD</code> does more than <code>COPY</code>: it extracts local tar archives automatically, and it can fetch a URL or a Git repository. Those extras are why style guides prefer <code>COPY</code> unless you need them: an archive silently expanding is surprising, and a remote download is a supply-chain input whose content can change while the instruction text stays the same. For remote sources, the builder downloads the content to compute the cache checksum, so a changed file does invalidate the step. Better still, pin it: <code>ADD --checksum=sha256:&lt;hash&gt; https://…/tool.tar.gz /tmp/</code> makes the build fail if the bytes ever differ, which turns "the URL changed under us" from a mystery into an error. The same thinking applies to <code>FROM</code>: a tag can move, a digest cannot (k8s5).</p>
+<h4>Compression choices</h4>
+<p>Layers are gzip-compressed by default. zstd (<code>--output type=image,compression=zstd</code>) decompresses several times faster at similar ratios, which shortens the unpack phase that often dominates cold starts on big images, and is supported by containerd and recent registries. eStargz and SOCI (k8s1) change the layout so files can be fetched individually. The constraint is the consumers: old runtimes cannot read zstd, so multi-platform or multi-compression outputs are sometimes published side by side.</p>
+<h4>Build context size and remote builders</h4>
+<p>The builder needs the context before it can compute COPY checksums. On a remote builder (a BuildKit pod in a cluster or a cloud build service) a 2 GB context of datasets and model weights is uploaded on every build. BuildKit transfers only the files that steps actually reference and keeps a session cache, but a tight .dockerignore remains the cheapest optimisation, and large artefacts such as model weights usually belong outside the image entirely (k8s14).</p>
+</section>
+
+<section data-field="prod">
+<h4>The case: secrets left in image layers (RWTH Aachen, ASIA CCS 2023)</h4>
+<p>Dahlmanns and colleagues downloaded and examined 337,171 images from Docker Hub and from 8,076 private registries reachable on the internet, and searched every layer for secrets. About 8.5% of images contained at least one secret, mostly private keys and API tokens; they found 52,107 valid private keys and 3,158 distinct API secrets across 28,621 images. Active scanning then found 275,269 hosts on the internet using leaked private keys for TLS or SSH authentication. Most leaks were in images from single users, consistent with accidents rather than intent.</p>
+<p>The mechanisms are exactly the ones in this lesson: <code>COPY . .</code> sweeping <code>.env</code> files, SSH keys and certificates into a layer because there was no .dockerignore; a key copied in to fetch private dependencies and deleted in a later step, leaving it in the earlier layer; tokens passed with <code>ARG</code> or <code>ENV</code> and recorded in the config history. The fixes are mechanical: a .dockerignore that excludes secrets by default, <code>RUN --mount=type=secret</code> for build-time credentials, multi-stage builds so build-time files never reach the final image, secret scanning of images in CI (Trivy and similar tools scan layers, not just the final view), and — once a secret has been pushed — revoking it, since deleting the tag does not un-publish copies already pulled.</p>
+<h4>Characteristic failure modes</h4>
+<ul>
+<li><strong>Every build reinstalls dependencies.</strong> Volatile COPY too early, missing .dockerignore, or a cold CI runner without cache import. BuildKit's progress output shows which step first lacks <code>CACHED</code>.</li>
+<li><strong>Images keep growing.</strong> Downloads, package caches (<code>/var/lib/apt/lists</code>, <code>~/.cache/pip</code>) or build tools left in layers; <code>chown -R</code> duplicating directories. <code>docker history</code> and tools like <code>dive</code> show bytes per layer and the files each layer adds or hides.</li>
+<li><strong>Stale or vulnerable packages despite rebuilds.</strong> Cached <code>apt-get</code>/<code>apk</code> steps and an old local base image. Rebuild on a schedule with <code>--pull --no-cache</code>.</li>
+<li><strong>Slow first write or disk spikes.</strong> Copy-up of large image files; move them to volumes.</li>
+<li><strong>Build works locally, fails in CI.</strong> The local build used a cached step whose command no longer works (an upstream URL moved), or the context differs because of .dockerignore or files that exist only locally.</li>
+</ul>
+<h4>Knobs people actually turn</h4>
+<p>The builder: a shared remote BuildKit (a long-lived builder pod or service) keeps a warm local cache across CI jobs and is often simpler than exporting cache on every run. Cache garbage collection: BuildKit prunes its cache by size and age (<code>docker buildx prune</code>, builder GC policy); too small a budget silently evicts the expensive steps. Cache scope: in CI, key the cache by branch with a fallback to the main branch's cache so feature branches start warm. Base-image refresh: a scheduled no-cache rebuild picks up security patches, paired with automated pull requests that bump pinned base digests. Context hygiene: a .dockerignore reviewed like code, and a CI check that fails if the build context exceeds a size budget.</p>
+<h4>What to measure</h4>
+<p>Build duration and per-step cache hit rate in CI; final image size compressed (what nodes pull) and unpacked; number and size of layers that change per release (only the top ones should); and pull time on a fresh node. Budget the image like any other resource: a 200 MB increase is a cold-start regression and should be visible in review.</p>
+</section>
+
+<section data-field="lab">
+<p>Steps 1-2 need Docker (BuildKit is the default builder). Step 3 runs here with Python 3.12.</p>
+<ol>
+<li><strong>Watch the cache chain (Needs Docker).</strong> In an empty directory create <code>app.py</code> (<code>print("v1")</code>), <code>requirements.txt</code> (<code>requests==2.32.3</code>) and a Dockerfile in "version A" order (<code>COPY . .</code> before <code>RUN pip install -r requirements.txt</code>). Run <code>docker build -t cachedemo .</code> twice; the second run shows <code>CACHED</code> on every step. Edit <code>app.py</code> and build again: the COPY step and the <code>pip install</code> step rerun. Reorder to version B and repeat: only the final COPY reruns. In the output look for lines like <code>=&gt; CACHED [3/5] COPY requirements.txt .</code>.</li>
+<li><strong>See a deleted file survive (Needs Docker).</strong>
+<pre>printf 'FROM alpine:3.22\nRUN head -c 50000000 /dev/urandom &gt; /big\nRUN rm /big\n' &gt; Dockerfile.big
+docker build -f Dockerfile.big -t bigdemo .
+docker history bigdemo            # the RUN head row shows ~50MB
+docker run --rm bigdemo ls /big   # No such file or directory</pre>
+The image is about 58 MB though the file "does not exist".</li>
+<li><strong>Simulate the cache (runs here).</strong> Save as <code>cachesim.py</code>:
+<pre>import hashlib
+def key(parent, instr, files):
+    h = hashlib.sha256((parent + instr).encode())
+    for name in sorted(files):               # COPY: contents, not mtime
+        h.update(name.encode() + hashlib.sha256(files[name]).digest())
+    return h.hexdigest()[:12]
+def build(steps, ctx, cache, cost):
+    parent, total = "", 0
+    for instr, pattern in steps:
+        files = {n: c for n, c in ctx.items() if pattern and (pattern == "." or n == pattern)}
+        k = key(parent, instr, files)
+        hit = k in cache; cache.add(k); parent = k
+        t = 0 if hit else cost.get(instr, 1); total += t
+        print(f"  {'CACHED' if hit else 'RUN   '} {instr:42} {t:4}s")
+    print("  total", total, "s")
+A = [("FROM python:3.12-slim", None), ("COPY . .", "."), ("RUN pip install -r requirements.txt", None)]
+B = [("FROM python:3.12-slim", None), ("COPY requirements.txt .", "requirements.txt"),
+     ("RUN pip install -r requirements.txt", None), ("COPY . .", ".")]
+cost = {"RUN pip install -r requirements.txt": 180}
+for name, steps in (("A", A), ("B", B)):
+    cache = set(); ctx = {"app.py": b"print('v1')", "requirements.txt": b"flask==3.1.2"}
+    print(name, "cold"); build(steps, ctx, cache, cost)
+    ctx["app.py"] = b"print('v2')"
+    print(name, "after editing app.py"); build(steps, ctx, cache, cost)</pre>
+Expect A to rerun the 180 s install after the edit and B to show only the last COPY rerunning. Then change <code>requirements.txt</code> in the script and see both versions pay the 180 s.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Fix: a 1.4 GB image that rebuilds for eight minutes</b>
+<p>A data-science team's inference service has this Dockerfile, no .dockerignore, and CI on ephemeral runners:</p>
+<pre>FROM python:3.12
+COPY . /app
+WORKDIR /app
+RUN apt-get update
+RUN apt-get install -y build-essential libgomp1
+RUN pip install -r requirements.txt
+RUN rm -rf /root/.cache/pip
+CMD python serve.py</pre>
+<p>Builds take eight minutes on every commit and the image is 1.4 GB. List what is wrong and write the improved build.</p>
+<details><summary>Answer</summary>
+<p>Problems, in order of impact: (1) <code>COPY . /app</code> comes first, so every source change — and every commit, since <code>.git</code> is in the context — invalidates everything after it, including the dependency install. (2) CI runners are fresh, so even a perfect order gets no cache without <code>--cache-from/--cache-to</code>. (3) <code>apt-get update</code> is a separate, permanently cached step, so installs run against a stale index. (4) <code>build-essential</code> (compilers, about 250 MB) ships in the runtime image. (5) <code>rm -rf /root/.cache/pip</code> in its own step frees nothing; the cache is already in the previous layer. (6) Shell-form CMD makes <code>/bin/sh</code> PID 1, so the server never sees <code>SIGTERM</code> (k8s1).</p>
+<pre># syntax=docker/dockerfile:1
+FROM python:3.12 AS builder
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+FROM python:3.12-slim
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends libgomp1 \
+ &amp;&amp; rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+WORKDIR /app
+COPY . .
+USER 10001
+CMD ["python", "serve.py"]</pre>
+<p>Add a .dockerignore (<code>.git</code>, <code>.venv</code>, <code>__pycache__</code>, <code>.env</code>, data and notebooks), and build in CI with a registry cache in <code>mode=max</code> so the builder stage is cached too. Expect code-only commits to rebuild in under a minute (one COPY plus push of a small top layer) and the image to drop to the slim base plus the virtual environment, a few hundred megabytes depending on the ML libraries. The full builder image (gcc, headers) never leaves CI.</p>
+</details>
+</section>

@@ -30,6 +30,11 @@ describe("content", () => {
     }
   });
 
+  it("every learning topic has a difficulty, which sets its XP", () => {
+    for (const [k, list] of Object.entries(TRACKS)) for (const t of list)
+      expect(["E", "M", "H"], `${k}/${t.id} difficulty`).toContain(t.difficulty);
+  });
+
   it("every design has a primer and a senior layer", () => {
     for (const [k, list] of Object.entries(DESIGNS)) for (const d of list) {
       expect(d.primer, `${k}/${d.id} primer`).toBeTruthy();

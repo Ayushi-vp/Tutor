@@ -1,0 +1,620 @@
+<!-- topic source for torch/pt5; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "pt5",
+  "t": "Data loading: Dataset, DataLoader, workers, pinning, collate and bottlenecks",
+  "tag": "Data",
+  "sum": "How a batch gets from disk to the GPU: map-style and iterable datasets, the DataLoader's worker processes and why they are processes, fork vs forkserver vs spawn, worker seeding and sharding, pinned memory, collate_fn and padding, samplers, and how to prove the input pipeline is the bottleneck.",
+  "prereq": [
+    [
+      "py8",
+      "CPython's GIL lets only one thread run Python bytecode at a time; reference counting writes to every object you touch, even when you only read it."
+    ],
+    [
+      "py9",
+      "multiprocessing runs separate interpreter processes (no shared GIL); fork copies the parent's address space copy-on-write, spawn starts a fresh interpreter and pickles what it needs."
+    ],
+    [
+      "pt1",
+      "Tensors are views over storages; torch.from_numpy shares memory; non_blocking copies need pinned host memory; .item() and printing synchronise with the GPU."
+    ],
+    [
+      "pt2",
+      "Batches are tensors with a leading batch axis; masks mark padding; attention masks have API-specific polarity."
+    ]
+  ],
+  "myths": [
+    [
+      "More workers is always faster.",
+      "Throughput rises until the GPU is no longer waiting, then flattens; beyond that, extra workers only add memory (each holds its own dataset replica and prefetched batches), start-up time and contention for CPU cores, disk and network. On a shared node, too many workers can slow the training process itself, which needs CPU time to launch GPU work. Measure data-wait time and stop when it is near zero."
+    ],
+    [
+      "A DataLoader with workers uses threads.",
+      "It uses processes, because Python data transforms hold the GIL and threads could not run them in parallel. That is why dataset objects must be picklable under spawn, why each worker has its own copy of the dataset and RNG state, why tensors come back through shared memory, and why a Docker container's small /dev/shm can kill workers."
+    ],
+    [
+      "Workers share the dataset, so memory is only paid once.",
+      "With fork, pages are shared copy-on-write, but CPython writes reference counts into every object a worker touches. A dataset that is a Python list of millions of strings gets its pages copied into every worker over time, so memory grows to roughly workers × dataset size. The PyTorch docs point to issue #13246 and recommend NumPy, pandas or PyArrow storage instead of Python objects."
+    ],
+    [
+      "An IterableDataset is split across workers automatically.",
+      "Each worker gets a full replica of the IterableDataset, so with 4 workers every sample is produced 4 times unless you shard inside __iter__ using torch.utils.data.get_worker_info(). Under DDP you must also shard by rank. Map-style datasets do not have this problem because the sampler in the main process hands out indices."
+    ],
+    [
+      "shuffle=True with DistributedSampler shuffles differently every epoch.",
+      "DistributedSampler seeds its permutation with seed + epoch, and the epoch only changes when you call sampler.set_epoch(epoch) before each epoch. Without it every epoch on every rank sees the same order. The docs mark this with a warning."
+    ],
+    [
+      "pin_memory=True makes host-to-device copies faster on its own.",
+      "Pinning lets the GPU's copy engine read host memory directly, which is both faster and able to run asynchronously — but only if you also pass non_blocking=True to .to(device). Without that, the copy still blocks the Python thread. And pinning has a cost: pinned memory is locked and cannot be swapped, so pinning very large batches or huge buffers can starve the host."
+    ]
+  ],
+  "recap": [
+    "A map-style Dataset implements __getitem__ and __len__; an IterableDataset implements __iter__ for streams; the DataLoader turns either into batches.",
+    "With num_workers > 0, the sampler runs in the main process and sends batches of indices to worker processes, which fetch samples, run collate_fn, and return tensors through shared memory; prefetch_factor × num_workers batches are in flight.",
+    "Workers are processes because Python transforms hold the GIL; on Unix they start with fork before Python 3.14 and forkserver from 3.14, and with spawn on Windows and macOS, which requires picklable datasets and an if __name__ == '__main__' guard.",
+    "Each worker seeds torch, random and NumPy's global RNG from base_seed + worker_id, but RNG objects created in the dataset's __init__ are copied identically into every worker.",
+    "Python objects in a dataset defeat copy-on-write because of reference counting; store large metadata in NumPy, pandas or PyArrow.",
+    "IterableDatasets must shard themselves by worker (get_worker_info) and by rank; DistributedSampler needs set_epoch every epoch and pads to an even split unless drop_last=True.",
+    "collate_fn turns a list of samples into a batch; for variable-length sequences it pads and builds a mask, and bucketing by length cuts padding waste.",
+    "pin_memory=True plus .to(device, non_blocking=True) lets host-to-device copies overlap with compute.",
+    "You know the input pipeline is the bottleneck when the time spent waiting for the next batch is a large fraction of the step; fix it with more or persistent workers, cheaper decoding, pre-processed formats, or GPU-side augmentation."
+  ],
+  "glossary": [
+    [
+      "Batch sampler",
+      "A sampler that yields lists of indices, one list per batch, letting you control batch composition (for example by length)."
+    ],
+    [
+      "Bucketing",
+      "Grouping samples of similar length into the same batch so that less padding is needed."
+    ],
+    [
+      "collate_fn",
+      "The function that turns a list of samples into one batch, by default stacking tensors and recursing into tuples and dicts."
+    ],
+    [
+      "Copy-on-write",
+      "An operating-system technique where a forked child shares the parent's memory pages until either writes to a page, at which point that page is copied."
+    ],
+    [
+      "Dataset (map-style)",
+      "An object with __getitem__(i) and __len__ that returns the i-th sample."
+    ],
+    [
+      "DistributedSampler",
+      "A sampler that gives each data-parallel rank a disjoint subset of indices, shuffled with seed + epoch."
+    ],
+    [
+      "DMA (direct memory access)",
+      "Hardware copying memory between host and device without the CPU moving each byte; needs pinned host memory."
+    ],
+    [
+      "fork / forkserver / spawn",
+      "Ways Python starts child processes: fork clones the parent; forkserver forks children from a clean helper process; spawn starts a fresh interpreter and pickles what it needs."
+    ],
+    [
+      "get_worker_info",
+      "A function that, inside a DataLoader worker, returns the worker's id, the number of workers, its seed and its dataset copy; None in the main process."
+    ],
+    [
+      "GIL",
+      "CPython's global interpreter lock, which lets only one thread execute Python bytecode at a time."
+    ],
+    [
+      "IterableDataset",
+      "A dataset defined by __iter__, used for streams, sharded files and data whose length is unknown."
+    ],
+    [
+      "NCCL",
+      "NVIDIA's library for collective communication (all-reduce and friends) between GPUs, used by DDP and FSDP (pt11)."
+    ],
+    [
+      "OOM (out of memory)",
+      "Running out of memory: on the host the kernel's OOM killer ends a process; on the GPU an allocation raises an error."
+    ],
+    [
+      "persistent_workers",
+      "A DataLoader option that keeps worker processes alive between epochs instead of restarting them."
+    ],
+    [
+      "Pinned (page-locked) memory",
+      "Host memory the OS will not move or swap, which the GPU can copy from directly and asynchronously."
+    ],
+    [
+      "prefetch_factor",
+      "How many batches each worker prepares ahead of time; the default of 2 means 2 × num_workers batches in flight."
+    ],
+    [
+      "RNG",
+      "Random number generator; each worker and library keeps its own state, which is why seeding has to be done per worker."
+    ],
+    [
+      "Sampler",
+      "An iterable of dataset indices that decides the order in which samples are drawn."
+    ],
+    [
+      "Shared memory (/dev/shm)",
+      "An in-memory file system used to pass tensors between processes without copying; Docker limits it to 64 MB by default."
+    ],
+    [
+      "WeightedRandomSampler",
+      "A sampler that draws indices with given probabilities, with or without replacement, used for class balancing."
+    ],
+    [
+      "worker_init_fn",
+      "A function called in each worker after seeding and before loading, used to configure per-worker state such as file handles or shards."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What is the difference between a map-style Dataset and an IterableDataset?",
+      "A map-style Dataset supports random access through __getitem__(i) and __len__, so a sampler can shuffle indices and the DataLoader can hand index batches to workers. An IterableDataset only supports iteration, which suits streams, huge sharded files and data whose length is unknown; it cannot be shuffled by index, and it must split its own work across workers and ranks."
+    ],
+    [
+      "E",
+      "Why does PyTorch's DataLoader use worker processes rather than threads?",
+      "Most data work — decoding, tokenising, augmenting — runs Python code, and CPython's GIL lets only one thread execute Python bytecode at a time, so threads would not run it in parallel. Separate processes each have their own interpreter and GIL. The costs are inter-process communication (tensors are passed through shared memory), per-worker memory, and pickling under spawn.",
+      "Follow-up: When would threads be enough? — When the work releases the GIL, such as file I/O or NumPy and image libraries that do their heavy lifting in C, or on a free-threaded CPython build; the DataLoader still uses processes on 2.14."
+    ],
+    [
+      "E",
+      "What do pin_memory=True and non_blocking=True do together?",
+      "pin_memory makes the DataLoader place each batch in page-locked host memory, which the GPU's copy engine can read directly by DMA. non_blocking=True on .to('cuda') then queues the copy and returns immediately, so it can overlap with GPU compute already queued. Either one alone gives little: pageable memory forces a staging copy, and a blocking copy waits."
+    ],
+    [
+      "M",
+      "You train with 8 workers and see CPU memory grow steadily until the machine runs out, although the dataset is 'just a list of file paths'. Why?",
+      "With fork, workers share the parent's pages copy-on-write. Every time a worker reads a Python object, CPython increments and decrements its reference count, which writes to the page holding it, so the page is copied into that worker. A list of millions of Python strings is spread over many pages, and over an epoch each worker ends up with its own copy: memory approaches 8 × the dataset's Python-object size. Fix by storing the paths in a NumPy array of fixed-width bytes, a pandas or PyArrow column, or a memory-mapped file — objects without per-element refcounts. This is PyTorch issue #13246, referenced from the DataLoader docs.",
+      "Follow-up: Why doesn't it happen with spawn? — With spawn each worker unpickles its own copy at start-up, so you pay workers × size immediately instead of gradually — the same total, just visible up front."
+    ],
+    [
+      "M",
+      "How do you write an IterableDataset that works with num_workers = 4 and with DDP?",
+      "Inside __iter__, call torch.utils.data.get_worker_info(); if it is None you are in the main process, otherwise use info.id and info.num_workers. Combine with the DDP rank and world size into a global shard index (rank × num_workers + worker id) and a total shard count, and yield only the files or lines belonging to your shard. Without this, each of the 4 workers on each rank yields the full stream and every sample appears world_size × 4 times.",
+      "Follow-up: What goes wrong at the end of an epoch? — Shards rarely have equal sizes, so some ranks run out first; in DDP that makes the others hang waiting in a collective. Balance shards, cap steps per epoch, or use DDP's join context."
+    ],
+    [
+      "M",
+      "What does collate_fn do by default, and when do you write your own?",
+      "default_collate takes the list of samples returned by the dataset and stacks tensors along a new batch dimension, converting NumPy arrays and numbers to tensors and recursing into tuples, lists and dicts. Stacking requires equal shapes, so variable-length sequences fail with a size error. Write your own to pad sequences and build an attention mask, to handle custom objects, or to tokenise a batch at once; keep it a top-level function so it pickles under spawn."
+    ],
+    [
+      "M",
+      "Why should you call sampler.set_epoch(epoch) with DistributedSampler, and what else does that sampler do that can bite you?",
+      "Its shuffle is seeded with seed + epoch, so without set_epoch every epoch uses the same permutation on every rank. It also makes the index list evenly divisible across ranks by repeating samples from the start (drop_last=False, the default), so evaluation with DistributedSampler counts some examples twice; for exact metrics, evaluate on rank 0 only, gather per-sample results and de-duplicate, or use a sampler that does not pad."
+    ],
+    [
+      "M",
+      "How would you prove that a training job is input-bound?",
+      "Measure, per step, the time spent waiting for next(loader) separately from the time in forward/backward/step (with a torch.cuda.synchronize before reading the clock, or CUDA events). If waiting is a significant fraction, the pipeline is the bottleneck. Confirm by replacing the loader with a cached batch reused every step: if throughput jumps, it was the data. The profiler shows the same thing as long gaps on the GPU timeline and time in the DataLoader's __next__.",
+      "Follow-up: What fixes would you try first? — Increase num_workers until waiting disappears, enable persistent_workers and pin_memory, move heavy work offline (pre-tokenise, pre-resize, store in a sequential format), and move augmentation to the GPU."
+    ],
+    [
+      "M",
+      "Each worker's random augmentations come out identical. How can that still happen in 2.14?",
+      "The DataLoader seeds torch, Python's random and NumPy's global RNG in each worker from base_seed + worker_id, so those are different. But an RNG object you create in the dataset's __init__ — np.random.default_rng(0), a random.Random instance, or a library's own generator — is copied as-is into every worker by fork or pickle, so all workers draw the same sequence. Create per-worker generators in worker_init_fn or lazily in __getitem__ seeded from get_worker_info().seed."
+    ],
+    [
+      "H",
+      "Draw the path of one batch through a DataLoader with num_workers = 4, pin_memory = True and prefetch_factor = 2.",
+      "The main process's sampler yields indices, grouped into a batch of indices by the batch sampler; the loader puts each index batch on one worker's index queue, round-robin, keeping up to 2 × 4 = 8 batches outstanding. A worker calls dataset[i] for each index, calls collate_fn, and puts the resulting tensors into shared memory, sending a handle through the result queue. A pin-memory thread in the main process copies each batch into pinned memory. The training loop receives batches in order (or out of order with in_order=False), and calls .to(device, non_blocking=True), which the GPU's copy engine executes while earlier work runs.",
+      "Follow-up: What is head-of-line blocking here? — With in_order=True, one slow sample stalls delivery of later batches that are already ready; in_order=False lets ready batches through at the cost of a non-deterministic order."
+    ],
+    [
+      "H",
+      "A job runs fine on a workstation but in a Docker container workers die with 'bus error' or 'DataLoader worker (pid …) is killed by signal'. Why?",
+      "Workers return tensors through shared memory backed by /dev/shm, and Docker gives containers 64 MB of shared memory by default. A few large prefetched batches exceed it, and the worker crashes when the allocation fails. Fix with --shm-size (for example 8g) or --ipc=host, or in Kubernetes by mounting an emptyDir with medium: Memory at /dev/shm; reducing prefetch or batch size is the fallback.",
+      "Follow-up: Why not just set num_workers=0 there? — It works but serialises data loading with training; it is the right diagnosis step, not the fix."
+    ],
+    [
+      "H",
+      "Variable-length text batches waste compute on padding. Quantify and fix it.",
+      "Padding waste is 1 − (sum of real lengths)/(batch size × max length). A batch with lengths 12, 50, 512 and 30 padded to 512 uses 604 of 2,048 positions: 70.5% of the attention and MLP compute is on padding. Fixes: bucketing (sort or group samples by length so batches are homogeneous, shuffling buckets rather than samples), token-budget batching (variable batch size with a fixed number of tokens), packing several sequences into one row with document masks, or nested/jagged tensors that store no padding at all.",
+      "Follow-up: What does sorting by length do to training? — Fully sorted batches correlate length with step order and hurt optimisation; bucketing keeps randomness by shuffling within buckets and shuffling the order of buckets."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "PyTorch 2.14 — torch.utils.data",
+      "Dataset types, the DataLoader's arguments, multi-process loading, platform-specific start methods (forkserver for Python ≥ 3.14 on Unix), worker seeding and memory pinning.",
+      "https://docs.pytorch.org/docs/2.14/data.html"
+    ],
+    [
+      "code",
+      "PyTorch issue #13246 — DataLoader num_workers &gt; 0 causes CPU memory from parent process to be replicated in all worker processes",
+      "The long-running issue the DataLoader docs point to for the reference-counting copy-on-read problem and its workarounds.",
+      "https://github.com/pytorch/pytorch/issues/13246"
+    ],
+    [
+      "docs",
+      "PyTorch tutorials — A guide on good usage of non_blocking and pin_memory() in PyTorch",
+      "When pinning and non-blocking copies help, when they hurt, and how to measure.",
+      "https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — Multiprocessing best practices",
+      "Sharing tensors between processes, start methods, and avoiding CUDA in forked children.",
+      "https://docs.pytorch.org/docs/2.14/notes/multiprocessing.html"
+    ],
+    [
+      "docs",
+      "Python 3.14 — multiprocessing: contexts and start methods",
+      "fork, spawn and forkserver, and the 3.14 change of the default on POSIX platforms other than macOS.",
+      "https://docs.python.org/3.14/library/multiprocessing.html#contexts-and-start-methods"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.nn.utils.rnn.pad_sequence",
+      "Padding a list of variable-length tensors, including batch_first and padding_side.",
+      "https://docs.pytorch.org/docs/2.14/generated/torch.nn.utils.rnn.pad_sequence.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team rents eight top-end GPUs for a fine-tuning run. The training script is borrowed from a tutorial: a Dataset that opens an image file, decodes it, resizes and augments it, and a DataLoader with the default settings. The first epoch takes six hours. <code>nvidia-smi</code> shows GPU utilisation flickering between 0% and 100%, averaging about 20%. Nothing is wrong with the model; the GPUs are simply waiting. With <code>num_workers=0</code>, every image is decoded on the one Python thread that also drives the GPUs, and the GPUs finish each batch in a quarter of the time it takes to prepare the next. They paid for eight GPUs and are using about two.</p>
+<p>The fix sounds like one argument — <code>num_workers=8</code> — and it does make the job four times faster. Then new problems appear. Memory on the host climbs every hour until the kernel's out-of-memory killer ends the run, because the dataset kept a Python list of twelve million file paths and every worker gradually copied it. In a Docker container the workers die with "bus error", because shared memory is 64 MB by default. The augmentation random crops are identical across workers, because an RNG was created in the dataset's constructor. And when the team switches to a streaming IterableDataset to read from cloud storage, every sample shows up eight times per epoch, once per worker.</p>
+<p>Input pipelines are the least glamorous part of training and one of the most common reasons expensive hardware sits idle. In interviews they appear in two forms: design questions ("how would you feed 64 GPUs from object storage?") and debugging questions ("GPU utilisation is 30% — what do you check?", "why is memory growing?", "why does each epoch see the same order?"). Strong answers depend on knowing the machinery underneath: what runs in the main process versus the workers, why workers are processes, how they start and what they copy, how batches travel back, and where the time goes.</p>
+<p>This lesson builds that picture. It covers the two dataset types, the DataLoader's arguments and their defaults on PyTorch 2.14, the worker pipeline step by step, the GIL and the fork/forkserver/spawn story (which changed with Python 3.14), seeding and sharding, the reference-count memory trap from PyTorch issue #13246, pinned memory and non-blocking copies, collate functions and padding, samplers including the distributed one, and a method — with real numbers — for proving whether your input pipeline is the bottleneck and fixing it.</p>
+</section>
+
+<section data-field="primer">
+<p>Think of training as a restaurant kitchen. The GPU is the head chef: extraordinarily fast, but only at cooking. Each batch is a set of plates that must be prepped — ingredients fetched from the store room (disk or network), washed and chopped (decoding, tokenising, augmenting), and arranged on a tray (collating into tensors). If the head chef also does all the prep, they spend most of the night chopping. The DataLoader is the kitchen's prep team: a manager (the main process) decides which ingredients go into which tray (the sampler), hands the orders to several prep cooks (worker processes), and the cooks place finished trays on a pass (a queue) where the chef can grab them. Pinned memory is a dedicated conveyor belt to the chef's station; non-blocking copies mean the chef does not stop cooking while the next tray rides the belt.</p>
+<p>The design follows from three constraints:</p>
+<ul>
+<li><strong>Prep is mostly Python, and Python threads cannot run Python code in parallel</strong> because of the GIL (py8). So the cooks must be separate processes, each with its own interpreter.</li>
+<li><strong>Processes do not share Python objects.</strong> Each worker has its own copy of the dataset object, its own random number generators, and its own memory. Finished batches come back to the main process through shared memory rather than by copying through a pipe.</li>
+<li><strong>The GPU should never wait.</strong> So several batches are prepared ahead of time (prefetching), and the copy to GPU memory should overlap with computation.</li>
+</ul>
+
+<figure>
+<svg viewBox="0 0 640 310" width="100%" role="img" aria-label="DataLoader pipeline: sampler in the main process sends index batches to four worker processes; workers load samples, collate, and return tensors via shared memory; a pin-memory thread copies them to pinned memory; the training loop copies them to the GPU non-blocking">
+  <defs><marker id="pt5-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="20" width="150" height="270" rx="8" style="fill:none;stroke:var(--s1);stroke-dasharray:5 3"/>
+    <text x="85" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">Main process</text>
+    <rect x="25" y="55" width="120" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="85" y="72" text-anchor="middle" style="fill:var(--ink)">Sampler →</text>
+    <text x="85" y="87" text-anchor="middle" style="fill:var(--ink)">index batches</text>
+    <rect x="25" y="170" width="120" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="85" y="187" text-anchor="middle" style="fill:var(--ink)">pin-memory</text>
+    <text x="85" y="202" text-anchor="middle" style="fill:var(--ink)">thread</text>
+    <rect x="25" y="235" width="120" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="85" y="252" text-anchor="middle" style="fill:var(--ink)">training loop</text>
+    <text x="85" y="267" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">.to(dev, nb=True)</text>
+    <g>
+      <rect x="250" y="40" width="200" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/>
+      <text x="350" y="57" text-anchor="middle" style="fill:var(--ink)">worker 0: dataset[i] × B</text>
+      <text x="350" y="72" text-anchor="middle" style="fill:var(--ink-2)">→ collate_fn</text>
+      <rect x="250" y="90" width="200" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/>
+      <text x="350" y="115" text-anchor="middle" style="fill:var(--ink)">worker 1</text>
+      <rect x="250" y="140" width="200" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/>
+      <text x="350" y="165" text-anchor="middle" style="fill:var(--ink)">worker 2</text>
+      <rect x="250" y="190" width="200" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/>
+      <text x="350" y="215" text-anchor="middle" style="fill:var(--ink)">worker 3</text>
+    </g>
+    <line x1="145" y1="70" x2="250" y2="60" marker-end="url(#pt5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="145" y1="78" x2="250" y2="110" marker-end="url(#pt5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="198" y="56" text-anchor="middle" style="fill:var(--muted)">index</text>
+    <text x="198" y="70" text-anchor="middle" style="fill:var(--muted)">queues</text>
+    <line x1="250" y1="210" x2="147" y2="192" marker-end="url(#pt5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="200" y="232" text-anchor="middle" style="fill:var(--muted)">result queue</text>
+    <text x="200" y="246" text-anchor="middle" style="fill:var(--muted)">(/dev/shm)</text>
+    <line x1="85" y1="210" x2="85" y2="235" marker-end="url(#pt5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="490" y="200" width="140" height="80" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="560" y="222" text-anchor="middle" style="fill:var(--ink);font-weight:600">GPU</text>
+    <text x="560" y="240" text-anchor="middle" style="fill:var(--ink-2)">copy engine (H2D)</text>
+    <text x="560" y="256" text-anchor="middle" style="fill:var(--ink-2)">overlaps compute</text>
+    <line x1="145" y1="258" x2="490" y2="250" marker-end="url(#pt5-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="470" y="40" style="fill:var(--ink-2)">in flight:</text>
+    <text x="470" y="56" style="fill:var(--ink-2)">prefetch_factor ×</text>
+    <text x="470" y="72" style="fill:var(--ink-2)">num_workers</text>
+    <text x="470" y="88" style="fill:var(--ink-2)">= 2 × 4 = 8 batches</text>
+  </g>
+</svg>
+<figcaption>Only indices flow out of the main process and only finished batches flow back. Everything expensive — reading, decoding, augmenting, collating — happens in the workers, in parallel, ahead of time.</figcaption>
+</figure>
+
+<p>Three numbers decide whether an input pipeline keeps up, and you can estimate all of them before writing code. The first is the <strong>GPU step time</strong> — how long one forward, backward and optimiser step takes for a batch; this is the rate at which batches are consumed. The second is the <strong>per-sample CPU cost</strong> — reading, decoding and transforming one example on one core — multiplied by the batch size, which gives the CPU time to produce one batch. The third is the <strong>number of cores</strong> you can devote to loading per GPU. Workers needed ≈ (per-sample cost × batch size) ÷ step time, rounded up with some headroom; if that exceeds the cores available, no DataLoader setting will save you and the work itself has to get cheaper (pre-processing offline, lighter decoding, GPU augmentation). The rest of the lesson is about making those workers actually run in parallel, start correctly, see the right data, not waste memory, and hand their batches to the GPU without stalling it.</p>
+<p>Where the kitchen analogy breaks: real prep cooks share a pantry, but worker processes do not share Python objects — each starts with its own copy of the dataset, which is the root of both the memory trap and the duplicated-RNG trap. And unlike cooks, workers cannot be told "skip ahead"; with an IterableDataset each worker produces its own stream, and dividing the work is your job.</p>
+<p>If you remember one sentence: <em>the main process hands out indices, worker processes turn them into batches in parallel and ahead of time, and pinned, non-blocking copies hide the transfer — so the GPU should never wait, and when it does, you measure the wait and fix the slowest stage</em>.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Dataset: map-style and iterable</h4>
+<p>A <strong>map-style dataset</strong> is any object with <code>__getitem__(i)</code> returning sample i and <code>__len__</code> returning the count. It supports random access, so shuffling is just permuting indices.</p>
+<pre>class TokenFile(torch.utils.data.Dataset):
+    def __init__(self, path, T):
+        self.data = np.memmap(path, dtype=np.uint16, mode="r")   # no Python objects
+        self.T = T
+    def __len__(self):
+        return (len(self.data) - 1) // self.T
+    def __getitem__(self, i):
+        chunk = self.data[i * self.T : (i + 1) * self.T + 1].astype(np.int64)
+        x = torch.from_numpy(chunk[:-1]); y = torch.from_numpy(chunk[1:])
+        return x, y                        # (T,), (T,): inputs and next-token targets</pre>
+<p>This is the pattern nanoGPT-style training uses: a memory-mapped array of token ids, slices for inputs and targets shifted by one, and an explicit cast from uint16 to int64 because embeddings and losses want int64 (pt1). Note the comment on the first line of <code>__init__</code>; it will matter in section 6.</p>
+<p>An <strong>iterable-style dataset</strong> subclasses <code>IterableDataset</code> and implements <code>__iter__</code>. Use it when random access is impossible or expensive: a stream from a message queue, compressed shards in object storage read sequentially, or generated data. You cannot shuffle it by index; you shuffle by reading shards in a random order and keeping a shuffle buffer. And, as section 5 shows, it must split its work across workers itself.</p>
+
+<h4>2. DataLoader arguments and their 2.14 defaults</h4>
+<p>The DataLoader wraps a dataset and yields batches. Its signature on 2.14, with defaults:</p>
+<table>
+<thead><tr><th>Argument</th><th>Default</th><th>What it does</th></tr></thead>
+<tr><td><code>batch_size</code></td><td>1</td><td>Samples per batch; <code>None</code> disables automatic batching.</td></tr>
+<tr><td><code>shuffle</code></td><td>None (False)</td><td>True uses a RandomSampler over indices.</td></tr>
+<tr><td><code>sampler</code> / <code>batch_sampler</code></td><td>None</td><td>Custom index order / custom batch composition.</td></tr>
+<tr><td><code>num_workers</code></td><td>0</td><td>0 loads in the main process; n &gt; 0 starts n worker processes.</td></tr>
+<tr><td><code>collate_fn</code></td><td>None (default_collate)</td><td>Turns a list of samples into a batch.</td></tr>
+<tr><td><code>pin_memory</code></td><td>False</td><td>Put batches in page-locked memory.</td></tr>
+<tr><td><code>drop_last</code></td><td>False</td><td>Drop the final incomplete batch.</td></tr>
+<tr><td><code>timeout</code></td><td>0</td><td>Seconds to wait for a batch from workers; 0 means forever.</td></tr>
+<tr><td><code>worker_init_fn</code></td><td>None</td><td>Called in each worker after seeding.</td></tr>
+<tr><td><code>multiprocessing_context</code></td><td>None</td><td>Override the start method ("fork", "forkserver", "spawn").</td></tr>
+<tr><td><code>generator</code></td><td>None</td><td>RNG for the sampler and base seed — pass one for reproducible order.</td></tr>
+<tr><td><code>prefetch_factor</code></td><td>None → 2 if workers</td><td>Batches prepared ahead per worker.</td></tr>
+<tr><td><code>persistent_workers</code></td><td>False</td><td>Keep workers alive between epochs.</td></tr>
+<tr><td><code>in_order</code></td><td>True</td><td>Return batches in sampler order; False allows out-of-order delivery.</td></tr>
+</table>
+<p>(<code>pin_memory_device</code> is deprecated on 2.14: pinning now targets the current accelerator.) Two defaults deserve suspicion in any script you inherit: <code>num_workers=0</code> (fine for debugging, slow for training) and <code>drop_last=False</code> (the last batch is smaller, which can break code that assumes a fixed batch size and makes BatchNorm see a tiny batch — pt4).</p>
+
+<h4>3. What happens when you iterate: the worker pipeline</h4>
+<p>With <code>num_workers=0</code>, <code>for batch in loader</code> is a simple loop in the main process: get a batch of indices from the batch sampler, call <code>dataset[i]</code> for each, call <code>collate_fn</code>, optionally pin, yield. Everything is serial with your training step.</p>
+<p>With <code>num_workers=4</code>, creating the iterator (the <code>for</code> statement, or <code>iter(loader)</code>) starts four worker processes, each holding a copy of the dataset, <code>collate_fn</code> and <code>worker_init_fn</code>. Then, step by step:</p>
+<ol>
+<li>The main process's batch sampler produces a list of B indices.</li>
+<li>The loader puts that list on one worker's <em>index queue</em>, round-robin across workers, and keeps doing so until <code>prefetch_factor × num_workers</code> = 8 batches are outstanding.</li>
+<li>Each worker loops: take an index list, call <code>dataset[i]</code> for each index, call <code>collate_fn</code> on the samples, and put the resulting batch on the shared <em>result queue</em>. Tensors in the batch are moved into shared memory first, so only a small handle is pickled through the queue.</li>
+<li>If <code>pin_memory=True</code>, a thread in the main process takes batches from the result queue and copies them into pinned memory.</li>
+<li>The training loop's <code>next()</code> returns the next batch in sampler order (with <code>in_order=True</code>), and the loader sends another index list to the worker that produced it, keeping the pipeline full.</li>
+<li>At the end of the iterator the workers shut down — unless <code>persistent_workers=True</code>, in which case they wait for the next epoch, keeping their dataset copies and any state they built (open files, caches).</li>
+</ol>
+<p>Two consequences. Worker start-up is paid per epoch without persistent workers; for datasets with expensive constructors or many workers this adds seconds to every epoch. And the first batch of every epoch has to wait for a worker to produce it from scratch, so the GPU idles at each epoch boundary — another reason for persistent workers.</p>
+
+<h4>4. Why processes, and how they start: fork, forkserver, spawn</h4>
+<p>The GIL (py8) lets only one thread at a time execute Python bytecode. Decoding a JPEG with a C library releases it, but tokenising in Python, building dicts, applying Python-level augmentations, and running <code>__getitem__</code> itself do not. Threads would serialise; processes run truly in parallel.</p>
+<p>How a worker process starts depends on the platform and, since Python 3.14, on the Python version. The 2.14 docs state it directly: on Unix the default start method is <strong>forkserver</strong> for Python ≥ 3.14 and <strong>fork</strong> for Python &lt; 3.14; on Windows and macOS it is <strong>spawn</strong>.</p>
+<ul>
+<li><strong>fork</strong> clones the parent process. The child sees the parent's memory — the dataset, imported modules, everything — immediately, shared copy-on-write. Start-up is fast. The danger is threads: if the parent has other threads (a CUDA context, a logging thread, an OpenMP pool) holding locks at the moment of the fork, the child inherits locked locks with no thread to release them, and can deadlock. CUDA cannot be used in a forked child at all if the parent initialised it.</li>
+<li><strong>forkserver</strong> starts one clean helper process early, and forks workers from that helper rather than from your (possibly multi-threaded) training process. It is safer with threads, still fairly fast, but the dataset and functions must be picklable because they are sent to the new process.</li>
+<li><strong>spawn</strong> starts a fresh interpreter, re-imports your main module, and unpickles the dataset, <code>collate_fn</code> and <code>worker_init_fn</code>. It is the slowest and the strictest: lambdas and locally defined functions cannot be pickled ("Can't pickle local object"), and your script must guard its top level with <code>if __name__ == "__main__":</code>, or each worker will re-run the training script as it imports it. This is what you get on Windows — including this machine — and on macOS.</li>
+</ul>
+<p>Practical rule: write datasets and collate functions as top-level, picklable classes and functions, keep heavy state lazy (open files in the worker, not in <code>__init__</code>), and always use the <code>__main__</code> guard. Then the same code works under all three start methods.</p>
+
+<h4>5. Seeds and shards: per-worker state</h4>
+<p>Each worker is seeded on start. Reading the 2.14 worker source: the worker computes <code>seed = base_seed + worker_id</code>, calls <code>random.seed(seed)</code> and <code>torch.manual_seed(seed)</code>, and, if NumPy is installed, seeds NumPy's global RNG with a state derived from base seed and worker id through a SeedSequence-style hash. <code>base_seed</code> is drawn from the main process's RNG (or the <code>generator</code> you pass) each time an iterator is created. So augmentations that use <code>torch.rand</code>, <code>random</code> or <code>np.random.*</code> differ across workers and across epochs. (Older PyTorch versions did not seed NumPy, and identical augmentations across workers were a famous bug; it was fixed years ago, but the advice persists.)</p>
+<p>What is <em>not</em> handled: RNG objects you create yourself in the dataset's <code>__init__</code>. <code>self.rng = np.random.default_rng(0)</code> is copied into every worker by fork or pickle, so every worker draws the same sequence. Create such generators per worker, seeded from <code>torch.utils.data.get_worker_info().seed</code>, either in <code>worker_init_fn</code> or lazily on first use in <code>__getitem__</code>.</p>
+<p><strong>Sharding</strong> an IterableDataset is the other per-worker duty. Every worker gets a full replica, and the DataLoader just interleaves what they yield, so without sharding, four workers produce every sample four times. The standard pattern:</p>
+<pre>class ShardStream(torch.utils.data.IterableDataset):
+    def __init__(self, files):
+        self.files = files                                  # list of shard paths
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        wid, nw = (info.id, info.num_workers) if info else (0, 1)
+        rank, world = get_rank_and_world_size()             # 0, 1 when not distributed
+        shard, nshards = rank * nw + wid, world * nw
+        for f in self.files[shard::nshards]:                # this worker's files only
+            yield from read_records(f)</pre>
+<p>With 2 GPUs and 4 workers each there are 8 shards; rank 1's worker 2 is shard 6 and reads files 6, 14, 22, … Uneven shard sizes make some ranks finish early; in DDP that leaves the others blocked in a gradient all-reduce (pt11), so either balance shards, cap the number of steps per epoch, or use DDP's uneven-input support.</p>
+
+<h4>6. The memory trap: reference counts break copy-on-write</h4>
+<p>With fork, a worker shares the parent's memory pages until it writes to one, at which point the operating system copies that page — <strong>copy-on-write</strong>. It sounds like reading a dataset in a worker is free. In CPython it is not: every Python object carries a reference count in its header, and simply touching an object (indexing a list, passing a string to a function) increments and decrements it. That is a write, so the page holding the object is copied into the worker. The 2.14 docs warn that "after several iterations, the loader worker processes will consume the same amount of CPU memory as the parent process for all Python objects in the parent process which are accessed from the worker processes", so total memory becomes about "number of workers × size of parent process", and recommend replacing Python objects "with non-refcounted representations such as Pandas, Numpy or PyArrow objects", pointing to PyTorch issue #13246, a long thread of reports and workarounds.</p>
+<p>A worked number: 12 million file paths averaging 60 characters, as a Python list of str. Each str object is about 49 bytes of header plus its characters, roughly 110 bytes, plus an 8-byte pointer in the list: about 1.4 GB in the parent. With 16 workers the copies grow, over the first epoch, toward 16 × 1.4 ≈ 22 GB of extra host memory — the steady climb that ends in the out-of-memory killer. The same paths in a NumPy array of fixed-width bytes (<code>dtype="S96"</code>) take 12M × 96 ≈ 1.15 GB in one buffer with a single object header; workers read slices of it without writing anything, so the pages stay shared. A memory-mapped token file like <code>TokenFile</code> above is better still: the pages belong to the OS page cache and are shared by every process that maps the file.</p>
+<p>Under spawn and forkserver the trap looks different: each worker unpickles its own copy at start-up, so you pay the full multiple immediately instead of gradually. Either way, the fix is the same — keep big metadata out of Python objects.</p>
+
+<h4>7. Shared memory and how batches come back</h4>
+<p>A worker cannot hand a tensor to the main process by reference; they are different processes. PyTorch moves each tensor's storage into shared memory — on Linux a file in <code>/dev/shm</code> — and sends a small handle through the queue; the main process maps the same memory. No bulk copy through a pipe happens. The limit is the size of that shared-memory file system. Docker gives containers 64 MB of <code>/dev/shm</code> by default; a batch of 256 RGB images at 224 × 224 in float32 is 256 × 3 × 224 × 224 × 4 bytes ≈ 154 MB, so a single prefetched batch does not fit, and workers die with "bus error" or "DataLoader worker (pid …) is killed by signal: Bus error". Start containers with <code>--shm-size=8g</code> or <code>--ipc=host</code>, or mount a memory-backed volume at <code>/dev/shm</code> in Kubernetes. Returning uint8 images and converting to float on the GPU also cuts the shared-memory and transfer volume by four.</p>
+
+<h4>8. collate_fn and padding</h4>
+<p><code>default_collate</code> receives the list of B samples and builds one batch: tensors are stacked along a new first dimension (so they must have equal shapes), NumPy arrays and Python numbers become tensors, and tuples, lists and dicts are collated element-wise. For text, sequences have different lengths and stacking fails with "stack expects each tensor to be equal size". A custom collate pads and builds a mask:</p>
+<pre>from torch.nn.utils.rnn import pad_sequence
+def collate_pad(samples, pad_id=0):
+    ids = [s["input_ids"] for s in samples]                  # list of (L_i,) int64
+    lengths = torch.tensor([len(x) for x in ids])
+    batch = pad_sequence(ids, batch_first=True, padding_value=pad_id)  # (B, L_max)
+    mask = torch.arange(batch.shape[1])[None, :] &lt; lengths[:, None]    # (B, L_max) True = real token
+    labels = batch.masked_fill(~mask, -100)                  # ignored by cross_entropy
+    return {"input_ids": batch, "attention_mask": mask, "labels": labels}</pre>
+<p>Each line uses something from pt2: broadcasting to build the mask, bool masks with an explicit polarity (here True = real token; convert as needed for the attention API you call), and −100 as the label for positions <code>F.cross_entropy</code> should ignore. <code>pad_sequence</code> on 2.14 also takes <code>padding_side="left"</code>, which decoder-only generation needs so that the last real token of every row is at the same position.</p>
+<p>Padding costs compute. The waste in a batch is 1 − Σ lengths / (B × L<sub>max</sub>). Lengths 12, 50, 512 and 30 padded to 512 use 604 of 2,048 positions — 70.5% of the batch's attention and MLP work is spent on padding. <strong>Bucketing</strong> fixes most of it: a batch sampler that groups samples of similar length, shuffling within buckets and shuffling the order of batches so training does not see a length curriculum. Token-budget batching goes further, choosing the batch size per batch so that B × L<sub>max</sub> stays near a fixed token count; packing concatenates several short sequences into one row with a document mask; and nested (jagged) tensors avoid storing padding at all.</p>
+
+<h4>9. Samplers</h4>
+<p>A <strong>sampler</strong> yields indices; a <strong>batch sampler</strong> yields lists of indices. The built-ins: <code>SequentialSampler</code> (what <code>shuffle=False</code> uses), <code>RandomSampler</code> (<code>shuffle=True</code>; with a <code>generator</code> it is reproducible), <code>SubsetRandomSampler</code>, <code>WeightedRandomSampler</code> (draws index i with probability proportional to <code>weights[i]</code>, usually with replacement, the standard way to oversample a rare class) and <code>BatchSampler</code>.</p>
+<p><code>DistributedSampler</code> gives each data-parallel rank a disjoint slice of the index list. Two behaviours bite. First, its shuffle is seeded with <code>seed + epoch</code>, and the epoch only changes when you call <code>sampler.set_epoch(epoch)</code> before creating each epoch's iterator; the 2.14 docs carry a warning that otherwise "the same ordering will be always used". Second, with the default <code>drop_last=False</code> it makes the index list evenly divisible by the number of ranks by adding extra indices (repeating some samples), so a distributed evaluation over 10,001 samples on 8 ranks scores 10,008 — some examples twice. Exact evaluation needs de-duplication or a non-padding sampler.</p>
+
+<h4>10. Pinned memory and non-blocking copies</h4>
+<p>Normal host memory is <strong>pageable</strong>: the operating system may move or swap it. The GPU's copy engine uses direct memory access (DMA) and needs physical addresses that will not change, so a copy from pageable memory is done in two hops: the driver copies into an internal pinned staging buffer, then DMA copies to the GPU, and the calling thread waits. <strong>Pinned</strong> (page-locked) memory skips the staging hop and can be copied asynchronously.</p>
+<pre>loader = DataLoader(ds, batch_size=256, num_workers=8, pin_memory=True)
+for x, y in loader:
+    x = x.to("cuda", non_blocking=True)    # queued on the copy engine, returns at once
+    y = y.to("cuda", non_blocking=True)
+    loss = model(x, y)                     # queued after the copies on the same stream</pre>
+<p>With both pieces, the copy is queued on the current CUDA stream and Python moves on to queue the forward pass, which the GPU will run after the copy; meanwhile the previous step's work can still be executing. Numbers to reason with: a 154 MB float32 image batch over PCIe 4.0 ×16 (about 25 GB/s in practice) takes about 6 ms; as uint8 it is 38.5 MB and about 1.5 ms. Against a 250 ms training step either is small — if overlapped. Token batches are tiny: 32 × 2,048 int64 ids are 512 KB. Pinning everything is not free: pinned pages cannot be swapped, and allocating pinned memory is slow, which is why the DataLoader reuses a pinning thread rather than you calling <code>.pin_memory()</code> on every tensor yourself. The PyTorch tutorial on <code>pin_memory</code> and <code>non_blocking</code> measures cases where naive pinning makes things slower.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Two timelines: with num_workers 0 the GPU idles while the CPU prepares each batch; with 4 workers and prefetching the next batch is ready and the GPU runs back to back">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">num_workers=0: load and train take turns</text>
+    <text x="20" y="48" style="fill:var(--muted)">CPU</text>
+    <rect x="70" y="34" width="120" height="20" style="fill:var(--s3);stroke:none;opacity:0.7"/>
+    <rect x="250" y="34" width="120" height="20" style="fill:var(--s3);stroke:none;opacity:0.7"/>
+    <rect x="430" y="34" width="120" height="20" style="fill:var(--s3);stroke:none;opacity:0.7"/>
+    <text x="20" y="78" style="fill:var(--muted)">GPU</text>
+    <rect x="190" y="64" width="60" height="20" style="fill:var(--accent);stroke:none"/>
+    <rect x="370" y="64" width="60" height="20" style="fill:var(--accent);stroke:none"/>
+    <rect x="550" y="64" width="60" height="20" style="fill:var(--accent);stroke:none"/>
+    <text x="130" y="100" text-anchor="middle" style="fill:var(--crit)">GPU idle</text>
+    <text x="310" y="100" text-anchor="middle" style="fill:var(--crit)">GPU idle</text>
+    <text x="20" y="124" style="fill:var(--ink-2)">step time = load (480 ms) + compute (240 ms) → GPU busy 33%</text>
+    <line x1="20" y1="140" x2="620" y2="140" style="fill:none;stroke:var(--line-2)"/>
+    <text x="20" y="164" style="fill:var(--ink);font-weight:600">num_workers=4, prefetch: loading overlaps compute</text>
+    <text x="20" y="190" style="fill:var(--muted)">w0..w3</text>
+    <rect x="70" y="178" width="120" height="14" style="fill:var(--s3);opacity:0.7"/>
+    <rect x="70" y="194" width="120" height="14" style="fill:var(--s3);opacity:0.5"/>
+    <rect x="130" y="210" width="120" height="14" style="fill:var(--s3);opacity:0.7"/>
+    <rect x="190" y="178" width="120" height="14" style="fill:var(--s3);opacity:0.5"/>
+    <rect x="250" y="194" width="120" height="14" style="fill:var(--s3);opacity:0.7"/>
+    <rect x="310" y="210" width="120" height="14" style="fill:var(--s3);opacity:0.5"/>
+    <text x="20" y="244" style="fill:var(--muted)">GPU</text>
+    <rect x="190" y="232" width="60" height="18" style="fill:var(--accent)"/>
+    <rect x="252" y="232" width="60" height="18" style="fill:var(--accent)"/>
+    <rect x="314" y="232" width="60" height="18" style="fill:var(--accent)"/>
+    <rect x="376" y="232" width="60" height="18" style="fill:var(--accent)"/>
+    <rect x="438" y="232" width="60" height="18" style="fill:var(--accent)"/>
+    <text x="510" y="246" style="fill:var(--ink-2)">back to back</text>
+    <text x="20" y="266" style="fill:var(--ink-2)">needs workers ≥ load ÷ compute = 480 ÷ 240 = 2 (plus headroom)</text>
+  </g>
+</svg>
+<figcaption>The rule of thumb behind num_workers: enough workers that, together, they produce a batch at least as fast as the GPU consumes one. Only the first batch after start-up still waits.</figcaption>
+</figure>
+
+<h4>11. Finding and fixing an input-pipeline bottleneck</h4>
+<p>Measure before tuning. The simplest instrument splits each step into "waiting for data" and "everything else":</p>
+<pre>t0 = time.perf_counter()
+for step, (x, y) in enumerate(loader):
+    t1 = time.perf_counter()                      # data wait = t1 - t0
+    x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
+    loss = model(x, y); loss.backward(); opt.step(); opt.zero_grad()
+    torch.cuda.synchronize()                      # make GPU time visible to the clock
+    t0_next = time.perf_counter()
+    log(data_wait=t1 - t0, compute=t0_next - t1)
+    t0 = t0_next</pre>
+<p>(The <code>synchronize</code> is only for measurement; remove it afterwards, since it stops the CPU from queuing ahead — pt12.) A worked example: an image model where one core decodes and augments an image in 3.75 ms, batch size 128, and the GPU step takes 240 ms. One core needs 128 × 3.75 = 480 ms per batch, so with <code>num_workers=0</code> each step takes about 480 + 240 = 720 ms and the GPU is busy a third of the time. Two workers would exactly match the GPU; four gives headroom for slow images and jitter, and the step drops to about 240 ms — three times faster. Beyond about four, nothing improves, because the GPU is now the bottleneck.</p>
+<p>A second check isolates the pipeline: cache one batch on the GPU and train on it repeatedly. If throughput jumps far above the real run, data is the bottleneck. Then work down the list of fixes, cheapest first:</p>
+<ol>
+<li><code>num_workers</code> up to roughly the number of physical cores available per GPU (minus one or two for the training process), with <code>persistent_workers=True</code> and <code>pin_memory=True</code>.</li>
+<li>Do less work per sample: decode at lower resolution, return uint8 and normalise on the GPU, tokenise offline once rather than every epoch.</li>
+<li>Change the storage format: many small files on a network file system are slow to open; sequential shard formats (tar-based WebDataset-style shards, Arrow, Parquet, memory-mapped token files) turn random small reads into large sequential ones.</li>
+<li>Move augmentation to the GPU (batched transforms on device tensors), or use a GPU-accelerated decoding pipeline.</li>
+<li>Cache: if the dataset fits in RAM after decoding, decode once.</li>
+</ol>
+</section>
+
+<section data-field="deep">
+<h4>Head-of-line blocking and in_order=False</h4>
+<p>With <code>in_order=True</code>, the loader must return batch k before batch k + 1, even if a worker finished k + 1 first. One slow sample — a huge image, a network read that hit a slow server, a long document in a tokeniser — stalls delivery of every batch behind it, and the GPU idles even though ready batches sit in the queue. <code>in_order=False</code> (added in recent releases and present on 2.14) lets the loader hand over whatever is ready. The cost is reproducibility of batch order: two runs with the same seed may see batches in different orders, which matters for exact resumption (pt8) and determinism (pt6). Many large-scale pipelines accept that trade for throughput and record which samples were consumed instead of relying on order.</p>
+
+<h4>CUDA and forked workers do not mix</h4>
+<p>If the parent process has initialised CUDA (by touching a GPU tensor) before workers are forked, a worker that tries to use CUDA fails with "Cannot re-initialize CUDA in forked subprocess". This is why the docs recommend returning CPU tensors from workers and letting <code>pin_memory</code> and the main process handle the transfer, and why GPU-based decoding inside workers requires spawn or forkserver. It is also one reason Python 3.14 moved the POSIX default away from fork: forking a multi-threaded process is inherently unsafe, and a training process with CUDA, NCCL and logging threads is very multi-threaded.</p>
+
+<h4>Worker count, CPU threads and oversubscription</h4>
+<p>Each worker is a full process, and libraries inside it may spawn their own thread pools: PyTorch's intra-op OpenMP threads, OpenCV's, NumPy's BLAS. Sixteen workers each starting sixteen threads on a 32-core machine produce 256 runnable threads competing for 32 cores, and throughput collapses. The DataLoader sets <code>torch.set_num_threads(1)</code> inside workers, but other libraries need their own settings (environment variables such as <code>OMP_NUM_THREADS</code>, or <code>cv2.setNumThreads(0)</code> in <code>worker_init_fn</code>). On multi-GPU nodes, divide the cores among the ranks: eight GPUs on a 96-core node leave about ten cores per rank for workers.</p>
+
+<h4>Streaming from object storage at scale</h4>
+<p>At the scale of hundreds of GPUs, the bottleneck often moves from CPU decoding to storage: small random reads from S3-style object stores have high latency (tens of milliseconds per request), so a map-style dataset that opens one object per sample cannot keep up. The standard answer is to reorganise data into large shards (hundreds of megabytes each), read them sequentially with an IterableDataset sharded by rank and worker as in the body, shuffle with a buffer plus random shard order, and prefetch shards ahead of use. The trade-off is weaker shuffling (only within the buffer and across shards) and harder exact resumption, because "where am I in the data" is now a per-worker position in a stream; pt8 shows how to checkpoint it with a stateful loader.</p>
+
+<h4>Multi-epoch randomness and generators</h4>
+<p>The DataLoader draws a new <code>base_seed</code> from the main process's RNG — or from the <code>generator</code> you pass — every time you create an iterator. Passing a seeded <code>torch.Generator</code> makes the shuffle order and worker seeds reproducible across runs; using the global RNG makes them depend on everything else that consumed random numbers before the loop (model init, dropout in a warm-up step). For exact reproducibility, give the loader its own generator, seed it, and use <code>persistent_workers</code> with care: persistent workers keep their RNG state from the previous epoch rather than being re-seeded, which is fine for randomness but means the per-epoch seeds differ from the non-persistent case.</p>
+
+<h4>Resumable data pipelines</h4>
+<p>A training run that restarts from a checkpoint should continue with the next unseen batch, not replay the epoch from the start (which over-trains on early data) or skip to a new epoch (which drops data). For a map-style dataset with a seeded sampler, the position is just "epoch e, batch b": recreate the sampler with the same seed and epoch and skip b batches of indices — cheap, because only indices are skipped, not samples loaded. For streaming IterableDatasets the position is per worker and per rank (which shard, which offset, the shuffle buffer's contents), so the dataset itself must expose a <code>state_dict</code>. PyTorch's torchdata project provides a <code>StatefulDataLoader</code> for this purpose, which asks each worker for its dataset state when you checkpoint; pt8 covers what a truly exact resume needs, including the RNG states that drive augmentation.</p>
+<h4>Free-threaded Python and the future of workers</h4>
+<p>CPython 3.13 introduced an optional free-threaded build without the GIL, and 3.14 continued that work. With it, thread-based data loading could run Python transforms in parallel without the process machinery — no pickling, no copy-on-write trap, shared caches. As of PyTorch 2.14, the DataLoader still uses processes, and most of the ecosystem (image libraries, tokenisers) needs to be verified as thread-safe without the GIL before thread-based loading becomes the default. The underlying lesson stays: the input pipeline is a parallel program, and its constraints come from how the interpreter runs parallel code.</p>
+</section>
+
+<section data-field="prod">
+<h4>Failure mode: low GPU utilisation</h4>
+<p>Symptom: <code>nvidia-smi</code> utilisation fluctuates or averages well below 90%, step time varies, and the profiler timeline shows gaps between steps. First suspect: the input pipeline. Check data-wait time per step, then the cached-batch test. Other causes that look the same: host–device synchronisation in the training loop (pt12), very small batches (launch overhead dominates), and in multi-GPU jobs a slow rank that everyone waits for. A data-bound job usually shows high CPU usage across worker processes; a sync-bound job shows a single busy core.</p>
+
+<h4>Failure mode: host memory growth and OOM kills</h4>
+<p>Symptom: resident memory of the training job climbs through the first epoch and the kernel's OOM killer ends it, often with no Python traceback. Causes: Python-object datasets copied into every worker (issue #13246), large prefetch buffers (prefetch_factor × num_workers × batch size), caches inside workers that grow per epoch with persistent workers, and pinned-memory pools. Measure per-process memory (each worker shows up as a separate process) rather than just the total; if every worker's memory grows similarly, it is copy-on-read.</p>
+
+<h4>Failure mode: workers that die or hang</h4>
+<p>"DataLoader worker (pid X) is killed by signal: Bus error" — shared memory exhausted (Docker's 64 MB default). "Killed by signal: Killed" — the OOM killer. A hang with no error — often a deadlock in a forked worker (a library lock held at fork time), an exception swallowed in a custom IterableDataset, or uneven shards in DDP leaving one rank in a collective. Set <code>timeout</code> to a finite value (for example 600 seconds) in production so a hung worker becomes an error with a stack trace, and debug with <code>num_workers=0</code>, which turns worker errors into ordinary tracebacks in the main process.</p>
+
+<h4>Failure mode: duplicated or missing data</h4>
+<p>Symptom: epoch length in samples is a multiple of what it should be, or validation metrics are suspiciously good. Causes: an unsharded IterableDataset (every worker and rank yields everything), a DistributedSampler without <code>set_epoch</code> (same order every epoch), padding from DistributedSampler in evaluation, or train/validation splits computed per worker with different random states. Detection: log the count of unique sample ids seen per epoch on each rank, at least in a short test run.</p>
+
+<h4>Knobs, in the order teams usually tune them</h4>
+<ul>
+<li><code>num_workers</code>: start at 4–8 per GPU and measure; cap at the cores per rank.</li>
+<li><code>persistent_workers=True</code> when the epoch is short or worker start-up is expensive.</li>
+<li><code>pin_memory=True</code> with <code>non_blocking=True</code> copies.</li>
+<li><code>prefetch_factor</code>: raise it (4–8) when per-batch time is bursty; lower it when host memory or shared memory is tight.</li>
+<li><code>in_order=False</code> when a few slow samples cause stalls and exact order does not matter.</li>
+<li><code>timeout</code> finite in production; <code>num_workers=0</code> while debugging.</li>
+</ul>
+
+<h4>The public case: issue #13246</h4>
+<p>PyTorch issue #13246, "DataLoader num_workers &gt; 0 causes CPU memory from parent process to be replicated in all worker processes", is the canonical record of the reference-count trap: users reporting memory that grows with the number of workers on datasets held as Python lists and dicts, maintainers explaining copy-on-read through reference counts, and workarounds (NumPy arrays of strings, serialising each item to bytes, pandas, PyArrow). The DataLoader documentation now carries a warning that links to it. It is a good example of a framework behaviour that is not a bug in PyTorch at all but an interaction between the operating system's fork and CPython's memory model — exactly the kind of cross-layer reasoning interviewers look for.</p>
+</section>
+
+<section data-field="lab">
+<p>CPU, PyTorch 2.14 in <code>gpt_env</code> on Windows (so workers use <strong>spawn</strong>); about 15 minutes. Save as <code>pt5_lab.py</code> and keep everything under the <code>__main__</code> guard.</p>
+<pre>import time, numpy as np, torch
+from torch.utils.data import Dataset, IterableDataset, DataLoader, get_worker_info
+
+class SlowDS(Dataset):                       # simulates 4 ms of Python work per sample
+    def __len__(self): return 512
+    def __getitem__(self, i):
+        t = time.perf_counter()
+        while time.perf_counter() - t &lt; 0.004: pass
+        return torch.randn(3, 32, 32), i % 10
+
+class Stream(IterableDataset):
+    def __init__(self, n, shard=True): self.n, self.shard = n, shard
+    def __iter__(self):
+        info = get_worker_info()
+        wid, nw = (info.id, info.num_workers) if info and self.shard else (0, 1)
+        yield from range(wid, self.n, nw)
+
+def rate(loader, steps=16):
+    it = iter(loader); next(it)              # exclude start-up
+    t = time.perf_counter()
+    for _ in range(steps): next(it)
+    return steps / (time.perf_counter() - t)
+
+if __name__ == "__main__":
+    for w in (0, 2, 4):
+        dl = DataLoader(SlowDS(), batch_size=32, num_workers=w, persistent_workers=w &gt; 0)
+        print(f"workers={w}: {rate(dl):.1f} batches/s")
+    for shard in (False, True):
+        seen = [int(x) for b in DataLoader(Stream(12, shard), batch_size=4, num_workers=3) for x in b]
+        print("shard" if shard else "no shard", sorted(seen))
+    lens = [12, 50, 512, 30]
+    print("padding waste:", 1 - sum(lens) / (len(lens) * max(lens)))</pre>
+<ol>
+<li>Expect roughly 7–8 batches/s with 0 workers (32 × 4 ms = 128 ms per batch) and close to 2× and 4× that with 2 and 4 workers, if you have the cores.</li>
+<li>Without sharding the stream yields every number three times; with sharding each exactly once.</li>
+<li>Padding waste prints 0.705 — the body's worked example.</li>
+<li>Pass <code>collate_fn=lambda b: b</code> to a loader with <code>num_workers=2</code> and watch spawn refuse to pickle the lambda.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Find the bug: an input pipeline that is slow, repetitive and leaky</b>
+<p>This pipeline feeds a 4-GPU DDP job (one process per GPU). GPU utilisation is about 35%, every epoch's loss curve looks identical, host memory grows by several GB per hour, and the dataset's random crops look the same across workers. Find the bugs and their symptoms.</p>
+<pre>class CropDS(Dataset):
+    def __init__(self, index_file):
+        self.items = [json.loads(l) for l in open(index_file)]   # 9M dicts: path, label
+        self.rng = np.random.default_rng(1234)
+    def __len__(self): return len(self.items)
+    def __getitem__(self, i):
+        item = self.items[i]
+        img = decode_and_resize(item["path"])                    # ~5 ms
+        x0 = self.rng.integers(0, 32)
+        return torch.from_numpy(img[:, x0:x0 + 224]), item["label"]
+
+sampler = DistributedSampler(CropDS("index.jsonl"))
+loader = DataLoader(sampler.dataset, batch_size=64, sampler=sampler, num_workers=2)
+for epoch in range(epochs):
+    for x, y in loader:
+        x = x.cuda().float() / 255
+        ...</pre>
+<details><summary>Answer</summary>
+<p><strong>Bug 1 — too few workers for the work.</strong> 64 images × 5 ms = 320 ms of decoding per batch, split over 2 workers is 160 ms per batch per rank; if the GPU step is about 60 ms, the GPU waits most of the time — matching 35% utilisation. Fix: raise <code>num_workers</code> (6–8 per rank if the cores exist), add <code>persistent_workers=True</code>, <code>pin_memory=True</code> and <code>x.cuda(non_blocking=True)</code>. Measure data-wait time to confirm.</p>
+<p><strong>Bug 2 — no set_epoch.</strong> DistributedSampler shuffles with <code>seed + epoch</code>, and the epoch never changes, so every epoch sees the same order on every rank — identical loss curves per epoch. Fix: <code>sampler.set_epoch(epoch)</code> at the top of the epoch loop.</p>
+<p><strong>Bug 3 — 9 million Python dicts in the dataset.</strong> Each worker touches the dicts, reference counting writes to their pages, and copy-on-write copies them into every worker (2 workers × 4 ranks = 8 copies today, and more after fixing bug 1) — the steady memory growth (PyTorch issue #13246). Fix: load the index into NumPy arrays (fixed-width byte strings for paths, an int array for labels) or a PyArrow table, or a memory-mapped file.</p>
+<p><strong>Bug 4 — the RNG is created in __init__.</strong> <code>np.random.default_rng(1234)</code> is copied into every worker (and identical on every rank), so all of them draw the same crop sequence. The DataLoader's per-worker seeding covers NumPy's <em>global</em> RNG, not Generator objects you create. Fix: create the generator per worker in <code>worker_init_fn</code> or lazily in <code>__getitem__</code>, seeded from <code>get_worker_info().seed</code> (which already differs by worker and epoch); include the rank if seeds must differ across ranks.</p>
+<p><strong>Smaller issue:</strong> <code>x.cuda().float() / 255</code> transfers uint8 (good — four times less than float32) but synchronously; with pinning and <code>non_blocking=True</code> the copy overlaps compute.</p>
+</details>
+<b>Estimate: how many workers?</b>
+<p>A speech model trains at 0.4 s per step with batch 48. Loading and featurising one utterance takes 22 ms on one core. The node has 64 cores and 8 GPUs. How many workers per GPU, and is the node CPU-bound?</p>
+<details><summary>Answer</summary>
+<p>Per batch: 48 × 22 ms = 1.06 s of CPU work. To deliver one batch per 0.4 s needs at least 1.06 / 0.4 ≈ 2.6 workers; with headroom for variance, 4 per GPU. Across 8 GPUs that is 32 worker processes plus 8 training processes on 64 cores — comfortable, about 60% of the cores. If featurisation were twice as slow, 6 per GPU would push the node to 56 processes and close to saturation; then move featurisation offline or to the GPU rather than adding workers.</p>
+</details>
+</section>

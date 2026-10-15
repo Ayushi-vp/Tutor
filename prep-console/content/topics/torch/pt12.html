@@ -1,0 +1,590 @@
+<!-- topic source for torch/pt12; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "pt12",
+  "t": "Making it fast: the profiler, host–device syncs, torch.compile, CUDA graphs and fused optimisers",
+  "tag": "Performance",
+  "sum": "A method for speeding up PyTorch training and inference: measure with torch.profiler, remove host–device synchronisations, let torch.compile fuse kernels (and understand graph breaks, recompiles and modes), cut launch overhead with CUDA graphs, and pick cheap wins — TF32, channels_last, fused and foreach optimisers.",
+  "prereq": [
+    [
+      "gpu6",
+      "Kernel fusion avoids writing intermediates to memory; Triton generates fused GPU kernels; torch.compile captures graphs and lowers them to fused kernels."
+    ],
+    [
+      "gpu11",
+      "Profiling separates compute-bound, memory-bound and overhead-bound time; a timeline shows gaps where the GPU is idle."
+    ],
+    [
+      "pt1",
+      "GPU work is queued asynchronously; .item(), printing, .cpu() and if-statements on tensors make the CPU wait for the GPU (a host–device synchronisation)."
+    ],
+    [
+      "pt7",
+      "Mixed precision uses tensor cores; memory snapshots show allocations; autocast keeps sensitive ops in float32."
+    ]
+  ],
+  "myths": [
+    [
+      "torch.compile makes everything faster.",
+      "It removes Python overhead and fuses memory-bound operations, which helps most when many small or element-wise operations dominate. A model whose time is already in large matmuls gains little, and compilation itself costs seconds to minutes. Graph breaks, recompiles and dynamic shapes can erase the gain or make things slower. Measure before and after; the PyTorch 2 paper reports geometric-mean speed-ups (1.41× for training on A100), not universal ones."
+    ],
+    [
+      "A loss.item() per step is too small to matter.",
+      "It forces the CPU to wait until every queued GPU kernel has finished, so the CPU can no longer queue work ahead of the GPU. The next step's kernels start from an empty queue, and the GPU idles while Python launches them. For small or medium models this alone can cost 10–30% of throughput. Log every N steps or accumulate on the GPU."
+    ],
+    [
+      "GPU utilisation at 100% means the GPU is busy.",
+      "nvidia-smi's utilisation is the fraction of time any kernel was running, not how much of the GPU it used. A stream of tiny, launch-bound kernels shows 100% while achieving a few percent of peak FLOPs. Look at the profiler timeline and at MFU instead."
+    ],
+    [
+      "CUDA graphs speed up the GPU's arithmetic.",
+      "They remove CPU launch overhead by recording a sequence of kernels once and replaying it with one launch. The kernels themselves run at the same speed. They help when the CPU cannot launch kernels as fast as the GPU executes them — small batches, decode steps — and require static shapes, static memory addresses and no synchronisation inside the captured region."
+    ],
+    [
+      "Graph breaks are errors.",
+      "A graph break is torch.compile stopping its capture at an unsupported Python construct, running it eagerly, and resuming capture afterwards. The program stays correct, but each break splits the model into smaller compiled pieces with less fusion and adds overhead at the boundary. fullgraph=True turns breaks into errors when you need one graph."
+    ],
+    [
+      "The profiler's slowest operator is the place to optimise.",
+      "Only if it is on the critical path. A large kernel that overlaps with communication or with another stream may cost nothing; a gap where the GPU waits for the CPU costs time without appearing as any operator. Read the timeline for idle gaps before sorting the operator table."
+    ]
+  ],
+  "recap": [
+    "Measure first: time steps with CUDA events or synchronised timers, then profile a few steps with torch.profiler and read the timeline for idle gaps, launch-bound regions and the top kernels.",
+    "Host–device synchronisations (.item(), print, .cpu(), .tolist(), Python if on a tensor, boolean indexing, nonzero) stop the CPU from queuing ahead; torch.cuda.set_sync_debug_mode('warn') reports them.",
+    "torch.compile uses TorchDynamo to capture graphs from Python bytecode and TorchInductor to generate fused kernels; the PyTorch 2 paper reports 2.27× inference and 1.41× training geometric-mean speed-ups on an A100 across 180+ models.",
+    "Graph breaks split the graph at unsupported code (print, .item(), data-dependent control flow, some third-party calls); TORCH_LOGS='graph_breaks' and torch._dynamo.explain list them, and fullgraph=True makes them errors.",
+    "Recompiles happen when guards fail (new shapes, dtypes, Python constants); after a shape changes once, dynamic shapes are assumed, and recompile_limit (8 by default) caps recompilation per function.",
+    "Modes: default; reduce-overhead adds CUDA graphs; max-autotune adds kernel autotuning and CUDA graphs; max-autotune-no-cudagraphs autotunes without them.",
+    "CUDA graphs replay a recorded kernel sequence with one launch, removing CPU overhead, and need static shapes and addresses.",
+    "Cheap wins: TF32 or bf16 matmuls, channels_last for convolutions, fused or foreach optimisers, larger batches, preallocated buffers and fewer small kernels."
+  ],
+  "glossary": [
+    [
+      "CUDA event",
+      "A marker recorded on a CUDA stream; elapsed time between two events measures GPU time without stalling the whole program."
+    ],
+    [
+      "CUDA graph",
+      "A recorded sequence of GPU operations replayed with a single launch, removing per-kernel CPU launch overhead."
+    ],
+    [
+      "CUDA stream",
+      "A queue of GPU work executed in order; different streams can overlap."
+    ],
+    [
+      "Dynamic shapes",
+      "Compiling a graph with symbolic sizes so it works for many input shapes without recompiling."
+    ],
+    [
+      "FlexAttention",
+      "A PyTorch API that generates fused attention kernels from a user-written score-modification function."
+    ],
+    [
+      "Fused optimiser",
+      "An optimiser implementation that updates many parameters in one or a few kernels (fused=True) instead of several kernels per parameter."
+    ],
+    [
+      "FX graph",
+      "PyTorch's intermediate representation of a captured program: a graph of operator calls produced by Dynamo or symbolic tracing."
+    ],
+    [
+      "Graph break",
+      "A point where torch.compile stops capturing, runs code eagerly, and starts a new graph afterwards."
+    ],
+    [
+      "Guard",
+      "A check torch.compile attaches to a compiled graph (shapes, dtypes, constants); if it fails on a new call, the function is recompiled."
+    ],
+    [
+      "Host–device synchronisation",
+      "The CPU waiting for all queued GPU work to finish, typically to read a value."
+    ],
+    [
+      "Kernel launch overhead",
+      "The CPU time to issue one GPU kernel (a few microseconds), which dominates when kernels are tiny."
+    ],
+    [
+      "Memory-bound",
+      "Limited by memory bandwidth rather than arithmetic: the kernel moves many bytes per operation."
+    ],
+    [
+      "MFU",
+      "Model FLOPs utilisation: achieved model FLOPs per second divided by the hardware peak."
+    ],
+    [
+      "PEP 523",
+      "The CPython API that lets a library intercept frame evaluation, which TorchDynamo uses to capture graphs."
+    ],
+    [
+      "Recompile",
+      "torch.compile compiling a function again because its guards failed for new inputs."
+    ],
+    [
+      "Regional compilation",
+      "Compiling one repeated block (such as a transformer layer) and reusing it for all layers, to cut compile time."
+    ],
+    [
+      "TF32",
+      "TensorFloat-32: a tensor-core mode on NVIDIA GPUs that runs float32 matmuls with a 10-bit mantissa for higher speed."
+    ],
+    [
+      "TorchDynamo",
+      "The part of torch.compile that intercepts Python bytecode and extracts graphs of PyTorch operations."
+    ],
+    [
+      "TorchInductor",
+      "torch.compile's default backend, which turns captured graphs into fused Triton (GPU) or C++ (CPU) kernels."
+    ],
+    [
+      "Trace (profiler)",
+      "A timeline of CPU and GPU activity exported by the profiler, viewable in Perfetto or Chrome's trace viewer."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why is .item() in the training loop a performance problem?",
+      "GPU work is asynchronous: the CPU queues kernels and moves on. .item() needs the value on the CPU, so the CPU waits until every queued kernel has run. Afterwards the GPU's queue is empty, and it idles while Python launches the next step's kernels. Call it every N steps, keep running sums on the GPU, or move logging to a side thread with non-blocking copies."
+    ],
+    [
+      "E",
+      "How do you time a GPU operation correctly?",
+      "Either synchronise before reading the clock (torch.cuda.synchronize(); t = time.perf_counter()) on both sides, or record CUDA events (start.record(); …; end.record(); torch.cuda.synchronize(); start.elapsed_time(end)). Without synchronisation you measure only how long it took to queue the work. Warm up first, since the first iterations include allocator growth, cuDNN autotuning and compilation."
+    ],
+    [
+      "E",
+      "What does torch.compile do at a high level?",
+      "TorchDynamo hooks into Python's frame evaluation, reads the function's bytecode and extracts a graph of PyTorch operations, guarded by conditions on the inputs; TorchInductor compiles that graph into fused kernels (Triton on GPU, C++ on CPU). Later calls that satisfy the guards run the compiled code; unsupported constructs cause graph breaks and run eagerly."
+    ],
+    [
+      "M",
+      "What causes graph breaks and how do you find them?",
+      "Constructs Dynamo cannot capture: print and logging, .item() and .tolist() (unless capture_scalar_outputs is set), Python control flow on tensor values, calls into unsupported third-party or C extensions, some in-place tricks. Find them with TORCH_LOGS='graph_breaks' or torch._dynamo.explain(fn)(inputs), which lists each break and its reason; on 2.14 a function with a tensor-dependent if, a print and a float(x.mean()) produced 4 graphs and 3 breaks. Fix by moving the construct out of the compiled region, replacing control flow with torch.where or torch.cond, or compiling with fullgraph=True to enforce one graph.",
+      "Follow-up: Is a graph break always bad? — A break at the end of a step (around logging) costs little; breaks inside a hot layer, repeated per layer, cost a lot."
+    ],
+    [
+      "M",
+      "Why does a compiled model recompile, and what does recompile_limit do?",
+      "Each compiled graph has guards — input shapes, dtypes, devices, values of Python constants and attributes it read. If a call fails the guards, Dynamo compiles a new version. Varying sequence lengths are the common cause: after a dimension changes once, Dynamo marks it dynamic and compiles a shape-generic graph. recompile_limit (8 by default on 2.14) caps recompiles per function, after which it falls back to eager. Diagnose with TORCH_LOGS='recompiles'; fix by padding to a few bucket sizes, marking dimensions dynamic up front, or removing Python values that change every call (a step counter read inside forward).",
+      "Follow-up: Why is a Python float learning rate a problem in a compiled optimiser step? — Its value becomes a guard; changing it every step forces recompiles. Pass it as a tensor instead."
+    ],
+    [
+      "M",
+      "Compare the torch.compile modes.",
+      "default: good fusion, moderate compile time. reduce-overhead: adds CUDA graphs to remove launch overhead — best for small batches and decode — at the cost of extra memory and requirements on static inputs. max-autotune: benchmarks several kernel configurations (Triton matmul templates, convolution choices) and enables CUDA graphs, for the best steady-state speed at a much longer compile. max-autotune-no-cudagraphs: autotuning without graphs. On 2.14, torch._inductor.list_mode_options() shows the exact settings, including an additional 'lite' entry."
+    ],
+    [
+      "M",
+      "How would you read a profiler trace of a slow training step?",
+      "Look at the GPU rows first: are there gaps between kernels (CPU-bound or synchronisation), many tiny kernels (launch-bound, a case for fusion or CUDA graphs), or long kernels (compute or memory bound — check which ops)? Then at the CPU rows during the gaps: what was Python doing — data loading, a synchronisation (cudaStreamSynchronize, aten::item), optimiser loops? Then at the operator table sorted by self CUDA time for the heaviest ops. Correlate with record_function labels to map time to code."
+    ],
+    [
+      "M",
+      "What do foreach and fused optimiser implementations change?",
+      "The naive optimiser loops over parameters in Python, launching several small kernels per parameter per step — thousands per step for a large model. foreach groups tensors and uses multi-tensor kernels, cutting launches by orders of magnitude; fused does the whole update for many tensors in one kernel. They change speed, not the update rule (up to floating-point order). foreach is the default on CUDA when available; fused=True must be requested for Adam/AdamW."
+    ],
+    [
+      "H",
+      "A small transformer at batch 4 runs at 30% MFU. The GPU shows 100% utilisation. What is happening and what would you try?",
+      "At small batch, each kernel is tiny, so the step is dominated by launching hundreds of kernels from Python — launch-bound. nvidia-smi counts time with any kernel running, so it shows 100%. Remedies: increase the batch if possible; torch.compile to fuse element-wise ops (fewer kernels); mode='reduce-overhead' to capture the step in a CUDA graph and replay it with one launch; fused optimiser; remove synchronisations so the CPU stays ahead. Verify with the trace: kernels should run back to back with no gaps.",
+      "Follow-up: What breaks CUDA graphs? — Dynamic shapes, CPU synchronisation inside the region, operations that allocate with data-dependent sizes, and inputs whose memory addresses change (static input buffers are needed)."
+    ],
+    [
+      "H",
+      "Explain what TF32 is and how PyTorch controls it.",
+      "On NVIDIA Ampere and later, tensor cores can run float32 matmuls in TF32: inputs rounded to a 10-bit mantissa (like fp16's) with float32's 8-bit exponent and float32 accumulation. It is several times faster than full float32 and accurate enough for most training. PyTorch controls it with torch.set_float32_matmul_precision: 'highest' (full float32, the default — the installed 2.14 reports 'highest'), 'high' (allow TF32) or 'medium' (allow bf16 internally). Under bf16 autocast it matters only for operations kept in float32."
+    ],
+    [
+      "H",
+      "You compile a model and the first epoch is slower than eager, then later epochs are 25% faster. Explain, and say how you would reduce the first-epoch cost.",
+      "The first calls pay compilation: Dynamo tracing plus Inductor code generation and, with max-autotune, kernel benchmarking — seconds to minutes per graph, more with recompiles for new shapes (variable sequence lengths, the last smaller batch). Reduce it by compiling with fewer distinct shapes (bucketing, drop_last), marking dynamic dimensions up front, using default mode while iterating, and the compile caches (Inductor's on-disk cache and mega-cache artefacts) so later runs reuse kernels. Compile per block (regional compilation) when the model repeats a layer, so one compiled block serves all layers."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Ansel et al. — PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation (ASPLOS 2024)",
+      "TorchDynamo and TorchInductor; 2.27× inference and 1.41× training geometric-mean speed-ups on an A100 across 180+ real-world models; causes of graph breaks.",
+      "https://docs.pytorch.org/assets/pytorch2-2.pdf"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.compile",
+      "fullgraph, dynamic, mode (default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs) and recompile_limit.",
+      "https://docs.pytorch.org/docs/2.14/generated/torch.compile.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.compiler troubleshooting",
+      "Graph breaks, recompilations, TORCH_LOGS options and explain().",
+      "https://docs.pytorch.org/docs/2.14/torch.compiler_troubleshooting.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.profiler",
+      "profile, schedule, record_function, key_averages and exporting traces.",
+      "https://docs.pytorch.org/docs/2.14/profiler.html"
+    ],
+    [
+      "docs",
+      "PyTorch tutorials — Profiling your PyTorch module",
+      "A walk through profiling CPU and CUDA time, memory and stack traces.",
+      "https://docs.pytorch.org/tutorials/recipes/recipes/profiler_recipe.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — CUDA semantics (asynchronous execution, streams, CUDA graphs, TF32)",
+      "Why GPU calls are asynchronous, how to time them, stream semantics, graph capture and float32 matmul precision.",
+      "https://docs.pytorch.org/docs/2.14/notes/cuda.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Two teams train the same 350M-parameter model on the same eight GPUs. One finishes in four days, the other in nine. Nothing about the model differs. The slower team's loop prints the loss with <code>.item()</code> every step, computes an accuracy with a boolean mask and a Python <code>if</code>, uses the default optimiser implementation that launches thousands of tiny kernels, keeps matmuls in full float32, and never looked at a profiler trace. Each habit costs 5–30%; together they cost more than half the run. At cloud prices for eight top-end GPUs, the difference is tens of thousands of dollars for one model.</p>
+<p>Performance work in PyTorch has a reputation for being black magic, but most of it follows from one fact covered in pt1: the CPU queues GPU work asynchronously, and the GPU is only busy if the CPU stays ahead of it with enough large kernels. Everything that makes the CPU wait (synchronisations), everything that makes it fall behind (Python overhead, thousands of tiny kernel launches), and everything that wastes the GPU's time (unfused memory-bound operations, slow precision modes, idle gaps while waiting for data or communication) shows up as lost throughput. PyTorch gives you tools for each: a profiler that shows the timeline, a sync-debugging mode, <code>torch.compile</code> to capture and fuse graphs, CUDA graphs to eliminate launch overhead, and fused optimisers.</p>
+<p><code>torch.compile</code> deserves particular attention because it is both powerful and opaque. The PyTorch 2 paper (Ansel et al., ASPLOS 2024) describes how TorchDynamo captures graphs from ordinary Python by analysing bytecode, and how TorchInductor generates fused kernels, reporting geometric-mean speed-ups of 2.27× for inference and 1.41× for training on an NVIDIA A100 across more than 180 real-world models. Getting that speed-up in your own code requires understanding graph breaks, recompiles and modes — which is what interviewers probe when they ask "you added torch.compile and it got slower, why?".</p>
+<p>This lesson gives a method: measure correctly, profile and read the trace, remove synchronisations, compile and debug the compilation, use CUDA graphs where launch overhead dominates, and take the cheap wins. Numbers and APIs are checked against PyTorch 2.14; GPU-only experiments are marked.</p>
+</section>
+
+<section data-field="primer">
+<p>Picture the CPU as a restaurant's order desk and the GPU as the kitchen. The desk writes orders (kernel launches) onto a rail; the kitchen cooks them in order, as fast as it can. When the desk writes faster than the kitchen cooks, orders pile up on the rail and the kitchen never waits — that is the healthy state. Three things break it:</p>
+<ul>
+<li><strong>The desk walks into the kitchen to ask a question.</strong> "How did the last dish turn out?" — <code>.item()</code>, <code>print(tensor)</code>, an <code>if</code> on a tensor's value. The desk must wait until every dish on the rail is finished. Meanwhile it writes no new orders, so when it returns, the rail is empty and the kitchen waits for the next order. This is a <strong>host–device synchronisation</strong>.</li>
+<li><strong>The orders are tiny and many.</strong> Writing an order takes the desk a few microseconds. If each dish takes the kitchen even less time — adding a bias, applying an activation to a small tensor — the kitchen finishes faster than the desk can write, and waits between every order. This is being <strong>launch-bound</strong>.</li>
+<li><strong>The kitchen does wasteful work.</strong> Every separate small step fetches ingredients from the store room and puts the result back (reads and writes GPU memory). Combining steps into one — fusion — fetches once. Using faster appliances — tensor cores in bf16 or TF32 — cooks the big dishes faster.</li>
+</ul>
+<p>The tools map onto these: the <strong>profiler</strong> draws the rail and the kitchen on a timeline so you can see waits; the <strong>sync debug mode</strong> catches the desk's trips into the kitchen; <strong>torch.compile</strong> merges many small orders into fewer fused ones and removes Python overhead; <strong>CUDA graphs</strong> let the desk hand over an entire pre-written order book with one action; precision settings and fused optimisers make the kitchen's work cheaper.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Timelines: healthy CPU queuing ahead of GPU; a sync from item() empties the queue causing an idle gap; launch-bound tiny kernels leave gaps between them">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Healthy: CPU runs ahead, GPU busy</text>
+    <text x="20" y="46" style="fill:var(--muted)">CPU</text>
+    <rect x="70" y="34" width="200" height="16" style="fill:var(--s1);opacity:0.5"/>
+    <text x="20" y="72" style="fill:var(--muted)">GPU</text>
+    <rect x="100" y="60" width="500" height="16" style="fill:var(--accent);opacity:0.7"/>
+    <text x="20" y="108" style="fill:var(--ink);font-weight:600">.item() each step: queue drains, GPU idles</text>
+    <text x="20" y="134" style="fill:var(--muted)">CPU</text>
+    <rect x="70" y="122" width="80" height="16" style="fill:var(--s1);opacity:0.5"/>
+    <rect x="150" y="122" width="140" height="16" style="fill:var(--crit);opacity:0.3"/><text x="220" y="135" text-anchor="middle" style="fill:var(--ink)">waiting (sync)</text>
+    <rect x="290" y="122" width="80" height="16" style="fill:var(--s1);opacity:0.5"/>
+    <text x="20" y="160" style="fill:var(--muted)">GPU</text>
+    <rect x="100" y="148" width="190" height="16" style="fill:var(--accent);opacity:0.7"/>
+    <rect x="320" y="148" width="190" height="16" style="fill:var(--accent);opacity:0.7"/>
+    <text x="305" y="178" text-anchor="middle" style="fill:var(--crit)">idle</text>
+    <text x="20" y="206" style="fill:var(--ink);font-weight:600">Launch-bound: tiny kernels, CPU can't keep up</text>
+    <text x="20" y="232" style="fill:var(--muted)">GPU</text>
+    <g style="fill:var(--accent);opacity:0.7">
+      <rect x="100" y="220" width="12" height="16"/><rect x="132" y="220" width="12" height="16"/><rect x="164" y="220" width="12" height="16"/><rect x="196" y="220" width="12" height="16"/><rect x="228" y="220" width="12" height="16"/><rect x="260" y="220" width="12" height="16"/><rect x="292" y="220" width="12" height="16"/><rect x="324" y="220" width="12" height="16"/><rect x="356" y="220" width="12" height="16"/><rect x="388" y="220" width="12" height="16"/>
+    </g>
+    <text x="420" y="233" style="fill:var(--ink-2)">fix: fuse (compile) or</text>
+    <text x="420" y="251" style="fill:var(--ink-2)">replay (CUDA graphs)</text>
+  </g>
+</svg>
+<figcaption>Throughput is lost in gaps, not in kernels. A sync drains the queue; tiny kernels outrun the launcher. The profiler timeline shows both directly.</figcaption>
+</figure>
+
+<p>Every performance problem in this lesson can be placed in one of four regimes, and naming the regime is the first step of any answer. <strong>Idle-bound</strong>: the GPU waits for something outside it — data loading, a synchronisation, communication. <strong>Overhead-bound</strong> (or launch-bound): the GPU runs, but in kernels so small that the time to launch them dominates. <strong>Memory-bound</strong>: kernels are large, but each does little arithmetic per byte it reads or writes, so memory bandwidth limits them (element-wise operations, normalisation, softmax). <strong>Compute-bound</strong>: large matmuls running near the tensor cores' peak. The remedies differ completely — fix the pipeline, fuse or replay with graphs, fuse to cut memory traffic, or use faster precision and better shapes — and applying the wrong one wastes effort. A profiler trace tells you the regime in minutes.</p>
+<p>Some orders of magnitude make the regimes concrete. Launching one kernel from PyTorch costs the CPU roughly 5–20 microseconds. A large matmul in a transformer layer takes hundreds of microseconds to milliseconds on the GPU. An element-wise operation over a few million values takes tens of microseconds. A host–device synchronisation costs whatever work was queued — possibly the rest of the step. So a step built from big matmuls with a few hundred kernels is comfortably compute-bound; the same model at batch 1 in decode, where every kernel shrinks to microseconds, becomes launch-bound; and one sync per step can cost more than all the kernels of the optimiser together. Keeping these numbers in mind lets you predict from the model and batch size which regime you are in before you open a profiler.</p>
+<p>Where the restaurant analogy breaks: a real kitchen can cook several orders at once, and so can a GPU — but only across separate streams or within one large kernel, not across a single stream's queue, which runs in order. That is why fusion (one big kernel instead of ten small ones) and overlapping communication on a separate stream (pt11) matter as much as they do.</p>
+<p>If you remember one sentence: <em>keep the CPU ahead of the GPU — no synchronisations, few and large kernels — and measure with a timeline before and after every change</em>.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Measuring correctly</h4>
+<p>Because GPU calls are asynchronous, <code>time.perf_counter()</code> around a GPU operation measures how long it took to queue it, not to run it. Two correct ways:</p>
+<pre># 1. synchronise around the timed region
+torch.cuda.synchronize(); t0 = time.perf_counter()
+for _ in range(20): step()
+torch.cuda.synchronize(); dt = (time.perf_counter() - t0) / 20
+
+# 2. CUDA events (no global stall inside the loop)
+start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+start.record()
+for _ in range(20): step()
+end.record(); torch.cuda.synchronize()
+ms_per_step = start.elapsed_time(end) / 20</pre>
+<p>Always warm up first — the first iterations include allocator growth (pt7), cuDNN algorithm selection and, with <code>torch.compile</code>, compilation — and time enough steps to average out noise. Report throughput in the unit that matters (tokens or samples per second) and, for training, MFU (pt10): achieved model FLOPs per second divided by the GPU's peak. MFU tells you how much headroom is left in a way that utilisation percentages do not.</p>
+
+<h4>2. The profiler</h4>
+<pre>from torch.profiler import profile, ProfilerActivity, schedule, record_function
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+             schedule=schedule(wait=1, warmup=1, active=3),
+             record_shapes=True, with_stack=True,
+             on_trace_ready=lambda p: p.export_chrome_trace(f"trace_{p.step_num}.json")) as prof:
+    for step in range(5):
+        with record_function("forward"):
+            loss = model(x, y)
+        with record_function("backward"):
+            loss.backward()
+        opt.step(); opt.zero_grad()
+        prof.step()
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))</pre>
+<p>The schedule skips one step, warms up for one, and records three — profiling every step of a run is too slow. <code>record_function</code> labels regions so they appear on the timeline. Open the exported trace in Perfetto (ui.perfetto.dev) or Chrome's trace viewer. Reading it, in order:</p>
+<ol>
+<li><strong>GPU stream rows.</strong> Are kernels back to back, or are there gaps? Gaps mean the GPU waited — for the CPU, for data, for a synchronisation or for communication.</li>
+<li><strong>CPU rows during the gaps.</strong> What was the CPU doing? <code>aten::item</code> or <code>cudaStreamSynchronize</code> is a sync; <code>enumerate(DataLoader)…__next__</code> is data loading (pt5); long Python stretches between operator calls are framework or user overhead.</li>
+<li><strong>Kernel sizes.</strong> Many kernels of a few microseconds each signal a launch-bound regime; a few long kernels signal compute- or memory-bound work.</li>
+<li><strong>The operator table.</strong> Only now sort by self CUDA time to see which operations to make cheaper.</li>
+</ol>
+<p>Memory profiling (<code>profile_memory=True</code>) and the snapshot tool from pt7 complement the timeline.</p>
+
+<h4>3. Host–device synchronisations: find and remove them</h4>
+<p>Operations that synchronise, because they need a GPU value on the CPU or need to know a data-dependent size:</p>
+<ul>
+<li><code>.item()</code>, <code>.tolist()</code>, <code>.cpu()</code>, <code>.numpy()</code>, <code>print(tensor)</code>, <code>float(tensor)</code>, <code>int(tensor)</code>.</li>
+<li>Python control flow on tensor values: <code>if loss &gt; 10:</code>, <code>while not converged:</code>, <code>assert (x &gt; 0).all()</code>.</li>
+<li>Operations with data-dependent output sizes: boolean indexing <code>x[mask]</code>, <code>nonzero</code>, <code>unique</code>, <code>masked_select</code> (pt2).</li>
+<li>Copies from GPU to pageable host memory, and explicit <code>torch.cuda.synchronize()</code>.</li>
+</ul>
+<p><code>torch.cuda.set_sync_debug_mode("warn")</code> (or <code>"error"</code>) makes PyTorch report synchronising calls as they happen; run a few steps with it to get a list. Replacements: log every N steps; accumulate metrics in GPU tensors (<code>running_loss += loss.detach()</code>) and read them occasionally; replace data-dependent selection with masks (<code>(loss * mask).sum() / mask.sum()</code>); replace Python branches with <code>torch.where</code>; move checks such as NaN detection to every N steps. The cost of one sync depends on the overlap it destroys. Suppose a step's kernels take 150 ms of GPU time and launching them takes 100 ms of CPU time. Without syncs, launching step n+1 overlaps with executing step n, so a step costs about 150 ms. With a sync at the end of every step, the CPU only starts launching step n+1 after step n has finished, and the first kernels of each step wait for Python: the GPU idles for a good part of every launch phase, and the step stretches toward 150 + 100 ms in the worst case.</p>
+
+<h4>4. torch.compile: what it does</h4>
+<p><code>model = torch.compile(model)</code> (or decorating a function) returns a wrapper. On the first call, TorchDynamo intercepts the Python frame, symbolically executes its bytecode, and records every PyTorch operation into an FX graph, stopping where it meets something it cannot represent. It attaches <strong>guards</strong> — conditions on input shapes, dtypes, devices and the Python values the graph depended on. TorchInductor then compiles the graph: it decomposes operations into a smaller set of primitives, fuses chains of element-wise and reduction operations into single kernels (generated in Triton on GPU or C++ on CPU), chooses matmul implementations, and plans memory. Later calls check the guards and run the compiled code directly. The PyTorch 2 paper reports that TorchDynamo captures a whole-program graph most of the time and that TorchInductor achieved geometric-mean speed-ups of 2.27× (inference) and 1.41× (training) on an A100 over more than 180 real-world models — the gains come mostly from fusing memory-bound operations and removing Python overhead (gpu6).</p>
+<p>What it does not do: change your model's mathematics, make large matmuls much faster than cuBLAS already does, or help code that is dominated by data loading or synchronisations outside the compiled region.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="torch.compile pipeline: Python function, TorchDynamo bytecode analysis producing an FX graph plus guards, AOTAutograd producing forward and backward graphs, TorchInductor producing fused Triton or C++ kernels; unsupported code falls back to eager at a graph break">
+  <defs><marker id="pt12-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="40" width="110" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="65" y="62" text-anchor="middle" style="fill:var(--ink)">Python fn /</text><text x="65" y="78" text-anchor="middle" style="fill:var(--ink)">nn.Module</text>
+    <rect x="150" y="40" width="120" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="210" y="62" text-anchor="middle" style="fill:var(--ink)">TorchDynamo</text><text x="210" y="78" text-anchor="middle" style="fill:var(--muted)">bytecode → FX graph</text>
+    <rect x="300" y="40" width="120" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="360" y="62" text-anchor="middle" style="fill:var(--ink)">AOTAutograd</text><text x="360" y="78" text-anchor="middle" style="fill:var(--muted)">fwd + bwd graphs</text>
+    <rect x="450" y="40" width="180" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="540" y="62" text-anchor="middle" style="fill:var(--ink)">TorchInductor</text><text x="540" y="78" text-anchor="middle" style="fill:var(--muted)">fused Triton / C++ kernels</text>
+    <line x1="120" y1="65" x2="150" y2="65" marker-end="url(#pt12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="270" y1="65" x2="300" y2="65" marker-end="url(#pt12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="420" y1="65" x2="450" y2="65" marker-end="url(#pt12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="150" y="130" width="120" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="210" y="149" text-anchor="middle" style="fill:var(--ink)">guards</text><text x="210" y="165" text-anchor="middle" style="fill:var(--muted)">shapes, dtypes, consts</text>
+    <line x1="210" y1="90" x2="210" y2="130" marker-end="url(#pt12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="10" y="130" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="65" y="149" text-anchor="middle" style="fill:var(--ink)">graph break</text><text x="65" y="165" text-anchor="middle" style="fill:var(--muted)">run eagerly</text>
+    <line x1="165" y1="90" x2="100" y2="130" marker-end="url(#pt12-arrow)" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/>
+    <text x="10" y="206" style="fill:var(--ink-2)">Unsupported code (print, .item(), tensor-dependent if, NumPy) ends the graph and runs in Python; capture resumes after it.</text>
+    <text x="10" y="226" style="fill:var(--ink-2)">Each later call checks the guards: pass → run compiled code; fail → recompile (up to recompile_limit = 8).</text>
+    <text x="10" y="246" style="fill:var(--ink-2)">backend="eager" stops after Dynamo, "aot_eager" after AOTAutograd — the bisection for wrong results.</text>
+  </g>
+</svg>
+<figcaption>torch.compile is a pipeline with a safety valve: anything it cannot capture runs normally, at the price of a split graph. Guards decide when cached code may be reused.</figcaption>
+</figure>
+<h4>5. Graph breaks</h4>
+<p>When Dynamo meets an unsupported construct, it ends the current graph, runs the construct in normal Python, and starts a new graph afterwards — a <strong>graph break</strong>. A function on 2.14:</p>
+<pre>def f(x):
+    y = x.sin()
+    if y.sum() &gt; 0:          # branch on a tensor value
+        y = y * 2
+    print("hi")              # unsupported builtin
+    return y.cos() + float(x.mean())   # .item()-style scalar read
+ex = torch._dynamo.explain(f)(torch.randn(8))
+ex.graph_count, ex.graph_break_count    # (4, 3)</pre>
+<p>The three reasons reported are exactly the three marked lines: a jump on a tensor value, "Failed to trace builtin operator print", and "Unsupported Tensor.item() call with capture_scalar_outputs=False". In real models, the paper lists the most common causes as calls to non-PyTorch libraries such as NumPy, data-dependent control flow, and printing or logging. Find them with <code>TORCH_LOGS="graph_breaks" python train.py</code> or <code>torch._dynamo.explain</code>. Fixes:</p>
+<ul>
+<li>Move logging and metrics out of the compiled function (compile the model, not the whole loop body with prints).</li>
+<li>Replace tensor-dependent branches with <code>torch.where</code> (both sides computed) or <code>torch.cond</code> (a captured conditional).</li>
+<li>Keep NumPy out of the forward; use torch equivalents.</li>
+<li>Set <code>torch._dynamo.config.capture_scalar_outputs = True</code> when scalar reads are intended inside the graph.</li>
+<li>Compile with <code>fullgraph=True</code> to turn breaks into errors in code that must compile as one graph (export paths, CUDA graphs).</li>
+</ul>
+
+<h4>6. Recompiles and dynamic shapes</h4>
+<p>If a later call fails a guard — a different sequence length, a different dtype, a Python attribute that changed — Dynamo compiles a new version. With <code>automatic_dynamic_shapes</code> (True on 2.14), the first time a dimension changes, Dynamo recompiles once with that dimension marked dynamic (symbolic), so subsequent sizes reuse the graph. <code>recompile_limit</code> (8 on 2.14) caps recompiles per code object; past it, the function falls back to eager execution, silently losing the speed-up. Diagnose with <code>TORCH_LOGS="recompiles"</code>, which prints the failed guard (for example a size that changed). Common causes and fixes: variable sequence lengths (bucket them to a few sizes, or mark the dimension dynamic with <code>torch._dynamo.mark_dynamic</code>); a smaller last batch (<code>drop_last=True</code>); Python scalars that change each step read inside the compiled code (pass them as tensors — the learning rate in a compiled optimiser step is the classic case); toggling <code>model.train()</code>/<code>eval()</code>, which changes guarded attributes (expected: one compile per mode).</p>
+
+<h4>7. Modes and options</h4>
+<p>The 2.14 docstring documents four modes:</p>
+<table>
+<thead><tr><th>mode</th><th>What it adds</th><th>Use when</th></tr></thead>
+<tr><td><code>"default"</code></td><td>Fusion and code generation with moderate compile time</td><td>The starting point</td></tr>
+<tr><td><code>"reduce-overhead"</code></td><td>CUDA graphs ("reduces the overhead of python with CUDA graphs, useful for small batches"), caching workspace memory</td><td>Launch-bound steps: small batches, decode</td></tr>
+<tr><td><code>"max-autotune"</code></td><td>Benchmarks Triton/template matmul and convolution kernels; CUDA graphs on GPU</td><td>Long runs where compile time is amortised</td></tr>
+<tr><td><code>"max-autotune-no-cudagraphs"</code></td><td>Autotuning without graphs</td><td>When graphs cannot be used</td></tr>
+</table>
+<p><code>torch._inductor.list_mode_options()</code> shows the exact settings each mode applies (on 2.14 it also lists a <code>"lite"</code> entry). Other useful arguments: <code>fullgraph=True</code>, <code>dynamic=True/False</code> to force or forbid dynamic shapes, and <code>backend="eager"</code> or <code>"aot_eager"</code> to check whether a problem comes from capture (Dynamo) or code generation (Inductor) — the standard bisection when a compiled model gives different results.</p>
+<p>Compile regionally when the model repeats a block: <code>for b in model.blocks: b.compile()</code> compiles one block's code once and reuses it for all layers, cutting compile time compared with compiling the whole model as one graph.</p>
+
+<h4>8. CUDA graphs</h4>
+<p>A CUDA graph records a sequence of kernel launches with their arguments and replays them with one launch call. On a small model where launching 500 kernels takes 2 ms of CPU time but running them takes 1 ms of GPU time, replaying a graph cuts the step to about the GPU time. <code>mode="reduce-overhead"</code> applies this automatically to compiled regions; the manual API is <code>torch.cuda.CUDAGraph</code> with <code>torch.cuda.graph(g):</code> capture blocks. Requirements follow from "replay exactly the same launches": static shapes; static memory addresses for inputs and outputs (copy new data into the same input buffers before each replay); no CPU synchronisation inside the region; no data-dependent control flow or allocation sizes. The KV-cache decode step (pt10) is the textbook use: preallocate the cache, give every step identical shapes, and capture once.</p>
+
+<h4>9. Cheap wins outside the compiler</h4>
+<ul>
+<li><strong>Precision.</strong> bf16 autocast (pt7). For code that stays in float32, <code>torch.set_float32_matmul_precision("high")</code> allows TF32 on Ampere and later — float32 range with a 10-bit mantissa, several times faster for matmuls. The default on 2.14 is <code>"highest"</code> (no TF32).</li>
+<li><strong>Fused and foreach optimisers.</strong> <code>AdamW(..., fused=True)</code> updates many parameters per kernel; <code>foreach</code> (the default on CUDA when available) groups tensors. A model with 300 parameter tensors goes from thousands of optimiser kernels per step to a handful.</li>
+<li><strong>channels_last</strong> for convolutional networks: <code>model.to(memory_format=torch.channels_last)</code> and inputs likewise (pt1). Tensor-core convolution kernels prefer NHWC; gains of 10–30% are common for CNNs in mixed precision.</li>
+<li><strong>Shapes that suit the hardware.</strong> Dimensions that are multiples of 8 (fp16/bf16) or 64 tile well; nanoGPT pads the vocabulary from 50,257 to 50,304 for this reason (pt10).</li>
+<li><strong>Larger batches</strong>, when memory allows and the optimisation tolerates them, raise arithmetic intensity and amortise per-step overhead.</li>
+<li><strong>cudnn.benchmark = True</strong> for convolutional models with fixed input sizes lets cuDNN pick the fastest algorithm (at the cost of determinism, pt6).</li>
+</ul>
+<h4>10. A worked optimisation of one training step</h4>
+<p>To see how the pieces combine, follow a realistic sequence on a 125M-parameter GPT at batch 16 and sequence length 1,024 on one modern GPU. The numbers are illustrative of typical proportions rather than a benchmark of a specific card, but each step's reasoning is the one you would use.</p>
+<ol>
+<li><strong>Baseline.</strong> Eager float32, default optimiser, <code>loss.item()</code> printed every step, <code>num_workers=0</code>. Measured with CUDA events: 420 ms per step, about 39,000 tokens per second. The trace shows gaps between steps (data loading and the sync) and long float32 matmuls.</li>
+<li><strong>Remove the idle time.</strong> Four DataLoader workers with pinned memory and non-blocking copies; log every 50 steps. The gaps disappear: 340 ms. Nothing about the model changed.</li>
+<li><strong>Use the tensor cores.</strong> bf16 autocast (pt7). Matmuls run several times faster and activations halve: 150 ms. The trace now shows matmuls taking under half the step; the rest is many short element-wise and normalisation kernels plus the optimiser.</li>
+<li><strong>Fuse and cut overhead.</strong> <code>torch.compile</code> (default mode) fuses the element-wise chains; <code>AdamW(fused=True)</code> collapses the optimiser to a few kernels: 105 ms. The first steps are slower while compiling.</li>
+<li><strong>Use the fused attention kernel.</strong> If attention was hand-written, switching to <code>F.scaled_dot_product_attention</code> (pt10) removes the T × T intermediates: a further 10–20% at this sequence length, and much less memory, which in turn allows a larger batch.</li>
+</ol>
+<p>The overall improvement, about 4× in this illustration, came from five changes, none of which touched the model's mathematics. The order matters: removing idle time first makes later measurements meaningful, and precision before compilation means the compiler fuses the kernels you will actually run. At each step, the trace said what to do next.</p>
+
+<h4>11. Inference-specific speed</h4>
+<p>Inference changes the bottlenecks. Run under <code>torch.inference_mode()</code> (pt3), which removes autograd bookkeeping, with weights in bf16 (pt7). For batch prediction, larger batches raise throughput until memory or latency limits are hit. For autoregressive generation, the decode step is small and launch-bound at low batch, so the biggest wins are a static KV cache (pt10) with <code>torch.compile(mode="reduce-overhead")</code> or a manual CUDA graph, and batching many sequences into each decode step so each weight read serves more tokens. Prefill, in contrast, is compute-bound like training. Serving stacks (pt13) build on exactly these mechanisms — static caches, CUDA graphs per batch-size bucket and continuous batching — which is why understanding them in plain PyTorch makes those systems legible.</p>
+<h4>12. Streams: overlapping copies and compute yourself</h4>
+<p>All the work in a simple training loop runs on one CUDA stream, in order. A second stream lets independent work overlap: copying the next batch to the GPU while the current batch computes, or offloading tensors to the host during backward (pt7). The pattern for prefetching a batch:</p>
+<pre>copy_stream = torch.cuda.Stream()
+def prefetch(batch):
+    with torch.cuda.stream(copy_stream):
+        return [t.to("cuda", non_blocking=True) for t in batch]     # needs pinned memory
+nxt = prefetch(next(it))
+for _ in range(steps):
+    torch.cuda.current_stream().wait_stream(copy_stream)            # order: copy before use
+    cur = nxt
+    for t in cur: t.record_stream(torch.cuda.current_stream())      # tell the allocator
+    nxt = prefetch(next(it))                                        # overlaps with compute below
+    loss = model(*cur); loss.backward(); opt.step(); opt.zero_grad()</pre>
+<p>Two rules make it correct. <code>wait_stream</code> inserts a dependency so the compute stream does not read a tensor before its copy finishes — without it, the model can read half-copied data with no error. And <code>record_stream</code> tells the caching allocator that a tensor allocated on one stream is used on another, so its memory is not reused while still in use. Most code never needs this, because pinned memory with <code>non_blocking=True</code> copies on the default stream already overlap with earlier queued work; explicit streams matter when copies are large, as in offloading, or when you build infrastructure such as FSDP's communication streams.</p>
+</section>
+
+<section data-field="deep">
+<h4>How Dynamo captures Python without rewriting it</h4>
+<p>Earlier capture approaches had a fundamental problem, which the PyTorch 2 paper describes: <code>torch.jit.trace</code> records one execution and silently bakes in its control flow, and <code>torch.jit.script</code> requires a restricted subset of Python that real models rarely fit. TorchDynamo instead uses CPython's frame evaluation hook (PEP 523) to intercept each function call before it runs, analyses the function's bytecode, and symbolically executes it, building a graph of tensor operations while tracking Python values it depends on as guards. Anything it cannot handle becomes a graph break with the original bytecode as a fallback, so correctness is preserved. That design explains its behaviour: it is robust (fallback, not failure), guarded (it re-checks assumptions every call) and sensitive to Python-level values (constants become guards).</p>
+
+<h4>AOTAutograd: compiling the backward pass</h4>
+<p>Training needs the backward pass compiled too. AOTAutograd traces the forward graph through PyTorch's autograd to produce a joint forward-and-backward graph ahead of time, then partitions it into a forward graph and a backward graph, choosing which intermediates to save and which to recompute (a min-cut over the joint graph, similar in spirit to selective activation checkpointing, pt7). Inductor compiles both. This is why compiled training can also use less memory than eager: cheap element-wise intermediates are recomputed in the fused backward kernels instead of being stored.</p>
+
+<h4>Why fusion helps: memory traffic</h4>
+<p>An element-wise operation on a tensor of N float32 elements reads 4N bytes and writes 4N bytes and does one arithmetic operation per element — far below what a GPU can compute per byte moved, so it is memory-bound (gpu2). A chain of five such operations (bias, GELU, dropout, residual add, scale) unfused moves 40N bytes; fused into one kernel it reads the inputs once and writes the output once, about 8N–12N bytes, a 3–5× reduction for that chain. Transformers have many such chains around their matmuls (normalisation, activations, residuals, masking), which is where Inductor's fused kernels win. The matmuls themselves already run in cuBLAS at close to peak, which is why whole-model speed-ups are 1.3–2× rather than 5×.</p>
+
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Memory traffic for a chain of five element-wise ops: unfused, each op reads and writes the full tensor (ten passes); fused, one read and one write">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">bias → GELU → dropout → residual add → scale on N elements (fp32)</text>
+    <text x="20" y="52" style="fill:var(--crit)">unfused: 5 kernels</text>
+    <g style="fill:var(--crit);opacity:0.45">
+      <rect x="170" y="38" width="40" height="20"/><rect x="214" y="38" width="40" height="20"/><rect x="258" y="38" width="40" height="20"/><rect x="302" y="38" width="40" height="20"/><rect x="346" y="38" width="40" height="20"/>
+      <rect x="390" y="38" width="40" height="20"/><rect x="434" y="38" width="40" height="20"/><rect x="478" y="38" width="40" height="20"/><rect x="522" y="38" width="40" height="20"/><rect x="566" y="38" width="40" height="20"/>
+    </g>
+    <text x="170" y="76" style="fill:var(--ink-2)">read + write per op ≈ 10 passes over memory ≈ 40N bytes (+ residual input)</text>
+    <text x="20" y="116" style="fill:var(--good)">fused: 1 kernel</text>
+    <g style="fill:var(--good);opacity:0.5">
+      <rect x="170" y="102" width="40" height="20"/><rect x="214" y="102" width="40" height="20"/><rect x="258" y="102" width="40" height="20"/>
+    </g>
+    <text x="170" y="140" style="fill:var(--ink-2)">read inputs once, write output once ≈ 8–12N bytes</text>
+    <text x="20" y="180" style="fill:var(--ink)">Memory-bound ops run at memory speed: cutting bytes moved cuts time almost proportionally.</text>
+    <text x="20" y="200" style="fill:var(--ink-2)">Matmuls are already near peak in cuBLAS, so whole-model gains are 1.3–2×, not 5×.</text>
+  </g>
+</svg>
+<figcaption>Fusion's win is memory traffic: intermediates stay in registers instead of making a round trip to GPU memory for every element-wise step.</figcaption>
+</figure>
+<h4>Compile and distributed training</h4>
+<p>torch.compile composes with DDP and FSDP, with caveats. DDP's bucket all-reduces are triggered by autograd hooks; a whole-model compiled graph would hide those boundaries, so Dynamo splits graphs at bucket boundaries (DDPOptimizer) to keep overlap. FSDP2 is designed to be traced, and compiling per block keeps its all-gathers and reduce-scatters at block granularity. Compiled autograd extends capture to the backward hooks themselves. The practical rule: compile per block (regional compilation) in distributed jobs, measure overlap in a trace, and expect the first steps to be slow while every rank compiles.</p>
+
+<h4>Kernel launch overhead in numbers</h4>
+<p>Launching a CUDA kernel from PyTorch costs on the order of 5–20 microseconds of CPU time including Python and dispatcher overhead. A GPT-style layer in eager mode issues dozens of kernels in forward and more in backward; a 24-layer model can issue a few thousand per step, plus thousands more in a non-fused optimiser. At 10 µs each, 5,000 launches cost 50 ms of CPU time per step — negligible next to a 500 ms step at large batch, dominant next to a 20 ms step at small batch or in decode. This is the quantitative reason CUDA graphs and fusion matter most for small batches and inference, and why the same model can be compute-bound in training and overhead-bound in serving.</p>
+<h4>Compile caches and cold starts</h4>
+<p>Compilation cost is paid per process: every new training job, every restarted rank and every inference replica recompiles unless it can reuse earlier work. Inductor keeps on-disk caches of generated kernels and compiled graphs keyed by the graph and environment, so a second run of the same code on the same machine compiles much faster; PyTorch also provides ways to package compiled artefacts and carry them to other machines with the same software and hardware. For services that scale out frequently, cold-start time — model load plus compilation plus CUDA-graph capture — becomes a product metric, and teams warm caches at build time or keep replicas warm rather than compiling on the first user request.</p>
+
+<h4>When the compiler is not enough: custom kernels</h4>
+<p>Some operations are not expressible as a fusion of standard ops with good performance — a novel attention variant, a quantised matmul with an unusual packing, a fused cross-entropy over a huge vocabulary that never materialises the logits. Then teams write a kernel in Triton (Python-like GPU kernel language, gpu6) or CUDA and register it as a custom operator with <code>torch.library</code>, providing a fake (shape-only) implementation so <code>torch.compile</code> can trace through it without breaking the graph and an autograd formula if it is used in training. FlexAttention, in PyTorch itself, is a middle path for attention variants: you write the score modification as a small Python function, and the compiler generates a fused attention kernel for it.</p>
+<h4>Reading MFU honestly</h4>
+<p>MFU (model FLOPs utilisation) counts only the FLOPs the model mathematically needs — about 6N per token for training plus the attention term — divided by the hardware's peak. It deliberately ignores recomputation from activation checkpointing (which makes the GPU do more work than the model needs) and does not reward running extra FLOPs. A related number, hardware FLOPs utilisation, counts everything the GPU executes, including recomputation, so it is higher whenever checkpointing is on. When comparing optimisations, use MFU: turning on checkpointing to fit a larger batch is a win only if MFU, not hardware utilisation, goes up. Typical well-tuned large-model training reports MFU in the range of roughly 40–55% on recent GPUs; small models, short sequences and small batches land far lower because overheads and memory-bound operations take a larger share of each step.</p>
+</section>
+
+<section data-field="prod">
+<h4>A performance investigation, step by step</h4>
+<p>The order that works in practice: establish a baseline (tokens per second, MFU, step time with proper synchronisation); check data-wait time (pt5) and exposed communication (pt11) first, because no amount of kernel work fixes them; profile three steps and classify the time as idle gaps, launch-bound, memory-bound or compute-bound; fix the biggest category; re-measure. Keep a log of each change and its effect, because performance changes interact and some regress others (CUDA graphs can raise memory, max-autotune lengthens start-up, larger batches change the optimisation).</p>
+
+<h4>Failure mode: compile made it slower</h4>
+<p>Causes: recompiles on every new shape (variable sequence lengths, the last batch), possibly hitting the recompile limit and falling back to eager; many graph breaks inside the hot path; compile time not amortised over a short job; CUDA graphs re-recorded because inputs change addresses or shapes. Diagnose with <code>TORCH_LOGS="recompiles,graph_breaks"</code> and a trace; fix shapes first.</p>
+
+<h4>Failure mode: compiled results differ from eager</h4>
+<p>Small differences (in the last few bits) are expected, because fused kernels change the order of floating-point operations. Larger differences need bisection: run with <code>backend="eager"</code> (Dynamo capture only), then <code>"aot_eager"</code> (plus AOTAutograd), then <code>"inductor"</code>; the first backend that changes results localises the problem. Inductor's minifier tools can shrink a failing graph to a small reproduction for a bug report.</p>
+
+<h4>Failure mode: hidden synchronisations in libraries</h4>
+<p>Some synchronisations do not look like it: a metric library computing accuracy with boolean indexing, a logging callback calling <code>.item()</code> on several tensors every step, gradient clipping with <code>error_if_nonfinite=True</code> (which must read the norm), a learning-rate scheduler reading a tensor. <code>set_sync_debug_mode("warn")</code> for one step names them all.</p>
+
+<h4>The public case: the PyTorch 2 evaluation</h4>
+<p>The PyTorch 2 paper is the reference for what to expect from <code>torch.compile</code>: whole-graph capture most of the time, graph breaks caused mainly by non-PyTorch library calls, data-dependent control flow and printing, and geometric-mean speed-ups of 2.27× for inference and 1.41× for training on an A100 across 180+ models from TorchBench, Hugging Face and TIMM. Its ablation study shows that removing fusion or inlining loses much of the gain — confirming that the speed comes from memory traffic and overhead, not from faster matmuls. Quoting a geometric mean, not a promise, is the honest way to set expectations for a team adopting it.</p>
+<h4>Guarding performance in CI</h4>
+<p>Performance regressions are as real as correctness bugs and harder to notice: a refactor that adds a <code>.item()</code> in a helper, a new layer that causes a graph break, a dependency upgrade that changes a kernel choice. Teams that care run a short benchmark in continuous integration on the target hardware — a few hundred steps of a reduced model, timed with CUDA events after warm-up — and fail the build when throughput drops by more than a set margin. Logging the number of graph breaks and recompiles (from <code>TORCH_LOGS</code> or <code>torch._dynamo.utils.counters</code>) in the same job catches compiler regressions before they reach a long run.</p>
+
+<h4>Profiling distributed jobs</h4>
+<p>In multi-GPU training, profile one rank (or a few) for a handful of steps and look for three things on the timeline: communication kernels (NCCL all-reduce, all-gather, reduce-scatter) and whether they overlap with compute or sit exposed at the end of backward (pt11); differences between ranks' step times (stragglers); and waits inside collectives, which mean some other rank arrived late. Exposed communication is fixed with overlap, bucket and wrapping choices, or topology-aware parallelism; waiting in collectives is fixed by finding what delays the slow rank — often data loading or a synchronisation unique to that rank, such as rank 0's logging.</p>
+<h4>When to stop optimising</h4>
+<p>Performance work has diminishing returns, and a senior answer says when to stop. Compute what the remaining headroom is worth: if a run costs 2,000 GPU-hours and the next optimisation might save 5%, that is 100 GPU-hours — worth an afternoon, not a week, and not worth any risk to correctness. Prefer changes that are general (precision, fused optimisers, removing syncs, compile) over ones that are fragile (hand-tuned kernels for one shape), and keep every optimisation behind a flag with a correctness check, so it can be turned off when it breaks after an upgrade.</p>
+</section>
+
+<section data-field="lab">
+<p>CPU parts run on PyTorch 2.14 in <code>gpt_env</code>; about 15 minutes. GPU steps are marked. Save as <code>pt12_lab.py</code>.</p>
+<pre>import time, torch, torch.nn as nn, torch._dynamo as dynamo
+from torch.profiler import profile, ProfilerActivity, record_function
+
+# 1. graph breaks, counted without compiling code (backend-free explain)
+def f(x):
+    y = x.sin()
+    if y.sum() &gt; 0:
+        y = y * 2
+    print("side effect")
+    return y.cos() + float(x.mean())
+ex = dynamo.explain(f)(torch.randn(8))
+print("graphs", ex.graph_count, "breaks", ex.graph_break_count)
+for r in ex.break_reasons: print(" -", str(r.reason).splitlines()[0][:80])
+
+# 2. sync cost on CPU is tiny, but count the item() calls a loop makes
+model = nn.Sequential(*[nn.Linear(256, 256) for _ in range(8)])
+x = torch.randn(64, 256)
+with profile(activities=[ProfilerActivity.CPU]) as prof:
+    for _ in range(5):
+        with record_function("step"):
+            loss = model(x).sum(); loss.backward()
+            _ = loss.item()
+print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=8))
+prof.export_chrome_trace("pt12_trace.json")      # open at ui.perfetto.dev
+
+# 3. foreach vs naive optimiser step (CPU timing, illustrative)
+for fe in (False, True):
+    opt = torch.optim.AdamW(model.parameters(), foreach=fe)
+    t = time.perf_counter()
+    for _ in range(50): opt.step()
+    print("foreach" if fe else "for-loop", f"{(time.perf_counter() - t) / 50 * 1e3:.2f} ms/step")</pre>
+<ol>
+<li>Step 1 prints 4 graphs and 3 breaks with the three reasons from the body.</li>
+<li>Step 2's table lists <code>aten::item</code> among the operations; open the trace and find the "step" ranges.</li>
+<li>Step 3 shows the foreach step faster even on CPU; on GPU the gap is much larger because kernel launches dominate.</li>
+<li><strong>Needs a CUDA GPU:</strong> time a small model's step with and without <code>loss.item()</code> using CUDA events; then <code>torch.compile(model)</code> and <code>mode="reduce-overhead"</code>; set <code>torch.cuda.set_sync_debug_mode("warn")</code> and read the warnings. Expect the largest gains from removing the sync and from reduce-overhead at small batch.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Find the bug: a training loop that wastes half the GPU</b>
+<p>A 125M-parameter GPT trains on one GPU at batch 8, reaching 18% MFU. The team compiled the model and saw no improvement. Find the performance bugs.</p>
+<pre>model = torch.compile(GPT(cfg).cuda())
+opt = torch.optim.AdamW(model.parameters(), lr=6e-4)        # foreach/fused not set
+for step, (x, y) in enumerate(loader):                       # num_workers=0
+    x, y = x.cuda(), y.cuda()
+    logits, loss = model(x, y)
+    if torch.isnan(loss):                                     # NaN guard every step
+        raise RuntimeError("nan")
+    loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step(); opt.zero_grad()
+    for g in opt.param_groups:                                # schedule
+        g["lr"] = lr_at(step)
+    acc = (logits.argmax(-1)[y != -100] == y[y != -100]).float().mean()
+    print(step, loss.item(), norm.item(), acc.item())</pre>
+<details><summary>Answer</summary>
+<p><strong>Bug 1 — four synchronisations per step.</strong> <code>if torch.isnan(loss)</code> is a Python branch on a GPU value; boolean indexing <code>[y != -100]</code> has a data-dependent size; and three <code>.item()</code> calls in the print. Each forces the CPU to wait for the GPU, so the CPU never runs ahead and the GPU idles between steps. Fix: check for NaN every N steps (or with <code>error_if_nonfinite</code> occasionally), compute accuracy with a mask (<code>((pred == y) &amp; valid).sum() / valid.sum()</code>) kept on the GPU, and log every 50 steps.</p>
+<p><strong>Bug 2 — compile cannot help a sync-bound loop.</strong> The compiled forward is faster, but the step time is dominated by the gaps the syncs create and by data loading; compiling the model does not touch either. Measure with a trace before compiling.</p>
+<p><strong>Bug 3 — data loading in the main process, synchronous copies.</strong> <code>num_workers=0</code> and blocking <code>.cuda()</code> copies serialise data preparation with training. Fix: workers, <code>pin_memory=True</code>, <code>non_blocking=True</code> (pt5).</p>
+<p><strong>Bug 4 — a slow optimiser step and a Python learning rate.</strong> At batch 8 the step is short, so the optimiser's per-parameter kernels matter: use <code>fused=True</code>. Writing a new Python float into <code>param_groups</code> each step is fine in eager mode, but if the optimiser step is later compiled, the changing float becomes a guard and forces recompiles; store the learning rate as a tensor. Also consider <code>mode="reduce-overhead"</code> at this small batch once the syncs are gone, and a larger batch if memory allows. Expected result: MFU roughly doubling, verified with CUDA-event timing and a before/after trace.</p>
+</details>
+<b>Estimate: is this step launch-bound?</b>
+<p>A decode step of a 24-layer model at batch 1 launches about 30 kernels per layer, each taking about 8 µs of GPU time; PyTorch's launch overhead is about 10 µs per kernel. What limits the step, and what would CUDA graphs save?</p>
+<details><summary>Answer</summary>
+<p>Kernels: 24 × 30 = 720 per step. GPU time ≈ 720 × 8 µs ≈ 5.8 ms; CPU launch time ≈ 720 × 10 µs ≈ 7.2 ms. The CPU cannot launch faster than the GPU executes, so the step takes about 7.2 ms — launch-bound, with the GPU idle about 20% of the time. A CUDA graph replays all 720 kernels with one launch, so the step falls to roughly the GPU time, ≈ 5.8 ms (about 20% faster), and fusion with torch.compile can cut the kernel count — and the GPU time — further.</p>
+</details>
+</section>

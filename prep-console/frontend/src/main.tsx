@@ -3,6 +3,9 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import "./styles.css";
 import "./app.css";
+import "./tutor.css";
+import "./tree.css";
+import "./lesson.css";
 import { App } from "./App";
 
 createRoot(document.getElementById("root")!).render(

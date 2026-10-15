@@ -1,0 +1,451 @@
+<!-- topic source for mlc/mc24; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "mc24",
+  "t": "Speculative decoding: draft, verify, and the exact rejection rule",
+  "tag": "Inference",
+  "sum": "A cheap draft model proposes γ tokens and the target model checks them all in one pass: the accept-with-probability-min(1, p/q) rule and the residual distribution worked by hand, a proof that outputs follow the target exactly, expected tokens per target call (1 − α^(γ+1))/(1 − α), a loop and a batched implementation on tiny random-weight models, and an empirical check against the target's exact distribution.",
+  "prereq": [
+    ["mc20", "Sampling: softmax turns logits into probabilities and a token is drawn from them; temperature and top-k/top-p reshape the distribution first."],
+    ["mc18", "Autoregressive generation runs the model once per token; a KV cache stores past keys and values so each step only processes the new token."],
+    ["lm13", "Serving throughput: decoding one token at a time is limited by memory bandwidth, not arithmetic, so a forward pass over several tokens costs little more than over one."],
+    ["mc10", "A numerically stable softmax subtracts the maximum logit before exponentiating."]
+  ],
+  "myths": [
+    ["Speculative decoding trades quality for speed.", "With the rejection rule in this lesson, every emitted token is distributed exactly as if it had been sampled from the target model. The draft only changes how many target calls are needed, never what the target would have said in distribution. A worse draft makes it slower, not wrong."],
+    ["On rejection you resample from the target distribution p.", "That is the most common bug. Tokens the draft over-proposed have already been accepted with probability p/q; resampling from p on rejection adds even more probability to them. The correct fallback is the residual norm(max(0, p − q)), which adds exactly the missing mass. In this lesson's worked example the wrong rule gives [0.40, 0.36, 0.24] instead of [0.5, 0.3, 0.2]."],
+    ["A good draft model must agree with the target's top token.", "What matters is the overlap Σ min(p(x), q(x)), the probability a drafted token is accepted. A draft whose distributions are close to the target's in total variation gets a high acceptance rate even when its argmax differs sometimes. For greedy decoding the criterion does reduce to matching the argmax."],
+    ["More draft tokens always means more speed.", "The expected tokens per target call is (1 − α^(γ+1))/(1 − α), which saturates at 1/(1 − α), while drafting costs grow linearly with γ. With α = 0.8 and a draft costing 5% of the target, the walltime gain is 2.80× at γ = 4 and falls as γ grows large; the best γ depends on α and the cost ratio."],
+    ["The target model still runs once per token, so nothing is saved.", "The target runs once per round, scoring all γ drafted positions plus one more in a single forward pass. Because decoding is memory-bandwidth bound, that pass costs about the same as a one-token pass; the saving is the number of sequential passes."]
+  ],
+  "recap": [
+    "Speculative decoding uses a cheap draft model to propose γ tokens and the expensive target model to verify them in one parallel pass.",
+    "Drafted token x is accepted with probability min(1, p(x)/q(x)), checked as u·q(x) < p(x) to avoid dividing.",
+    "At the first rejection, a replacement is sampled from the residual norm(max(0, p − q)) and the round ends; if all γ are accepted, one bonus token is sampled from the target's next distribution.",
+    "The output distribution equals p: P(x) = q(x)·min(1, p(x)/q(x)) + (1 − β)·residual(x) = min(p, q) + (p − min(p, q)) = p(x).",
+    "The per-token acceptance probability β = Σ min(p, q) = 1 − TV(p, q); its average is the acceptance rate α.",
+    "With independent acceptances, a round produces (1 − α^(γ+1))/(1 − α) tokens per target call, and the walltime gain is that divided by (γc + 1), where c is the draft's cost relative to the target.",
+    "Drafting is sequential, but target verification is one batched call over γ + 1 contexts, and acceptance is one vectorised comparison.",
+    "An exactness test compares sequences from speculative decoding with the target's exact distribution, alongside plain sampling as the noise baseline.",
+    "Sampling settings (temperature, top-k, top-p) must be applied identically to p and q before the rule, and the KV caches must roll back rejected positions."
+  ],
+  "glossary": [
+    ["Acceptance rate (α)", "The average probability that a drafted token is accepted, equal to the expected overlap Σ min(p, q) between target and draft distributions."],
+    ["Bonus token", "The extra token sampled from the target's distribution after all γ drafted tokens are accepted, using the target pass already computed."],
+    ["Cost coefficient (c)", "The time of one draft forward pass divided by the time of one target forward pass."],
+    ["Draft model", "A smaller, faster model whose proposals are verified by the target."],
+    ["Inverse-CDF sampling", "Drawing from a discrete distribution by finding where a uniform random number falls in its cumulative sums."],
+    ["Residual distribution", "norm(max(0, p − q)): the target probability mass the draft under-proposed, used to resample after a rejection."],
+    ["Speculative decoding", "Generating with a draft model's guesses that a target model verifies, keeping the target's output distribution."],
+    ["Target model", "The large model whose output distribution must be preserved."],
+    ["Total variation distance", "Half the sum of absolute differences between two distributions; 0 for identical, 1 for disjoint."],
+    ["γ (gamma)", "The number of tokens the draft proposes per round."]
+  ],
+  "qa": [
+    ["E", "How does speculative decoding speed up generation?", "A cheap draft model proposes several tokens one at a time; the target model then evaluates all of those positions in one forward pass, which costs about the same as a single-token pass because decoding is memory-bound. Accepted tokens are kept, so each target pass can yield several tokens instead of one. The acceptance rule guarantees the result is distributed exactly as target-only sampling."],
+    ["E", "State the acceptance rule.", "For each drafted token x in order, with target probability p(x) and draft probability q(x), accept with probability min(1, p(x)/q(x)) — always if p ≥ q. At the first rejection, sample a replacement from norm(max(0, p − q)) and stop the round. If all γ tokens are accepted, sample one more token from the target's distribution for the next position."],
+    ["E", "Why is the output distribution unchanged?", "For one position: a token x comes out either by being drafted and accepted, with probability q(x)·min(1, p/q) = min(p(x), q(x)), or by a rejection followed by resampling, with probability (1 − β)·(p(x) − min(p, q))/(1 − β), where β = Σ min(p, q). The sum is p(x). Later positions are conditioned on the accepted prefix, so the argument repeats."],
+    ["M", "Work the example p = [0.5, 0.3, 0.2], q = [0.3, 0.5, 0.2].", "β = min summed = 0.3 + 0.3 + 0.2 = 0.8, so a drafted token is accepted 80% of the time. Residual = max(0, p − q) = [0.2, 0, 0], normalised to [1, 0, 0]. Token 0: drafted with 0.3 and always accepted (p ≥ q) = 0.3, plus rejection mass 0.2 × 1 = 0.5. Token 1: drafted with 0.5, accepted with 0.3/0.5 = 0.6, giving 0.3. Token 2: 0.2. Exactly p.", "Follow-up: What if you resample from p on rejection? — Token 1 would get 0.3 + 0.2 × 0.3 = 0.36: the draft's over-proposed token gains probability, so the output is biased toward the draft."],
+    ["M", "How many tokens does one target call produce on average?", "If each drafted token is accepted independently with probability α, the number accepted before the first rejection is geometric, capped at γ, and one target token is always added. The expectation is (1 − α^(γ+1))/(1 − α). With α = 0.8 and γ = 4 that is 3.36 tokens per target call; the cap as γ grows is 1/(1 − α) = 5.", "Follow-up: And the walltime gain? — Divide by the cost of a round in target-pass units, γc + 1: with a draft at 5% of the target's cost, 3.36 / 1.2 = 2.80×."],
+    ["M", "What is α in terms of the two distributions?", "For one position, β = Σ min(p(x), q(x)) = 1 − TV(p, q), one minus the total variation distance. α is its average over the positions met during generation. So a draft is good exactly when its next-token distributions are close to the target's, which is why drafts are usually distilled from or trained alongside the target."],
+    ["M", "Which parts can be vectorised?", "Drafting is sequential — each draft token depends on the previous one. Target verification is one batched call over the γ + 1 contexts. Acceptance is one comparison of γ uniform numbers against p/q, the first rejection is found with argmin, and the residual is one vector operation. In a real system the target's batched pass is a single forward over γ + 1 positions with the KV cache."],
+    ["M", "How do you test that an implementation is exact?", "Analytically: for random p and q, compute q·min(1, p/q) + (1 − β)·residual and check it equals p. Empirically: on small models, enumerate the target's exact probability of every short sequence, generate many sequences with speculative decoding, and compare with total variation — using plain target sampling with the same sample size as the noise baseline. Also run the known-buggy variant to confirm the test can detect bias."],
+    ["H", "How do temperature and top-p interact with speculative decoding?", "The rule preserves whatever distribution p is, so p must be the target's distribution after the same temperature, top-k and top-p transformations used in normal decoding, and q must be the draft's distribution under its own settings. Apply transformations before computing acceptance. Under greedy decoding (temperature 0) p and q are one-hot, and the rule reduces to accepting while the draft's token equals the target's argmax.", "Follow-up: What breaks if top-p is applied to p but not q? — Nothing in correctness — p is still preserved — but q may propose tokens outside p's nucleus, which are always rejected, lowering α."],
+    ["H", "How does the KV cache work with rejections?", "Both models extend their caches as they process drafted tokens. After a round accepts n of γ, the target's cache must keep only the prefix plus the n accepted tokens (the position of the replacement or bonus token is computed on the next round), and the draft's cache must be truncated to the same point. Caches are usually managed as lengths or page tables so rollback is a pointer change, not a copy."],
+    ["H", "Choose γ for α = 0.8 and c = 0.05.", "Maximise (1 − α^(γ+1)) / ((1 − α)(γc + 1)) over integers. γ = 3: 2.95/1.15 = 2.57; γ = 4: 3.36/1.2 = 2.80; γ = 5: 3.69/1.25 = 2.95; γ = 6: 3.95/1.3 = 3.04; γ = 7: 4.16/1.35 = 3.08; γ = 8: 4.33/1.4 = 3.09; γ = 9: 4.46/1.45 = 3.08. The optimum is around 8 and flat between 6 and 10, so in practice choose the smaller end to limit wasted work when α varies, or adapt γ to recent acceptance."],
+    ["H", "When does speculative decoding not help?", "When the target is not memory-bound — large batches on a busy server already use the hardware's arithmetic, so verifying γ + 1 positions costs nearly γ + 1 times as much. When α is low (the draft disagrees with the target), most work is wasted. When the draft is not much cheaper than the target. And for very short outputs, where fixed overheads dominate. It shines for single-stream, latency-sensitive decoding with a well-matched draft."]
+  ],
+  "refs": [
+    ["paper", "Fast inference from transformers via speculative decoding (Leviathan, Kalman, Matias; ICML 2023)", "The algorithm, the proof that outputs follow the target, α = E[Σ min(p, q)], expected tokens (1 − α^(γ+1))/(1 − α) and the walltime improvement (1 − α^(γ+1))/((1 − α)(γc + 1)).", "https://arxiv.org/abs/2211.17192"],
+    ["paper", "Accelerating large language model decoding with speculative sampling (Chen et al., DeepMind 2023)", "The same rule derived independently; reports a 2-2.5× decoding speedup on Chinchilla 70B in a distributed setup.", "https://arxiv.org/abs/2302.01318"],
+    ["docs", "NumPy: numpy.random.Generator", "The seeded generator used for reproducible draws in the tests.", "https://numpy.org/doc/stable/reference/random/generator.html"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A large language model generates text one token at a time: each new token needs a full forward pass through the network, and each pass must wait for the previous token. On a GPU, that pass is dominated not by arithmetic but by reading every weight from memory, so a 70-billion-parameter model spends most of each step moving 140 GB of 16-bit weights to produce one token — and could have processed several tokens in that same pass almost for free, if only it knew what they were. A small model, a tenth or a hundredth the size, can guess the next few tokens quickly and is often right on the easy ones ("the", a closing bracket, the rest of a common word).</p>
+<p>Speculative decoding turns that observation into an algorithm. The small <strong>draft</strong> model proposes γ tokens. The large <strong>target</strong> model scores all γ positions in one forward pass. A careful acceptance rule keeps drafted tokens with probability min(1, p/q), and on the first rejection samples a replacement from a specific <em>residual</em> distribution. The remarkable property, proved by Leviathan, Kalman and Matias and independently by Chen and colleagues at DeepMind in 2023, is that the result is distributed <em>exactly</em> as if the target had generated every token itself. The draft changes only the speed. Chen et al. reported 2-2.5× faster decoding on the 70-billion-parameter Chinchilla.</p>
+<p>The interview problem asks you to implement the rule and prove it, which tests probability reasoning as much as NumPy. This lesson does both: the rule in plain words and equations; a three-token worked example where the output distribution can be added up by hand (and the most common bug gives the wrong answer by 0.1); the expected number of tokens per target call, (1 − α^(γ+1))/(1 − α), worked for α = 0.8; a loop implementation and a batched one on tiny random-weight language models; and tests that check the rule analytically on 1,000 random distributions, that the two implementations agree draw for draw, that 20,000 generated sequences match the target's exact distribution as closely as plain sampling does, that the buggy variant is detectably biased, and that tokens per call match the formula.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: a junior drafting, a senior signing off</h4>
+<p>A senior lawyer's time is expensive, and writing a contract clause by clause, each one waiting for the last, wastes it. So a junior drafts the next five clauses quickly. The senior reads all five at once — reading is fast compared with writing — and goes through them in order. Each clause the senior would have been at least as likely to write is kept. A clause the junior was over-eager about is kept only some of the time, in proportion to how much the senior agrees. At the first clause the senior rejects, the senior writes a replacement, choosing among wordings the junior under-used, and the draft from there on is thrown away, since it was built on the rejected clause. If all five pass, the senior adds a sixth of their own. The final contract reads exactly as if the senior had written it alone — but the senior "wrote" several clauses per sitting instead of one.</p>
+<p>The junior is the <strong>draft model</strong> q; the senior is the <strong>target model</strong> p; reading five clauses at once is the <strong>batched verification pass</strong>; keeping a clause with probability min(1, p/q) is the <strong>acceptance rule</strong>; writing a replacement from the under-used wordings is sampling the <strong>residual</strong> norm(max(0, p − q)); the sixth clause is the <strong>bonus token</strong>.</p>
+<p>The analogy breaks in a useful place: a human senior who disagrees writes what they prefer. The algorithm's senior must <em>sample</em> the replacement from a precise distribution — the part of p that q left out — or the contract would no longer read like the senior's own. That one detail is what makes the method exact.</p>
+
+<h4>What the interviewer is checking</h4>
+<p>Three things, in order of how often candidates miss them. First, the probability argument: can you show, not just assert, that the output follows the target? The two-term sum — accepted mass min(p, q) plus residual mass p − min(p, q) — is the whole proof, and saying it cleanly is the strongest signal in this round. Second, the residual: many candidates know "accept with p/q" but resample from p on rejection, which is wrong in a way that is easy to demonstrate with three tokens. Third, the systems reasoning: why one target pass over several positions costs about the same as over one, why drafting cannot be parallelised, and when the trick stops paying. The implementation itself is short; the explanation around it is what is being graded.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="One round of speculative decoding with gamma equals 4. The draft model proposes tokens x1 to x4 one at a time. The target model evaluates the prefix plus the drafts at five positions in one pass, giving p1 to p5. Acceptance checks run left to right: x1 accepted, x2 accepted, x3 rejected; a replacement is sampled from the residual of p3 minus q3, and x4 is discarded. Output: x1, x2 and the replacement — three tokens for one target pass.">
+  <defs><marker id="mc24-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="10" y="40" style="fill:var(--ink)">draft q</text>
+    <rect x="90" y="24" width="90" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="135" y="41" text-anchor="middle" style="fill:var(--ink)">prefix</text>
+    <rect x="190" y="24" width="60" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="220" y="41" text-anchor="middle" style="fill:var(--ink)">x1</text>
+    <rect x="260" y="24" width="60" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="290" y="41" text-anchor="middle" style="fill:var(--ink)">x2</text>
+    <rect x="330" y="24" width="60" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="360" y="41" text-anchor="middle" style="fill:var(--ink)">x3</text>
+    <rect x="400" y="24" width="60" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="430" y="41" text-anchor="middle" style="fill:var(--ink)">x4</text>
+    <text x="520" y="41" style="fill:var(--muted)">4 cheap passes,</text>
+    <text x="520" y="57" style="fill:var(--muted)">one at a time</text>
+    <text x="10" y="110" style="fill:var(--ink)">target p</text>
+    <rect x="90" y="88" width="440" height="36" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="310" y="104" text-anchor="middle" style="fill:var(--ink);font-weight:600">ONE pass over 5 positions</text>
+    <text x="310" y="119" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">p1  p2  p3  p4  p5</text>
+    <line x1="310" y1="52" x2="310" y2="86" marker-end="url(#mc24-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="10" y="170" style="fill:var(--ink)">check</text>
+    <rect x="190" y="152" width="60" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="220" y="170" text-anchor="middle" style="fill:var(--good)">accept</text>
+    <rect x="260" y="152" width="60" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="290" y="170" text-anchor="middle" style="fill:var(--good)">accept</text>
+    <rect x="330" y="152" width="60" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="360" y="170" text-anchor="middle" style="fill:var(--crit)">reject</text>
+    <rect x="400" y="152" width="60" height="28" rx="3" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="430" y="170" text-anchor="middle" style="fill:var(--muted)">discard</text>
+    <text x="520" y="160" style="fill:var(--muted)">u·q(x) &lt; p(x)?</text>
+    <text x="520" y="176" style="fill:var(--muted)">left to right</text>
+    <text x="10" y="232" style="fill:var(--ink)">output</text>
+    <rect x="190" y="216" width="60" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="220" y="234" text-anchor="middle" style="fill:var(--ink)">x1</text>
+    <rect x="260" y="216" width="60" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="290" y="234" text-anchor="middle" style="fill:var(--ink)">x2</text>
+    <rect x="330" y="216" width="110" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="385" y="234" text-anchor="middle" style="fill:var(--ink)">y ~ max(0, p3 − q3)</text>
+    <text x="520" y="228" style="fill:var(--good)">3 tokens for</text>
+    <text x="520" y="244" style="fill:var(--good)">1 target pass</text>
+  </g>
+</svg>
+<figcaption>The target's single pass already contains the distribution for every position, including the one after the last draft (p5), which supplies the bonus token when all drafts pass. Everything after the first rejection is thrown away because it was conditioned on a token that is no longer there.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<h4>1. The problem as it is usually asked</h4>
+<p>"Implement speculative sampling: given a draft model and a target model that both return next-token distributions, generate tokens using γ draft proposals per round, so that the output is distributed exactly as sampling from the target. Prove it, and say how much faster it is." Clarify: both models share a vocabulary; the target can evaluate many positions in one call; sampling is plain (temperature 1) unless stated; we need a proof, a working implementation, and a test that the output distribution is right. Outline: the rule and the proof by hand; the expected-speed formula; a loop implementation; a batched one; tests.</p>
+
+<h4>2. The maths in plain words</h4>
+<p>At one position the draft says "token x with probability q(x)" and the target says "x with probability p(x)". Draw x from the draft. If the target likes x at least as much as the draft did (p(x) ≥ q(x)), keep it. If the target likes it less, keep it only with probability p(x)/q(x) — the fraction of the draft's enthusiasm the target shares. This alone gives every token probability min(p(x), q(x)) of coming out, which is too little for tokens the draft under-proposed. The missing amount for each token is p(x) − min(p, q) = max(0, p(x) − q(x)). Rejections happen with total probability 1 − Σ min(p, q), and that is exactly the total missing amount. So on rejection, draw from the missing amounts, normalised — the residual — and every token ends up with exactly p(x).</p>
+<p>The speed comes from doing this for several positions per target pass. The draft proposes x<sub>1</sub>…x<sub>γ</sub> one after another (each conditioned on the previous ones). The target computes p at all γ positions, plus the one after, in one batched pass. Then the checks run left to right; the first rejection ends the round with a residual sample, and if none occurs, the target's distribution at position γ + 1 provides a free extra token.</p>
+
+<h4>3. The equations</h4>
+<pre>draft:        x_i ~ q_i = q(· | prefix, x_1..x_{i-1})            i = 1..γ      (γ sequential draft calls)
+verify:       p_i = p(· | prefix, x_1..x_{i-1})                 i = 1..γ+1    (ONE batched target call)
+accept x_i:   u_i ~ U(0,1);   accept  ⟺  u_i · q_i(x_i) &lt; p_i(x_i)   (i.e. u &lt; p/q; always if p ≥ q)
+n = number accepted before the first rejection
+if n &lt; γ:     y ~ norm(max(0, p_{n+1} − q_{n+1}))                (residual)
+else:         y ~ p_{γ+1}                                        (bonus token)
+emit:         x_1 .. x_n, y                                       (n + 1 tokens per round)
+
+exactness:    P(x) = q(x)·min(1, p(x)/q(x)) + (1 − β)·max(0, p(x) − q(x))/(1 − β)
+                   = min(p, q)(x) + p(x) − min(p, q)(x) = p(x),      β = Σ_x min(p(x), q(x))
+acceptance:   β = 1 − TV(p, q),   α = E[β]
+speed:        E[tokens per target call] = (1 − α^{γ+1}) / (1 − α)
+              walltime gain = (1 − α^{γ+1}) / ((1 − α)(γc + 1)),   c = draft cost / target cost</pre>
+
+<h4>4. A worked example by hand</h4>
+<p>Three tokens. Target p = [0.5, 0.3, 0.2]; draft q = [0.3, 0.5, 0.2]. The draft under-proposes token 0, over-proposes token 1, and matches token 2.</p>
+<ul>
+<li><strong>Acceptance probability.</strong> β = min(0.5, 0.3) + min(0.3, 0.5) + min(0.2, 0.2) = 0.3 + 0.3 + 0.2 = <strong>0.8</strong>. Equivalently, the total variation distance is ½(0.2 + 0.2 + 0) = 0.2.</li>
+<li><strong>Residual.</strong> max(0, p − q) = [0.2, 0, 0]; normalised, [1, 0, 0]. After a rejection the replacement is always token 0 — the only one the draft under-served.</li>
+<li><strong>Token 0.</strong> Drafted with probability 0.3; since p ≥ q it is always accepted: 0.3. Rejections (probability 0.2) always produce token 0: +0.2. Total <strong>0.5</strong>.</li>
+<li><strong>Token 1.</strong> Drafted with 0.5; accepted with 0.3/0.5 = 0.6: 0.5 × 0.6 = <strong>0.3</strong>. Never produced by the residual.</li>
+<li><strong>Token 2.</strong> Drafted with 0.2, always accepted: <strong>0.2</strong>.</li>
+</ul>
+<p>Exactly p. Now the bug: resample from p instead of the residual on rejection. Token 0: 0.3 + 0.2 × 0.5 = 0.40; token 1: 0.3 + 0.2 × 0.3 = 0.36; token 2: 0.2 + 0.2 × 0.2 = 0.24. The output leans toward the draft's over-proposed token 1, by 0.06 — a bias that compounds over a long generation.</p>
+<p><strong>Speed by hand.</strong> With α = 0.8 and γ = 4, the expected tokens per target call are (1 − 0.8<sup>5</sup>)/(1 − 0.8) = (1 − 0.32768)/0.2 = <strong>3.36</strong>. If a draft pass costs c = 0.05 of a target pass, a round costs 4 × 0.05 + 1 = 1.2 target-pass units, so the walltime gain is 3.36/1.2 = <strong>2.80×</strong>. The paper's Table 1 lists 3.69× for α = 0.8, γ = 5 with c = 0, which the formula reproduces. The first block asserts every number.</p>
+<figure>
+<svg viewBox="0 -10 640 260" width="100%" role="img" aria-label="Bar chart for the worked example over three tokens. Target p is 0.5, 0.3, 0.2; draft q is 0.3, 0.5, 0.2. The accepted mass min of p and q is 0.3, 0.3, 0.2, totalling 0.8. The residual max of p minus q is 0.2, 0, 0, which is exactly the probability of rejection, 0.2. Stacking accepted mass and residual gives back p.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="60" y1="200" x2="620" y2="200" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="52" y="204" text-anchor="end" style="fill:var(--muted)">0</text>
+    <text x="52" y="104" text-anchor="end" style="fill:var(--muted)">0.25</text>
+    <line x1="60" y1="100" x2="620" y2="100" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <text x="150" y="222" text-anchor="middle" style="fill:var(--ink)">token 0</text>
+    <text x="330" y="222" text-anchor="middle" style="fill:var(--ink)">token 1</text>
+    <text x="510" y="222" text-anchor="middle" style="fill:var(--ink)">token 2</text>
+    <rect x="95" y="0" width="30" height="200" style="fill:var(--s1)"/>
+    <rect x="130" y="80" width="30" height="120" style="fill:var(--s2)"/>
+    <rect x="165" y="80" width="30" height="120" style="fill:var(--good)"/>
+    <rect x="165" y="0" width="30" height="80" style="fill:var(--s4)"/>
+    <rect x="275" y="80" width="30" height="120" style="fill:var(--s1)"/>
+    <rect x="310" y="0" width="30" height="200" style="fill:var(--s2)"/>
+    <rect x="345" y="80" width="30" height="120" style="fill:var(--good)"/>
+    <rect x="455" y="120" width="30" height="80" style="fill:var(--s1)"/>
+    <rect x="490" y="120" width="30" height="80" style="fill:var(--s2)"/>
+    <rect x="525" y="120" width="30" height="80" style="fill:var(--good)"/>
+    <text x="180" y="44" text-anchor="middle" style="fill:var(--surface)">+0.2</text>
+    <rect x="70" y="232" width="12" height="12" style="fill:var(--s1)"/><text x="88" y="243" style="fill:var(--ink)">p (target)</text>
+    <rect x="180" y="232" width="12" height="12" style="fill:var(--s2)"/><text x="198" y="243" style="fill:var(--ink)">q (draft)</text>
+    <rect x="290" y="232" width="12" height="12" style="fill:var(--good)"/><text x="308" y="243" style="fill:var(--ink)">accepted: min(p, q)</text>
+    <rect x="450" y="232" width="12" height="12" style="fill:var(--s4)"/><text x="468" y="243" style="fill:var(--ink)">from residual (0.2 × [1, 0, 0])</text>
+  </g>
+</svg>
+<figcaption>The green bars are what acceptance delivers on its own — 0.8 of the mass. Rejections happen with the remaining 0.2, and the residual puts all of it where the draft fell short, on token 0. Green plus orange rebuilds the target bars exactly; resampling from p instead would spread that 0.2 over all three tokens.</figcaption>
+</figure>
+
+<pre class="run">import numpy as np
+
+# The hand-worked example: three tokens, target p and draft q.
+p = np.array([0.5, 0.3, 0.2]); q = np.array([0.3, 0.5, 0.2])
+beta = np.minimum(p, q).sum()                                  # acceptance probability = 1 - TV(p, q)
+residual = np.maximum(p - q, 0) / np.maximum(p - q, 0).sum()
+out = q * np.minimum(1, p / q) + (1 - beta) * residual         # P(emit x) after one speculative token
+assert np.isclose(beta, 0.8) and residual.tolist() == [1.0, 0.0, 0.0]
+assert np.allclose(out, p)                                     # 0.3 + 0.2, 0.3, 0.2: exactly the target
+wrong = q * np.minimum(1, p / q) + (1 - beta) * p              # resample from p instead of the residual
+assert np.allclose(wrong, [0.4, 0.36, 0.24])                   # biased toward the draft's mistakes
+
+# Expected tokens per target call and walltime improvement (Leviathan et al., Eq. 1 and Thm 3.8).
+def expected_tokens(alpha, gamma):
+    return (1 - alpha ** (gamma + 1)) / (1 - alpha)
+def walltime_gain(alpha, gamma, c):
+    return expected_tokens(alpha, gamma) / (gamma * c + 1)
+assert round(expected_tokens(0.8, 4), 4) == 3.3616
+assert round(walltime_gain(0.8, 4, 0.05), 2) == 2.80
+assert round(expected_tokens(0.8, 5), 2) == 3.69               # the paper's Table 1 (c = 0)</pre>
+
+<h4>5. The naive implementation: loops on tiny models</h4>
+<p>To test the algorithm we need two language models that are cheap, deterministic and whose exact output distributions can be computed. <code>TinyLM</code> is an order-2 model: random logits indexed by the previous two tokens, a stand-in for a transformer's next-token head. The target has logits of scale 2; the draft adds noise of scale 0.7 to the same logits, so it is a decent but imperfect approximation (at the empty context, β ≈ 0.84). Both expose <code>probs(contexts)</code>, which evaluates many contexts in one call — the equivalent of a transformer's single forward pass over several positions. <code>sample</code> draws by inverse CDF from a supplied uniform number, so a test can feed two implementations the same random stream.</p>
+<p>The naive round follows the algorithm literally: draft γ tokens in a loop, call the target once per position (deliberately unbatched), draw γ uniforms, check left to right with <code>u · q(x) &lt; p(x)</code> — multiplying instead of dividing avoids a division by q, which matters when q is tiny — and on the first failure sample the residual (the <code>sample</code> function normalises by the cumulative total, so the unnormalised residual can be passed directly).</p>
+<pre class="run">V, SEED = 4, 0                                                 # vocabulary size; tokens 0..3, 0 also pads
+
+def softmax(z, axis=-1):
+    z = z - z.max(axis=axis, keepdims=True)                     # stable: largest logit becomes 0
+    e = np.exp(z)
+    return e / e.sum(axis=axis, keepdims=True)
+
+class TinyLM:
+    """A random-weight order-2 language model: next-token logits depend on the last two tokens.
+    Stands in for a transformer: probs(contexts) evaluates many contexts in ONE call."""
+    def __init__(self, logits):
+        self.logits = logits                                     # (V, V, V): [a, b] -&gt; logits of next token
+
+    def probs(self, ctx):                                        # ctx: (..., 2) integer array
+        ctx = np.asarray(ctx)
+        return softmax(self.logits[ctx[..., 0], ctx[..., 1]])
+
+rng = np.random.default_rng(SEED)
+target = TinyLM(rng.normal(scale=2.0, size=(V, V, V)))
+draft = TinyLM(target.logits + rng.normal(scale=0.7, size=(V, V, V)))   # a cheaper, noisier guess of it
+
+def sample(probs, u):
+    """Inverse-CDF sampling: index of the first cumulative probability above u * total."""
+    c = np.cumsum(probs, axis=-1)
+    return int(np.searchsorted(c, u * c[-1], side="right").clip(max=len(probs) - 1))
+
+def spec_step_naive(seq, gamma, rng):
+    """One round of speculative sampling, written as plain loops."""
+    ctx, qs, xs = list(seq), [], []
+    for _ in range(gamma):                                       # 1. draft proposes gamma tokens
+        q_i = draft.probs(ctx[-2:]); x = sample(q_i, rng.random())
+        qs.append(q_i); xs.append(x); ctx.append(x)
+    ps = [target.probs((list(seq) + xs[:i])[-2:]) for i in range(gamma + 1)]   # 2. target scores all
+    us, out = [rng.random() for _ in range(gamma)], []
+    for i, x in enumerate(xs):                                   # 3. accept or reject, left to right
+        if us[i] * qs[i][x] &lt; ps[i][x]:                          # u &lt; p/q, written without dividing
+            out.append(x)
+        else:
+            r = np.maximum(ps[i] - qs[i], 0.0)
+            out.append(sample(r, rng.random()))                  # residual: norm(max(0, p - q))
+            return out
+    out.append(sample(ps[gamma], rng.random()))                  # all accepted: one bonus token from p
+    return out</pre>
+
+<h4>6. The batched implementation</h4>
+<p>Drafting stays a loop: each draft token conditions on the previous one, and that dependency is the whole reason the target is slow too. Everything else becomes array operations. The target's γ + 1 contexts are stacked into one array and scored with one <code>probs</code> call — the single verification pass. Acceptance for all γ positions is one comparison of a vector of uniforms against p/q, written as <code>u * q[i, x_i] &lt; p[i, x_i]</code> with fancy indexing. The number accepted is γ if everything passed, otherwise the index of the first <code>False</code>, found with <code>argmin</code> on the boolean array. The last token comes from the residual at that index or from the bonus distribution. <code>generate</code> repeats rounds until enough tokens exist and counts target calls and accepted drafts.</p>
+<pre class="run">def spec_step(seq, gamma, rng):
+    """Same algorithm, vectorised where it can be: one batched target call over gamma + 1 contexts,
+    one comparison for all acceptances, the first rejection found with argmin."""
+    ctx = list(seq)
+    q = np.empty((gamma, V)); xs = np.empty(gamma, dtype=int)
+    for i in range(gamma):                                       # drafting is inherently sequential
+        q[i] = draft.probs(ctx[-2:]); xs[i] = sample(q[i], rng.random()); ctx.append(int(xs[i]))
+    full = np.array(list(seq) + xs.tolist())
+    contexts = np.stack([full[len(seq) - 2 + i: len(seq) + i] for i in range(gamma + 1)])
+    p = target.probs(contexts)                                   # (gamma + 1, V): ONE target call
+    u = rng.random(gamma)
+    ok = u * q[np.arange(gamma), xs] &lt; p[np.arange(gamma), xs]
+    n = gamma if ok.all() else int(np.argmin(ok))                # tokens accepted before the first rejection
+    if n &lt; gamma:
+        last = sample(np.maximum(p[n] - q[n], 0.0), rng.random())
+    else:
+        last = sample(p[gamma], rng.random())
+    return xs[:n].tolist() + [last], n
+
+def generate(n_tokens, gamma, rng, start=(0, 0)):
+    seq, calls, accepted = list(start), 0, 0
+    while len(seq) - 2 &lt; n_tokens:
+        new, n = spec_step(seq, gamma, rng)
+        seq += new; calls += 1; accepted += n
+    return seq[2:2 + n_tokens], calls, accepted</pre>
+
+<h4>7. Testing it</h4>
+<p>Six checks. <strong>(1)</strong> The exactness identity on 1,000 random pairs of 7-token distributions drawn from a Dirichlet with concentration 0.5 (so many entries are near zero, the hard case): q·min(1, p/q) + (1 − β)·residual equals p every time. <strong>(2)</strong> The naive and batched rounds return identical tokens for 200 seeds — same algorithm, same random stream. <strong>(3)</strong> The empirical test that matters: generate 20,000 three-token sequences with speculative decoding (γ = 3) and 20,000 with plain target sampling, enumerate the target's exact probability for all 4<sup>3</sup> = 64 sequences, and compare total variation distances. Both are about 0.017 (0.0169 and 0.0162 in the reference run), and they differ by far less than the sampling noise; the assertion requires both under 0.03 and within 0.01 of each other. Plain sampling is the yardstick: with finite samples TV is never zero, so the question is whether speculative decoding is as close as the real thing. <strong>(4)</strong> The test can see a bug: the resample-from-p variant, on the first token alone, lands at a TV of about 0.11 — more than four times the correct method's. <strong>(5)</strong> Tokens per target call: with context-independent p = [0.4, 0.3, 0.2, 0.1] and q uniform, β is a constant 0.8; 20,000 rounds with γ = 4 average 3.35 tokens per call against the formula's 3.36. <strong>(6)</strong> If PyTorch is installed, the batched softmax matches <code>torch.softmax</code> to 10<sup>−12</sup>.</p>
+<pre class="run">import itertools
+
+# 1. The acceptance rule reproduces p exactly, for any p and q (analytic check, 1,000 random pairs).
+r = np.random.default_rng(1)
+for _ in range(1000):
+    pp = r.dirichlet(np.ones(7) * 0.5); qq = r.dirichlet(np.ones(7) * 0.5)
+    b = np.minimum(pp, qq).sum()
+    res = np.maximum(pp - qq, 0); res = res / res.sum() if res.sum() &gt; 0 else pp
+    assert np.allclose(qq * np.minimum(1, pp / qq) + (1 - b) * res, pp)
+
+# 2. Naive and vectorised steps agree draw for draw when fed the same random numbers.
+for s in range(200):
+    a = spec_step_naive([0, 0, 3], 4, np.random.default_rng(s))
+    b2, _ = spec_step([0, 0, 3], 4, np.random.default_rng(s))
+    assert a == b2
+
+# 3. Empirical check: whole 3-token sequences from speculative decoding match the target's exact
+#    distribution over all 4^3 = 64 sequences, as well as plain sampling from the target does.
+def exact_target_dist(n=3, start=(0, 0)):
+    dist = {}
+    for seq in itertools.product(range(V), repeat=n):
+        full, pr = list(start) + list(seq), 1.0
+        for i in range(n):
+            pr *= target.probs(full[i:i + 2])[seq[i]]
+        dist[seq] = pr
+    return dist
+exact = exact_target_dist()
+assert abs(sum(exact.values()) - 1) &lt; 1e-12
+N = 20_000
+g = np.random.default_rng(7)
+spec_counts, plain_counts = {}, {}
+calls_total = acc_total = 0
+for _ in range(N):
+    s, calls, acc = generate(3, gamma=3, rng=g)
+    spec_counts[tuple(s)] = spec_counts.get(tuple(s), 0) + 1
+    calls_total += calls; acc_total += acc
+    ctx = [0, 0]
+    for _ in range(3):
+        ctx.append(sample(target.probs(ctx[-2:]), g.random()))
+    plain_counts[tuple(ctx[2:])] = plain_counts.get(tuple(ctx[2:]), 0) + 1
+tv = lambda counts: 0.5 * sum(abs(counts.get(k, 0) / N - v) for k, v in exact.items())
+tv_spec, tv_plain = tv(spec_counts), tv(plain_counts)
+assert tv_spec &lt; 0.03 and tv_plain &lt; 0.03 and abs(tv_spec - tv_plain) &lt; 0.01
+
+# 4. The common bug -- resampling from p on rejection -- is visibly biased at this sample size.
+def biased_first_token(n, rng):
+    q0, p0 = draft.probs([0, 0]), target.probs([0, 0])
+    x = np.array([sample(q0, u) for u in rng.random(n)])
+    keep = rng.random(n) * q0[x] &lt; p0[x]
+    redo = np.array([sample(p0, u) for u in rng.random(n)])
+    return np.where(keep, x, redo), p0
+xb, p0 = biased_first_token(N, np.random.default_rng(3))
+tv_biased = 0.5 * np.abs(np.bincount(xb, minlength=V) / N - p0).sum()
+assert tv_biased &gt; 4 * tv_spec                                  # about 0.11 versus 0.017
+
+# 5. Tokens per target call match (1 - a^(g+1)) / (1 - a) when the acceptance rate is constant.
+pc = np.array([0.4, 0.3, 0.2, 0.1]); qc = np.array([0.25, 0.25, 0.25, 0.25])
+alpha_c = np.minimum(pc, qc).sum()                               # 0.25 + 0.25 + 0.2 + 0.1 = 0.8
+gamma, steps, h = 4, 20_000, np.random.default_rng(11)
+x = np.array([[sample(qc, u) for u in h.random(gamma)] for _ in range(steps)])
+ok = h.random((steps, gamma)) * qc[x] &lt; pc[x]
+n_acc = np.where(ok.all(axis=1), gamma, np.argmin(ok, axis=1))
+tokens_per_call = (n_acc + 1).mean()                             # accepted drafts plus one target token
+assert np.isclose(alpha_c, 0.8) and abs(tokens_per_call - expected_tokens(0.8, gamma)) &lt; 0.05
+
+# 6. Cross-check the batched target probabilities against PyTorch, if available.
+try:
+    import torch
+    ctxs = np.array([[0, 0], [1, 3], [3, 2]])
+    ref = torch.softmax(torch.tensor(target.logits[ctxs[:, 0], ctxs[:, 1]]), dim=-1).numpy()
+    assert np.allclose(target.probs(ctxs), ref, atol=1e-12)
+except ImportError:
+    pass
+alpha_markov = acc_total / (calls_total * 3)                     # accepted fraction of drafted tokens
+if __name__ == "__main__":
+    print(f"TV(spec)={tv_spec:.4f} TV(plain)={tv_plain:.4f} TV(biased first token)={tv_biased:.4f}")
+    print(f"tokens/call constant-alpha: {tokens_per_call:.3f} vs formula {expected_tokens(0.8, gamma):.3f}")
+    print(f"tiny LM: {calls_total} target calls for {3*N} tokens; accepted fraction {alpha_markov:.3f}")</pre>
+<p>On the tiny models, 60,000 tokens took about 29,400 target calls — roughly 2 tokens per call — with 66% of drafted tokens accepted. The calls are capped by the short sequences (three tokens each), which limits how many drafts a round can use; with longer generations and a closer draft, real systems see the 2-3× the papers report.</p>
+
+<h4>8. Numerical and practical traps</h4>
+<p><strong>Dividing by q.</strong> p/q overflows or divides by zero when q(x) is tiny; compare <code>u · q(x) &lt; p(x)</code> instead. A token the draft gives zero probability is never drafted, so q(x) = 0 never reaches the check. <strong>Residual of zero mass.</strong> If p = q exactly, β = 1 and rejection is impossible, but floating-point noise can still make the residual sum zero after a "rejection" at u ≈ 1; guard by falling back to p when the residual sums to zero. <strong>Negative residual entries from rounding.</strong> Always take max(0, ·) before normalising. <strong>Mismatched sampling settings.</strong> Temperature, top-k and top-p must already be applied to both p and q; the rule then preserves the transformed target distribution. <strong>Reusing random numbers.</strong> The uniform for the acceptance test and the one for the residual draw must be independent; reusing u biases the residual draw toward low cumulative probability.</p>
+
+<h4>9. Edge cases worth naming</h4>
+<p><strong>γ = 0</strong> degenerates to ordinary sampling from the target (one bonus token per call). <strong>Identical models</strong> accept everything: γ + 1 tokens per call. <strong>Disjoint supports</strong> accept nothing: one token per call plus wasted drafting. <strong>End of sequence</strong>: if a drafted or replacement token is the end-of-sequence token, stop and discard the rest. <strong>Greedy decoding</strong>: p and q are one-hot, so accept exactly while the draft's token equals the target's argmax, and on rejection emit the target's argmax.</p>
+
+<h4>10. Complexity</h4>
+<p>Per round: γ sequential draft passes and one target pass over γ + 1 positions, plus O(γ·V) arithmetic for acceptance and the residual, where V is the vocabulary size. Expected target passes per generated token: (1 − α)/(1 − α<sup>γ+1</sup>). Memory: the target's pass needs activations for γ + 1 positions instead of one, and both models keep KV caches. The wall-clock benefit assumes the target pass over γ + 1 positions costs about the same as over one, which holds when decoding is memory-bandwidth bound (small batches) and fades at large batch sizes.</p>
+
+<h4>11. Talking through the design</h4>
+<p>In an interview, lead with the rule and the one-line proof (min(p, q) from acceptance plus p − min(p, q) from the residual), then the speed formula with numbers, then implementation details: sequential drafting, one batched verification, multiply instead of divide, residual on rejection, bonus token on full acceptance, KV-cache rollback. Close with when it helps (latency-sensitive, small batches, a well-matched draft) and when it does not (large batches, low α, an expensive draft).</p>
+</section>
+
+<section data-field="deep">
+<h4>Where the draft comes from</h4>
+<p>α is everything, and α is the overlap between the two models' next-token distributions. The original papers used smaller models from the same family (Leviathan et al. observed that draft models about two orders of magnitude smaller worked best); Chen et al. trained a 4-billion-parameter draft for Chinchilla 70B. Distilling the draft from the target raises α further. Other designs drop the separate model: Medusa adds extra prediction heads to the target to propose several future tokens at once; EAGLE drafts from the target's own internal features rather than from tokens; n-gram or "prompt lookup" drafts copy spans from the prompt, which is surprisingly effective for editing and summarising tasks where the output repeats the input. Leviathan et al. note that even a trivial bigram draft gave α ≈ 0.2 and a 1.25× gain in one translation setting.</p>
+
+<h4>Tree speculation</h4>
+<p>One drafted sequence is a single bet: a rejection at position 2 wastes positions 3 to γ. Tree-based methods draft several candidate continuations at each step (the top few draft tokens), arrange them in a tree, and verify the whole tree in one target pass using an attention mask that lets each node see only its ancestors. The longest accepted path is kept. More candidates raise the expected accepted length per pass, at the cost of a wider target pass; since that pass is memory-bound, the extra width is nearly free up to a point. Preserving the exact distribution with multiple candidates needs a generalised acceptance rule that tries candidates in turn against updated residuals.</p>
+
+<h4>Why verification is nearly free</h4>
+<p>During decoding with a batch of one, each forward pass reads every weight once and performs about two floating-point operations per weight per token. A GPU can do hundreds of operations in the time it takes to read one weight from high-bandwidth memory, so processing 5 tokens instead of 1 adds arithmetic the hardware was idling through anyway. This is the arithmetic-intensity argument from lm13. It also explains the limit: at large batch sizes the weights are already reused across many sequences, decoding becomes compute-bound, and the γ + 1 positions really cost γ + 1 times as much — which is why serving systems often disable speculation under heavy load.</p>
+
+<h4>The proof across positions</h4>
+<p>The single-position identity is the heart of it, but a round emits several tokens, so the full argument is an induction. Condition on the prefix. The first emitted token is distributed as p<sub>1</sub> by the identity. Given that the first emitted token is x<sub>1</sub> <em>and it was the accepted draft</em>, the second position's draft and target distributions are q<sub>2</sub> and p<sub>2</sub> conditioned on the prefix plus x<sub>1</sub>, so the identity applies again. If instead the first token came from the residual, the round ends, and the next round starts afresh from the new prefix — again with the correct conditional. Either way each emitted token has the target's conditional distribution given everything before it, so the whole sequence has the target's joint distribution. The empirical test on full three-token sequences checks exactly this joint claim.</p>
+
+<h4>Speculation inside a batched server</h4>
+<p>Real servers decode many requests at once, and each request's acceptance in a round differs: one accepts 5 tokens, another 0. A batched implementation must handle ragged results — different numbers of new tokens per sequence — by tracking per-sequence lengths, and the target's verification pass covers γ + 1 positions for every sequence in the batch, even those that will reject early. As the batch grows, that extra work is no longer free, which is why servers often tie γ to load: generous speculation when traffic is light and requests are latency-sensitive, little or none when the GPU is saturated and throughput matters more.</p>
+
+<h4>Lossless versus lossy variants</h4>
+<p>Some systems relax exactness for speed: accepting a draft token if it is in the target's top-k, or if p(x) exceeds a threshold, raises the acceptance rate but changes the output distribution. These "lossy" variants can be fine for some applications, but they are a different algorithm with different guarantees, and evaluations must then compare output quality, not just speed. The appeal of the rule in this lesson is that it needs no quality evaluation at all: correctness is a theorem.</p>
+</section>
+
+<section data-field="prod">
+<h4>Where speculative decoding runs</h4>
+<p>Most production inference servers support some form of speculative decoding — separate draft models, extra decoding heads, or n-gram drafts — because single-request latency is what users feel in chat and coding assistants. It is typically turned on for interactive, low-batch traffic and adjusted or turned off as batch sizes grow and the hardware becomes compute-bound.</p>
+
+<h4>Failure modes and symptoms</h4>
+<p><strong>No speedup.</strong> Symptom: tokens per second unchanged or worse. Causes: low α (the draft is poorly matched, or sampling settings differ between models), a draft that is not cheap enough, or a server already compute-bound at its batch size. Diagnose with acceptance rate and mean accepted length per round.</p>
+<p><strong>Subtle output drift.</strong> Symptom: outputs with speculation differ in style or quality from outputs without. Cause: an implementation bug — resampling from p on rejection, mismatched temperature or top-p between p and q, reused random numbers. Diagnose by comparing token-level statistics with and without speculation on the same prompts, or by running the exactness test on a small model.</p>
+<p><strong>Cache corruption.</strong> Symptom: garbage after the first rejection. Cause: rejected positions not rolled back in the KV cache of the target or the draft.</p>
+<p><strong>Latency spikes.</strong> Symptom: occasional slow tokens. Cause: long runs of rejections, each wasting γ draft passes. Adaptive γ — shrinking it when recent acceptance is low — smooths this.</p>
+
+<h4>What to monitor and tune</h4>
+<p>Acceptance rate per model pair and per traffic type (code, chat, structured output have very different α); mean accepted tokens per round; draft time as a fraction of round time (the measured c); tokens per second per request with and without speculation; and γ. Tune γ from measured α and c using the walltime formula, revisit when the target or draft changes, and consider disabling speculation above a batch-size threshold.</p>
+
+<h4>A cost estimate</h4>
+<p>A 70B target at 16 bits is about 140 GB of weights; on a GPU with 3 TB/s of memory bandwidth, one decoding pass takes at least about 47 ms (140 / 3,000 s) at batch size one, about 21 tokens per second. A 1B draft costs about 0.7 ms per pass (c ≈ 0.015). With α = 0.8 and γ = 5: expected tokens per round (1 − 0.8<sup>6</sup>)/0.2 = 3.69; round cost 47 + 5 × 0.7 ≈ 50.5 ms; about 73 tokens per second — roughly 3.5× faster, before overheads.</p>
+
+<h4>The reference for this problem</h4>
+<p>Leviathan, Kalman and Matias, "Fast Inference from Transformers via Speculative Decoding" (ICML 2023), define the sampling rule — keep x if q(x) ≤ p(x), otherwise reject with probability 1 − p(x)/q(x) and resample from norm(max(0, p(x) − q(x))) — prove it preserves p, define β = Σ min(p, q) and α = E[β], derive the expected tokens per run (1 − α<sup>γ+1</sup>)/(1 − α) and the walltime improvement (1 − α<sup>γ+1</sup>)/((1 − α)(γc + 1)), and tabulate speeds (for example 3.69× at α = 0.8, γ = 5, c = 0). Chen et al., "Accelerating Large Language Model Decoding with Speculative Sampling" (DeepMind, 2023), arrived at the same rule independently and reported 2-2.5× decoding speedups on Chinchilla 70B in a distributed setup.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then vary it, break it and measure it. Python 3.12 with NumPy (the gpt_env venv); PyTorch only for the optional cross-check.</p>
+<ol>
+<li>Run the four blocks as one script. All assertions pass and it prints the TV distances, tokens per call and the tiny models' acceptance.</li>
+<li><strong>Vary by hand.</strong> Redo section 4 with p = [0.6, 0.1, 0.3] and q = [0.2, 0.5, 0.3]: compute β, the residual and each token's output probability, then check with the first block's three lines.</li>
+<li><strong>Break it.</strong> In <code>spec_step</code>, resample from <code>p[n]</code> instead of the residual. Rerun test 3 and see the sequence-level TV rise above plain sampling's.</li>
+<li><strong>Vary the draft.</strong> Change the draft noise from 0.7 to 0.2 and to 2.0; record the accepted fraction and target calls per token.</li>
+<li><strong>Vary γ.</strong> Generate 30-token sequences with γ = 1 to 8 and plot target calls per token against (1 − α)/(1 − α<sup>γ+1</sup>) using the measured α.</li>
+<li><strong>Add temperature.</strong> Apply temperature 0.7 to both models' logits and confirm the exactness test still passes against the tempered target.</li>
+</ol>
+<p>Each experiment runs in seconds on the tiny models, so it is cheap to sweep parameters and plot results. What to look for: the wrong residual is detectable at this sample size; a closer draft raises acceptance and lowers calls per token; gains saturate as γ grows; and tempering both models consistently keeps exactness.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>(a) A team measures α = 0.7 and c = 0.1 for their draft. Find the best γ from 1 to 10 and the expected walltime gain. (b) They propose a cheaper draft with c = 0.02 but α = 0.55. Which pair is better?</p>
+<details><summary>Answer</summary>
+<pre class="run">def best_gamma(alpha, c, max_gamma=10):
+    gains = {g: walltime_gain(alpha, g, c) for g in range(1, max_gamma + 1)}
+    g = max(gains, key=gains.get)
+    return g, gains[g]
+g_a, gain_a = best_gamma(0.7, 0.1)
+g_b, gain_b = best_gamma(0.55, 0.02)
+assert (g_a, round(gain_a, 2)) == (4, 1.98)
+assert (g_b, round(gain_b, 2)) == (5, 1.96)</pre>
+<p>(a) The gain (1 − 0.7<sup>γ+1</sup>)/(0.3(0.1γ + 1)) rises to γ = 4 — (1 − 0.7<sup>5</sup>)/0.3 = 2.77 tokens per call, divided by a round cost of 1.4 — giving <strong>1.98×</strong>, then falls (1.96× at γ = 5). (b) With α = 0.55 and c = 0.02 the peak is at γ = 5: (1 − 0.55<sup>6</sup>)/0.45 = 2.16 tokens per call, divided by 1.1 = <strong>1.96×</strong>. The two drafts are nearly tied: the cheaper one makes more speculation affordable but wastes more of it. Exactly this kind of near-tie is why the decision should be made from measured α and c with the walltime formula rather than intuition — and the lower-α draft will also have more variable latency, since long runs of rejections are more likely.</p>
+</details>
+</section>

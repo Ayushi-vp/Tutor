@@ -2,9 +2,9 @@
 
 The interview-prep console as a real app: a **React** frontend, a **Flask** API, and a
 **SQLite** file that keeps your progress. It replaces the single-file console in `../src/`
-and carries over everything it had, now with 72 design cases, 116 DSA problems, flashcards
-and mock rounds. It has 12 learning tracks (159 topics): the AI tracks from the old console plus
-Engineering tracks for senior-engineer interviews. It supports a small invited group: people sign in
+and carries over everything it had, now with 119 design cases, 256 DSA problems, flashcards
+and mock rounds. It has 27 learning tracks (393 topics, including a DSA patterns track): the AI tracks from the old console, an AI evaluation and
+data track, an agentic systems track, an AI safety & alignment track, a search, ranking and recommender systems track, a hands-on PyTorch in practice track (including the ML-debugging round), a Product & metrics sense track in the Design group, and Engineering tracks for senior-engineer interviews, including an Auth & identity track, a Cloud fundamentals track, a Data engineering for ML track and a Behavioural interviews track. It supports a small invited group: people sign in
 with Google or GitHub, each person has their own progress, and admins manage the invite list. Every topic and design case is layered for beginner-to-expert reading: a
 "Start here" primer, the core body, and a "Going deeper" senior layer, then an exercise,
 quick checks and sources.
@@ -126,6 +126,55 @@ To move from this PC to the server, stop the app here, copy `backend\prep.db` in
 `docker compose exec -u root app chown prep:prep /data/prep.db` and `docker compose restart app`), and update `BASE_URL` and the OAuth
 redirect URLs.
 
+### The page tutor
+
+Readers can ask an AI tutor about whatever they are reading:
+
+- **Highlight text**: a toolbar pops up with *Explain · Example · Simplify · Quiz me · Ask…*.
+- **Right-click the highlight**: the same actions as a menu. Shift+right-click still gives the browser menu.
+- **Ctrl+K** (⌘K on a Mac), or the **Ask tutor** button in the corner, opens the chat for the topic on screen.
+  Each topic also has an **Ask the tutor** button next to *Mark this topic*.
+- Answers stream in, chats are saved per topic (the clock icon lists them), and **Add to notes** appends an
+  answer to the topic's *My notes* box.
+- **Pin to lesson** (on answers about highlighted text) keeps the answer in the lesson itself: the passage stays
+  highlighted and a collapsible card sits under its paragraph. A pin stores the passage plus the text around it
+  (`frontend/src/anchor.ts`), so it finds the right spot even when a phrase repeats; if a lesson rewrite removes
+  the passage, the pin is listed at the end of the topic instead of being lost.
+
+It talks to any OpenAI-compatible chat API and stays off until two settings are in `.env`:
+
+```
+LLM_BASE_URL=https://api.openai.com/v1     # or OpenRouter, http://localhost:11434/v1 for Ollama, LM Studio, vLLM
+LLM_API_KEY=sk-...                         # blank for a local server that needs none
+LLM_MODEL=gpt-4o-mini
+CHAT_DAILY_LIMIT=50                        # per member per day; admins are not limited; 0 = no limit
+```
+
+Restart the app after changing them. `LLM_PROVIDER=fake` gives canned answers, to try the UI without a model.
+The browser sends only the topic id, the highlighted passage and the question; the server reads the lesson
+from `content/` and puts it at the start of the prompt, which providers that cache prompt prefixes reuse
+across follow-ups. The API key never leaves the server. If an answer fails (wrong key, server down), the
+question does not count against the limit and the panel shows the reason.
+
+### Learning map
+
+The home page shows each track as a tree, built from the `prereq` lists in `content/` — nothing to
+maintain by hand (`frontend/src/tree.ts`). A topic is *ready* once the topics it builds on in the same
+track are done or flagged for review; prerequisites from other tracks are shown (`+1`) but never lock
+anything. Only direct links are drawn (a link already implied through another prerequisite is left out).
+*Next up* lists the best ready topics across all tracks: it finishes tracks you have started first,
+prefers topics that unlock more, and takes at most two from one track.
+
+### Topic XP and milestones
+
+Every learning topic has a `difficulty` (`E`, `M` or `H`) in `content/tracks/`. Marking it done earns
+50, 100 or 200 XP, shown on its card, its lesson page and in a short toast. XP is not stored: it is
+worked out from saved statuses (`frontend/src/xp.ts`), so undo, import and reset keep it right, and
+changing a topic's difficulty changes everyone's totals. Each track has four milestones by share of its
+XP (first topic, a quarter, half, complete); the home page shows the total and the closest next
+milestone. They measure progress through the material, not mastery. Design cases, DSA problems and
+bank questions earn no XP yet; design track pages use case counts for their milestones.
+
 ### While developing
 
 Two terminals, with hot reload on the UI:
@@ -149,13 +198,16 @@ backend/
   auth.py                  Google/GitHub sign-in, sessions, invites, admin checks
   db.py                    SQLite schema and queries, per user
   backup.py                online copy of the database into backups/
+  chat.py                  the page tutor: lesson text for the prompt, OpenAI-compatible streaming client
   tests/                   pytest
 frontend/src/
   content.ts               loads content/, derives the bank and pillars, defines the sidebar
   auth.tsx                 who is signed in; api.ts wraps fetch for the API
   store.tsx                progress state, synced to the API (falls back to the browser if it is down)
+  xp.ts                    topic XP by difficulty and track milestones, derived from progress
+  tutor.tsx                tutor chat state and the answer stream; markdown.tsx renders answers
   views/                   one component per page
-  components/              layout, cards, figure mounting
+  components/              layout, cards, figure mounting, TutorPanel and AskMenu (highlight toolbar)
   legacy/viz.js            the hand-built SVG chart toolkit and figures, carried over unchanged
 scripts/                   content helpers, the old-build migration, windows-task.ps1
 Dockerfile, docker-compose.yml, Caddyfile   Linux server deployment
@@ -165,7 +217,8 @@ Dockerfile, docker-compose.yml, Caddyfile   Linux server deployment
 
 **Edit or add a topic** — edit `content/tracks/<track>.json`. Optional `primer` (beginner layer)
 and `deep` (senior layer) HTML fields render above and below the body. Each topic is
-`{ id, t, tag, sum, body, viz?, drill?, qa?, refs? }`; `body` and `drill` are HTML.
+`{ id, t, tag, difficulty, sum, body, viz?, drill?, qa?, refs? }`; `body` and `drill` are HTML.
+`difficulty` is `E`, `M` or `H` and sets the topic's XP; the content test fails without it.
 `qa` rows are `[difficulty, question, answer]` and appear in the bank, flashcards and mock rounds too.
 Ids must stay unique and stable — progress is keyed by them.
 
@@ -186,8 +239,8 @@ a pillar in `PILLARS` and a line in `NAV`. If its checks need a new bank categor
 ## Checks
 
 ```powershell
-backend\.venv\Scripts\python -m pytest backend\tests    # API, accounts, backups: 27 tests
-cd frontend; npm test                                   # content integrity, every page, every figure, sign-in: 88 tests
+backend\.venv\Scripts\python -m pytest backend\tests    # API, accounts, backups, tutor, pins: 49 tests
+cd frontend; npm test                                   # content integrity, every page, every figure, sign-in, tutor, pins, learning map: 181 tests
 npm run typecheck
 ```
 

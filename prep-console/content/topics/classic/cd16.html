@@ -1,0 +1,378 @@
+<!-- topic source for classic/cd16; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "cd16",
+  "t": "Design an e-commerce flash sale (inventory and checkout under a spike)",
+  "tag": "Traffic spikes",
+  "sum": "Ten thousand units, a million buyers, one minute: a 100× spike worked by hand, a waiting room driven by a feedback controller, the oversell race and four ways to decrement inventory atomically (conditional UPDATE, row locks, Redis, sharded counters), reservations that expire, payment with idempotency, bot defence and degrading on purpose.",
+  "prereq": [
+    ["cd7", "Ticket booking: an atomic conditional hold with an expiry, payment inside the hold, and a waiting room that admits users at the rate inventory can absorb."],
+    ["cd9", "Payments: idempotency keys make retries safe, authorisation reserves funds and capture moves them, and a timeout means the outcome is unknown, not failed."],
+    ["cd12", "A rate limiter counts per key in a shared store with an atomic script, and fails open or closed by policy."],
+    ["db9", "Concurrency control: SELECT … FOR UPDATE takes a row lock until commit; a conditional UPDATE is checked and applied atomically by the database."],
+    ["in3", "Redis runs each command and script atomically on one thread per shard, and replicates to replicas asynchronously."],
+    ["sc10", "A queue decouples a fast front end from slow work, absorbing bursts so the back end runs at its own rate."],
+    ["sc12", "Load shedding rejects work when overloaded, and degrading features keeps the core working."]
+  ],
+  "myths": [
+    ["Autoscaling handles flash sales.", "Autoscaling reacts in minutes; a flash sale goes from normal to 100× in seconds and is often over before new instances are warm. Worse, the bottleneck is usually one row or one counter for the hot product, which more web servers only hit harder. Flash sales are handled by pre-scaling the stateless tiers and by admission control in front of the stateful ones."],
+    ["Overselling is prevented by checking stock before decrementing it.", "Checking and then decrementing as two steps is exactly what causes overselling: hundreds of requests read 'one left' before any of them writes. The check and the decrement must be one atomic operation — a conditional UPDATE whose row count is the decision, a Redis DECR whose returned value is the decision, or a locked read-modify-write."],
+    ["Putting inventory in Redis makes it correct.", "Redis makes the decrement fast and atomic, but Redis replication is asynchronous: if the primary fails after acknowledging a decrement, the replica may not have it, and units can be sold twice or lost. Redis works as a fast gate in front of a durable source of truth, with reconciliation, not as the only record of what was sold."],
+    ["A waiting room is only for fairness.", "Its first job is capacity protection: it turns an arrival rate the checkout cannot survive into an admission rate it can. Fairness — first come first served versus a randomised draw — is a policy chosen on top. Without admission control the site falls over and nobody, fair or not, gets to buy."],
+    ["When the units are reserved, the sale is over.", "Reservations expire. If 30% of reserving shoppers abandon payment, 30% of the stock comes back to the pool over the next ten minutes, in waves as holds time out. A design that shows 'sold out' permanently at the first zero leaves units unsold; one that keeps everyone waiting forever wastes their time. Show 'sold out, check back' and admit more users as holds expire."]
+  ],
+  "recap": [
+    "A flash sale is a fixed, small amount of inventory meeting a sudden demand many times larger, so most requests must be turned away cheaply and the few that can succeed must be handled exactly once.",
+    "Working the spike by hand shows where it breaks: page views can be absorbed by a CDN, but checkout writes and the inventory counter cannot scale with demand.",
+    "A waiting room converts the arrival rate into an admission rate the checkout can handle, set by a feedback loop on checkout load and by remaining inventory.",
+    "Overselling comes from check-then-act; the fix is an atomic decrement whose result is the decision: a conditional UPDATE with a row-count check, a row lock, a Redis DECR or Lua script, or a sharded counter.",
+    "A single hot row serialises every buyer; Redis moves the counter to memory, and sharded counters split it across keys at the cost of false 'sold out' when one shard empties first.",
+    "Redis is a fast gate, the database is the source of truth, and the two are reconciled.",
+    "A reservation holds a unit for a few minutes; it ends in exactly one of paid, expired or cancelled, enforced by conditional state transitions.",
+    "Payments use idempotency keys, authorise at checkout and capture later, and treat a timeout as unknown until confirmed.",
+    "Bots are fought with per-account and per-card limits, verification and challenges at the queue, and by making the queue rather than speed decide who buys.",
+    "Graceful degradation means switching off everything that is not browsing the product or buying it, and serving 'sold out' from cache."
+  ],
+  "glossary": [
+    ["Admission control", "Deciding how many users or requests are allowed into a system per unit time, and holding or rejecting the rest."],
+    ["Authorisation (payment)", "Asking the card issuer to reserve an amount on the buyer's card without moving money yet."],
+    ["Capture", "Turning an earlier authorisation into an actual charge."],
+    ["CAPTCHA", "A challenge meant to be easy for people and hard for automated scripts, such as identifying images."],
+    ["CDN", "Content delivery network: servers near users that cache and serve pages and files so requests do not reach the origin."],
+    ["Check-then-act", "Reading a value, deciding, and writing in separate steps, so another actor can change the value in between."],
+    ["Conditional UPDATE", "An UPDATE with a WHERE clause that only matches if the precondition holds (such as available ≥ 1), so the database checks and writes atomically."],
+    ["Feedback controller", "A loop that measures an output (checkout load) and adjusts an input (admission rate) to hold the output near a target."],
+    ["Graceful degradation", "Turning off non-essential features under load so the essential path keeps working."],
+    ["Hot row / hot key", "A single database row or cache key receiving so many writes that it, not the fleet, limits throughput."],
+    ["Idempotency key", "A client-chosen identifier sent with a request so that retries of the same request have their effect only once."],
+    ["Lost update", "Two transactions read the same value and both write a result based on it, so one write silently overwrites the other."],
+    ["Oversell", "Confirming more orders than there are units in stock."],
+    ["Origin", "The application servers and databases behind the CDN, where requests that cannot be served from cache end up."],
+    ["Reservation (hold)", "A temporary claim on a unit for one shopper, with an expiry after which the unit returns to stock."],
+    ["Sharded counter", "A single logical counter split across several keys or rows, each holding part of the total, to spread write load."],
+    ["SKU", "Stock-keeping unit: one distinct sellable item, such as one product in one size and colour; inventory is counted per SKU."],
+    ["Signed token", "Data plus a cryptographic signature, so the server can trust data stored on the client (such as a queue position) without a database lookup."],
+    ["Waiting room", "A holding page that queues users before a high-demand flow and admits them at a controlled rate."]
+  ],
+  "qa": [
+    ["E", "How do you prevent overselling?", "Make the stock check and the decrement one atomic operation, and let its result decide. In SQL: UPDATE inventory SET available = available − 1 WHERE sku = ? AND available ≥ 1, and treat a row count of 1 as success and 0 as sold out. In Redis: DECR and treat a negative result as sold out (and increment it back), or a Lua script that checks and decrements together. Never SELECT the stock, compare in the application and then write it back."],
+    ["E", "Why does a flash sale need a waiting room?", "Because demand arrives at a rate the checkout cannot process, and the excess turns into timeouts, retries and a collapsed site where nobody buys. A waiting room holds users on a cheap static page and admits them at a rate the checkout can absorb, so the people admitted complete purchases quickly. It also lets the sale be fair by a chosen rule instead of by who retries hardest."],
+    ["E", "What happens to a reservation if the shopper never pays?", "It expires after a fixed time (for example 10 minutes) and the unit returns to available stock. Expiry is done by a conditional transition (reserved → expired only if still reserved and past expiry), run lazily when someone needs stock and actively by a sweeper or delay queue, so units come back promptly."],
+    ["M", "Compare SELECT … FOR UPDATE, a conditional UPDATE and Redis DECR for the inventory decrement.", "SELECT FOR UPDATE locks the row for the whole transaction, so throughput is one transaction per lock-hold time — a few hundred per second if the transaction does other work. A conditional UPDATE locks the row only for the statement and commit, so it is simpler and faster, perhaps around a thousand per second on one row. Redis DECR is an in-memory operation, so a single key handles tens of thousands per second or more, but it is not durable in the same way and must be reconciled with the database.", "Follow-up: When is the row lock still right? — When the decision needs several reads in one transaction (a bundle of SKUs, a per-customer limit) and throughput per row is modest."],
+    ["M", "Walk through the arithmetic of a 100× spike.", "Normal: 2,000 requests per second. A million people arrive in the first minute: about 16,700 per second; at 10 requests per page view that is roughly 167,000 per second, about 80-100×. Eight of those 10 requests are static and served by the CDN, leaving about 33,000 per second at the origin. Checkout is the limit: at 10 database writes per checkout and 10,000 writes per second of headroom, the store can complete 1,000 checkouts per second. With 10,000 units and half of admitted users converting, the waiting room should admit about 1,000 per second for roughly 20 seconds."],
+    ["M", "How do sharded counters work and what is their weakness?", "Split 10,000 units over 10 keys of 1,000; each request picks a shard (randomly or by user hash) and decrements it, so write load spreads across 10 keys or shards. The weakness is false sold-out: a shard can hit zero while others still have stock, so on a zero the request must try other shards, and near the end the remaining units are scattered. Rebalance by moving units from full shards to empty ones, or fall back to a single counter for the last few percent.", "Follow-up: How do you show the total? — Sum the shards for display, accepting that it is approximate while decrements are in flight."],
+    ["M", "Redis says stock is 0 but the database shows 40 units unsold. What happened?", "Reservations or decrements were counted in Redis but never completed: shoppers abandoned, payments failed, or Redis decrements were not paired with database orders because a process died in between. Without a release path, Redis drifts below the truth. Fix with expiry that returns units to both stores, and a reconciler that periodically recomputes available = stock − paid − active holds from the database and corrects Redis."],
+    ["M", "How do you make checkout safe to retry?", "The client generates an idempotency key per checkout attempt and sends it with every retry; the server stores the key with the result in the same transaction as the order, and a repeat returns the stored result. The payment call to the processor carries its own idempotency key derived from the order. A timeout from the processor is treated as unknown, resolved by querying the processor or waiting for its webhook, never by charging again."],
+    ["M", "How do you stop bots buying the whole stock?", "Make speed and volume useless and identities expensive: limit units per account, per payment card, per shipping address and per device; require a verified account created before the sale; challenge suspicious sessions at the waiting room rather than at checkout; issue queue positions in signed tokens tied to the session; and randomise positions for everyone who arrives before the start so bots gain nothing by arriving at 09:59:59.999. For the most valuable drops, a registration-then-lottery replaces the race entirely."],
+    ["H", "Design the waiting room's admission rate.", "Admit at the rate checkout can complete, adjusted continuously. Measure checkout in-flight count and latency; a controller raises admissions when there is headroom and lowers them when latency rises, the way Shopify's stateless queue moves its cutoff using a proportional term on how full its checkout throttle is. Cap total admissions by remaining stock plus a margin for expected abandonment, and stop admitting when available plus active holds would be exhausted.", "Follow-up: Why not admit a fixed 1,000 per second? — Because checkout capacity varies with payment provider latency and cache warmth; a fixed rate is either too slow when healthy or overloads when degraded."],
+    ["H", "Payment succeeded but the reservation had already expired. What now?", "This is a race between two terminal transitions. Prevent it by making 'mark paid' a conditional transition that succeeds only if the reservation is still in reserved state, and by giving the payment step a grace window (expiry sweeps skip holds with a payment in progress). If it still happens — the processor confirmed after expiry and the unit was resold — either allocate from any remaining stock or refund automatically and apologise; never ship a unit you do not have.", "Follow-up: Why authorise and capture separately here? — Authorising reserves money without moving it, so a reservation lost to the race can be released by voiding the authorisation, which is cheaper and cleaner than a refund."],
+    ["H", "What do you degrade, and in what order, when the site is overloaded?", "Protect, in order: checkout for admitted users, the product page, then everything else. Turn off personalised recommendations, reviews, search suggestions and live inventory counts; serve the product page and 'sold out' state from the CDN with short TTLs; shed browse traffic before checkout traffic; and switch non-critical writes (analytics, wishlists) to a queue processed later. Prepare these as feature flags and rehearse them, because there is no time to build them during the sale."],
+    ["H", "How would you run the same sale in three regions?", "Inventory is global but latency wants it local. Allocate stock per region in advance by expected demand (say 50/30/20), decrement locally, and move unsold units between regions as the sale progresses through a coordinator. A single global counter would add a cross-region round trip to every decrement. Keep orders and payments in each region, with a single global reconciliation of units sold against stock after the sale."]
+  ],
+  "refs": [
+    ["post", "Surviving flashes of high-write traffic using scriptable load balancers, Part I (Shopify Engineering, 2017)", "Flash sales that took down a database shard, a leaky-bucket checkout throttle in Nginx and Lua at the edge, a queue page instead of a 429, and why random polling was unfair.", "https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-i"],
+    ["post", "Surviving flashes of high-write traffic using scriptable load balancers, Part II (Shopify Engineering, 2017)", "The stateless fair queue: a signed-cookie timestamp per user and a per-load-balancer cutoff moved by a proportional controller.", "https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-ii"],
+    ["docs", "PostgreSQL: explicit locking", "Row-level locks taken by UPDATE and SELECT FOR UPDATE, and how concurrent updates of one row queue behind each other.", "https://www.postgresql.org/docs/current/explicit-locking.html"],
+    ["docs", "Redis DECR", "Atomic decrement of an integer key, returning the new value: the building block for an in-memory stock gate.", "https://redis.io/docs/latest/commands/decr/"],
+    ["post", "Designing robust and predictable APIs with idempotency (Stripe, 2017)", "Idempotency keys, retries with backoff and jitter, and how a server records keys with results.", "https://stripe.com/blog/idempotency"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>At 10:00:00 a limited-edition games console goes on sale: 10,000 units at a discount, announced a week ago. At 09:59:30 the store, which normally serves 2,000 requests per second, is already seeing ten times that from people refreshing the product page. At 10:00:02 it is a hundred times. The product page loads slowly, then times out; shoppers press refresh, which doubles the load. The few who reach checkout see a spinner while their payment is processed, and some press "Pay" again. By 10:00:40 the inventory database's CPU is pinned on a single row — the console's stock count — and every checkout is queued behind it. At 10:03 the sale is declared over. The next morning the reconciliation shows 11,340 orders for 10,000 consoles, 412 customers charged twice, a fifth of the stock bought by a few dozen accounts with automated scripts, and a trending hashtag about the store.</p>
+<p>Every one of those failures has a known cause. The site fell over because the arrival rate was let straight through to the stateful tier. The oversell came from reading the stock, deciding and then writing it, in separate steps. The double charges came from retries without idempotency. The bots won because the sale rewarded speed. The single hot row is the bottleneck nobody scaled, because it cannot be scaled by adding servers.</p>
+<p>A flash sale is the purest form of a common shape: a small, fixed supply meeting a sudden demand many times larger. The same design serves sneaker drops, limited game releases, concert presales for general-admission tickets, coupon redemptions and seasonal events where everything is cheap for an hour. The ticket-booking case (cd7) covers one variant — distinct seats, each a row with a hold. This lesson covers the other — <em>fungible</em> inventory, where any unit is as good as another, so the stock is a counter and the counter becomes the hottest thing in the system.</p>
+<p>The lesson works the 100× spike by hand to find exactly which component breaks; designs the waiting room and its admission rate (including Shopify's feedback-controlled queue); dissects the oversell race and compares four ways to decrement atomically — conditional UPDATE, row locks, Redis, sharded counters — with their throughput; designs reservations that expire without losing or double-counting units; integrates payment with idempotency; and finishes with bot defence and planned degradation. The lab reproduces the oversell with real database connections and fixes it with one conditional UPDATE.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a bakery with 500 cakes and a ticket roll</h4>
+<p>A famous bakery sells 500 special cakes once a year, at 8 a.m. Ten thousand people turn up. If the door simply opens, the shop fills, nobody can reach the counter, the staff cannot work, and the till queue is chaos — the bakery sells fewer cakes, more slowly, to angrier people. So the bakery does three things. A <strong>doorman</strong> lets in only as many people as the counter can serve, say ten a minute; everyone else waits outside in an orderly line. At the counter, the baker takes a <strong>numbered token</strong> off a rack of 500 and hands it over: you have claimed a cake. You then have ten minutes to pay at the till; if you wander off, your token goes back on the rack for the next person. And one cake per customer, checked against a list of names, so the person who brought twenty friends in disguise does not walk off with all of them.</p>
+<p>The design maps directly. The doorman is the <strong>waiting room</strong> with an <strong>admission rate</strong>. The rack of tokens is the <strong>inventory counter</strong>, and taking one is an <strong>atomic decrement</strong> — two hands cannot take the same token. The ten minutes to pay is a <strong>reservation with an expiry</strong>. The till is <strong>payment</strong>, which must charge each customer once even if they hand over their card twice. The list of names is <strong>bot defence and purchase limits</strong>.</p>
+<p>The analogy breaks in one important place. In the bakery the rack is one physical thing that only one hand can touch at a time, which is exactly what makes it correct — and exactly what limits the speed. Online, the "rack" can be a database row (correct but slow under contention), an in-memory counter (fast but needing care to stay durable), or several racks with part of the stock each (fast, but one rack can empty while another still has cakes). Choosing among those is the heart of the design.</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Flash sale funnel. One million visitors arrive in the first minute; the CDN serves the static product page and the waiting room page. The waiting room admits about 1,000 users per second. Admitted users reserve a unit with an atomic decrement of the 10,000-unit inventory; reservations expire after 10 minutes. About half pay; payment uses idempotency keys. Orders are written asynchronously. Numbers shrink at each stage: 1,000,000 visitors, about 20,000 admitted, 10,000 reserved, about 10,000 paid after expired holds are resold.">
+  <defs><marker id="cd16-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <path d="M20,40 L620,40 L540,90 L100,90 Z" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="320" y="62" text-anchor="middle" style="fill:var(--ink);font-weight:600">1,000,000 visitors in minute one (~167k req/s)</text>
+    <text x="320" y="80" text-anchor="middle" style="fill:var(--muted)">CDN serves product page + waiting room (static)</text>
+    <path d="M100,98 L540,98 L470,148 L170,148 Z" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="320" y="120" text-anchor="middle" style="fill:var(--ink);font-weight:600">Waiting room admits ~1,000/s</text>
+    <text x="320" y="138" text-anchor="middle" style="fill:var(--muted)">signed queue token · rate from a feedback loop</text>
+    <path d="M170,156 L470,156 L420,206 L220,206 Z" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:1.5"/>
+    <text x="320" y="178" text-anchor="middle" style="fill:var(--ink);font-weight:600">Reserve: atomic decrement</text>
+    <text x="320" y="196" text-anchor="middle" style="fill:var(--muted)">10,000 units · hold 10 min</text>
+    <path d="M220,214 L420,214 L385,264 L255,264 Z" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="320" y="236" text-anchor="middle" style="fill:var(--ink);font-weight:600">Pay (idempotent)</text>
+    <text x="320" y="254" text-anchor="middle" style="fill:var(--muted)">authorise now, capture later</text>
+    <text x="320" y="288" text-anchor="middle" style="fill:var(--good)">→ order written, confirmation sent</text>
+    <path d="M470,190 C560,190 580,120 545,100" marker-end="url(#cd16-arrow)" style="fill:none;stroke:var(--s4);stroke-dasharray:4 3"/>
+    <text x="572" y="170" style="fill:var(--s4)">expired holds</text>
+    <text x="572" y="185" style="fill:var(--s4)">→ admit more</text>
+    <text x="30" y="125" style="fill:var(--muted)">everyone else:</text>
+    <text x="30" y="141" style="fill:var(--muted)">queue page, then</text>
+    <text x="30" y="157" style="fill:var(--muted)">"sold out" from cache</text>
+  </g>
+</svg>
+<figcaption>Each stage exists to make the next one smaller. The CDN absorbs page views, the waiting room turns a million arrivals into a rate checkout can handle, and the atomic decrement turns contention for 10,000 units into exactly 10,000 successes. Expired holds feed back into admissions.</figcaption>
+</figure>
+
+<h4>Read path and write path have nothing in common</h4>
+<p>The traffic splits into two very different kinds. The <strong>read path</strong> — the product page, images, the waiting room page, "is it sold out yet?" — is enormous but identical for everyone, so it can be cached at the edge and served without touching the store's own servers. The <strong>write path</strong> — reserve a unit, pay, create an order — is small in volume (at most a few tens of thousands of successful operations for 10,000 units) but every operation contends for the same scarce thing and must happen exactly once. Almost every mistake in flash-sale design comes from letting the read path's volume reach the write path's components, or from scaling the write path as if it were the read path.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–14</span><span class="ck-t">The spike by hand</span></div><div class="ck"><span class="ck-m">14–20</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">20–27</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">27–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> (1) A sale starts at a scheduled time for one or a few products with a fixed quantity. (2) Shoppers view the product, join a queue if demand is high, and when admitted, reserve a unit. (3) A reservation holds the unit for a fixed time (say 10 minutes) during which the shopper pays; unpaid reservations expire and the unit returns to stock. (4) Payment completes the order exactly once. (5) Per-customer purchase limits (one per account, per card, per address). (6) Everyone can see whether stock remains. Out of scope, said aloud: fulfilment and shipping, returns, and the general catalogue and search (which stay up but may be degraded).</p>
+<p><strong>Non-functional.</strong> <strong>Never oversell</strong> — confirming an order for a unit that does not exist is the worst outcome. <strong>Never double-charge.</strong> Do not undersell either: units should not stay stuck in abandoned reservations. Survive a spike of 100× normal traffic arriving within seconds. Be fair by a stated rule. Keep the rest of the store usable, at least for browsing. The sale should sell out at the rate checkout can actually complete, not stall.</p>
+<p><strong>Clarifying questions.</strong> How many units and how many products (one hot SKU, or a hundred)? How much demand is expected, and is there a registration count from a pre-sale signup? One region or several? Is fairness first-come-first-served or a draw? Can a customer buy more than one? Are we integrating with an external payment processor? Does the sale have a fixed end, or does it run until sold out?</p>
+
+<h4>2 · The 100× spike, worked by hand</h4>
+<p>The aim of the arithmetic is to find which component breaks first and by how much — that decides the architecture. Assume: normal traffic <strong>2,000 requests per second</strong>; a pre-sale campaign implies <strong>1,000,000 people</strong> arrive in the first minute; <strong>10,000 units</strong>; each product page view costs <strong>10 requests</strong> (the HTML document, 2 API calls and 7 static assets such as images and scripts).</p>
+<p><strong>Arrival rate.</strong> 1,000,000 people ÷ 60 s ≈ <strong>16,700 people per second</strong>. Each loads the page once: 16,700 × 10 ≈ <strong>167,000 requests per second</strong>, about 80× normal — and refreshes, which people do when a page is slow, push it past 100×. In reality arrivals are not uniform: they concentrate in the seconds around 10:00:00, so the peak second can be several times the minute's average.</p>
+<p><strong>What the CDN absorbs.</strong> The 7 static assets per view and the HTML (if it is the same for everyone, which during a sale it can be made to be) are served by the CDN. That leaves the 2 API calls per view at the origin: 16,700 × 2 ≈ <strong>33,000 requests per second</strong>, about 17× normal. Still large, but reads that can be cached for a second or two (stock status, sale state) fall further. The read path is solvable by caching.</p>
+<p><strong>What checkout can do.</strong> The write path cannot be cached. Shopify's engineering write-up describes checkout as write-heavy — each step modifies the checkout's record — and that is typical. Suppose one completed purchase costs <strong>10 database writes</strong> (reservation, cart, address, payment attempt, order, order lines, inventory, and so on), and the primary database has headroom for <strong>10,000 writes per second</strong> beyond normal load. Then the store can complete about <strong>1,000 checkouts per second</strong>. If all 1,000,000 visitors tried to check out in the first minute, that would be 10,000,000 writes ÷ 60 s ≈ 167,000 writes per second — <strong>17× the database's headroom</strong>. This is the component that breaks, and adding web servers makes it worse.</p>
+<p><strong>The inventory counter.</strong> Every reservation decrements the same stock count. If that is one database row and each decrement holds the row lock for about 1 ms (statement plus commit), the row allows about <strong>1,000 decrements per second</strong> at best; if the decrement sits inside a longer transaction holding the lock for 5 ms, about <strong>200 per second</strong>. Either way it is a ceiling that does not move when you add hardware, because every buyer serialises on the same row. In Redis, a single key's DECR is an in-memory operation; one shard handles tens of thousands of such operations per second or more, so the counter stops being the limit.</p>
+<p><strong>How long the sale takes.</strong> Admit users at the checkout rate, about 1,000 per second. If half of admitted users complete a purchase (others are browsing, abandon, or fail payment), 10,000 units need about <strong>20,000 admissions</strong>, so admissions run for roughly <strong>20 seconds</strong> before available stock is fully reserved. Reservations that expire unpaid (say 30% of 10,000 = 3,000) return over the following 10 minutes, and the waiting room admits more users as they do. The other 980,000 people should learn quickly and cheaply that the sale is sold out — which means the sold-out state must be served from cache, not by each of them reaching the origin.</p>
+<p><strong>Waiting room load.</strong> A queued user's page polls for its turn, say every 10 seconds: 1,000,000 ÷ 10 = <strong>100,000 polls per second</strong>. That is why the queue check must be cheap and stateless — a signed token checked at the edge, not a database lookup per poll.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+<tr><td>Arrivals</td><td>1M people ÷ 60 s</td><td>~16,700/s</td></tr>
+<tr><td>Total requests</td><td>× 10 per view</td><td>~167,000/s (~80-100×)</td></tr>
+<tr><td>Origin requests</td><td>× 2 API calls per view</td><td>~33,000/s</td></tr>
+<tr><td>Checkout capacity</td><td>10,000 writes/s ÷ 10 per checkout</td><td>~1,000/s</td></tr>
+<tr><td>Unthrottled checkout demand</td><td>1M × 10 writes ÷ 60 s</td><td>~167,000 writes/s (17×)</td></tr>
+<tr><td>Single-row decrement ceiling</td><td>1 / (1-5 ms lock hold)</td><td>200-1,000/s</td></tr>
+<tr><td>Admissions to sell out</td><td>10,000 ÷ 50% conversion</td><td>~20,000 in ~20 s</td></tr>
+<tr><td>Queue polls</td><td>1M ÷ 10 s</td><td>~100,000/s at the edge</td></tr>
+</table>
+
+<h4>3 · The API</h4>
+<pre>GET  /sales/{sale_id}                     → {status: UPCOMING | LIVE | SOLD_OUT, starts_at, product, price}
+                                            (CDN-cached, 1-2 s TTL)
+POST /sales/{sale_id}/queue               → {queue_token (signed: sale, session, joined_at), poll_after_s}
+GET  /sales/{sale_id}/queue/status        → {admitted: false, poll_after_s: 10}
+                                          | {admitted: true, admission_token (signed, expires in 2 min)}
+POST /sales/{sale_id}/reservations        Idempotency-Key: 6f0c…   Authorization + admission_token
+     {sku, qty: 1}
+  → 201 {reservation_id, expires_at}     | 409 {error: "SOLD_OUT"} | 429 {error: "LIMIT_REACHED"}
+POST /checkouts                           Idempotency-Key: 9b1e…
+     {reservation_id, payment_method_token, shipping_address}
+  → 200 {order_id, status: CONFIRMED}    | 402 {error: "PAYMENT_DECLINED"} | 410 {error: "RESERVATION_EXPIRED"}</pre>
+<p>Three choices matter. <strong>Admission is a token, not a server-side session</strong>: the reservation endpoint accepts only requests carrying a valid, unexpired admission token, so a bot that skips the queue and calls the API directly is rejected at the edge. <strong>Every write carries an idempotency key</strong> generated by the client per logical action, so the "Pay" button pressed twice, or a mobile client retrying after a timeout, produces one reservation and one charge. And <strong>sold-out is a normal response</strong> (409), cheap to produce and cacheable at the sale level, not an error path that triggers retries.</p>
+
+<h4>4 · The data model</h4>
+<pre>inventory      (sku PK, total INT, available INT, version INT)
+               -- available = total − active reservations − sold
+reservations   (id PK, sale_id, sku, user_id, qty, status: RESERVED | PAID | EXPIRED | CANCELLED,
+                expires_at, idempotency_key UNIQUE, created_at)
+               -- index (status, expires_at) for the expiry sweeper
+               -- UNIQUE (sale_id, user_id) enforces one per customer
+orders         (id PK, reservation_id UNIQUE, user_id, amount_cents, payment_id, status, created_at)
+idempotency    (key PK, user_id, request_hash, response, created_at)
+
+Redis (fast gate, rebuilt from the database if lost):
+  stock:{sku}            → integer available (or stock:{sku}:0 … stock:{sku}:9 when sharded)
+  sale:{sale_id}:state   → LIVE | SOLD_OUT
+  limit:{sale_id}:{user} → 1 (SET NX, per-customer limit)</pre>
+<p>Two constraints carry correctness in the database itself rather than in application code: <code>UNIQUE (sale_id, user_id)</code> makes "one per customer" impossible to violate even under concurrency, and <code>reservation_id UNIQUE</code> on orders makes a reservation turn into at most one order. The <code>available</code> column is a <em>derived</em> number kept in step by the same transactions that change reservations, so it can always be recomputed from the reservations table — which is what the reconciler does.</p>
+
+<h4>5 · High-level design and the critical path</h4>
+<ol>
+<li><strong>Edge.</strong> The CDN serves the product page and the waiting room page. An edge function (code running on the CDN's servers) checks queue and admission tokens without contacting the origin, and serves the cached sale state.</li>
+<li><strong>Waiting room service.</strong> Issues signed queue tokens with the join time, and moves the admission cutoff according to the admission controller (deep dive A). Admitted users get a short-lived admission token.</li>
+<li><strong>Reservation service.</strong> Checks the admission token, the per-customer limit, and decrements inventory atomically (deep dive B). On success it writes a reservation row with an expiry, in the same transaction as the database decrement, or after a Redis gate decrement.</li>
+<li><strong>Checkout and payment.</strong> Takes the reservation, calls the payment processor with an idempotency key, and on success transitions the reservation to PAID and writes the order (deep dive C).</li>
+<li><strong>Expiry.</strong> A sweeper (or a delay queue) expires holds past their time and returns units to stock; the admission controller learns stock is back.</li>
+<li><strong>Asynchronous tail.</strong> Confirmation emails, fulfilment, analytics and search index updates go through a queue (sc10), so the checkout transaction stays short.</li>
+</ol>
+<p>Pre-scale everything stateless before the sale (web servers, edge functions, payment workers), warm caches by requesting the sale page through the CDN, and run a load test against the exact sale configuration days earlier. Autoscaling reacts in minutes, and the sale's critical first minute is over by then.</p>
+
+<h4>6 · Deep dive A: the waiting room and the admission rate</h4>
+<p>cd7 introduced the waiting room for seat booking. Here the focus is on how it decides <em>who</em> goes next and <em>how many</em>.</p>
+<p><strong>Admission must be stateless at the edge.</strong> With 100,000 polls per second, a central database lookup per poll would become the new bottleneck. Shopify's published design shows the alternative. In its first version, a leaky bucket in the edge load balancers (Nginx with OpenResty's Lua module) let through a fixed number of checkout requests per 5-second period and sent the rest to a queue page that polled; it protected the database but was a lottery — a user's chance on each poll was random, so some waited 40 minutes for a sale that lasted about 40 minutes. The second version made it fair without central state: on a user's first checkout attempt, the edge stores a <strong>timestamp in a securely signed cookie</strong>, so it cannot be forged; each load balancer keeps a virtual "now serving" <strong>cutoff time</strong>; requests whose timestamp is earlier than the cutoff go through to the leaky bucket, the rest keep waiting. The cutoff moves forward when the bucket has room and back when it is full.</p>
+<p><strong>The admission controller.</strong> Shopify borrowed from control theory: a PID controller adjusts an input based on the error between a target and a measurement, using a proportional term (react to the current error), an integral term (to accumulated error) and a derivative term (to its rate of change). After simulation they kept only the <strong>proportional</strong> term: error = bucket limit − requests already passed through; a positive error advances the cutoff (admit more), a negative one holds it. Worked: if the bucket allows 5,000 checkout requests per 5 seconds and 4,000 passed in the last period, error = +1,000, so the cutoff advances by an amount proportional to 1,000 — perhaps 2 seconds of queue — admitting everyone who joined in those 2 seconds. If 6,000 had passed, error = −1,000 and the cutoff would not advance. The result Shopify reported: median and 95th-percentile queue times converged and complaints about unfair waits stopped.</p>
+<p><strong>Cap admissions by stock.</strong> A capacity-driven controller alone would keep admitting people after the product is gone. Add a second limit: admissions stop when expected demand from those already admitted covers <em>available + active holds</em>. With 2,000 units left and a 50% conversion rate, 4,000 more admissions is enough; beyond that, set the sale state to "sold out, check back" (cached at the edge) and resume admitting only as holds expire.</p>
+<p><strong>Who goes first is policy.</strong> First-come-first-served by join time rewards whoever arrives first, which before the start time means whoever can click at 09:59:59.999 — usually a script. A common alternative is to give everyone who arrives before the start a <strong>random position</strong>, and order later arrivals by time; for the highest-demand drops, a <strong>registration then draw</strong> replaces the race entirely. All three fit the same signed-token mechanism; only how the position in the token is assigned changes.</p>
+
+<h4>7 · Deep dive B: inventory without overselling</h4>
+<p><strong>The race.</strong> The naive reservation code is: read <code>available</code>; if it is greater than zero, write <code>available − 1</code> and create the reservation. With one unit left, two requests both read 1, both decide yes, and both write 0. Two reservations, one unit. Under a flash sale's concurrency the gap between read and write is crossed by hundreds of requests at once; the lab shows 200 concurrent buyers for 50 units producing 200 orders while the counter ends at 40, because the writes are also <strong>lost updates</strong> — each overwrote the others' decrement. This is check-then-act (os4) on the most valuable row in the system.</p>
+<p><strong>Fix 1: the conditional UPDATE.</strong> Move the check into the write: <code>UPDATE inventory SET available = available − 1 WHERE sku = 'PS9' AND available &gt;= 1</code>. The database evaluates the condition and applies the change atomically, holding the row lock between them; the second of two concurrent statements waits for the first, re-reads the updated row (in PostgreSQL's read-committed mode, the waiting UPDATE re-evaluates its WHERE clause against the newly committed version) and finds <code>available = 0</code>. The application reads the <strong>row count</strong>: 1 means reserved, 0 means sold out. In the same transaction, insert the reservation row. Simple, durable, correct — and limited by the single row to roughly a thousand decrements per second, which the estimate showed is enough if the waiting room admits about 1,000 per second.</p>
+<p><strong>Fix 2: the row lock.</strong> <code>SELECT available FROM inventory WHERE sku = 'PS9' FOR UPDATE</code> locks the row until commit; the application then checks, writes, inserts and commits. Correct, and more flexible (the decision can involve several reads — a bundle of SKUs, a customer's existing reservations), but the lock is held for the whole transaction including application round trips, so throughput on the row drops to a few hundred per second. Use it when the decision is complex and the rate is modest. An <strong>optimistic</strong> variant reads a <code>version</code> column and writes <code>WHERE version = v</code>, retrying on a zero row count — but under heavy contention almost every attempt fails and retries, so optimistic concurrency is the wrong tool for the hottest row.</p>
+<p><strong>Fix 3: Redis as a fast gate.</strong> Keep the available count in Redis. <code>DECR stock:PS9</code> returns the new value atomically: ≥ 0 means a unit was claimed; negative means sold out, so <code>INCR</code> it back (or use a Lua script that checks before decrementing, so the count never goes negative). One key handles far more than the database row. But Redis is not the system of record: replication is asynchronous, so a failover can lose recent decrements, and a process that decrements Redis and then crashes before writing the reservation row leaks a unit. The working pattern is <strong>Redis gates, the database records</strong>: decrement in Redis; on success, insert the reservation in the database (where the unique constraints still protect per-customer limits); on failure to insert, increment Redis back; and run a <strong>reconciler</strong> every few seconds that recomputes available = total − sold − active holds from the database and corrects Redis. Redis can make only one kind of mistake you must guard against: allowing too many through after a failover, which the database's own check (Fix 1 behind it, or a final count check) catches.</p>
+<p><strong>Fix 4: sharded counters.</strong> When even one Redis key or one row is too hot — a sale across many regions or a very high-rate drop — split the stock: 10,000 units become 10 counters of 1,000, on different shards. Each reservation picks a shard (at random, or by user hash) and decrements it. Throughput multiplies by the number of shards. The cost is <strong>false sold-out</strong>: shard 3 hits zero while shard 7 still has 40 units, so a request that lands on an empty shard must try others; near the end, the remaining units are scattered and most attempts miss. Mitigations: on zero, try two or three other shards before reporting sold out; rebalance by moving units from full shards to empty ones; or merge back to a single counter for the last few percent of stock. A related trick is a <strong>token pool</strong>: pre-create one token per unit in a Redis list and have each reservation pop one — each pop is unique, so overselling is impossible by construction.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Two timelines with one unit left. Left: requests A and B both read available equals 1, both decide to sell, both write 0; two orders for one unit. Right: A and B both send a conditional UPDATE where available is at least 1; the database applies A's, setting 0 with row count 1; B waits on the row lock, re-checks the condition, finds 0 and gets row count 0, sold out.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="160" y="20" text-anchor="middle" style="fill:var(--crit);font-weight:600">Read, decide, write: oversold</text>
+    <text x="480" y="20" text-anchor="middle" style="fill:var(--good);font-weight:600">Conditional UPDATE: correct</text>
+    <line x1="320" y1="30" x2="320" y2="250" style="fill:none;stroke:var(--line-2)"/>
+    <text x="60" y="45" text-anchor="middle" style="fill:var(--ink)">A</text>
+    <text x="260" y="45" text-anchor="middle" style="fill:var(--ink)">B</text>
+    <rect x="20" y="58" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="60" y="75" text-anchor="middle" style="fill:var(--ink)">read → 1</text>
+    <rect x="220" y="68" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="260" y="85" text-anchor="middle" style="fill:var(--ink)">read → 1</text>
+    <rect x="20" y="110" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="60" y="127" text-anchor="middle" style="fill:var(--ink)">write 0</text>
+    <rect x="220" y="120" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="260" y="137" text-anchor="middle" style="fill:var(--ink)">write 0</text>
+    <rect x="20" y="162" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="60" y="179" text-anchor="middle" style="fill:var(--crit)">order ✓</text>
+    <rect x="220" y="172" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="260" y="189" text-anchor="middle" style="fill:var(--crit)">order ✓</text>
+    <text x="160" y="230" text-anchor="middle" style="fill:var(--crit)">2 orders, 1 unit, counter says 0</text>
+    <text x="380" y="45" text-anchor="middle" style="fill:var(--ink)">A</text>
+    <text x="580" y="45" text-anchor="middle" style="fill:var(--ink)">B</text>
+    <rect x="335" y="58" width="290" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="480" y="75" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">UPDATE … SET available = available − 1</text>
+    <text x="480" y="91" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">WHERE sku = ? AND available &gt;= 1</text>
+    <rect x="340" y="112" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="380" y="129" text-anchor="middle" style="fill:var(--ink)">rows = 1</text>
+    <rect x="540" y="112" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--line-2);stroke-dasharray:3 2"/>
+    <text x="580" y="129" text-anchor="middle" style="fill:var(--muted)">waits on lock</text>
+    <rect x="540" y="150" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="580" y="167" text-anchor="middle" style="fill:var(--ink)">re-check: 0</text>
+    <rect x="340" y="188" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="380" y="205" text-anchor="middle" style="fill:var(--good)">order ✓</text>
+    <rect x="540" y="188" width="80" height="24" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="580" y="205" text-anchor="middle" style="fill:var(--ink)">rows = 0</text>
+    <text x="480" y="240" text-anchor="middle" style="fill:var(--good)">1 order, B told "sold out"</text>
+  </g>
+</svg>
+<figcaption>On the left the decision is made on a stale read, so both requests sell the last unit and the second write even hides the first. On the right the database makes the decision under the row lock, and the row count tells each request what happened.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Approach</th><th>Throughput on one SKU</th><th>Durable?</th><th>Main cost</th><th>Use when</th></tr></thead>
+<tr><td>Conditional UPDATE</td><td>~1,000/s (one row)</td><td>Yes</td><td>Hot row ceiling</td><td>Default; admission rate below the ceiling</td></tr>
+<tr><td>SELECT … FOR UPDATE</td><td>~200-500/s</td><td>Yes</td><td>Lock held for whole transaction</td><td>Multi-step decisions, modest rate</td></tr>
+<tr><td>Redis DECR / Lua gate</td><td>tens of thousands/s</td><td>Not alone</td><td>Reconciliation with the database</td><td>Very high attempt rates</td></tr>
+<tr><td>Sharded counters</td><td>× number of shards</td><td>Depends on store</td><td>False sold-out, rebalancing</td><td>Beyond one key; multi-region</td></tr>
+</table>
+
+<h4>8 · Deep dive C: reservations, timeouts and payment</h4>
+<p><strong>The reservation lifecycle.</strong> A reservation is a small state machine: <code>RESERVED → PAID</code>, <code>RESERVED → EXPIRED</code>, <code>RESERVED → CANCELLED</code>. Each transition is a conditional UPDATE on the current state: <code>UPDATE reservations SET status = 'PAID' WHERE id = ? AND status = 'RESERVED'</code>. If two transitions race — the sweeper expiring a hold at the very moment payment confirms — only one finds the row in RESERVED and the other's row count is 0. That makes the outcome exactly one of the three, never two.</p>
+<p><strong>How long a hold lasts.</strong> Long enough to pay (typing card details, a 3-D Secure bank challenge), short enough that abandoned units come back while demand is still there. Ten minutes is common; some sales use 5. Show the countdown so shoppers know.</p>
+<p><strong>Releasing expired holds.</strong> Two mechanisms, used together. <em>Active</em>: a sweeper runs every few seconds — <code>UPDATE reservations SET status = 'EXPIRED' WHERE status = 'RESERVED' AND expires_at &lt; now() RETURNING sku, qty</code> — and increments inventory by the returned quantities in the same transaction (or a Redis sorted set scored by expiry time, or a delay queue message per hold, triggers the same transition). <em>Lazy</em>: when a reservation request finds stock at zero, it can expire overdue holds first, so returned units are available immediately even if the sweeper is behind. Either way the unit goes back by the same conditional transition, so it cannot be returned twice.</p>
+<p><strong>The payment race.</strong> Payment may complete after the hold expired: the shopper paid at 9:59 of a 10-minute hold and the processor took 3 seconds. Prevent most of these with a <strong>payment-in-progress</strong> state: checkout moves the reservation to <code>PAYING</code> (conditional on RESERVED and not expired) before calling the processor, and the sweeper does not expire PAYING holds until a longer deadline. If payment fails, PAYING returns to RESERVED (or EXPIRED if past time). If the processor confirms after the unit was genuinely lost, void the authorisation automatically.</p>
+<p><strong>Authorise now, capture later.</strong> Card payments have two steps: <strong>authorisation</strong> asks the issuer to reserve the amount on the card, and <strong>capture</strong> actually charges it, often when the item ships. Authorising at checkout means a reservation that is lost to a race, or an order that fails fraud review, can be released by voiding the authorisation, without a refund appearing on the customer's statement. For the sale, the order is confirmed on successful authorisation.</p>
+<p><strong>Idempotency end to end.</strong> The client generates one idempotency key per checkout attempt and resends it on every retry. The server records the key, a hash of the request and the final response in the same transaction as the order, so a retry returns the stored response instead of charging again; a retry with the same key but a different body is rejected. The call to the payment processor carries its own idempotency key derived from the order id, so a network timeout followed by a retry cannot create a second charge at the processor. A timeout is treated as <em>unknown</em> (cd9): poll the processor or wait for its webhook, never assume failure and charge again. This is the mechanism that would have prevented the 412 double charges in the opening story.</p>
+<p><strong>Keep the transaction short.</strong> The order transaction does: transition reservation to PAID, insert the order, insert the idempotency record. Emails, fulfilment requests, loyalty points and analytics go to a queue processed afterwards. Every extra write inside the transaction is time the hot rows stay locked during the sale's busiest seconds.</p>
+
+<h4>9 · Bot defence and graceful degradation</h4>
+<p><strong>Bots.</strong> Automated buyers win races because they are faster and more numerous. The design response is to make speed and numbers useless: limit units <strong>per account, per payment card, per shipping address and per device</strong> (enforced with unique constraints and Redis <code>SET NX</code> keys); require accounts to exist and be verified before the sale (new accounts created in the last hour are a strong signal); apply <strong>challenges</strong> — a CAPTCHA, or a small proof-of-work computation that costs a human nothing but costs a bot farm a lot — at the queue entrance rather than at checkout, where they would slow legitimate buyers at the worst moment; bind admission tokens to the session so they cannot be traded; and score sessions on behaviour and device signals. Randomising the queue position of everyone who arrives before the start removes the reward for millisecond timing. After the sale, cancel orders that violate limits (several accounts shipping to one address) before capture, which is another reason to authorise rather than charge.</p>
+<p><strong>Degrade on purpose.</strong> Decide in advance what to switch off, in order, and build each switch as a feature flag: personalised recommendations, reviews, "customers also bought", live stock counters, search suggestions, wishlists. Serve the product page as a static, CDN-cached page with the sale state embedded and refreshed every second or two. Shed browse traffic before checkout traffic: an admitted user mid-payment is worth protecting above everything else. Move non-critical writes (analytics events, view counts) to a queue that can lag by minutes. And serve "sold out" as a first-class cached page — the cheapest response to the most common outcome.</p>
+
+<h4>10 · Bottlenecks, failure modes and trade-offs</h4>
+<p><strong>The hot row or key.</strong> All reservations hit one SKU's counter; the admission rate must stay below its ceiling, or the counter must move to Redis or be sharded. Watch lock wait time on that row.</p>
+<p><strong>Redis and database drift.</strong> Decrements in Redis without matching reservations (a crash between the two writes) make Redis report sold out while units remain. The reconciler corrects it; alert when the difference exceeds a few units.</p>
+<p><strong>Retry storms.</strong> Slow responses cause client retries, which add load, which slows responses. Idempotency makes retries harmless to correctness; Retry-After hints, exponential backoff with jitter in the client and the waiting room's controller make them harmless to capacity.</p>
+<p><strong>Payment provider limits.</strong> A payment processor applies its own rate limits; a thousand authorisations per second may exceed them. Agree on capacity in advance, and let the admission controller watch payment latency as one of its inputs.</p>
+<p><strong>Trade-offs to close on.</strong> Durability versus throughput for the counter (database row versus Redis versus shards); fairness versus simplicity (lottery versus first-come); short holds (fewer stranded units) versus long holds (fewer frustrated payers); strict per-customer limits (fewer bots) versus friction for real customers; and the general principle that the sale is decided at admission control, not by adding servers.</p>
+</section>
+
+<section data-field="deep">
+<h4>The two-tier counter, done carefully</h4>
+<p>"Redis gates, the database records" needs an exact protocol, or it leaks units in both directions. Step 1: <code>DECR</code> (or a Lua check-and-decrement) on the Redis counter; if the result is negative, increment back and return sold out. Step 2: in a database transaction, insert the reservation (unique per customer) and decrement the database's <code>available</code> with a conditional UPDATE. Step 3: if step 2 fails for any reason — duplicate customer, database says zero, timeout — increment Redis back. A crash between step 1 and step 2 leaks a unit in Redis (too low); a Redis failover after step 1 may forget the decrement (too high). Neither breaks the guarantee that matters, because the database's conditional UPDATE is the final word — Redis only filters out the obvious losers cheaply. The reconciler then sets Redis to the database's truth every few seconds. The pattern generalises: a fast, approximate gate in front of a slow, exact check, with periodic correction.</p>
+
+<h4>Why the database row is slower than it looks</h4>
+<p>A single-statement conditional UPDATE in autocommit mode holds the row lock from the moment it acquires it until the commit's log record is durable. On a database that flushes its write-ahead log to disk on every commit, that is at least one disk flush — tens to hundreds of microseconds on NVMe, milliseconds on networked storage — during which every other decrement for the SKU waits. Group commit (the database flushing many transactions' log records together) helps total throughput but not one row's serial chain. That is why the ceiling is "about a thousand per second" rather than the hundreds of thousands of simple updates a database can do across many rows. Put the reservation insert in the same transaction and the lock is held slightly longer; put an external call (payment) inside it and the ceiling collapses to the external call's rate — never do that.</p>
+
+<h4>Pre-allocation instead of contention</h4>
+<p>Another way to remove the hot counter is to decide allocations before the sale. A <strong>lottery</strong> collects registrations for a day, draws 10,000 winners (plus a waitlist), and gives each a time-limited purchase link: the sale becomes 10,000 uncontended checkouts spread over hours. A <strong>token pool</strong> pre-creates one token per unit and has each admitted user pop one; a <strong>per-node allocation</strong> gives each reservation server a block of units to sell locally and lets it ask for more when it runs low, the inventory version of leased rate-limit tokens (cd12). Each removes contention by moving coordination to a moment when nobody is waiting.</p>
+
+<h4>Multi-SKU carts and bundles</h4>
+<p>A sale with sizes or colours is many SKUs, and a cart may hold several. Reserving them one at a time risks holding size 9 while size 10 is sold out, then releasing it. Two clean approaches: reserve all the cart's SKUs in one database transaction (conditional UPDATEs on each row, in a fixed order — for example sorted by SKU id — so two carts cannot deadlock by locking the same rows in opposite orders); or in Redis, one Lua script that checks every counter and decrements all only if all are available, with the counters sharing a hash tag so they live on one shard. Either way the reservation is all-or-nothing.</p>
+
+<h4>Multi-region sales</h4>
+<p>A global sale with buyers on three continents cannot afford a cross-region round trip per decrement. Split the stock in advance by expected demand (say 5,000 / 3,000 / 2,000), let each region sell its share locally, and run a coordinator that moves unsold units from slow regions to fast ones every few seconds. The sum across regions never exceeds the total because units are moved, not copied: the coordinator decrements one region's counter before incrementing another's. This is a sharded counter whose shards are regions.</p>
+
+<h4>Fairness has measurable definitions</h4>
+<p>"Fair" can be measured: the spread of queue wait times for users who joined at the same moment (Shopify's metric — median and 95th percentile converging), the share of units bought by accounts flagged as automated, the number of units per shipping address, and the proportion of buyers who were early registrants. Choose the definition before the sale, publish the rule (first-come, random draw, or registered first), and report against it afterwards; customers forgive "sold out" far more readily than they forgive "the bots got it".</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: Shopify's flash sales</h4>
+<p>Shopify's 2017 engineering write-up (Emil Stolarsky, in two parts) is a first-party account of flash sales hurting a multi-tenant platform. Some merchants ran drops that sold out in minutes, regularly — the post likens it to Black Friday every week or so — and in February 2016 one such sale took down not only that store but every store sharing its database shard. The bottleneck was checkout's writes: each checkout created a record and every step modified it. The first defence was a <strong>checkout throttle at the edge</strong>: Nginx with OpenResty's Lua module ran a leaky bucket allowing a fixed number of checkout requests per 5-second period, sized to what the application could handle; excess users were sent to a queue page in the merchant's own design (cached by Nginx) rather than shown an error, which polled until let through; admitted users got a signed cookie so they skipped the throttle for the rest of their session. Its flaw was fairness: polling made admission random, and some shoppers waited about as long as the sale lasted.</p>
+<p>Part II made the queue fair <strong>without central state</strong>. Each user's first checkout attempt gets a timestamp in a signed cookie; each load balancer computes its own cutoff time, a virtual "now serving" counter; requests timestamped before the cutoff pass to the leaky bucket. The cutoff moves under a controller borrowed from control theory — after MATLAB simulations of PID controllers, only the proportional term was kept, driven by the bucket's limit minus the requests already passed. The reported result was that median and 95th-percentile queue times converged, and complaints about long or unfair waits stopped at the next big sale. The lesson for interviews: the fairest, most scalable queue here was not a queue data structure at all, but a signed timestamp and a moving threshold.</p>
+
+<h4>Failure modes you will see</h4>
+<p><strong>The site falls over at T+0.</strong> Symptom: 5xx errors and timeouts across the store. Cause: the arrival spike reached the origin because the sale page was not cacheable (personalised HTML, a cookie that bypassed the CDN) or the waiting room was not enabled in time. Detection: origin request rate versus CDN hit rate in the first seconds. Prevention: a pre-sale checklist and a load test of the exact configuration.</p>
+<p><strong>Oversold.</strong> Symptom: orders exceed stock. Cause: a code path that decrements outside the atomic check (an admin tool, a mobile API version, a retry path that re-creates a reservation). Detection: a continuous invariant check — sold + active holds ≤ total — alerting on violation. Prevention: all decrements through one function, database constraints as backstop.</p>
+<p><strong>Undersold.</strong> Symptom: "sold out" while the database has units. Cause: Redis drift or holds that never expire because the sweeper is down. Detection: alert when database available minus Redis available exceeds a threshold, and on sweeper lag.</p>
+<p><strong>Double charges.</strong> Symptom: support tickets about two charges. Cause: retries without idempotency, or an idempotency record written outside the order transaction. Detection: count payments per order id.</p>
+
+<h4>What to monitor during the sale</h4>
+<p>Arrival rate, queue length and admission rate; checkout in-flight count, latency and error rate; lock wait time on the inventory row or Redis latency on the stock key; reservations created, paid, expired per second; Redis-versus-database available difference; payment authorisation latency and decline rate by reason; CDN hit rate; per-customer limit rejections and bot-score distribution. Put them on one screen with a named owner for each degradation switch.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> reproduce overselling with real concurrent database connections, then remove it with one conditional UPDATE. Python 3.12 standard library (<code>sqlite3</code>, <code>threading</code>), about 10 seconds.</p>
+<pre>"""Oversell race: 50 units, 200 concurrent buyers. Read-check-write vs atomic decrement."""
+import sqlite3, threading, os, tempfile, time
+
+DB = os.path.join(tempfile.mkdtemp(), "shop.db")
+STOCK, BUYERS = 50, 200
+
+def reset():
+    c = sqlite3.connect(DB); c.execute("PRAGMA journal_mode=WAL")
+    c.execute("DROP TABLE IF EXISTS inventory"); c.execute("DROP TABLE IF EXISTS orders")
+    c.execute("CREATE TABLE inventory (sku TEXT PRIMARY KEY, available INTEGER)")
+    c.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, buyer INTEGER)")
+    c.execute("INSERT INTO inventory VALUES ('PS9', ?)", (STOCK,)); c.commit(); c.close()
+
+def naive(buyer):                      # SELECT, decide in the app, UPDATE: the classic oversell
+    c = sqlite3.connect(DB, timeout=30, isolation_level=None)
+    (left,) = c.execute("SELECT available FROM inventory WHERE sku='PS9'").fetchone()
+    time.sleep(0.001)                  # app logic + network hop between read and write
+    if left &gt; 0:
+        c.execute("UPDATE inventory SET available = ? WHERE sku='PS9'", (left - 1,))
+        c.execute("INSERT INTO orders (buyer) VALUES (?)", (buyer,))
+    c.close()
+
+def atomic(buyer):                     # one conditional UPDATE; the row count is the decision
+    c = sqlite3.connect(DB, timeout=30, isolation_level=None)
+    c.execute("BEGIN IMMEDIATE")
+    cur = c.execute("UPDATE inventory SET available = available - 1 "
+                    "WHERE sku='PS9' AND available &gt;= 1")
+    if cur.rowcount == 1:
+        c.execute("INSERT INTO orders (buyer) VALUES (?)", (buyer,))
+    c.execute("COMMIT"); c.close()
+
+for fn in (naive, atomic):
+    reset(); t0 = time.perf_counter()
+    ts = [threading.Thread(target=fn, args=(i,)) for i in range(BUYERS)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    c = sqlite3.connect(DB)
+    sold = c.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    left = c.execute("SELECT available FROM inventory").fetchone()[0]
+    print(f"{fn.__name__:&gt;6}: orders={sold:&gt;3}  stock left={left:&gt;3}  "
+          f"oversold={max(0, sold - STOCK):&gt;3}  ({time.perf_counter() - t0:.2f}s)")</pre>
+<ol>
+<li>The naive run should report far more orders than 50 — often all 200 — <em>and</em> stock left well above zero: overselling and lost updates at once, because each write overwrote the others' decrements. The atomic run reports exactly 50 orders and 0 left.</li>
+<li>Remove the <code>time.sleep</code>. The naive version oversells less but still does: the window between read and write is shorter, not closed.</li>
+<li>Try the optimistic variant: read <code>available</code> and a <code>version</code>, then <code>UPDATE … WHERE version = ?</code> and retry on row count 0. Count retries per buyer — under this contention most attempts fail, which is why optimistic locking is wrong for the hottest row.</li>
+<li>Shard it: 5 rows of 10 units, each buyer picking a random row and falling back to the others on zero. Count how many buyers were told "sold out" while another row still had stock if you remove the fallback.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Estimate it</b>
+<p>A sneaker drop: 6,000 pairs across 12 sizes (500 each), expected 600,000 arrivals in the first 2 minutes, 12 requests per page view of which 9 are static, checkout costs 8 database writes, and the database has 8,000 writes per second of headroom. Size the origin load, the admission rate and how long admissions run if 40% of admitted users buy. Which counter is hottest?</p>
+<details><summary>Answer</summary>
+<p>Arrivals: 600,000 ÷ 120 s = 5,000 per second; requests 5,000 × 12 = 60,000 per second, of which 3 × 5,000 = <strong>15,000 per second</strong> reach the origin. Checkout capacity: 8,000 ÷ 8 = <strong>1,000 checkouts per second</strong>, so admit about 1,000 per second (minus a safety margin, say 800). Admissions needed: 6,000 ÷ 0.4 = 15,000, so about <strong>15-19 seconds</strong> of admissions before stock is fully reserved, then trickle admissions as holds expire. The hottest counters are the popular sizes, not the product: sizes 9-10 might take 15% of demand each, so their 500 units go in a few seconds while size 14 lingers. Each size is a separate row, so the per-row rate is the admission rate times that size's share — about 150 per second, well within a conditional UPDATE's ceiling. Show sold-out per size from cache.</p>
+</details>
+<b>Diagnose it</b>
+<p>Ten minutes into a sale, the site shows "sold out" but the reservations table has 1,200 fewer PAID rows than units, and only 50 active holds. Customers on social media are asking why the sale ended early. Redis is used as the stock gate. What happened and what do you do now?</p>
+<details><summary>Answer</summary>
+<p>Redis is too low by roughly 1,150 units. Likely causes: holds expired in the database (returning units to <code>available</code> there) but the expiry path never incremented Redis; or reservation attempts decremented Redis and then failed in the database (duplicate customer, payment declined, timeout) without incrementing back. Either way the gate is stricter than the truth. Now: run the reconciler — set Redis to total − paid − active holds from the database (about 1,150), flip the sale state back to live, and let the waiting room admit about 1,150 ÷ conversion rate more users. Then fix: every path that returns a unit must update both tiers (ideally the reconciler runs every few seconds so drift is bounded automatically), and alert on the difference between Redis and database available.</p>
+</details>
+</section>

@@ -1,0 +1,570 @@
+<!-- topic source for torch/pt10; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "pt10",
+  "t": "A GPT in PyTorch: embeddings, SDPA attention, pre-norm blocks, weight tying and a KV cache",
+  "tag": "Models",
+  "sum": "Building a GPT-2-style decoder in about 100 lines of PyTorch: token and position embeddings, multi-head attention through F.scaled_dot_product_attention, causal masks and their alignment, pre-norm residual blocks, weight tying and GPT-2 initialisation, a KV cache that matches uncached generation exactly, and checking the parameter count.",
+  "prereq": [
+    [
+      "lm3",
+      "A transformer block is attention plus an MLP, each wrapped in a residual connection with layer normalisation; GPT-style decoders stack identical blocks."
+    ],
+    [
+      "lm5",
+      "During generation the keys and values of earlier tokens do not change, so a KV cache stores them and each new token computes only its own; GQA shares KV heads to shrink the cache."
+    ],
+    [
+      "mc18",
+      "The NumPy GPT: embeddings, masked multi-head attention, MLP, layer norm, tied output layer, and generation with a cache."
+    ],
+    [
+      "pt2",
+      "Splitting heads is view then transpose; merging is transpose, contiguous, view; SDPA's boolean mask uses True for 'may attend'."
+    ],
+    [
+      "pt4",
+      "Weight tying is one shared Parameter; GPT-2 init is N(0, 0.02) with residual projections scaled by 1/√(2·n_layer); GPT-2 small has 124,439,808 parameters."
+    ]
+  ],
+  "myths": [
+    [
+      "is_causal=True always means 'each query sees itself and earlier keys'.",
+      "Only when queries and keys have the same length. For a non-square score matrix SDPA aligns the causal mask to the upper-left corner, so with a KV cache — one new query against 100 cached keys — is_causal=True lets the new token see only key 0. On 2.14 a 1×5 example attends to key 0 with weight 1.0. Use no mask for a single new token, or a lower-right aligned mask for a chunk."
+    ],
+    [
+      "F.scaled_dot_product_attention turns dropout off in eval mode.",
+      "It is a function and does not know the module's mode; it applies dropout_p whenever it is non-zero. The docs say to pass dropout_p=(self.p if self.training else 0.0). Passing a constant leaves attention dropout on during evaluation and generation."
+    ],
+    [
+      "Pre-norm and post-norm are an implementation detail.",
+      "Post-norm (normalise after adding the residual, as in the original transformer) puts every block's output through a normalisation, which makes deep stacks hard to train without careful warmup. Pre-norm (normalise the input to each sublayer, add the raw output to the residual) keeps a clean residual path from input to output, which is why GPT-2 and almost every later decoder use it — and why a final layer norm is needed before the output head."
+    ],
+    [
+      "A KV cache changes the model's output slightly.",
+      "Done correctly it gives exactly the same logits as recomputing the whole prefix, up to floating-point differences from different kernel shapes; on 2.14 the lesson's model generates identical token sequences with and without the cache. If cached and uncached generation diverge, the cache is buggy: wrong position indices, a wrong mask alignment, or keys appended in the wrong order."
+    ],
+    [
+      "The output layer needs its own weights.",
+      "In GPT-2 the output projection reuses the token-embedding matrix (weight tying), saving 38.6M of 163M parameters in the small model. Untied heads are a legitimate choice for large models, but tying is the GPT-2 default and halves the vocabulary-related parameters."
+    ],
+    [
+      "Computing logits for every position is necessary at generation time.",
+      "Only the last position's logits are used to pick the next token. Projecting all T positions onto a 50k-word vocabulary costs T times more and allocates a (B, T, V) tensor; at generation, apply the head to x[:, -1:] only."
+    ]
+  ],
+  "recap": [
+    "A GPT is token embeddings plus learned position embeddings, a stack of pre-norm blocks (x + attn(ln1(x)), then x + mlp(ln2(x))), a final layer norm and a linear head tied to the token embedding.",
+    "Attention splits C channels into H heads with view and transpose, calls F.scaled_dot_product_attention, and merges heads with transpose, contiguous and view; SDPA picks a fused kernel when the hardware supports it.",
+    "SDPA's is_causal aligns the mask to the upper-left corner; with a KV cache use no mask for one new token and a lower-right (diagonal-shifted) mask for a chunk.",
+    "Attention dropout in SDPA must be switched off explicitly outside training: dropout_p = p if self.training else 0.",
+    "GPT-2 initialisation draws weights from N(0, 0.02) and scales residual output projections by 1/√(2·n_layer); the step-0 loss should be close to ln V.",
+    "A KV cache stores each layer's keys and values for past positions; each new token computes one query and one key/value per layer, and position indices must continue from the cache length.",
+    "Cache memory is 2 × layers × KV heads × head size × bytes per token: 36,864 bytes per token for GPT-2 small in fp16.",
+    "Verify a GPT implementation with three checks: the parameter count (124,439,808 for GPT-2 small), the loss at init (≈ ln V), and identical cached and uncached generation."
+  ],
+  "glossary": [
+    [
+      "Causal mask",
+      "A mask that lets query position i attend only to key positions ≤ i."
+    ],
+    [
+      "Decode step",
+      "Generating one new token: one forward pass over a single position using the KV cache."
+    ],
+    [
+      "Fused attention kernel",
+      "A GPU kernel such as FlashAttention that computes softmax(QKᵀ)V in tiles without storing the full score matrix."
+    ],
+    [
+      "GELU",
+      "Gaussian Error Linear Unit, the smooth activation in GPT-2's MLP; nn.GELU() is the exact form, approximate=\"tanh\" the GPT-2 variant."
+    ],
+    [
+      "GQA (grouped-query attention)",
+      "Attention where groups of query heads share one key/value head, shrinking the KV cache."
+    ],
+    [
+      "Head size",
+      "The number of channels per attention head, C / H (64 for GPT-2 small)."
+    ],
+    [
+      "KV cache",
+      "Per-layer stored keys and values of all previous positions, reused at every generation step."
+    ],
+    [
+      "Left padding",
+      "Padding prompts at the start so their last real tokens line up, as decoder-only batched generation requires."
+    ],
+    [
+      "Lower-right causal alignment",
+      "Aligning the causal mask so the last query sees all keys: the right convention when queries are the newest tokens after a cache."
+    ],
+    [
+      "Perplexity",
+      "The exponential of the average per-token cross-entropy; lower means the model predicts the text better."
+    ],
+    [
+      "Pre-norm",
+      "Applying layer normalisation to a sublayer's input and adding its output to an unnormalised residual stream."
+    ],
+    [
+      "Prefill",
+      "Running the whole prompt through the model at once to fill the KV cache before generating."
+    ],
+    [
+      "Residual stream",
+      "The running sum x that each block reads from and adds its outputs to."
+    ],
+    [
+      "SDPA",
+      "torch.nn.functional.scaled_dot_product_attention, PyTorch's attention function that dispatches to fused kernels."
+    ],
+    [
+      "Temperature",
+      "A divisor applied to logits before softmax when sampling; below 1 sharpens, above 1 flattens, 0 means greedy."
+    ],
+    [
+      "Upper-left causal alignment",
+      "Aligning the causal mask to the top-left corner of a non-square score matrix; SDPA's is_causal does this."
+    ],
+    [
+      "Weight tying",
+      "Using the token-embedding matrix as the output projection's weight."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Describe the forward pass of a GPT-2-style model in PyTorch.",
+      "Token ids (B, T) are embedded with wte and added to position embeddings wpe(arange(T)) giving (B, T, C). Each of L blocks applies x = x + attn(ln1(x)) and x = x + mlp(ln2(x)), where attention is masked causally and the MLP is C→4C→C with GELU. A final LayerNorm and a linear head (tied to wte) produce (B, T, V) logits; training applies cross_entropy against the tokens shifted by one."
+    ],
+    [
+      "E",
+      "How do you split channels into heads and merge them back?",
+      "q.view(B, T, H, C // H).transpose(1, 2) gives (B, H, T, hs): view splits the channel axis (neighbouring axes, so view is correct) and transpose moves heads before time. After attention, y.transpose(1, 2).contiguous().view(B, T, C) moves heads back and merges them; contiguous is needed because the transpose left memory non-contiguous."
+    ],
+    [
+      "E",
+      "Why apply the output head only to the last position during generation?",
+      "Only the last position's distribution is used to choose the next token. Applying the head to all T positions costs T × C × V multiply-adds and allocates (B, T, V) logits — for T = 1,000 and V = 50,257 that is 1,000 times the necessary work and 200 MB per sequence in float32."
+    ],
+    [
+      "M",
+      "What does F.scaled_dot_product_attention do, and what do you have to handle yourself?",
+      "It computes softmax(QKᵀ/√d + mask)V and dispatches to a fused FlashAttention, memory-efficient or cuDNN kernel when inputs allow, falling back to a C++ math implementation. You handle: splitting and merging heads, the mask semantics (boolean True = may attend; is_causal aligns upper-left), dropout_p switched off outside training, enable_gqa for grouped-query attention, and dtype (fused kernels need fp16 or bf16 on CUDA).",
+      "Follow-up: How do you force or check a particular kernel? — Wrap the call in torch.nn.attention.sdpa_kernel([SDPBackend.FLASH_ATTENTION]); if that backend cannot run with these inputs, PyTorch raises or warns with the reason."
+    ],
+    [
+      "M",
+      "With a KV cache, why is is_causal=True wrong for the decode step, and what is right?",
+      "At decode the query has length 1 and the keys have length N (all cached positions plus the new one). SDPA's is_causal builds a causal mask aligned to the upper-left corner of the 1×N score matrix, so the single query may attend only to key 0. The new token should see every cached key, so pass no mask. For a chunk of T new tokens after a cache of N − T, use a boolean mask ones(T, N).tril(diagonal=N − T), i.e. lower-right alignment (torch.nn.attention.bias.causal_lower_right builds it).",
+      "Follow-up: How would you catch this bug? — Compare greedy generation with and without the cache: they must produce the same tokens."
+    ],
+    [
+      "M",
+      "What does the KV cache cost in memory, and how does GQA change it?",
+      "Per token: 2 (K and V) × layers × KV heads × head size × bytes. GPT-2 small in fp16: 2 × 12 × 12 × 64 × 2 = 36,864 bytes, so 1,024 tokens × batch 32 is about 1.2 GB. A 32-layer model with 32 heads of size 128 in fp16 needs 524,288 bytes (0.5 MB) per token; with grouped-query attention using 8 KV heads it drops to 128 KB. The cache, not the weights, often limits batch size in serving."
+    ],
+    [
+      "M",
+      "Why pre-norm, and why does a pre-norm model need a final LayerNorm?",
+      "Pre-norm blocks add each sublayer's output to an unnormalised residual stream, so there is an identity path from embeddings to the output; gradients flow through it unchanged, which makes deep stacks train stably without long warmups. The stream itself is never normalised by the blocks, and its scale grows with depth, so a final LayerNorm (ln_f) normalises it before the output head."
+    ],
+    [
+      "M",
+      "List three planted bugs you would look for in someone's GPT attention module.",
+      "Masking with multiplication instead of masked_fill(-inf) (future leak); softmax over dim -2 instead of -1; merging heads with view without transpose/contiguous, which mixes heads and time; constant dropout_p passed to SDPA; scaling by 1/d instead of 1/√d (or scaling twice when SDPA already scales); is_causal=True in the cached decode path; and position indices restarting at 0 for each new token with a cache.",
+      "Follow-up: Which single test catches most of them? — The gradient-dependency test (pt9) for the leaks, plus cached-versus-uncached generation equality for the cache bugs."
+    ],
+    [
+      "H",
+      "Write the decode loop with a KV cache and explain each line.",
+      "Prefill: run the prompt with empty per-layer caches; each attention layer stores its K and V (B, H, T, hs). Then loop: take logits of the last position, divide by temperature, softmax, sample (or argmax), append the token; run the model on just that token with start = current length − 1 so its position embedding is correct; each layer computes q, k, v for one position, concatenates k and v to its cache along the time axis, and attends with no mask. Under inference_mode, with the head applied to the last position only. Each step costs O(N) attention for N cached tokens instead of O(N²) recomputation.",
+      "Follow-up: What breaks when the sequence reaches the context length? — Learned position embeddings have only ctx rows; you must stop, or crop the cache and recompute (expensive), or use a model with relative positions such as RoPE."
+    ],
+    [
+      "H",
+      "How would you check that your GPT implementation is correct before training it?",
+      "Count parameters on the meta device and compare with the known value (124,439,808 for GPT-2 small) or the 12·L·C² + V·C + ctx·C formula. Check the step-0 loss is near ln V (10.8 for 50,257). Run the dependency test for causality. Check cached and uncached generation produce identical tokens. Overfit one batch. Ideally, load the published GPT-2 weights (mapping names and transposing GPT-2's Conv1D weights) and compare logits with a reference implementation on a fixed input.",
+      "Follow-up: Why must GPT-2 checkpoint weights be transposed? — The original code stores its linear layers as Conv1D with weight shape (in, out), while nn.Linear stores (out, in)."
+    ],
+    [
+      "H",
+      "What changes when you replace learned position embeddings with RoPE in this code?",
+      "wpe disappears; instead, inside attention, q and k (B, H, T, hs) are rotated pairwise by angles that depend on their absolute positions, using precomputed cos and sin tables registered as non-persistent buffers. With a KV cache, keys are rotated once when stored, and each new query is rotated with its own position (start + t). Because attention scores then depend only on relative positions, the model can be extended beyond its training length with frequency scaling — not possible with a learned table. Rotate in float32 and cast back to avoid precision loss in bf16."
+    ]
+  ],
+  "refs": [
+    [
+      "code",
+      "Karpathy — nanoGPT model.py",
+      "The reference compact GPT: SDPA attention with a fallback, pre-norm blocks, tied wte/lm_head, GPT-2 init, configure_optimizers and generate().",
+      "https://raw.githubusercontent.com/karpathy/nanoGPT/master/model.py"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.nn.functional.scaled_dot_product_attention",
+      "Signature, reference implementation, mask semantics, is_causal alignment, dropout warning, enable_gqa and backend selection.",
+      "https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.scaled_dot_product_attention.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.nn.attention.bias (causal_upper_left, causal_lower_right)",
+      "The two causal alignments for non-square attention and when each applies.",
+      "https://docs.pytorch.org/docs/2.14/nn.attention.bias.html"
+    ],
+    [
+      "paper",
+      "Radford et al. — Language Models are Unsupervised Multitask Learners (GPT-2, 2019)",
+      "The GPT-2 architecture changes: pre-norm layer norm, a final layer norm and residual-layer init scaled by 1/√N.",
+      "https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf"
+    ],
+    [
+      "docs",
+      "PyTorch tutorials — (Beta) Implementing High-Performance Transformers with SDPA",
+      "Using SDPA in a causal self-attention module, backend selection and benchmarks.",
+      "https://docs.pytorch.org/tutorials/intermediate/scaled_dot_product_attention_tutorial.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>"Implement a small GPT in PyTorch" is one of the most common coding exercises in ML-engineer interviews, and its debugging twin — "here is someone's GPT, it trains but generation is broken" — is one of the most common ML-debugging prompts. You may already have built one in NumPy (mc18), where every matrix multiply and every backward pass was explicit. In PyTorch the arithmetic is easy; the difficulty moves into the places where PyTorch's conveniences have semantics you must know: the axis bookkeeping of splitting heads, what <code>F.scaled_dot_product_attention</code> does with masks and dropout, how the causal mask is aligned when queries and keys have different lengths, how weight tying and initialisation interact, and how a KV cache must handle position indices.</p>
+<p>The bugs here are expensive because they are invisible during training. A causal-mask alignment mistake that only appears in the cached decode path produces a model whose training loss is perfect and whose generations are nonsense. Attention dropout left on at inference makes generation randomly worse. Position embeddings that restart at zero for each new token make the cache "work" while silently feeding the model the wrong positions. Each of these is a single line, and each is a classic planted bug.</p>
+<p>This lesson builds a complete GPT-2-style model in about 100 lines — the same architecture as Karpathy's nanoGPT, which follows OpenAI's GPT-2 paper — and checks it the way a careful engineer would: the parameter count matches GPT-2 small's 124,439,808 exactly, the loss at initialisation is close to ln V, and generation with a KV cache produces exactly the same tokens as generation without it. Along the way it explains every design choice: why pre-norm, why the final layer norm, why the residual projections get a smaller initialisation, what SDPA dispatches to, and why the decode step must not use <code>is_causal=True</code>. All code was run on PyTorch 2.14.</p>
+</section>
+
+<section data-field="primer">
+<p>A GPT is an assembly line that reads a sequence of tokens and, at every position, predicts the next token. Picture a long shared whiteboard — the <strong>residual stream</strong> — with one column per position, each column C numbers tall. The line works like this:</p>
+<ol>
+<li><strong>Embedding.</strong> Each token id is looked up in a table to get a C-dimensional vector, and a second table adds a vector for its position. These sums are written on the whiteboard.</li>
+<li><strong>Blocks.</strong> L identical stations each read the whiteboard and add something to it. Each station has two workers. The attention worker lets each column look at earlier columns (never later ones — that is the causal mask) and writes a summary of what it found. The MLP worker processes each column on its own and writes its result. Before reading, each worker normalises what it sees (pre-norm); what they write is added to the whiteboard unnormalised.</li>
+<li><strong>Output.</strong> The final whiteboard is normalised once more and each column is compared against every token's embedding (the same table as step 1 — weight tying) to score how likely each token is to come next.</li>
+</ol>
+<p>Training shows the model whole sequences and asks every position to predict the next token at once. Generation is different: it runs one step at a time, appending the chosen token and running again. Since columns never look forward, earlier columns' intermediate results never change when a token is appended — so a <strong>KV cache</strong> keeps each layer's keys and values for past positions and computes only the new column.</p>
+
+<figure>
+<svg viewBox="0 0 640 310" width="100%" role="img" aria-label="GPT architecture: token and position embeddings summed into the residual stream, L pre-norm blocks each adding attention and MLP outputs, final layer norm, tied linear head to logits">
+  <defs><marker id="pt10-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="250" width="120" height="32" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="80" y="270" text-anchor="middle" style="fill:var(--ink)">wte(idx) (B,T,C)</text>
+    <rect x="160" y="250" width="120" height="32" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="220" y="270" text-anchor="middle" style="fill:var(--ink)">wpe(pos) (T,C)</text>
+    <line x1="150" y1="250" x2="150" y2="235" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="150" y1="40" x2="150" y2="235" marker-end="url(#pt10-arrow)" style="fill:none;stroke:var(--accent);stroke-width:3" transform="rotate(180 150 137)"/>
+    <text x="150" y="246" text-anchor="middle" style="fill:var(--ink)">+</text>
+    <text x="40" y="140" style="fill:var(--accent)">residual</text>
+    <text x="40" y="156" style="fill:var(--accent)">stream x</text>
+    <rect x="200" y="130" width="230" height="90" rx="6" style="fill:none;stroke:var(--s2);stroke-dasharray:5 3"/>
+    <text x="315" y="124" text-anchor="middle" style="fill:var(--ink-2)">block × L (pre-norm)</text>
+    <rect x="215" y="180" width="90" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="260" y="199" text-anchor="middle" style="fill:var(--ink)">ln1 → attn</text>
+    <rect x="325" y="140" width="90" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="370" y="159" text-anchor="middle" style="fill:var(--ink)">ln2 → mlp</text>
+    <line x1="150" y1="200" x2="215" y2="195" marker-end="url(#pt10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="215" y1="185" x2="156" y2="185" marker-end="url(#pt10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="185" y="180" text-anchor="middle" style="fill:var(--muted)">add</text>
+    <line x1="150" y1="160" x2="325" y2="155" marker-end="url(#pt10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="325" y1="146" x2="156" y2="146" marker-end="url(#pt10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="100" y="60" width="100" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="150" y="80" text-anchor="middle" style="fill:var(--ink)">ln_f</text>
+    <rect x="100" y="14" width="100" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="150" y="34" text-anchor="middle" style="fill:var(--ink)">head → logits</text>
+    <line x1="150" y1="60" x2="150" y2="44" marker-end="url(#pt10-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <path d="M200,29 C 520,29 520,266 280,266" style="fill:none;stroke:var(--s1);stroke-dasharray:4 3"/>
+    <text x="470" y="60" style="fill:var(--ink-2)">tied: head.weight</text>
+    <text x="470" y="76" style="fill:var(--ink-2)">is wte.weight</text>
+    <text x="460" y="200" style="fill:var(--ink-2)">attention: each column</text>
+    <text x="460" y="216" style="fill:var(--ink-2)">reads earlier columns</text>
+    <text x="460" y="232" style="fill:var(--ink-2)">(causal), MLP: each</text>
+    <text x="460" y="248" style="fill:var(--ink-2)">column on its own</text>
+  </g>
+</svg>
+<figcaption>Blocks only ever add to the residual stream; normalisation happens on the way into each sublayer and once at the end. The head shares its weight with the token embedding.</figcaption>
+</figure>
+
+<p>Training and generation use the same model very differently, and most of this lesson's bugs live in the difference. In training, a batch of B sequences of length T goes through once; every position computes its prediction in parallel, the causal mask stops positions from cheating, and the loss averages over all B × T predictions. The work is dominated by large matrix multiplications and is compute-bound — the GPU is busy multiplying. In generation, the prompt is processed once in parallel (the <strong>prefill</strong>), and then the model runs one position at a time (each a <strong>decode step</strong>), each step reading every weight and every cached key and value to produce a single token per sequence. Decode is memory-bound — the GPU mostly waits for memory — and it is the path that training never exercises. Code that is perfect for training can still be wrong in decode, so decode needs its own tests.</p>
+<p>Where the whiteboard analogy breaks: the attention worker does not "look at" earlier columns directly; it computes from each column a query, a key and a value, and each column's summary is a weighted average of earlier columns' values, weighted by how well its query matches their keys. That is precisely why the cache stores keys and values — the quantities later queries need — and not the columns themselves.</p>
+<p>If you remember one sentence: <em>embeddings in, L pre-norm blocks each adding attention and MLP outputs to a residual stream, a final norm and a tied head out — and generation reuses each layer's cached keys and values so each new token costs one column of work</em>.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Configuration and the model skeleton</h4>
+<p>GPT-2 small is fixed by five numbers: vocabulary V = 50,257, context length 1,024, width C = 768, H = 12 heads (head size 64), L = 12 layers. A dataclass keeps them together:</p>
+<pre>@dataclass
+class Config:
+    vocab: int = 50257
+    ctx: int = 1024
+    C: int = 768
+    H: int = 12
+    L: int = 12
+    dropout: float = 0.0</pre>
+<p>The model has five parts, each registered properly (pt4): <code>wte</code> (token embedding, V × C), <code>wpe</code> (position embedding, ctx × C), <code>blocks</code> (an <code>nn.ModuleList</code> of L blocks), <code>ln_f</code> (final LayerNorm) and <code>head</code> (a bias-free <code>nn.Linear(C, V)</code> whose weight is tied to <code>wte</code>).</p>
+
+<h4>2. Attention with SDPA</h4>
+<pre>class Attention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.H, self.hs = cfg.H, cfg.C // cfg.H
+        self.qkv = nn.Linear(cfg.C, 3 * cfg.C)        # one matmul for q, k, v
+        self.proj = nn.Linear(cfg.C, cfg.C)           # writes into the residual stream
+        self.p = cfg.dropout
+
+    def forward(self, x, cache=None):                 # x: (B, T, C)
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=-1)         # 3 × (B, T, C), views
+        q, k, v = (t.view(B, T, self.H, self.hs).transpose(1, 2)
+                   for t in (q, k, v))                  # (B, H, T, hs)
+        ...                                            # cache handling: section 6
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                           dropout_p=self.p if self.training else 0.0)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)   # merge heads
+        return self.proj(y)</pre>
+<p>Three details. First, the head split is <code>view</code> then <code>transpose</code> and the merge is <code>transpose</code>, <code>contiguous</code>, <code>view</code> — pt2 explains why each is a view or a copy, and why using <code>view(B, H, T, hs)</code> directly would mix heads with time. Second, <code>F.scaled_dot_product_attention</code> (SDPA) computes softmax(QKᵀ/√hs + mask)·V. Its documentation includes a reference implementation in plain PyTorch, and on CUDA it dispatches to a fused kernel when inputs allow — FlashAttention-2, a memory-efficient kernel, or cuDNN attention — falling back to the C++ "math" implementation otherwise; fused kernels never materialise the T × T score matrix, which is where pt7's activation savings come from. On CPU, as on this machine, the math path is used. Third, dropout: the docs warn that SDPA "always applies dropout according to the specified dropout_p argument" and show exactly the <code>self.p if self.training else 0.0</code> idiom. A constant <code>dropout_p=0.1</code> leaves attention dropout on at evaluation and generation — a planted-bug favourite.</p>
+
+<h4>3. The block: pre-norm residuals</h4>
+<pre>class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.ln1, self.ln2 = nn.LayerNorm(cfg.C), nn.LayerNorm(cfg.C)
+        self.attn = Attention(cfg)
+        self.mlp = nn.Sequential(nn.Linear(cfg.C, 4 * cfg.C), nn.GELU(),
+                                 nn.Linear(4 * cfg.C, cfg.C))
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x, cache=None):
+        x = x + self.drop(self.attn(self.ln1(x), cache))   # normalise the input, add raw output
+        return x + self.drop(self.mlp(self.ln2(x)))</pre>
+<p>This is <strong>pre-norm</strong>: LayerNorm is applied to each sublayer's input, and the sublayer's output is added to the unnormalised stream. The original transformer used <strong>post-norm</strong> — <code>x = ln(x + attn(x))</code> — which normalises the stream itself after every addition. Post-norm places a normalisation on every path from input to output, so gradients to early layers pass through many of them; deep post-norm stacks are known to need careful learning-rate warmup to train at all. Pre-norm leaves an identity path through the whole network, which is why the GPT-2 paper moved layer normalisation "to the input of each sub-block" and added "an additional layer normalization ... after the final self-attention block" — the <code>ln_f</code> in our model. Without <code>ln_f</code>, the head would see a residual stream whose scale grows with depth.</p>
+
+<h4>4. Embeddings, head, tying and initialisation</h4>
+<pre>class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.wte, self.wpe = nn.Embedding(cfg.vocab, cfg.C), nn.Embedding(cfg.ctx, cfg.C)
+        self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.L))
+        self.ln_f = nn.LayerNorm(cfg.C)
+        self.head = nn.Linear(cfg.C, cfg.vocab, bias=False)
+        self.head.weight = self.wte.weight              # weight tying
+        self.apply(self._init)
+        for n, p in self.named_parameters():            # residual projections
+            if n.endswith("attn.proj.weight") or n.endswith("mlp.2.weight"):
+                nn.init.normal_(p, 0.0, 0.02 / math.sqrt(2 * cfg.L))
+
+    def _init(self, m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+        if isinstance(m, nn.Linear) and m.bias is not None:
+            nn.init.zeros_(m.bias)</pre>
+<p>Weight tying is one assignment (pt4): <code>head.weight</code> and <code>wte.weight</code> become the same Parameter. Initialisation follows GPT-2 and nanoGPT: N(0, 0.02) for every linear and embedding weight, zero biases, and N(0, 0.02/√(2L)) for the two projections that write into the residual stream in each block (<code>attn.proj</code> and the MLP's second linear, <code>mlp.2</code>). The GPT-2 paper describes it as scaling "the weights of residual layers at initialization by a factor of 1/√N where N is the number of residual layers"; with 2 residual additions per block, N = 2L. The reason (pt4): the stream is a sum of 2L contributions, and scaling each by 1/√(2L) keeps its variance from growing with depth. Note that the tied weight is initialised twice by <code>apply</code> (as an Embedding and as a Linear), harmlessly, with the same distribution.</p>
+
+<h4>5. The forward pass and the loss</h4>
+<pre>    def forward(self, idx, targets=None, caches=None, start=0):
+        B, T = idx.shape
+        pos = torch.arange(start, start + T, device=idx.device)
+        x = self.wte(idx) + self.wpe(pos)               # (B, T, C) + (T, C) broadcasts
+        for i, blk in enumerate(self.blocks):
+            x = blk(x, None if caches is None else caches[i])
+        x = self.ln_f(x)
+        if targets is None:
+            return self.head(x[:, -1:]), None           # inference: last position only
+        logits = self.head(x)                           # (B, T, V)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss</pre>
+<p>Positions are created on the input's device (a bare <code>torch.arange(T)</code> breaks on GPU, pt4) and start at <code>start</code>, which matters for the cache. Training passes <code>targets</code> = the input shifted by one (pt9's bug 2) and gets the mean token-level cross-entropy over raw logits (pt9's bug 6). At inference the head is applied to the last position only, cutting the head's cost and the (B, T, V) allocation by a factor of T.</p>
+
+<h4>6. The KV cache, and the mask alignment trap</h4>
+<p>During generation, at step n the model needs logits for position n only. Keys and values of positions 0…n−1 were already computed in previous steps and have not changed (later tokens cannot affect earlier positions in a causal model). So each attention layer keeps them:</p>
+<pre>        if cache is not None:                         # inside Attention.forward
+            if "k" in cache:
+                k = torch.cat([cache["k"], k], dim=2)   # (B, H, N, hs): past + new
+                v = torch.cat([cache["v"], v], dim=2)
+            cache["k"], cache["v"] = k, v
+        Tk = k.shape[2]
+        if T == Tk:                                   # training or prefill: square
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                               dropout_p=self.p if self.training else 0.0)
+        elif T == 1:                                  # decode: one query sees every key
+            y = F.scaled_dot_product_attention(q, k, v)
+        else:                                         # a chunk of T new queries after a cache
+            mask = torch.ones(T, Tk, dtype=torch.bool, device=x.device).tril(diagonal=Tk - T)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)</pre>
+<p>Why three cases? SDPA's <code>is_causal=True</code> builds a causal mask aligned to the <strong>upper-left</strong> corner of the score matrix: query i may see keys 0…i. When queries and keys have the same length that is exactly right. At a decode step, there is one query and N keys; upper-left alignment lets that single query see only key 0. Checked on 2.14: with one query and five keys, <code>is_causal=True</code> gives attention weights [1, 0, 0, 0, 0]. The correct behaviour — the newest token sees everything cached plus itself — is "no mask". For a chunk of T new tokens after N − T cached ones (chunked prefill, speculative decoding), query i (absolute position N − T + i) must see keys 0…N − T + i: a <strong>lower-right</strong> aligned mask, which is <code>tril(diagonal=N − T)</code>, or the <code>causal_lower_right(T, N)</code> helper from <code>torch.nn.attention.bias</code>. The SDPA docs describe the upper-left convention; the bias module documents both.</p>
+<p>The generation loop:</p>
+<pre>    @torch.inference_mode()
+    def generate(self, idx, n_new, temperature=1.0):
+        caches = [dict() for _ in self.blocks]
+        logits, _ = self(idx, caches=caches)               # prefill the prompt
+        for _ in range(n_new):
+            probs = F.softmax(logits[:, -1] / temperature, dim=-1)
+            nxt = torch.multinomial(probs, 1)              # or argmax for greedy
+            idx = torch.cat([idx, nxt], dim=1)
+            logits, _ = self(nxt, caches=caches, start=idx.shape[1] - 1)
+        return idx</pre>
+<p>Two lines carry the correctness: <code>start=idx.shape[1] - 1</code> gives the new token its true position (restarting at 0 is a classic bug that the cache hides: generation "works" but every new token believes it is at position 0), and the model is run on <code>nxt</code> alone, not on the whole sequence. The test of the implementation is decisive: greedy generation with and without the cache must produce identical tokens. On 2.14, with a small configuration of this exact code (V = 100, C = 64, 2 layers), cached and uncached greedy generation of 10 tokens are identical, and the chunk path's logits match the full forward pass to 1e-5.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Score matrices: training is square with lower-triangular causal mask; decode is one row seeing all cached keys; is_causal upper-left alignment would let the single row see only key 0">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="110" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">training / prefill: T×T</text>
+    <rect x="50" y="34" width="120" height="120" style="fill:none;stroke:var(--line-2)"/>
+    <polygon points="50,34 74,34 74,58 98,58 98,82 122,82 122,106 146,106 146,130 170,130 170,154 50,154" style="fill:var(--good);opacity:0.35"/>
+    <text x="110" y="176" text-anchor="middle" style="fill:var(--ink-2)">is_causal=True ✓</text>
+    <text x="330" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">decode: 1×N, correct</text>
+    <rect x="250" y="94" width="160" height="24" style="fill:var(--good);opacity:0.35;stroke:var(--line-2)"/>
+    <text x="330" y="140" text-anchor="middle" style="fill:var(--ink-2)">new token sees all N keys:</text>
+    <text x="330" y="156" text-anchor="middle" style="fill:var(--ink-2)">no mask</text>
+    <text x="540" y="20" text-anchor="middle" style="fill:var(--crit);font-weight:600">decode with is_causal=True</text>
+    <rect x="460" y="94" width="160" height="24" style="fill:none;stroke:var(--line-2)"/>
+    <rect x="460" y="94" width="20" height="24" style="fill:var(--crit);opacity:0.5"/>
+    <text x="540" y="140" text-anchor="middle" style="fill:var(--ink-2)">upper-left alignment:</text>
+    <text x="540" y="156" text-anchor="middle" style="fill:var(--ink-2)">sees key 0 only (2.14: [1,0,0,0,0])</text>
+    <text x="20" y="206" style="fill:var(--ink)">Chunk of T new queries after N−T cached keys: lower-right alignment, ones(T, N).tril(diagonal=N−T),</text>
+    <text x="20" y="226" style="fill:var(--ink)">or causal_lower_right(T, N). Test: greedy generation with and without the cache must match exactly.</text>
+  </g>
+</svg>
+<figcaption>The same flag means different things for square and non-square score matrices. The decode path is where the alignment bites.</figcaption>
+</figure>
+
+<h4>7. Checking the implementation: parameter count, loss at init, cache equality</h4>
+<p>Build the model on the meta device and count:</p>
+<pre>with torch.device("meta"):
+    g = GPT(Config())
+sum(p.numel() for p in g.parameters())    # 124439808 on 2.14</pre>
+<p>That is exactly GPT-2 small (pt4 derives it: 7,087,872 per block × 12, plus 38,597,376 token and 786,432 position embedding parameters, plus 1,536 for <code>ln_f</code>, with the head tied). A different number points at a missing bias, an untied head (+38.6M), or a wrong MLP width. The meta device makes the check instant and allocation-free, and <code>nn.init</code> functions are no-ops on meta tensors, so the constructor runs unchanged.</p>
+<p>Next, the loss at initialisation: for random tokens the loss should be close to ln V. With the small test configuration (V = 100) the measured initial loss was 4.53 against ln 100 = 4.61 — close, as expected from small N(0, 0.02) logits. For GPT-2 small the target is ln 50,257 ≈ 10.82. Then the dependency test from pt9 for causality, the cache-equality test from section 6, and overfitting one batch. These five checks take seconds and catch nearly every bug in this lesson's catalogue.</p>
+
+<h4>8. Memory and compute of the cache</h4>
+<p>The cache stores, per token, a key and a value per layer per KV head: 2 × L × H<sub>kv</sub> × hs × bytes. For GPT-2 small in fp16: 2 × 12 × 12 × 64 × 2 = 36,864 bytes per token; a batch of 32 sequences of 1,024 tokens needs 32 × 1,024 × 36,864 ≈ 1.2 GB. For a 32-layer model with 32 heads of size 128 it is 524,288 bytes — half a megabyte — per token; grouped-query attention with 8 KV heads cuts that to 128 KB (lm5). Passing <code>enable_gqa=True</code> lets SDPA consume k and v with fewer heads than q directly (pt2 explains why <code>repeat_interleave</code>, not <code>repeat</code>, is the right expansion if you do it by hand).</p>
+<p>Compute: without a cache, generating token n re-runs the whole prefix — O(n) work per layer for the MLP and O(n²) for attention, so a 1,000-token generation does on the order of 500,000 token-positions of MLP work. With the cache, each step processes one position: O(1) MLP work and O(n) attention reads. The decode step then becomes memory-bound: it reads every weight and the whole cache to produce one token per sequence, which is why serving batches many sequences together (gpu10, lm13, pt13).</p>
+<p>The implementation above grows the cache with <code>torch.cat</code>, which allocates a new tensor every step — fine for clarity, wasteful at scale. Production code preallocates a (B, H, ctx, hs) buffer per layer and writes into it with index assignment, which also gives static shapes for <code>torch.compile</code> and CUDA graphs (pt12), and serving engines manage the cache in fixed-size pages so that sequences of different lengths share memory without fragmentation.</p>
+<h4>9. Training it: a minimal loop</h4>
+<p>The model plugs into the loop of pt6 with two GPT-specific details. Batches are random windows of a token array with targets shifted by one (pt5, pt9). And the optimiser uses two parameter groups, as nanoGPT's <code>configure_optimizers</code> does: weight decay on matrices (every parameter with two or more dimensions — linear weights and the tied embedding) and none on biases and LayerNorm weights.</p>
+<pre>decay = [p for p in model.parameters() if p.dim() &gt;= 2]
+no_decay = [p for p in model.parameters() if p.dim() &lt; 2]
+opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                         {"params": no_decay, "weight_decay": 0.0}],
+                        lr=6e-4, betas=(0.9, 0.95))
+for step in range(max_steps):
+    x, y = get_batch("train")                          # (B, T) and (B, T) shifted by one
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        _, loss = model(x, targets=y)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step(); sched.step(); opt.zero_grad(set_to_none=True)</pre>
+<p>Because <code>model.parameters()</code> de-duplicates the tied weight, it appears once, in the decay group. With AdamW betas (0.9, 0.95), a learning rate around 6e-4 for a model this size, warmup and cosine decay (pt6), and bf16 autocast (pt7), this is essentially the configuration nanoGPT uses to reproduce GPT-2 small.</p>
+
+<h4>10. Batched generation with prompts of different lengths</h4>
+<p>Serving many prompts at once means prompts of different lengths in one batch. Two conventions exist. With <strong>left padding</strong>, shorter prompts are padded at the start so every prompt's last real token sits at the same column, and generation appends new tokens in the same column for all sequences; the attention mask must then also exclude the padding keys (a key-padding mask combined with the causal mask), and position indices must count only real tokens, or each padded sequence's positions are shifted by its padding length. With right padding, the last real token is at a different column per sequence, so the logits must be gathered at each sequence's own last position — and appending new tokens after padding breaks the sequence. Decoder-only generation therefore uses left padding (<code>pad_sequence(..., padding_side="left")</code>, pt5) with explicit masks and per-sequence positions, while serving engines avoid padding altogether by packing variable-length sequences and tracking each one's cache separately.</p>
+<h4>11. Precision inside the GPT</h4>
+<p>Under bf16 autocast (pt7) most of this model runs in bf16: the QKV and output projections, the MLP and the head are matmuls on the autocast list, and SDPA's fused kernels take bf16 inputs while accumulating in float32 internally. Three places deserve float32. The LayerNorms: on CUDA autocast runs <code>layer_norm</code> in float32 automatically, but a hand-written RMSNorm must upcast itself (pt4). The loss: <code>F.cross_entropy</code> runs in float32 under CUDA autocast, which matters because a log-softmax over 50,257 classes in bf16 loses the small probabilities that dominate the loss on hard tokens; if you compute log-probabilities yourself for evaluation, call <code>.float()</code> first. And sampling: softmax over bf16 logits divided by a small temperature can underflow most probabilities to zero, so production samplers upcast the last position's logits before temperature, top-k and top-p. The KV cache itself can stay in bf16 (or lower, with cache quantisation), since every read is followed by float32 accumulation inside the attention kernel.</p>
+</section>
+
+<section data-field="deep">
+<h4>What SDPA dispatches to, and why it sometimes does not</h4>
+<p>On CUDA, SDPA chooses among FlashAttention-2, a memory-efficient attention kernel, cuDNN attention and the math fallback, based on dtype (fused kernels require fp16 or bf16), head size, mask type, dropout and hardware. An arbitrary dense boolean or float mask rules out the FlashAttention kernel, because its tiling assumes either no mask or a causal one; the memory-efficient kernel accepts additive masks. So the explicit chunk mask in section 6 may fall back to a slower kernel, while <code>is_causal=True</code> and "no mask" both keep the fast paths — another reason serving code prefers structured masks (the bias module's <code>causal_lower_right</code> is recognised as causal) over materialised ones. To insist on a backend while debugging, wrap the call in <code>torch.nn.attention.sdpa_kernel([SDPBackend.FLASH_ATTENTION])</code>; if it cannot run, PyTorch reports why. Different kernels round differently, so small numerical differences between CPU and GPU runs, or between backends, are expected; the docs say so explicitly.</p>
+
+<h4>Fusing QKV and why the split is a view</h4>
+<p>One <code>nn.Linear(C, 3C)</code> instead of three <code>nn.Linear(C, C)</code> does the same arithmetic as one larger matmul, which uses the GPU better than three small launches. <code>split(C, dim=-1)</code> returns three views of its output, so the split itself costs nothing; the subsequent <code>view</code> and <code>transpose</code> produce non-contiguous q, k, v that SDPA accepts directly. When converting published checkpoints, the fused weight is where errors hide: GPT-2's original weights store <code>c_attn</code> as a Conv1D with shape (C, 3C), transposed relative to <code>nn.Linear</code>, and some other models store Q, K and V interleaved per head rather than concatenated — a mapping error produces a model that loads, runs and generates nonsense.</p>
+
+<h4>Weight tying and the gradient on the embedding</h4>
+<p>With tying, the shared matrix receives two gradients: a dense one from the head (every vocabulary row gets a gradient at every position, through the softmax) and a sparse one from the embedding lookup (only rows of tokens present in the batch). Autograd sums them (pt3). The head's gradient dominates, so rare tokens' embeddings are shaped mainly by their role as output classes. Practical consequences: the embedding's effective learning dynamics differ from an untied model's, weight decay applies to a matrix that is both an input table and an output layer (nanoGPT's optimiser groups decay all 2-D parameters, including this one), and tools that shard or quantise the model must keep the two uses on the same tensor.</p>
+
+<h4>Learned positions versus RoPE</h4>
+<p>GPT-2's learned position table has exactly <code>ctx</code> rows, so the model cannot process position 1,024 at all: generation must stop or slide a window and recompute. Most current models use rotary position embeddings (lm4, mc17), which rotate each head's queries and keys by position-dependent angles inside attention, so scores depend on relative position. In code, RoPE removes <code>wpe</code>, registers cos/sin tables as non-persistent buffers (pt4), and rotates q and k after the head split — in float32, cast back afterwards. With a cache, keys are stored already rotated, and each new query is rotated with its absolute position <code>start + t</code>; getting <code>start</code> wrong is the RoPE version of the restarting-positions bug.</p>
+
+<h4>A static cache for torch.compile and CUDA graphs</h4>
+<p>The <code>torch.cat</code> cache changes shape every step, so a compiled model would recompile (or fall back to dynamic shapes) and a CUDA graph (pt12) could not be captured at all. A static cache preallocates <code>k_cache</code> and <code>v_cache</code> of shape (B, H, ctx, hs) per layer, writes the new position with <code>k_cache[:, :, pos] = k</code>, and attends over the full buffer with a mask that hides positions not yet written. Every decode step then has identical shapes and can be captured once and replayed, removing Python and kernel-launch overhead that dominates small-batch decode. The cost is memory for the full context from the start and attention over masked, unused positions — which kernels designed for this case skip.</p>
+
+<h4>Grouped-query attention in the module</h4>
+<p>To turn this attention into grouped-query attention (lm5), the QKV projection produces H query heads but only H<sub>kv</sub> key and value heads: <code>nn.Linear(C, (H + 2·H_kv) · hs)</code>, split into sizes H·hs, H<sub>kv</sub>·hs, H<sub>kv</sub>·hs. The cache stores only the H<sub>kv</sub> heads — that is the whole point, a factor of H/H<sub>kv</sub> less memory — and SDPA with <code>enable_gqa=True</code> matches each group of H/H<sub>kv</sub> consecutive query heads with one KV head. If the backend does not support it, expand with <code>repeat_interleave</code> on the head axis, never <code>repeat</code>, which pairs queries with the wrong keys (pt2). Parameter count and attention cost both drop slightly; quality is close to full multi-head attention at the head ratios used in practice.</p>
+<h4>Sampling details that change outputs</h4>
+<p>The generation loop's sampling line hides several decisions (lm8, mc20). Temperature divides logits before softmax; temperature 0 must be special-cased as argmax, since dividing by zero gives inf. Top-k and top-p truncate the distribution by setting logits outside the kept set to −∞ before softmax. Sampling uses <code>torch.multinomial</code> on probabilities, which needs a generator for reproducibility. And numerics: computing softmax over 50k logits in bf16 is fine for sampling but not for computing exact log-probabilities for evaluation, which should upcast to float32 (pt7).</p>
+<h4>Why the scores are divided by √hs</h4>
+<p>If the components of q and k are roughly independent with unit variance, their dot product over hs dimensions has variance hs, so with hs = 64 the raw scores have a standard deviation around 8. Softmax over scores that large is nearly one-hot, and its gradient is nearly zero for all but one key, which slows learning and makes training brittle. Dividing by √hs brings the standard deviation back to about 1. SDPA applies this scale by default (<code>scale=None</code> means 1/√E); passing scores that you have already scaled, or adding your own division before calling SDPA, scales twice — a subtle planted bug whose symptom is attention that stays nearly uniform and a model that learns more slowly than it should.</p>
+</section>
+
+<section data-field="prod">
+<h4>Failure mode: training is fine, generation is garbage</h4>
+<p>The signature of decode-path bugs: validation loss is normal, but sampled text is repetitive or incoherent. Causes, in order: <code>is_causal=True</code> in the decode step (the new token sees only the first key); positions restarting at 0 for each new token; the cache concatenated along the wrong axis (dim 1 is heads, dim 2 is time); attention dropout active at inference; logits taken from the wrong position (index 0 instead of −1, or the head applied before <code>ln_f</code>). The cached-versus-uncached greedy comparison localises every one of these in seconds.</p>
+
+<h4>Failure mode: a model that trains suspiciously well</h4>
+<p>Training loss far below the expected curve points to a causal leak: a mask applied wrongly, softmax over the wrong dimension, or targets not shifted (pt9). For a GPT the dependency test is cheap: backpropagate from position t and assert the input gradient is zero for later positions.</p>
+
+<h4>Failure mode: slow attention</h4>
+<p>Symptom: attention dominates the profile and memory grows quadratically with sequence length. Causes: hand-written attention instead of SDPA; SDPA falling back to the math kernel because inputs are float32, the mask is a dense arbitrary tensor, or the head size is unsupported; a cache grown with <code>torch.cat</code> every step. Check which backend runs (the profiler shows kernel names such as flash or efficient attention, pt12), cast to bf16 under autocast, use structured causal masks, and preallocate the cache.</p>
+
+<h4>Failure mode: a checkpoint that loads but generates nonsense</h4>
+<p>When loading published weights into your implementation, every mapping step is a chance for a silent error: transposed Conv1D weights, fused QKV in a different order, a missing tie, layer norm epsilon (GPT-2 uses 1e-5, the PyTorch default), GELU variant (GPT-2 uses the tanh approximation; <code>nn.GELU()</code> defaults to the exact form, a small difference), or a vocabulary padded to a multiple of 64 (nanoGPT pads 50,257 to 50,304 for efficiency). Compare logits on a fixed input against a reference implementation before trusting any downstream number.</p>
+
+<h4>Evaluating the model: perplexity done right</h4>
+<p>Language models are compared by validation loss or its exponential, <strong>perplexity</strong>. Two details make the number trustworthy. First, compute it over tokens, with sums and counts (pt6), in eval mode, on a fixed validation set split by position from the training data (pt9). Second, mind the context: evaluating a long document in non-overlapping windows of 1,024 tokens gives the first tokens of each window almost no context, inflating the loss; a sliding window with stride smaller than the context (evaluating only the last part of each window) gives each token more context and a lower, more representative number. Report which method you used, because the difference can be larger than the gap between two models you are comparing.</p>
+<h4>The reference to check against</h4>
+<p>nanoGPT's <code>model.py</code> is the public implementation this lesson mirrors: its attention uses SDPA when available with a masked fallback, its blocks are pre-norm, it ties <code>wte</code> and <code>lm_head</code>, applies the GPT-2 initialisation with the 1/√(2·n_layer) residual scaling, crops the context in <code>generate</code>, and loads OpenAI's GPT-2 weights with the Conv1D transposes. Reading it after writing your own version is the fastest way to find the differences that matter.</p>
+<h4>Measuring training throughput: tokens per second and MFU</h4>
+<p>Once the model is correct, its training speed is reported in tokens per second and in <strong>model FLOPs utilisation</strong> (MFU): the fraction of the GPU's peak arithmetic the training actually achieves. A standard approximation counts about 6N floating-point operations per token for a forward and backward pass of an N-parameter model (2N forward, 4N backward), plus an attention term that grows with sequence length (gpu3). For GPT-2 small, 6 × 124M ≈ 0.75 GFLOP per token; at 200,000 tokens per second that is 1.5 × 10<sup>14</sup> FLOP/s, which on a GPU with a bf16 dense peak of about 10<sup>15</sup> FLOP/s is an MFU near 15%. Small models rarely exceed 30–40% because kernel launches, memory-bound operations and the optimiser step take a larger share; nanoGPT prints an MFU estimate during training for exactly this comparison. MFU is the number to watch when you apply pt12's speed-ups.</p>
+</section>
+
+<section data-field="lab">
+<p>CPU, PyTorch 2.14 in <code>gpt_env</code>; about 20 minutes. Assemble the classes from the body (Config, Attention with the cache code from section 6, Block, GPT with forward and generate) into <code>pt10_gpt.py</code>, then add:</p>
+<pre>if __name__ == "__main__":
+    import math
+    with torch.device("meta"):
+        print("GPT-2 small:", sum(p.numel() for p in GPT(Config()).parameters()))
+    torch.manual_seed(0)
+    cfg = Config(vocab=100, ctx=64, C=64, H=4, L=2)
+    m = GPT(cfg).eval()
+    x = torch.randint(0, 100, (2, 5))
+    _, loss = m(x, targets=torch.randint(0, 100, (2, 5)))
+    print("loss@init", round(loss.item(), 2), "ln V", round(math.log(100), 2))
+    def greedy(model, idx, n, cache):
+        caches = [dict() for _ in model.blocks] if cache else None
+        with torch.inference_mode():
+            logits, _ = model(idx, caches=caches)
+            for _ in range(n):
+                nxt = logits[:, -1].argmax(-1, keepdim=True); idx = torch.cat([idx, nxt], 1)
+                logits, _ = model(nxt, caches=caches, start=idx.shape[1] - 1) if cache else model(idx)
+        return idx
+    print("cache matches:", torch.equal(greedy(m, x, 10, True), greedy(m, x, 10, False)))</pre>
+<ol>
+<li>Expect 124,439,808, a loss near 4.6, and "cache matches: True".</li>
+<li>Plant the decode bug: in the <code>T == 1</code> branch pass <code>is_causal=True</code>. Rerun: the cache comparison prints False.</li>
+<li>Plant the position bug: pass <code>start=0</code> in the cached call. False again.</li>
+<li>Untie the head (delete the tying line) and recount on the meta device: 163,037,184.</li>
+<li><strong>Needs a CUDA GPU:</strong> run a forward pass in bf16 under <code>sdpa_kernel([SDPBackend.FLASH_ATTENTION])</code> and confirm it runs; then pass the explicit chunk mask and observe the error or warning explaining why flash cannot be used.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Find the bug: a GPT whose generations degrade after the first token</b>
+<p>A team's GPT reaches the expected validation loss, but sampled text is fluent for the first token after the prompt and then degrades into repetition. Their attention and generation code is below. Find the bugs.</p>
+<pre>def forward(self, x, cache=None):                          # Attention
+    B, T, C = x.shape
+    q, k, v = self.qkv(x).split(C, dim=-1)
+    q, k, v = (t.view(B, self.H, T, self.hs) for t in (q, k, v))
+    if cache is not None and "k" in cache:
+        k = torch.cat([cache["k"], k], dim=1); v = torch.cat([cache["v"], v], dim=1)
+    if cache is not None:
+        cache["k"], cache["v"] = k, v
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.1)
+    return self.proj(y.view(B, T, C))
+
+@torch.no_grad()
+def generate(self, idx, n):
+    caches = [dict() for _ in self.blocks]
+    logits, _ = self(idx, caches=caches)
+    for _ in range(n):
+        nxt = torch.multinomial(F.softmax(logits[:, -1], -1), 1)
+        idx = torch.cat([idx, nxt], 1)
+        logits, _ = self(nxt, caches=caches)                # start defaults to 0</pre>
+<details><summary>Answer</summary>
+<p><strong>Bug 1 — heads split with view alone.</strong> <code>t.view(B, self.H, T, self.hs)</code> reinterprets the (B, T, C) memory as (B, H, T, hs) without moving the head axis, so each "head" contains a mixture of time steps and channels (pt2). The merge <code>y.view(B, T, C)</code> has the same problem. Training still learns something (the model adapts to the scrambled layout during training), which is why validation loss looks normal. Fix: <code>view(B, T, H, hs).transpose(1, 2)</code> and <code>y.transpose(1, 2).contiguous().view(B, T, C)</code>.</p>
+<p><strong>Bug 2 — cache concatenated on the wrong axis.</strong> With (B, H, T, hs) tensors, time is dim 2; <code>dim=1</code> concatenates along heads, so the cached keys become extra heads. After fixing bug 1 this raises a shape error in SDPA or silently mismatches heads. Fix: <code>dim=2</code>.</p>
+<p><strong>Bug 3 — is_causal=True in the decode step.</strong> At each generation step there is one query and N keys; upper-left alignment lets it attend only to key 0 — the first prompt token. The first generated token comes from the prefill (square, correct), which is why the first token is fine and later ones degrade. Fix: no mask when T == 1, lower-right mask for chunks.</p>
+<p><strong>Bug 4 — positions restart at 0.</strong> <code>start</code> is not passed, so every generated token gets position embedding 0. Fix: <code>start=idx.shape[1] - 1</code>.</p>
+<p><strong>Bug 5 — attention dropout at inference.</strong> <code>dropout_p=0.1</code> is constant, so generation randomly drops attention weights. Fix: <code>dropout_p=self.p if self.training else 0.0</code> (and <code>generate</code> should also ensure eval mode). Verification after fixing: greedy generation with and without the cache is identical, and the dependency test passes.</p>
+</details>
+<b>Estimate: how many concurrent users fit?</b>
+<p>You serve a 32-layer model with 8 KV heads of size 128 in bf16 on an 80 GB GPU; weights take 16 GB. Each request uses up to 8,192 tokens. Ignoring activations and fragmentation, how many requests fit at full length?</p>
+<details><summary>Answer</summary>
+<p>KV bytes per token = 2 × 32 × 8 × 128 × 2 = 131,072 (128 KB). Per request at 8,192 tokens: 8,192 × 128 KB = 1 GiB (1.07 GB). Free memory ≈ 80 − 16 = 64 GB, minus some headroom: about 55–60 concurrent full-length requests. Without GQA (32 KV heads) the cache would be 4 GiB per request — only about 15 requests — which is why GQA matters so much for serving. Paged caches let shorter requests use proportionally less, raising the real concurrency.</p>
+</details>
+</section>

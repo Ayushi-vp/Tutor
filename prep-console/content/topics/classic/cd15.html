@@ -1,0 +1,530 @@
+<!-- topic source for classic/cd15; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "cd15",
+  "t": "Design a stock exchange / order-matching engine",
+  "tag": "Low latency",
+  "sum": "Microseconds and absolute fairness: order types, the limit order book as price levels of FIFO queues, price-time matching worked on a real book, a single-threaded sequencer and why it wins, risk checks, an event log that makes state replayable, market data fan-out by multicast, and failover that neither loses nor duplicates an order.",
+  "prereq": [
+    ["in1", "A log is an append-only, ordered sequence of records; consumers read it by offset, and the order is the contract."],
+    ["sc11", "An idempotency key lets a retried request be recognised as a duplicate so its effect happens once."],
+    ["db8", "A write-ahead log records each change durably before it is applied, so state can be rebuilt by replaying the log after a crash."],
+    ["sc6", "Replication copies changes from a leader to followers; synchronous replication waits for a follower before acknowledging, asynchronous does not."],
+    ["os4", "Locks serialise access to shared state, but contended locks cost microseconds and make timing unpredictable."],
+    ["net5", "UDP sends datagrams with no connection, no retransmission and no ordering; it is cheap and supports multicast."],
+    ["al28", "Designing a data structure means choosing a layout so every operation the workload needs hits its target complexity."]
+  ],
+  "myths": [
+    ["A matching engine must be massively multi-threaded to be fast.", "The fastest designs run each order book on one thread. Matching one order is a few hundred nanoseconds to a few microseconds of work on data already in cache; a lock handoff or cache-line bounce between cores costs as much as the matching itself. One thread also gives a single, deterministic order of events, which is what fairness, replay and failover all depend on. Parallelism comes from sharding symbols across threads, not from sharing one book."],
+    ["Fairness means first come, first served by the time the client sent the order.", "The exchange cannot see when a client sent anything; it can only see when a message reached its own sequencer. Fairness is defined at that point: the sequencer stamps each message with the next sequence number, and that order is final. Exchanges then make the path to the sequencer equal for everyone (equal-length cables in colocation, identical gateway hardware) rather than trying to reconstruct send times."],
+    ["Prices can be stored as floating-point numbers.", "Binary floating point cannot represent 100.10 exactly, so 0.1 + 0.2 style rounding makes two equal prices compare unequal and misplaces orders between price levels. Exchanges store prices as integers in ticks (or in fixed decimal units such as 1/10,000 of a dollar), so comparisons and sums are exact."],
+    ["If the engine writes trades to a database, a crash cannot lose anything.", "A database write per trade is far too slow for microsecond matching, and it records outputs, not causes. The robust design journals the inputs — every sequenced order and cancel — before or as they are processed, and makes the engine deterministic, so replaying the input log reproduces every trade and the exact book. The database, if any, is fed downstream from the output events."],
+    ["A hot standby that receives a copy of the state is enough for failover.", "Copying state is not enough: the standby must have exactly the same input sequence up to the last event the primary acknowledged, and must produce the same outputs for it. If the primary acknowledged an order the standby never received, failover loses it; if the standby re-publishes trades the primary already sent, clients see duplicates. The fix is to replicate the sequenced input before acknowledging, and to have clients de-duplicate by sequence number."]
+  ],
+  "recap": [
+    "An exchange accepts orders, ranks them in a limit order book and matches crossing buy and sell orders under a published rule, usually price-time priority.",
+    "A limit order book is two sides of price levels; each level is a FIFO queue of resting orders, with a hash map from order id to its queue node so cancels are O(1).",
+    "Price-time priority means the best price trades first and, at one price, the earliest order trades first; trades print at the resting order's price.",
+    "Prices are integers in ticks, never floats, so equal prices compare equal.",
+    "A sequencer assigns every inbound message a single global order; each book is processed by one thread in that order, which needs no locks and is deterministic.",
+    "Because the engine is deterministic, the sequenced input log is the source of truth: snapshot plus replay rebuilds the exact book and every trade.",
+    "A hot standby consumes the same sequenced log; acknowledging only after the log is replicated means failover neither loses an acknowledged order nor invents a new one.",
+    "Clients reconnect with their last-seen sequence number and the exchange replays what they missed; client order ids de-duplicate resent orders.",
+    "Market data goes out as sequenced UDP multicast in redundant A/B feeds, with retransmission and snapshot services for recovery.",
+    "Pre-trade risk checks (price bands, size limits, credit, kill switches) run in the gateway or in-line before matching, because a runaway algorithm can do enormous damage in minutes."
+  ],
+  "glossary": [
+    ["Ask (offer)", "A resting order to sell at a stated price; the best ask is the lowest one."],
+    ["Bid", "A resting order to buy at a stated price; the best bid is the highest one."],
+    ["Busy-spin", "A thread that loops checking for new work instead of sleeping, trading a CPU core for lower and steadier latency."],
+    ["Colocation", "Renting rack space inside the exchange's data centre so a trader's servers are a few metres of cable from the gateway."],
+    ["Cross (crossing order)", "An incoming order whose price reaches the best opposite price, so it can trade immediately."],
+    ["Deterministic", "Producing exactly the same outputs every time it is given the same inputs in the same order."],
+    ["Drop copy", "A real-time copy of a firm's executions sent to its risk or back-office systems, separate from the trading session."],
+    ["Event sourcing", "Storing the sequence of input events as the source of truth and deriving current state by replaying them."],
+    ["Execution report", "The message the exchange sends a client to acknowledge, fill, partially fill, cancel or reject an order."],
+    ["FIX", "The Financial Information eXchange protocol, a widely used text tag=value format for order entry; exchanges also offer faster binary protocols."],
+    ["FIFO", "First in, first out: items leave a queue in the order they entered it."],
+    ["Fill / partial fill", "A trade that completes all (fill) or some (partial fill) of an order's quantity."],
+    ["IOC / FOK", "Immediate-or-cancel trades whatever it can now and cancels the rest; fill-or-kill trades the whole quantity now or nothing."],
+    ["Jitter", "Variation in latency from one message to the next; in trading, tail latency and jitter matter as much as the average."],
+    ["Kill switch", "A control that instantly cancels a participant's open orders and blocks new ones."],
+    ["Limit order", "An order to buy or sell up to a quantity at a stated price or better."],
+    ["Limit order book", "The set of resting limit orders for one instrument, organised by side and price."],
+    ["Maker / taker", "The maker is the resting order that provided liquidity; the taker is the incoming order that traded against it."],
+    ["Market order", "An order to trade a quantity immediately at whatever prices are available."],
+    ["Multicast", "A network mode where one sent packet is delivered to every subscriber of a group, copied by switches rather than by the sender."],
+    ["Price-time priority", "The matching rule that ranks resting orders by best price first, then by earliest arrival at the same price."],
+    ["PTP", "Precision Time Protocol, which synchronises server clocks to well under a microsecond on a local network, far tighter than NTP (the Network Time Protocol used on ordinary servers)."],
+    ["Ring buffer", "A fixed-size array reused in a circle, with producer and consumer positions tracked by sequence counters, so messages pass between threads without locks or allocation."],
+    ["Sequencer", "The component that gives every inbound message a single, gap-free sequence number, defining the order the engine processes them."],
+    ["Spread", "The gap between the best ask and the best bid."],
+    ["Tick", "The minimum price increment for an instrument, such as one cent."]
+  ],
+  "qa": [
+    ["E", "What data structure would you use for a limit order book?", "Two sides, each a sorted collection of price levels; each level is a FIFO queue (a doubly linked list) of resting orders; plus a hash map from order id to its list node. Best price is the first level of each side, adding at an existing level is an append, and cancel is a hash lookup and an O(1) unlink. If prices are dense, an array indexed by tick replaces the sorted structure.", "Follow-up: Why not a heap? — A heap gives the best price cheaply but cancelling an arbitrary order is O(n) to find or needs lazy deletion, and you still need FIFO order within a price; price levels with linked lists do both."],
+    ["E", "Explain price-time priority with an example.", "Better prices trade first; at the same price, earlier orders trade first. If asks rest at 100.50 (order A 300, then B 100) and 101.00 (C 200), a buy for 450 at 101.00 takes A's 300 and B's 100 at 100.50, then 50 of C at 101.00. Each trade prints at the resting order's price, so the buyer gets the benefit of the better prices."],
+    ["E", "Why store prices as integers?", "Floating point cannot represent most decimal prices exactly, so equal prices may compare unequal and orders end up at the wrong level, and accumulated sums drift. Integer ticks (or fixed-point units like 1/10,000 of a dollar) make comparisons and arithmetic exact and are faster too."],
+    ["M", "Why is the matching engine single-threaded?", "Matching one order is sub-microsecond work on in-cache data; locks, cache-line transfers and context switches between threads cost as much or more and add jitter. One thread processing a sequenced stream needs no locks, is deterministic (so replay and a hot standby produce identical results), and defines fairness by sequence order. LMAX reported 6 million orders per second on one thread. Scale comes from sharding instruments across threads or machines.", "Follow-up: What if one symbol outgrows a thread? — Make that thread faster first (no allocation, no I/O, busy-spinning, kernel-bypass input); a single symbol rarely needs more, and splitting one book across threads destroys price-time priority."],
+    ["M", "How does the engine survive a crash without losing orders?", "The sequenced input is journaled and replicated to a standby before the client gets an acknowledgement. The engine is deterministic, so the standby, which processes the same input, has the same book. On failover it takes over from the last sequence number; nothing acknowledged is lost. Cold recovery is snapshot plus replay of the journal since the snapshot.", "Follow-up: What if the primary sent a fill but crashed before the standby saw the input? — That cannot happen if outputs are only released after the input is replicated; this ordering rule is the whole design."],
+    ["M", "How do clients avoid duplicate orders after a disconnect?", "Every order carries a client order id unique within the session, and the exchange rejects a repeat. Each session's outbound messages carry sequence numbers; on reconnect the client sends the last number it processed and the exchange resends the rest, so the client learns which orders were acknowledged instead of guessing. FIX does this with sequence numbers and resend requests."],
+    ["M", "How is market data distributed to thousands of subscribers?", "As sequenced UDP multicast: the publisher sends each update once and network switches copy it to every subscriber, so cost does not grow with subscriber count. Because UDP can drop packets, each message has a sequence number, two identical feeds (A and B) travel separate paths, and gaps are filled from a retransmission service or by re-syncing from a snapshot. Incremental order-level feeds like Nasdaq TotalView-ITCH publish add, execute, cancel and delete events.", "Follow-up: Why not TCP to each subscriber? — One slow subscriber would back up its own connection and the publisher would spend time per subscriber; fan-out cost and fairness both get worse."],
+    ["M", "Where do pre-trade risk checks run and what do they check?", "In the order entry path before matching, usually in the gateway for per-participant checks: price within a band of the last trade (fat-finger), quantity and notional limits, credit or margin, and order rate. A kill switch cancels everything for a participant. They must be in-line and fast, because a runaway algorithm can send millions of orders in minutes; the 2012 Knight Capital incident is the standard example.", "Follow-up: Why not check risk after the trade? — Because the trade is binding; post-trade checks find the loss, they do not prevent it."],
+    ["M", "Estimate the event log size for a busy day.", "Say 1 million inbound messages per second at peak, 200,000 on average over a 6.5-hour session, 100 bytes each. 200,000 × 23,400 s ≈ 4.7 billion messages ≈ 470 GB per day of input journal, written sequentially at about 20 MB/s on average and 100 MB/s at peak — easy for local NVMe, and replicated to a standby and to archive."],
+    ["H", "How would you design failover so it neither loses nor duplicates orders?", "Primary and standby both consume the sequencer's output. The sequencer only treats a message as committed once the standby (and the journal) has it, and the primary only releases acks and fills for committed messages. Both engines process the same sequence deterministically; only the primary's outputs are published. On primary failure the standby is promoted from the last committed sequence and publishes outputs from there, using the same output sequence numbers, so clients de-duplicate anything they had already seen. A coordination service or fencing ensures only one primary publishes.", "Follow-up: How fast is failover? — The standby already has the state in memory, so promotion is detection time plus a role switch; LMAX describes switching in microseconds, but real exchanges add safety checks and often halt briefly."],
+    ["H", "How do you make the engine deterministic, and what breaks determinism?", "Feed it only sequenced input, and make all logic depend only on that input and the current state. Things that break it: reading the wall clock (use the sequencer's timestamp in the message), iterating a hash map whose order depends on memory addresses or random seeds, multithreading inside a book, uninitialised memory, and floating point that differs across CPUs or compiler flags. Test it by replaying production logs through the new build and diffing outputs."],
+    ["H", "How do opening and closing auctions differ from continuous matching?", "In an auction orders accumulate without trading, then the exchange computes one price that maximises the quantity that can trade (with tie-breakers such as minimal imbalance and closeness to a reference price) and executes all crossing orders at that single uniform price. It concentrates liquidity at moments that matter, such as the close used to value funds. The engine runs it as one batch operation on the book rather than order by order."],
+    ["H", "How does fairness get engineered in colocation, and what is a speed bump?", "Exchanges give every colocated participant the same cable length and gateway hardware so nobody is closer to the sequencer. A speed bump deliberately delays incoming orders; IEX routes them through coiled fibre for 350 microseconds so the exchange can update its own prices from other markets before fast traders can act on stale quotes. Others propose frequent batch auctions so speed within a short interval stops mattering.", "Follow-up: Does a speed bump hurt anyone? — It slows everyone equally on entry, so it mainly removes the edge from racing stale quotes; critics argue it can also delay liquidity providers' cancels, which is why IEX's design is narrow."]
+  ],
+  "refs": [
+    ["post", "The LMAX Architecture (Martin Fowler, 2011)", "The single-threaded, in-memory business logic processor (6 million orders per second), input and output Disruptors, journaling and replication of input events, nightly snapshots and replay.", "https://martinfowler.com/articles/lmax.html"],
+    ["docs", "LMAX Disruptor technical paper", "Why queues between threads are slow, and the ring buffer with sequence counters that replaced them.", "https://lmax-exchange.github.io/disruptor/disruptor.html"],
+    ["docs", "Nasdaq TotalView-ITCH 5.0 specification", "A real order-level market data feed: add, execute, cancel, delete and replace messages, delivered by MoldUDP64 multicast or SoupBinTCP.", "https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHSpecification.pdf"],
+    ["docs", "SEC press release 2013-222: Knight Capital and the market access rule (archived copy)", "The first enforcement under Rule 15c3-5: missing pre-trade controls let millions of erroneous orders reach the market on 1 August 2012.", "https://web.archive.org/web/20241212222242/https://www.sec.gov/newsroom/press-releases/2013-222"],
+    ["docs", "IEX: technology and the speed bump", "How a 350-microsecond coil of fibre on order entry is used to protect resting orders from stale-quote arbitrage.", "https://www.iex.io/technology"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>At 09:30:00.000 a stock opens and, within the first millisecond, the exchange receives several thousand messages for it: new orders, cancels, modifications. Two of them are buy orders at the same price from two different firms, arriving 300 nanoseconds apart. Whichever is ranked first will be filled; the other may not be. Both firms have spent millions on servers placed metres from the exchange to win that race, and both will check, to the nanosecond, that the exchange ranked them by the rule it publishes. If the exchange gets that wrong once, it is a regulatory incident. If it loses an order it acknowledged, or reports a fill twice, firms hold positions they do not know about. If it pauses for 50 milliseconds while a garbage collector runs, the prices it shows are stale and someone trades against them.</p>
+<p>A stock exchange is the system-design case where every usual instinct points the wrong way. Most services scale by adding threads and machines; the core of an exchange runs on <em>one thread per order book</em>. Most services store state in a database; an exchange keeps the book in memory and treats a <em>log of inputs</em> as the truth. Most services measure latency in milliseconds; here the internal budget is <em>microseconds</em>, and the variation in latency matters as much as its average. Most services can tolerate an occasional duplicate; here a duplicated fill is someone else's money.</p>
+<p>The same design appears outside equities: crypto exchanges, prediction markets, ad exchanges running auctions, and any system where many parties compete for a scarce resource under a fairness rule that must be provably applied in order. It is also a clean way to learn determinism, event sourcing and replicated state machines, which reappear in databases and coordination services.</p>
+<p>This lesson works through the design in interview order: requirements and order types; arithmetic for message rates, per-message time budgets, log size and market data fan-out; the API; the limit order book as a data structure; then the architecture and the path of one order. The deep dives are price-time matching worked on a real book, the single-threaded sequencer and why it wins, and persistence, replay and failover without losing or duplicating orders. Market data, risk checks and fairness follow, with LMAX's published architecture and the Knight Capital incident as the real cases. The lab builds a price-time engine on 20 orders and proves replay reproduces it exactly.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: one clerk, one ledger, one queue</h4>
+<p>Picture an old trading pit replaced by a single clerk at a desk. Everyone who wants to trade writes their order on a slip and drops it into one slot. The slips fall into a single tray in the order they arrive, and the clerk stamps each with the next number: 1, 2, 3… The clerk then processes slips strictly in stamp order. On the desk is a ledger with two pages: buyers on the left, listed from the highest price they will pay down; sellers on the right, listed from the lowest price they will accept up. At each price there is a line of names in the order they arrived. When a new slip says "buy 450 at up to 101.00", the clerk looks at the cheapest seller, and if the price is acceptable, crosses off quantity from the top of that line, then the next name, then the next price, until the buyer is satisfied or the prices get too high. Whatever is left of the buyer's order goes into the buyers' page at 101.00, at the back of that line.</p>
+<p>Everything in the real design maps onto that picture. The slot is the <strong>gateway</strong>, where participants connect. The stamp is the <strong>sequencer</strong>, which gives every message a single global order. The clerk is the <strong>matching engine</strong>, one thread per instrument. The ledger is the <strong>limit order book</strong>. The rule "best price first, then earliest" is <strong>price-time priority</strong>. And the pile of stamped slips, kept in a box, is the <strong>event log</strong>: if the clerk is replaced mid-day, a new clerk with the same rules can take a blank ledger and re-read every stamped slip in order to reconstruct exactly the same ledger and the same trades.</p>
+<p>The analogy also explains the counter-intuitive choices. Why one clerk? Two clerks sharing a ledger would have to take turns holding the pen, argue about who saw which slip first, and could never reconstruct the day identically. Why stamp before processing? Because the stamp, not the time a trader wrote the slip, defines who was first. Where the analogy breaks: a real exchange has thousands of ledgers (one per instrument) and many clerks working in parallel, one per group of ledgers; and it cannot afford to keep the slips only in one box — the stamped log is copied to another building before anyone is told their order was accepted.</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Architecture: participants connect to order entry gateways that run risk checks. Gateways send messages to a sequencer, which stamps each with a sequence number and writes the stream to a journal and to a hot standby. Matching engine threads, one per shard of instruments, consume the sequenced stream and update in-memory order books. Outputs go to an execution report publisher back to participants and to a market data publisher that multicasts A and B feeds to subscribers.">
+  <defs><marker id="cd15-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="8" y="110" width="78" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="47" y="135" text-anchor="middle" style="fill:var(--ink)">Trading</text>
+    <text x="47" y="151" text-anchor="middle" style="fill:var(--ink)">firms</text>
+    <rect x="110" y="70" width="96" height="140" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="158" y="95" text-anchor="middle" style="fill:var(--ink)">Gateways</text>
+    <text x="158" y="115" text-anchor="middle" style="fill:var(--muted)">sessions</text>
+    <text x="158" y="131" text-anchor="middle" style="fill:var(--muted)">decode</text>
+    <text x="158" y="147" text-anchor="middle" style="fill:var(--muted)">risk checks</text>
+    <text x="158" y="163" text-anchor="middle" style="fill:var(--muted)">dedupe ids</text>
+    <line x1="86" y1="140" x2="108" y2="140" marker-end="url(#cd15-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="232" y="105" width="92" height="70" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="278" y="130" text-anchor="middle" style="fill:var(--ink);font-weight:600">Sequencer</text>
+    <text x="278" y="148" text-anchor="middle" style="fill:var(--muted)">seq = n + 1</text>
+    <text x="278" y="164" text-anchor="middle" style="fill:var(--muted)">timestamp</text>
+    <line x1="206" y1="140" x2="230" y2="140" marker-end="url(#cd15-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="232" y="225" width="92" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="278" y="243" text-anchor="middle" style="fill:var(--ink)">Journal</text>
+    <text x="278" y="258" text-anchor="middle" style="fill:var(--muted)">+ standby</text>
+    <line x1="278" y1="175" x2="278" y2="223" marker-end="url(#cd15-arrow)" style="fill:none;stroke:var(--crit)"/>
+    <text x="292" y="203" style="fill:var(--crit)">replicate first</text>
+    <rect x="352" y="40" width="120" height="200" rx="6" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="412" y="34" text-anchor="middle" style="fill:var(--muted)">matching engines</text>
+    <rect x="364" y="55" width="96" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="412" y="76" text-anchor="middle" style="fill:var(--ink)">Thread 1</text>
+    <text x="412" y="93" text-anchor="middle" style="fill:var(--muted)">AAPL, MSFT…</text>
+    <rect x="364" y="115" width="96" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="412" y="136" text-anchor="middle" style="fill:var(--ink)">Thread 2</text>
+    <text x="412" y="153" text-anchor="middle" style="fill:var(--muted)">TSLA, NVDA…</text>
+    <text x="412" y="200" text-anchor="middle" style="fill:var(--muted)">… thread k</text>
+    <line x1="324" y1="130" x2="362" y2="85" marker-end="url(#cd15-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="324" y1="140" x2="362" y2="140" marker-end="url(#cd15-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="498" y="60" width="132" height="54" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="564" y="82" text-anchor="middle" style="fill:var(--ink)">Execution reports</text>
+    <text x="564" y="99" text-anchor="middle" style="fill:var(--muted)">acks, fills, cancels</text>
+    <rect x="498" y="150" width="132" height="54" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="564" y="172" text-anchor="middle" style="fill:var(--ink)">Market data</text>
+    <text x="564" y="189" text-anchor="middle" style="fill:var(--muted)">multicast A + B</text>
+    <line x1="472" y1="100" x2="496" y2="90" marker-end="url(#cd15-arrow)" style="fill:none;stroke:var(--good)"/>
+    <line x1="472" y1="160" x2="496" y2="172" marker-end="url(#cd15-arrow)" style="fill:none;stroke:var(--good)"/>
+    <path d="M564,60 L564,22 L47,22 L47,108" marker-end="url(#cd15-arrow)" style="fill:none;stroke:var(--good);stroke-dasharray:4 3"/>
+    <text x="300" y="16" text-anchor="middle" style="fill:var(--muted)">back to the firm's session</text>
+    <line x1="564" y1="204" x2="564" y2="280" style="fill:none;stroke:var(--good);stroke-dasharray:4 3"/>
+    <text x="564" y="294" text-anchor="middle" style="fill:var(--muted)">to all subscribers</text>
+  </g>
+</svg>
+<figcaption>The whole design hangs on one line: the sequencer turns many concurrent inputs into one numbered stream, and that stream is replicated before anything is acknowledged. Everything to its right is deterministic and can be rebuilt from it.</figcaption>
+</figure>
+
+<h4>The three numbers that shape every decision</h4>
+<p>Three facts drive the design and are worth saying early in an interview. First, <strong>most messages are not trades</strong>: on busy electronic markets the large majority of orders are cancelled or modified rather than filled, because market makers constantly re-quote. So the engine is optimised for add, cancel and modify as much as for matching. Second, <strong>the work per message is tiny</strong>: finding the best price and appending to or removing from a queue is a few hundred nanoseconds on data already in the CPU's cache. That means overheads — locks, memory allocation, system calls, a network hop — dominate unless designed out. Third, <strong>traffic is extremely bursty</strong>: the open, the close and news events produce microbursts many times the average, and the engine must stay fast in exactly those moments, which is when fairness and stale prices matter most.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–20</span><span class="ck-t">API &amp; book</span></div><div class="ck"><span class="ck-m">20–28</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">28–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> (1) Participants connect through authenticated sessions and submit, cancel and modify orders for listed instruments. (2) The exchange matches crossing orders by <strong>price-time priority</strong> and reports every outcome — acknowledged, partially filled, filled, cancelled, rejected — to the order's owner in an <strong>execution report</strong>. (3) It publishes <strong>market data</strong>: every change to the book and every trade, to anyone subscribed. (4) It enforces <strong>pre-trade risk checks</strong> per participant. (5) It supports trading sessions: pre-open, an opening auction, continuous trading, a closing auction, halts. Out of scope, said aloud: clearing and settlement (the days-later process of actually moving cash and shares, run by a clearing house), the participants' own trading systems, and regulatory reporting beyond producing the data.</p>
+<p><strong>Order types.</strong> Interviewers expect you to name a handful and say how each touches the book. A <strong>limit order</strong> buys or sells up to a quantity at a stated price or better; whatever does not trade immediately rests in the book. A <strong>market order</strong> trades immediately at the best available prices and never rests; it is dangerous in a thin book because it will walk to any price, so many venues cap it with a protection band. <strong>Time in force</strong> says how long an order lives: DAY (until the close), GTC (good till cancelled, across days), <strong>IOC</strong> (immediate-or-cancel: trade what you can now, cancel the rest) and <strong>FOK</strong> (fill-or-kill: all now or nothing). A <strong>stop order</strong> is held off-book until the market trades through a trigger price, then becomes a market or limit order. A <strong>post-only</strong> order is rejected (or repriced) if it would trade immediately, used by market makers who only want to rest. An <strong>iceberg</strong> shows only part of its quantity; when the visible part fills, a new slice is displayed and goes to the back of the queue. Each extra type is extra logic in the engine; the core design only needs limit, market, IOC and cancel.</p>
+<p><strong>Non-functional.</strong> Correctness and fairness are absolute: every order is matched by the published rule, in the order received, and no acknowledged order is lost or duplicated. Latency: order acknowledgement within tens of microseconds inside the exchange, with tight tails (the 99.99th percentile matters). Throughput: hundreds of thousands to millions of messages per second across all instruments, with microbursts far above average. Availability: trading halts are front-page news, so failover must be fast and safe. Auditability: every input and output retained for years.</p>
+<p><strong>Clarifying questions.</strong> How many instruments and what peak message rate? Equities with auctions, or a 24/7 crypto venue? Which order types? Do we own clearing? Is a brief halt on failover acceptable, or must failover be invisible? How do participants connect — colocated binary protocol, FIX, or a public web API?</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Assume an equities venue with <strong>10,000 instruments</strong>, a peak of <strong>1,000,000 inbound messages per second</strong> across all of them, an average of <strong>200,000 per second</strong> over a <strong>6.5-hour</strong> session (23,400 seconds), and messages of about <strong>100 bytes</strong> in a binary format.</p>
+<p><strong>Skew and the per-message budget.</strong> Activity is concentrated: suppose the busiest instrument gets 5% of messages at peak, <strong>50,000 per second</strong>. If one thread owns that book, it has 1 s ÷ 50,000 = <strong>20 microseconds per message</strong> on average. Matching takes well under 1 µs, so one thread has 20× headroom on average — but bursts are what count. If the open brings 2,000 messages for that instrument in one millisecond, that is 0.5 µs each: the thread must sustain sub-microsecond processing, or a queue builds and latency for everyone behind it grows. This is why the engine avoids every overhead it can, and why a short queue in front of it (a ring buffer, below) is sized for bursts.</p>
+<p><strong>Threads.</strong> 1,000,000 messages per second at about 1 µs each is one core's worth of pure matching; with decoding, risk and publishing overheads and the need for burst headroom, spread the 10,000 instruments over perhaps <strong>8-16 matching threads</strong>, each pinned to its own core, assigning busy instruments to separate threads. A single machine holds this comfortably; a second identical machine is the hot standby.</p>
+<p><strong>Book memory.</strong> Each resting order is about 64 bytes (id, participant, price, quantity, timestamp, two list pointers). If 10 million orders rest across all books at once, that is 640 MB, plus the order-id index. It fits in RAM easily; the hard part is fitting the <em>hot</em> books into CPU caches, which is why compact layouts and pre-allocated memory matter.</p>
+<p><strong>Event log.</strong> 200,000 messages per second × 23,400 s ≈ <strong>4.7 billion messages per day</strong> × 100 B ≈ <strong>470 GB per day</strong> of input journal. Write rate: 20 MB/s on average, 100 MB/s at peak — sequential appends that a local NVMe drive handles easily. Output events (acks, fills, book updates) are of similar volume. Over a year of 252 trading days the input journal is about 120 TB, which goes to cheaper archive storage for audit.</p>
+<p><strong>Market data fan-out.</strong> Every book change produces an update: about 1,000,000 updates per second at peak. If 1,000 subscribers each received their own TCP copy, the publisher would send 1 billion messages per second — impossible. With <strong>multicast</strong>, the publisher sends each update once (about 100 MB/s, roughly 0.8 Gbit/s, fine on a 10 Gbit link) and network switches copy it to subscribers. The estimate alone rules out per-subscriber unicast for the full feed.</p>
+<p><strong>Latency budget inside the exchange.</strong> A plausible split for one order: gateway decode and risk 2-5 µs, gateway to sequencer and replication to the standby 5-10 µs (a hop on a local, low-latency network), matching under 1 µs, publishing the ack 2-5 µs. Total in the tens of microseconds. The largest single item is the replication hop, which is the price of not losing orders.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+<tr><td>Hottest instrument</td><td>5% × 1M msg/s</td><td>50k msg/s → 20 µs each</td></tr>
+<tr><td>Open microburst</td><td>2,000 msgs in 1 ms</td><td>0.5 µs each</td></tr>
+<tr><td>Matching threads</td><td>~1M msg/s, headroom</td><td>8-16 pinned cores</td></tr>
+<tr><td>Resting book memory</td><td>10M orders × 64 B</td><td>~640 MB</td></tr>
+<tr><td>Input journal</td><td>200k/s × 23,400 s × 100 B</td><td>~470 GB/day</td></tr>
+<tr><td>Market data</td><td>1M updates/s × 100 B, multicast once</td><td>~100 MB/s</td></tr>
+</table>
+
+<h4>3 · The API</h4>
+<p>Order entry is a long-lived session, not request-response HTTP. Colocated participants use a compact binary protocol over TCP; others use <strong>FIX</strong>, a text protocol of numbered tag=value fields that most of the industry speaks. The logical messages are the same either way:</p>
+<pre>Inbound (participant → exchange), each with a session sequence number:
+  NewOrder     {cl_ord_id: "F7-000123", symbol: "ACME", side: BUY, type: LIMIT,
+                price: 10100 (ticks of $0.01), qty: 450, tif: DAY}
+  Cancel       {cl_ord_id: "F7-000124", orig_cl_ord_id: "F7-000123"}
+  Replace      {cl_ord_id: "F7-000125", orig_cl_ord_id: "F7-000123", price: 10050, qty: 300}
+
+Outbound (exchange → participant), each with a session sequence number:
+  ExecutionReport {cl_ord_id, order_id: 88412, status: NEW | PARTIAL | FILLED | CANCELED | REJECTED,
+                   last_px, last_qty, leaves_qty, cum_qty, exch_seq: 5_120_448_903, ts_ns}</pre>
+<p>Three details carry weight. The <strong>client order id</strong> (<code>cl_ord_id</code>) is unique within the participant's session, so a resent order is recognised as a duplicate — an idempotency key (sc11) in trading clothes. <strong>Session sequence numbers</strong> in both directions let either side detect a gap and request a resend after a reconnect; that is how a participant learns whether its last order was accepted without guessing. And a <strong>replace</strong> is not free: by most exchanges' rules, reducing quantity keeps the order's place in the queue, but changing the price or increasing quantity sends it to the back, because otherwise a participant could hold a place in line at one price and move it to another.</p>
+
+<h4>4 · The data model: the limit order book</h4>
+<p>The book for one instrument has two sides. The <strong>bid</strong> side holds resting buy orders; the best bid is the highest price. The <strong>ask</strong> side holds resting sell orders; the best ask is the lowest. The gap between them is the <strong>spread</strong>. On each side, orders are grouped into <strong>price levels</strong>; each level is a <strong>FIFO queue</strong> of orders at that price in arrival order. The operations the workload needs, from most to least frequent, are: add an order at a price (often at or near the best), cancel an arbitrary order by id, find the best price, and consume from the front of the best level during a match. The layout that makes all of them cheap:</p>
+<ul>
+<li><strong>Price levels in a sorted structure per side</strong> — a balanced tree or skip list keyed by price gives O(log L) insert of a new level and O(1) access to the best (cache a pointer to it), where L is the number of distinct price levels, usually small (tens to hundreds near the top). When prices are dense around the spread, an <strong>array indexed by tick offset</strong> from a base price gives O(1) level lookup, which is what many production engines use.</li>
+<li><strong>Each level a doubly linked list</strong> of orders: append at the tail (time priority), consume from the head (matching), unlink from the middle in O(1) (cancel), and keep a running total quantity per level for market data.</li>
+<li><strong>A hash map from order id to its list node</strong>, so a cancel goes straight to the order without scanning.</li>
+</ul>
+<p>Prices are stored as integers in <strong>ticks</strong>: 101.00 dollars with a one-cent tick is 10100. Binary floating point cannot represent 0.10 exactly, so with floats two orders at "the same" price can land in different levels, and summed notional values drift. Quantities are integers too.</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Order book layout. Asks on the top half from 102.00 down to 100.50, bids on the bottom from 100.00 down to 99.00. Each price level holds a FIFO linked list of orders, for example 100.50 holds order 1 for 300 then order 3 for 100. A hash map from order id points into the list nodes for O(1) cancel. Best ask and best bid pointers mark the top of each side.">
+  <defs><marker id="cd15-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--crit);font-weight:600">ASKS (sell)</text>
+    <rect x="20" y="32" width="70" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="50" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">102.00</text>
+    <rect x="20" y="64" width="70" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="82" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">101.00</text>
+    <rect x="20" y="96" width="70" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:1.5"/>
+    <text x="55" y="114" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">100.50</text>
+    <text x="100" y="114" style="fill:var(--crit)">← best ask</text>
+    <rect x="180" y="32" width="70" height="26" rx="3" style="fill:var(--surface);stroke:var(--s3)"/>
+    <text x="215" y="50" text-anchor="middle" style="fill:var(--ink)">#7 · 500</text>
+    <rect x="180" y="64" width="70" height="26" rx="3" style="fill:var(--surface);stroke:var(--s3)"/>
+    <text x="215" y="82" text-anchor="middle" style="fill:var(--ink)">#2 · 200</text>
+    <rect x="180" y="96" width="70" height="26" rx="3" style="fill:var(--surface);stroke:var(--s3)"/>
+    <text x="215" y="114" text-anchor="middle" style="fill:var(--ink)">#1 · 300</text>
+    <rect x="270" y="96" width="70" height="26" rx="3" style="fill:var(--surface);stroke:var(--s3)"/>
+    <text x="305" y="114" text-anchor="middle" style="fill:var(--ink)">#3 · 100</text>
+    <line x1="250" y1="104" x2="268" y2="104" marker-end="url(#cd15-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="268" y1="114" x2="252" y2="114" marker-end="url(#cd15-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="20" y1="140" x2="360" y2="140" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="190" y="135" text-anchor="middle" style="fill:var(--muted)">spread = 0.50</text>
+    <text x="20" y="162" style="fill:var(--good);font-weight:600">BIDS (buy)</text>
+    <rect x="20" y="170" width="70" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--good);stroke-width:1.5"/>
+    <text x="55" y="188" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">100.00</text>
+    <text x="100" y="188" style="fill:var(--good)">← best bid</text>
+    <rect x="20" y="202" width="70" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="220" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">99.50</text>
+    <rect x="20" y="234" width="70" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="252" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">99.00</text>
+    <rect x="180" y="170" width="70" height="26" rx="3" style="fill:var(--surface);stroke:var(--s2)"/>
+    <text x="215" y="188" text-anchor="middle" style="fill:var(--ink)">#4 · 400</text>
+    <rect x="270" y="170" width="70" height="26" rx="3" style="fill:var(--surface);stroke:var(--s2)"/>
+    <text x="305" y="188" text-anchor="middle" style="fill:var(--ink)">#6 · 100</text>
+    <line x1="250" y1="183" x2="268" y2="183" marker-end="url(#cd15-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="180" y="202" width="70" height="26" rx="3" style="fill:var(--surface);stroke:var(--s2)"/>
+    <text x="215" y="220" text-anchor="middle" style="fill:var(--ink)">#5 · 200</text>
+    <rect x="180" y="234" width="70" height="26" rx="3" style="fill:var(--surface);stroke:var(--s2)"/>
+    <text x="215" y="252" text-anchor="middle" style="fill:var(--ink)">#8 · 300</text>
+    <text x="260" y="282" text-anchor="middle" style="fill:var(--muted)">head = oldest (trades first) → tail = newest</text>
+    <rect x="440" y="60" width="180" height="170" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="530" y="82" text-anchor="middle" style="fill:var(--ink);font-weight:600">order id → node</text>
+    <text x="460" y="108" style="fill:var(--ink);font-family:var(--mono)">1 → ask 100.50 [0]</text>
+    <text x="460" y="128" style="fill:var(--ink);font-family:var(--mono)">3 → ask 100.50 [1]</text>
+    <text x="460" y="148" style="fill:var(--ink);font-family:var(--mono)">4 → bid 100.00 [0]</text>
+    <text x="460" y="168" style="fill:var(--ink);font-family:var(--mono)">6 → bid 100.00 [1]</text>
+    <text x="460" y="188" style="fill:var(--muted);font-family:var(--mono)">…</text>
+    <text x="530" y="215" text-anchor="middle" style="fill:var(--muted)">cancel = lookup + unlink, O(1)</text>
+    <path d="M440,165 C400,165 380,183 342,183" marker-end="url(#cd15-arrow2)" style="fill:none;stroke:var(--accent);stroke-dasharray:4 3"/>
+  </g>
+</svg>
+<figcaption>Price levels give "best price first"; the linked list inside each level gives "earliest first"; the id map makes cancels — the most common operation after adds — constant time. This is the book the matching example below starts from.</figcaption>
+</figure>
+
+<p><strong>Why not a heap?</strong> A priority queue (al10) gives the best price in O(1) and insertion in O(log n), which looks perfect. It fails on cancels: removing an arbitrary order from a heap needs its position (an extra index kept in sync on every swap) or <em>lazy deletion</em> — mark it dead and skip it when it surfaces — which leaves dead orders occupying memory and distorting level totals. A heap also orders individual orders rather than levels, so time priority within a price must be encoded in the key. Price levels with linked lists are simpler and give every operation its target cost.</p>
+<p><strong>Other state.</strong> Beyond the books, the engine holds per-participant state needed for risk (open order counts, exposure), the instrument reference data (tick size, price bands, trading status) and, for each session, the next outbound sequence number. All of it is in memory and all of it is derived from the sequenced input, which is what makes replay possible.</p>
+
+<h4>5 · High-level design and the critical path of one order</h4>
+<p>Follow one buy order from the moment it leaves a participant's server.</p>
+<ol>
+<li><strong>Gateway.</strong> The order arrives on the participant's session. The gateway checks the session sequence number, decodes the message, rejects a duplicate <code>cl_ord_id</code>, and runs per-participant <strong>risk checks</strong> (price band, maximum quantity and notional, open order count, credit). Failing orders get a reject here without ever reaching the engine.</li>
+<li><strong>Sequencer.</strong> The gateway forwards the order to the sequencer, which assigns the next global sequence number and a timestamp. From this moment the order's place in history is fixed. The sequencer writes the message to its journal and sends it to the standby; it is <strong>committed</strong> once the standby confirms receipt.</li>
+<li><strong>Matching.</strong> The matching thread that owns the instrument reads the next committed message from an in-memory ring buffer and applies it to the book: match against the opposite side by price-time priority, rest any remainder, generate output events (ack, fills for both sides, book changes).</li>
+<li><strong>Outputs.</strong> Execution reports go back through the gateway to the two participants involved in each fill; book changes and trades go to the market data publisher, which multicasts them.</li>
+</ol>
+<p>The pieces between components are not general-purpose message queues; they are <strong>ring buffers</strong> — fixed-size arrays reused in a circle, where the producer and each consumer track their position with a sequence counter. LMAX's Disruptor is the well-known example: no locks, no memory allocation per message, and consumers can process a batch of everything available at once when they fall behind, which is how such a system catches up after a burst. Around the hot path sit the slower services: reference data, the session manager, drop copies to participants' risk systems, surveillance, and the archive.</p>
+
+<h4>6 · Deep dive A: price-time matching on a real book</h4>
+<p>Start from the book in the figure, built by eight earlier orders (prices in dollars, quantities in shares):</p>
+<table>
+<thead><tr><th>Side</th><th>Price</th><th>Queue (oldest first)</th></tr></thead>
+<tr><td>Ask</td><td>102.00</td><td>#7 500</td></tr>
+<tr><td>Ask</td><td>101.00</td><td>#2 200</td></tr>
+<tr><td>Ask</td><td>100.50</td><td>#1 300, #3 100</td></tr>
+<tr><td>Bid</td><td>100.00</td><td>#4 400, #6 100</td></tr>
+<tr><td>Bid</td><td>99.50</td><td>#5 200</td></tr>
+<tr><td>Bid</td><td>99.00</td><td>#8 300</td></tr>
+</table>
+<p><strong>Order #9: buy 450 limit 101.00.</strong> The best ask is 100.50, which is at or below the buyer's limit of 101.00, so the order <em>crosses</em>. Take from the head of the 100.50 queue: #1 has 300, so trade 300 at 100.50; #1 is filled and removed. Next in the queue is #3 with 100: trade 100 at 100.50; #3 removed. The 100.50 level is empty, so remove it; the best ask is now 101.00, still within the limit. #2 has 200; #9 needs only 50 more: trade 50 at 101.00, leaving #2 with 150 at the head of its queue. #9 is filled: 450 bought for 300 × 100.50 + 100 × 100.50 + 50 × 101.00 = 40,200 + 5,050 = <strong>$45,250</strong>, an average of about 100.56 — better than the 101.00 the buyer was willing to pay. Three rules showed up: better prices first (100.50 before 101.00), earlier orders first within a price (#1 before #3), and <strong>each trade prints at the resting order's price</strong>, not the incoming order's limit. The resting order is the <strong>maker</strong> (it made liquidity available); #9 is the <strong>taker</strong>. Many exchanges charge takers a fee and pay makers a rebate to reward resting liquidity.</p>
+<p><strong>Order #10: sell 450 limit 100.00.</strong> The best bid is 100.00, which meets the seller's limit, so it crosses. #4 at the head has 400: trade 400 at 100.00. #6 is next with 100: trade 50 at 100.00, leaving #6 with 50. Note what did not happen: #5 at 99.50 was never touched, because 99.50 is below the seller's limit — a limit protects the seller from the worse prices further down.</p>
+<p><strong>Cancel #6.</strong> Look up #6 in the id map, unlink it from the 100.00 list, and since the level is now empty, remove the level. The best bid becomes 99.50. No search, no shifting of other orders.</p>
+<p><strong>Order #11: IOC buy 100 limit 101.50.</strong> The best ask is #2's remaining 150 at 101.00: trade 100 at 101.00, #2 keeps 50. Had the IOC been for 300, it would have taken #2's 150, found the next ask at 102.00 above its limit, and the remaining 150 would have been <em>cancelled</em> instead of resting, because immediate-or-cancel never rests.</p>
+<p><strong>Order #13: market buy 200.</strong> A market order has no limit, so it walks the book: 50 from #2 at 101.00 (emptying that level), then 150 from #7 at 102.00. The buyer paid 102.00 for most of it because the book was thin above 101 — the reason exchanges add price protection to market orders and the reason a "fat finger" market order in a thin book is dangerous.</p>
+<p>The algorithm behind all of these is short enough to write on a whiteboard:</p>
+<pre>def submit(o):
+    opp = asks if o.side == BUY else bids
+    while o.qty &gt; 0 and opp.not_empty():
+        best = opp.best_price()
+        if o.type == LIMIT and not crosses(o, best): break   # buy: o.price &gt;= best; sell: o.price &lt;= best
+        level = opp.level(best)
+        while o.qty &gt; 0 and level.not_empty():
+            maker = level.head()
+            n = min(o.qty, maker.qty)
+            emit_trade(taker=o, maker=maker, price=best, qty=n)  # at the resting price
+            o.qty -= n; maker.qty -= n
+            if maker.qty == 0: level.pop_head(); index.remove(maker.id)
+        if level.empty(): opp.remove_level(best)
+    if o.qty &gt; 0:
+        if o.type == LIMIT and o.tif not in (IOC, FOK): rest(o)  # append to tail of its level
+        else: emit_cancel(o, o.qty)</pre>
+<p>Each fill costs O(1); each level emptied costs O(log L) or O(1) with an array; a cancel is O(1). <strong>FOK</strong> needs one extra pass first: walk the crossing levels summing available quantity without trading, and only if the total covers the order run the loop above — otherwise reject it untouched. This is why exchanges keep a running total quantity per level.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Matching trace for buy 450 limit 101.00. Before: asks at 100.50 hold order 1 for 300 and order 3 for 100, at 101.00 order 2 for 200. The buy takes 300 from order 1 and 100 from order 3 at 100.50, then 50 from order 2 at 101.00. After: the 100.50 level is gone and order 2 has 150 left at 101.00.">
+  <defs><marker id="cd15-arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="120" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Asks before</text>
+    <text x="520" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Asks after</text>
+    <text x="320" y="20" text-anchor="middle" style="fill:var(--accent);font-weight:600">#9 BUY 450 @ 101.00</text>
+    <text x="20" y="58" style="fill:var(--ink);font-family:var(--mono)">101.00</text>
+    <rect x="80" y="42" width="80" height="24" rx="3" style="fill:var(--surface);stroke:var(--s3)"/>
+    <text x="120" y="59" text-anchor="middle" style="fill:var(--ink)">#2 · 200</text>
+    <text x="20" y="98" style="fill:var(--ink);font-family:var(--mono)">100.50</text>
+    <rect x="80" y="82" width="80" height="24" rx="3" style="fill:var(--surface);stroke:var(--s3)"/>
+    <text x="120" y="99" text-anchor="middle" style="fill:var(--ink)">#1 · 300</text>
+    <rect x="170" y="82" width="80" height="24" rx="3" style="fill:var(--surface);stroke:var(--s3)"/>
+    <text x="210" y="99" text-anchor="middle" style="fill:var(--ink)">#3 · 100</text>
+    <rect x="270" y="40" width="100" height="120" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="320" y="62" text-anchor="middle" style="fill:var(--ink)">① 300 @ 100.50</text>
+    <text x="320" y="84" text-anchor="middle" style="fill:var(--ink)">② 100 @ 100.50</text>
+    <text x="320" y="106" text-anchor="middle" style="fill:var(--ink)">③ 50 @ 101.00</text>
+    <text x="320" y="132" text-anchor="middle" style="fill:var(--good)">filled 450</text>
+    <text x="320" y="149" text-anchor="middle" style="fill:var(--muted)">avg 100.56</text>
+    <line x1="250" y1="94" x2="268" y2="80" marker-end="url(#cd15-arrow3)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="160" y1="54" x2="268" y2="104" marker-end="url(#cd15-arrow3)" style="fill:none;stroke:var(--ink-2);stroke-dasharray:3 2"/>
+    <text x="420" y="58" style="fill:var(--ink);font-family:var(--mono)">101.00</text>
+    <rect x="480" y="42" width="80" height="24" rx="3" style="fill:var(--surface);stroke:var(--s3)"/>
+    <text x="520" y="59" text-anchor="middle" style="fill:var(--ink)">#2 · 150</text>
+    <text x="420" y="98" style="fill:var(--muted);font-family:var(--mono)">100.50</text>
+    <text x="520" y="99" text-anchor="middle" style="fill:var(--muted)">level removed</text>
+    <line x1="370" y1="100" x2="410" y2="100" marker-end="url(#cd15-arrow3)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="320" y="196" text-anchor="middle" style="fill:var(--ink-2)">price first (100.50 before 101.00), then time (#1 before #3), each fill at the maker's price</text>
+    <text x="320" y="216" text-anchor="middle" style="fill:var(--muted)">bids untouched: best bid 100.00 stays, spread is now 101.00 − 100.00</text>
+  </g>
+</svg>
+<figcaption>Three fills from one order. Order #3 arrived after #1 at the same price, so it waited; order #2 at a worse price waited for both. Each trade printed at the resting order's price, which is why the buyer paid an average of 100.56, not 101.00.</figcaption>
+</figure>
+
+<p><strong>Other matching rules exist.</strong> Price-time is the default for equities and most crypto venues. Some futures markets use <strong>pro-rata</strong> matching, where an incoming order at a price is split among all resting orders in proportion to their size, rewarding size over speed; hybrids give the first order a priority allocation and split the rest. The engine structure is the same; only the inner loop's allocation changes. Say which rule you are implementing.</p>
+
+<h4>7 · Deep dive B: the single-threaded sequencer, and why it wins</h4>
+<p><strong>The instinct and why it fails.</strong> The instinct is to run many threads over a shared book with a lock. Consider what one match costs: a few hundred nanoseconds of comparisons and pointer updates on memory already in the CPU's L1 or L2 cache (the small, fast memories next to each core). Acquiring a contended lock costs on the order of a hundred nanoseconds to microseconds, involves moving the cache line holding the lock between cores, and, if a thread has to sleep, a context switch of several microseconds. So the coordination costs as much as the work, and the variation is worse: a thread descheduled while holding the lock stalls everyone. The book's data also bounces between cores' caches. Adding threads makes it slower and less predictable.</p>
+<p><strong>One writer per book.</strong> The alternative is to give each book exactly one thread that owns it. That thread never shares the book, so it never locks; the book stays in that core's cache; and its time per message is steady. This is the <em>single-writer principle</em>, and LMAX's write-up of its exchange made it famous: its business logic processor handled, in Fowler's account, 6 million orders per second on a single thread, with no database — all state in memory, recoverable from journaled input events. Parallelism comes from <strong>sharding instruments</strong>: thread 1 owns one set of books, thread 2 another. Instruments are independent (a trade in one never depends on the book of another), so they never need to coordinate. Assign the busiest instruments to their own threads.</p>
+<p><strong>The sequencer.</strong> Many gateways receive orders concurrently, so something must turn concurrent arrivals into one order. That is the sequencer: a single component through which every inbound message passes, which assigns the next number in a gap-free sequence and a timestamp. Its output is a <strong>total order</strong> of all events. Three things follow. <em>Fairness</em> is defined: whoever the sequencer numbers first is first. <em>Determinism</em> is possible: if each matching thread processes its messages in sequence order and its logic depends only on its inputs and its state, its outputs are a pure function of the sequence. <em>Replication</em> becomes simple: send the same sequence to another machine running the same code and it reaches the same state, which is state machine replication (the idea behind consensus-based databases and coordination services, in8) without needing consensus on every step, because there is only one sequencer.</p>
+<p><strong>Making one thread fast.</strong> A single thread only wins if it never waits. The techniques, each with its reason: <strong>pre-allocate</strong> order objects in pools so no memory allocation (and in Java, no garbage collection pause) happens on the hot path; <strong>busy-spin</strong> on the input ring buffer instead of sleeping, because waking a sleeping thread takes microseconds; <strong>pin</strong> each thread to a dedicated core isolated from the operating system's other work, so it is never preempted; keep data structures <strong>compact and contiguous</strong> so they stay in cache; do <strong>no I/O</strong> on the matching thread — journaling and publishing happen on other threads reading the same ring buffer; and use <strong>kernel bypass</strong> networking (the network card delivers packets straight into user-space memory, skipping the kernel's network stack) at the edges. Each removes a source of microseconds or of jitter.</p>
+<p><strong>The sequencer as a bottleneck.</strong> One sequencer for all instruments is also one thread. Its work per message is tiny — assign a number, copy to a buffer — so it can handle millions per second, but very large venues partition: one sequencer per group of instruments, each with its own sequence. Cross-partition ordering is then not defined, which is fine because books do not interact. Operations that span instruments (a multi-leg spread order, a participant-wide kill switch) need care: route them through each affected partition, or give them a dedicated mechanism.</p>
+
+<h4>8 · Deep dive C: persistence, replay and failover without loss or duplicates</h4>
+<p><strong>The input log is the database.</strong> Because the engine is deterministic, the book at any moment is a function of the sequenced inputs so far. So instead of writing the book to a database, write every sequenced input to a <strong>journal</strong> — an append-only file, like a database's write-ahead log (db8) — and treat it as the source of truth. This is <strong>event sourcing</strong>. Recovery is <em>load the latest snapshot, then replay the journal from the snapshot's sequence number</em>. Fowler's LMAX article describes nightly snapshots taken during quiet periods and a full restart — the Java virtual machine (JVM), snapshot load, a day's journal replayed — in under a minute. Snapshots bound replay time; the journal bounds loss.</p>
+<p><strong>The rule that prevents loss.</strong> An order is <em>acknowledged</em> to the participant only after its sequenced input is durable on at least two machines (the journal and the hot standby, or two journals in different racks). Then any crash leaves that order in a surviving copy of the log. If the engine published a fill before the input was replicated and then crashed, the standby would never have seen the order: the participant holds a fill the exchange's surviving state does not contain. The ordering <em>replicate input → process → release output</em> is the entire guarantee. It is also why the replication hop shows up as the largest item in the latency budget.</p>
+<p><strong>Hot standby.</strong> The standby consumes the same committed sequence and runs the same engine code, so its books match the primary's message for message, but its outputs are discarded. LMAX describes two business logic processors in the primary data centre and a third at a disaster recovery site, all processing input events, with all but one having their output ignored. On primary failure, the standby is promoted: it already has the state in memory, so it starts publishing outputs from the next sequence number. A <strong>fencing</strong> mechanism (a coordination service lease, in8, or a hardware-level switch) guarantees the old primary cannot keep publishing if it was only partitioned rather than dead — two primaries would be the worst outcome of all.</p>
+<p><strong>Why outputs cannot duplicate.</strong> Outputs carry their own sequence numbers per session and per market data channel, generated deterministically from the input sequence. The promoted standby generates exactly the same numbers for the same events. Suppose the primary had sent execution reports up to session sequence 1,204 before dying and the standby resumes publishing from 1,201 (the last it knew to be delivered). Participants receive 1,201-1,204 again with identical numbers and content and drop them as duplicates, then accept 1,205 onwards. Duplicates are harmless when they are recognisable; the danger would be the same fill with a <em>new</em> number, which determinism rules out.</p>
+<p><strong>The participant side.</strong> On reconnect after a failover or network blip, the participant tells the exchange the last outbound sequence number it processed, and the exchange resends everything after it (FIX's resend request does this). The participant learns, from the replayed execution reports, which of its in-flight orders were accepted. If it resends an order whose <code>cl_ord_id</code> was already accepted, the gateway rejects it as a duplicate — so the participant cannot accidentally double its position by retrying.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Sequence: the gateway sends order seq 501 to the sequencer, which sends it to the standby and journal; only after the standby confirms does the primary engine process it and release the fill. The primary then crashes. The standby, which processed 501 too, is promoted and resumes publishing output from the next number, while the participant reconnects with its last-seen number and receives any missed reports, dropping duplicates.">
+  <defs><marker id="cd15-arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="70" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Participant</text>
+    <text x="240" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Sequencer</text>
+    <text x="410" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Primary</text>
+    <text x="570" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Standby</text>
+    <line x1="70" y1="28" x2="70" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="240" y1="28" x2="240" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="410" y1="28" x2="410" y2="160" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="570" y1="28" x2="570" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="70" y1="42" x2="238" y2="52" marker-end="url(#cd15-arrow4)" style="fill:none;stroke:var(--accent)"/>
+    <text x="150" y="40" text-anchor="middle" style="fill:var(--ink-2)">order (cl_ord_id)</text>
+    <line x1="240" y1="60" x2="568" y2="72" marker-end="url(#cd15-arrow4)" style="fill:none;stroke:var(--crit)"/>
+    <text x="470" y="60" text-anchor="middle" style="fill:var(--crit)">seq 501 → journal + standby</text>
+    <line x1="570" y1="80" x2="242" y2="92" marker-end="url(#cd15-arrow4)" style="fill:none;stroke:var(--crit);stroke-dasharray:3 2"/>
+    <text x="470" y="100" text-anchor="middle" style="fill:var(--crit)">ack: committed</text>
+    <line x1="240" y1="108" x2="408" y2="116" marker-end="url(#cd15-arrow4)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="325" y="104" text-anchor="middle" style="fill:var(--ink-2)">process 501</text>
+    <line x1="410" y1="124" x2="72" y2="140" marker-end="url(#cd15-arrow4)" style="fill:none;stroke:var(--good)"/>
+    <text x="250" y="144" text-anchor="middle" style="fill:var(--good)">fill, out-seq 1204</text>
+    <text x="410" y="178" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕ crash</text>
+    <rect x="510" y="168" width="120" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="570" y="185" text-anchor="middle" style="fill:var(--ink)">promoted (fenced)</text>
+    <line x1="72" y1="212" x2="568" y2="212" marker-end="url(#cd15-arrow4)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="320" y="206" text-anchor="middle" style="fill:var(--ink-2)">reconnect: last seen out-seq 1204</text>
+    <line x1="568" y1="232" x2="72" y2="240" marker-end="url(#cd15-arrow4)" style="fill:none;stroke:var(--good)"/>
+    <text x="320" y="252" text-anchor="middle" style="fill:var(--good)">resend from 1205 (same numbers the primary would have used)</text>
+  </g>
+</svg>
+<figcaption>The red step is the guarantee: an input is committed on two machines before any output depends on it. Because both engines are deterministic, the standby's output numbering matches the primary's, so the participant can de-duplicate by number after failover.</figcaption>
+</figure>
+
+<h4>9 · Market data, risk checks and fairness</h4>
+<p><strong>Market data fan-out.</strong> The estimate showed the full feed must be multicast. Real feeds come in levels: <em>level 1</em> is the best bid and ask and the last trade; <em>level 2</em> is aggregated quantity per price level; <em>level 3</em> (order-by-order) publishes every add, execute, cancel and delete, from which subscribers rebuild the whole book themselves. Nasdaq's TotalView-ITCH is a real order-level feed: messages such as Add Order, Order Executed, Order Cancel, Order Delete and Order Replace, delivered over MoldUDP64, a sequenced multicast framing, with a TCP alternative. Because UDP drops packets silently, every message carries a sequence number; exchanges send two identical feeds (<strong>A and B</strong>) over separate network paths so a subscriber takes whichever copy arrives first; a <strong>retransmission service</strong> answers requests for a few missed messages; and a <strong>snapshot</strong> service gives the full book at a sequence number so a late joiner or a badly lagging subscriber can start from the snapshot and apply incremental messages after it. Retail-facing distribution (websites, apps) is a different tier entirely: conflated updates (only the latest state every 100 ms or so) over WebSockets through ordinary fan-out infrastructure (net11), because a phone cannot consume a million messages per second.</p>
+<p><strong>Risk checks.</strong> Pre-trade checks run before an order can trade: a <strong>price band</strong> (reject a buy far above the last trade — the fat-finger check), <strong>maximum order quantity and notional</strong>, <strong>credit or margin</strong> available, <strong>order rate</strong> limits per session, and <strong>self-trade prevention</strong> (do not let a firm trade with itself, which can look like market manipulation). A <strong>kill switch</strong> cancels all of a participant's open orders and blocks new ones in one action. Per-participant checks that need only the participant's own state run in the gateway, which can be scaled out; checks that need the book (price bands relative to the current best, self-trade prevention) run in the matching thread just before matching. Market-wide controls — halting an instrument when its price moves too far too fast (US equities use limit up-limit down bands) — are part of the engine's trading-status logic.</p>
+<p><strong>Fairness, engineered.</strong> Since the sequencer defines "first", fairness becomes a property of the path to it. Exchanges give every colocated participant identical cable lengths and identical gateway hardware, so nobody is physically closer. They spread a participant's sessions across gateways or require several gateways to have identical latency. Some venues deliberately add delay: IEX's speed bump routes order messages through a coil of optical fibre equal to 350 microseconds, so the exchange can update prices from other markets before fast traders can trade on its stale quotes. Others have proposed <strong>frequent batch auctions</strong> — collect orders for a short interval and match them all at one price — so that being a few microseconds faster within the interval stops mattering.</p>
+
+<h4>10 · Bottlenecks, failure modes and trade-offs</h4>
+<p><strong>The hot instrument.</strong> One book on one thread is a hard ceiling. When an instrument's burst exceeds what a thread can process, the input ring buffer fills; the producers must then wait, which pushes latency back to every instrument sharing the sequencer. Mitigations: give the hottest instruments dedicated threads, make the thread faster, and size ring buffers for the worst observed burst (Fowler reports ring buffers of 20 million slots for input and 4 million for each output in LMAX). You cannot split one book across threads without breaking price-time priority.</p>
+<p><strong>Slow consumers.</strong> A gateway or market data publisher that falls behind must not slow the engine. Each consumer reads the ring buffer at its own position; if one falls more than the buffer's size behind, it is disconnected and recovers from the journal or snapshot, rather than making the producer wait.</p>
+<p><strong>Non-determinism.</strong> A build that reads the wall clock, iterates a hash map in memory-address order, or uses a floating-point operation whose result differs across CPUs will make the standby drift from the primary — silently, until a failover reveals two different books. Defend by taking all time from the sequenced messages, and by replaying each day's production journal through the new build in a test environment and diffing every output.</p>
+<p><strong>Split brain.</strong> If the network between primary and standby fails but both are alive, both may think they should be primary. Fencing (only the holder of a lease or token can publish) prevents two sets of outputs. When in doubt, an exchange halts trading: a halt is embarrassing, two primaries are catastrophic.</p>
+<p><strong>Trade-offs to close on.</strong> Latency versus durability (acknowledge after replication, which costs microseconds, or before, which risks loss — exchanges pay the microseconds). Throughput versus fairness (multi-threading a book would add capacity and destroy the ordering guarantee). Simplicity versus features (each order type is engine logic on the hot path). Multicast's efficiency versus its unreliability (handled by sequence numbers, A/B feeds and recovery services). A single deterministic engine versus a fleet of services: here the monolith is the right answer, and saying why is the senior signal.</p>
+</section>
+
+<section data-field="deep">
+<h4>Determinism is a discipline, not a property</h4>
+<p>Every recovery and failover argument in this design assumes the engine is deterministic, so it is worth knowing precisely what breaks it. Reading the system clock anywhere in matching logic (expiry of a DAY order, a timestamp on a trade) makes the result depend on when the code ran; the fix is to use the timestamp the sequencer put in the message, so replay sees the same time. Iterating a hash map whose order depends on memory addresses or a per-process random seed makes, for example, a mass cancel produce events in a different order on the standby. Undefined behaviour — uninitialised memory, data races, integer overflow in some languages — can differ between runs. Floating point can differ across CPU models or compiler optimisation flags, which is one more reason prices and quantities are integers. Teams enforce determinism by construction (all inputs through the sequencer, no other side channels into the engine) and by testing: replay yesterday's production journal through today's build and require byte-identical outputs.</p>
+
+<h4>Ring buffers and mechanical sympathy</h4>
+<p>The LMAX Disruptor paper's argument is that conventional queues between threads are slow because the head and tail are shared mutable state: producers and consumers contend on locks or on compare-and-swap operations, and the counters sit on the same cache line, so every write by one core invalidates it in the others ("false sharing"). The ring buffer replaces this with a pre-allocated array, a sequence counter owned by the single producer, and a separate sequence counter owned by each consumer, padded onto their own cache lines. A consumer waits only by reading the producer's counter; a producer only by reading the slowest consumer's. Consumers can form a dependency graph — the journaller and replicator must finish an entry before the business logic reads it — expressed by which sequences each one waits on, with no queues in between. And when a consumer falls behind, it can read everything up to the producer's sequence in one batch, which amortises costs exactly when load is highest. "Mechanical sympathy" is the name for designing data structures around how caches and cores actually behave.</p>
+
+<h4>Auctions: a different algorithm on the same book</h4>
+<p>Opening and closing auctions do not match order by order. During the call period, orders accumulate in the book even if they cross. At the auction time the engine computes one price: the price that maximises the executable volume (the quantity where cumulative buy interest at or above the price meets cumulative sell interest at or below it), with tie-breakers such as minimising the leftover imbalance and staying close to a reference price. Every crossing order then executes at that single uniform price, with price-time priority deciding who is filled when one side is larger. Exchanges publish indicative prices and imbalance information during the call so participants can respond. The closing auction matters disproportionately because the closing price values index funds and derivatives, which is why it often carries a large share of the day's volume.</p>
+
+<h4>Gateways are where the scale-out happens</h4>
+<p>The single-threaded core handles one stream of messages, so everything that can be done before the sequencer is done in parallel, in the gateways: TCP session handling, decoding FIX or binary messages, authentication, duplicate detection, per-participant risk checks and rate limits. A gateway rejects bad orders without ever spending core capacity on them. Gateways also translate between external identifiers and compact internal ones (a 4-byte instrument number instead of a ticker string), so that the message the core sees is small and fixed-size. This is the same pattern as an API gateway (sc2), with the difference that every microsecond in the gateway is visible to participants, so these too are pinned, busy-spinning processes.</p>
+
+<h4>Why not a database with row locks?</h4>
+<p>An interviewer may push: "why not store orders in Postgres and match with <code>SELECT … FOR UPDATE</code>?" Walk the numbers. A transaction that locks the best rows, updates them and commits with a durable log flush takes on the order of a millisecond, and all transactions for one instrument serialise on the same rows at the top of the book, so throughput per instrument is about a thousand orders per second — fifty times below the estimate for the hottest instrument, with jitter from lock waits and flushes. A database is a fine design for a low-volume venue (an internal marketplace, a small crypto exchange's early days) and the right place for downstream records; it is the wrong tool for the hot path because it re-solves concurrency the sequencer has already eliminated.</p>
+
+<h4>Cancels, modifies and queue position</h4>
+<p>Because most messages are cancels and modifies, their semantics shape both the engine and participants' strategies. Reducing an order's quantity normally keeps its queue position, because it only makes the order less aggressive. Increasing quantity or changing price loses position, because otherwise a participant could reserve a place in line with a small order and then enlarge it. Market makers therefore care intensely about where they are in a queue, and some venues publish enough order-level data for them to estimate it. For the engine, a modify that keeps priority is an in-place update of the node; a modify that loses priority is a cancel plus a new order with a new sequence position.</p>
+
+<h4>Clearing and settlement sit downstream</h4>
+<p>Matching produces trades; it does not move money. Trades flow to a central counterparty (a clearing house), which becomes the buyer to every seller and the seller to every buyer, nets each member's obligations, and collects margin so a member's default does not cascade. Settlement — actually exchanging cash and securities — happens later (one business day after the trade for most US equities since May 2024). For the design, this means the engine's job ends at producing an exact, durable, sequenced trade record; correctness downstream depends on that record being complete and free of duplicates, which is one more reason the output sequence numbering matters.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: LMAX</h4>
+<p>Martin Fowler's 2011 write-up of the LMAX architecture is the most cited public description of an exchange core, and its numbers are worth knowing precisely. The business logic processor runs on a single thread, entirely in memory, with no database; Fowler reports it handling 6 million orders per second, measured on a 3 GHz dual-socket quad-core Nehalem server. Input messages pass through an <strong>input Disruptor</strong> whose consumers journal them to the file system, replicate them to other nodes and unmarshal them before the business logic processes them; outputs pass through <strong>output Disruptors</strong> that marshal them for the network. Ring buffers were sized at 20 million slots for input and 4 million for each output. LMAX ran two business logic processors in its main data centre and a third at a disaster-recovery site, all processing the input events, with only the leader's output used, and snapshots taken nightly so a restart — the Java virtual machine (JVM), snapshot load, a day's journal replay — took under a minute. The article is also candid about the cost: developers had to learn to write code that never blocks, and the team rewrote much of its earlier, more conventional design to get there.</p>
+
+<h4>The cautionary case: Knight Capital, 1 August 2012</h4>
+<p>Knight Capital was not an exchange but a market maker, and its incident is the standard argument for in-line pre-trade risk controls. During a deployment, one of eight servers kept old, repurposed code; when trading opened, that server's router sent millions of erroneous orders to the market. The SEC's order (its first enforcement action under the 2010 market access rule, Rule 15c3-5) found that Knight lacked adequate controls to prevent the entry of erroneous orders; Knight agreed to pay $12 million. The widely reported figures from the order are that in roughly 45 minutes the router sent more than 4 million orders trying to fill 212 customer orders, traded about 397 million shares and lost more than $460 million. The design lessons map directly onto this lesson: per-participant order-rate and exposure limits in the order path, a kill switch that someone is empowered to pull, and alerts that are designed as alerts (the order notes that the system emailed warnings before the open that nobody acted on).</p>
+
+<h4>Failure modes you will see</h4>
+<p><strong>Latency spikes at the open.</strong> Symptom: the 99.99th percentile acknowledgement latency jumps from 20 µs to milliseconds for a few seconds at 09:30. Cause: a burst for a handful of instruments sharing one thread, or a consumer (journal, replicator) that cannot keep up, back-pressuring the sequencer. Detection: per-thread queue depth and per-stage latency histograms. Fix: rebalance hot instruments, enlarge buffers, find the slow stage.</p>
+<p><strong>Standby divergence.</strong> Symptom: after a failover, participants' rebuilt books disagree with the exchange's. Cause: non-determinism introduced by a code change. Detection: continuously compare a hash of each engine's state, or of its output stream, between primary and standby; any mismatch is a page, not a log line.</p>
+<p><strong>Market data gaps.</strong> Symptom: a subscriber's book is wrong. Cause: dropped multicast packets on one feed. Detection: gap counters per feed per subscriber; A/B arbitration should hide single-path loss. Fix: retransmission request, or re-sync from snapshot if the gap is large.</p>
+<p><strong>Session storms.</strong> Symptom: after a network blip, hundreds of participants reconnect at once and request resends. Cause: recovery traffic competing with live traffic. Fix: serve resends from a separate replay service reading the journal, not from the live path.</p>
+
+<h4>What to monitor</h4>
+<p>Per-stage latency histograms in nanoseconds (gateway, sequencer, replication, matching, publish) with the 99th, 99.9th and 99.99th percentiles, not averages; ring buffer occupancy per consumer; messages per second per instrument and per thread; primary/standby state hash agreement; journal write latency and disk headroom; multicast gap and retransmission counts; reject rates by reason (risk, duplicate id, halted instrument); and kill-switch and halt events. Clock synchronisation of the timestamping hosts (PTP, the Precision Time Protocol, rather than NTP) matters because regulators require accurate event timestamps.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run a price-time matching engine on 20 orders, check its trades against the worked example, and prove that replaying the input log rebuilds the identical book. Python 3.12 standard library, under a second.</p>
+<pre>"""Price-time matching on 20 events, then replay from the log."""
+from collections import deque
+from dataclasses import dataclass
+import bisect, json
+
+@dataclass
+class Order:
+    oid: int; side: str; price: int | None; qty: int; kind: str = "LIMIT"   # cents; None = market
+
+class Book:
+    def __init__(self):
+        self.levels = {"B": {}, "S": {}}          # price -&gt; deque (FIFO = time priority)
+        self.prices = {"B": [], "S": []}          # sorted ascending
+        self.index, self.trades = {}, []
+
+    def best(self, side):
+        p = self.prices[side]
+        return None if not p else (p[-1] if side == "B" else p[0])
+
+    def submit(self, o):
+        opp = "S" if o.side == "B" else "B"
+        while o.qty &gt; 0 and (bp := self.best(opp)) is not None:
+            if o.price is not None and (o.price &lt; bp if o.side == "B" else o.price &gt; bp): break
+            q = self.levels[opp][bp]
+            while q and o.qty &gt; 0:
+                r = q[0]; n = min(o.qty, r.qty)
+                self.trades.append((o.oid, r.oid, bp, n))      # at the resting price
+                o.qty -= n; r.qty -= n
+                if r.qty == 0: q.popleft(); self.index.pop(r.oid)
+            if not q: del self.levels[opp][bp]; self.prices[opp].remove(bp)
+        if o.qty &gt; 0 and o.kind == "LIMIT":                  # IOC/market remainders cancel
+            lv = self.levels[o.side]
+            if o.price not in lv: lv[o.price] = deque(); bisect.insort(self.prices[o.side], o.price)
+            lv[o.price].append(o); self.index[o.oid] = o
+
+    def cancel(self, oid):
+        o = self.index.pop(oid); q = self.levels[o.side][o.price]; q.remove(o)
+        if not q: del self.levels[o.side][o.price]; self.prices[o.side].remove(o.price)
+
+EVENTS = [("NEW",1,"S",10050,300),("NEW",2,"S",10100,200),("NEW",3,"S",10050,100),
+  ("NEW",4,"B",10000,400),("NEW",5,"B",9950,200),("NEW",6,"B",10000,100),("NEW",7,"S",10200,500),
+  ("NEW",8,"B",9900,300),("NEW",9,"B",10100,450),("NEW",10,"S",10000,450),("CXL",6),
+  ("NEW",11,"B",10150,100,"IOC"),("NEW",12,"S",9950,100),("NEW",13,"B",None,200,"MKT"),
+  ("NEW",14,"S",10050,200),("NEW",15,"S",10050,100),("NEW",16,"B",10050,250),
+  ("NEW",17,"B",9950,100),("NEW",18,"S",9900,350),("NEW",19,"B",10300,50)]
+
+def run(events):
+    b = Book()
+    for e in events:
+        if e[0] == "CXL": b.cancel(e[1])
+        else: b.submit(Order(e[1], e[2], e[3], e[4], e[5] if len(e) &gt; 5 else "LIMIT"))
+    return b
+
+book = run(EVENTS)
+for taker, maker, px, n in book.trades: print(f"#{taker:&gt;2} x #{maker:&gt;2}  {n:&gt;3} @ {px/100:.2f}")
+replay = run(json.loads(json.dumps(EVENTS)))               # the log is the state
+assert replay.trades == book.trades and replay.prices == book.prices
+print("replay identical; resting:", {s: book.prices[s] for s in "BS"})</pre>
+<ol>
+<li>The first five trades should match deep dive A: #9 takes 300 and 100 at 100.50 and 50 at 101.00; #10 takes 400 and 50 at 100.00. Then check #18: it sells 350 and takes #5 at 99.50 <em>before</em> #17 at the same price — time priority.</li>
+<li>Break time priority on purpose: change <code>q[0]</code> to <code>q[-1]</code> and see which trades change. Then store prices as floats (100.5 instead of 10050) and add an order at <code>100.1 + 0.2</code> next to one at <code>100.3</code>: they land in different levels.</li>
+<li>Add FOK: before matching, sum the quantity available at crossing levels and reject without trading if it is short. Measure: time 200,000 random adds and cancels and compute microseconds per message.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Estimate and design</b>
+<p>A crypto exchange runs 500 trading pairs 24/7. Peak inbound is 400,000 messages per second; BTC-USD alone takes 30% of it. Messages average 80 bytes. (a) What is BTC-USD's per-message time budget on one thread at peak? (b) How large is the input journal per day if the average rate is a quarter of peak? (c) The team proposes running BTC-USD's book on 4 threads with a lock to get more headroom. What do you say?</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> 30% × 400,000 = 120,000 messages per second, so 1 s ÷ 120,000 ≈ <strong>8.3 µs per message</strong> on average. Matching is well under 1 µs, so there is roughly 8× headroom on average; the risk is bursts, so size the ring buffer for the worst observed second and keep the thread free of allocation and I/O.</p>
+<p><strong>(b)</strong> Average 100,000 messages per second × 86,400 s = 8.64 billion messages × 80 B ≈ <strong>690 GB per day</strong>, about 8 MB/s sustained — trivial for sequential writes, about 250 TB a year for archive.</p>
+<p><strong>(c)</strong> Decline. Four threads sharing one book must serialise on the top of the book anyway, because every crossing order touches the best level; the lock adds contention, cache-line bouncing and jitter, so throughput likely falls. It also breaks determinism (outputs depend on thread scheduling), so the hot standby and replay stop being exact, and fairness becomes "whoever got the lock". Instead: dedicate a core to BTC-USD alone, move decoding and risk checks into gateways, and profile the matching thread for allocation and cache misses.</p>
+</details>
+<b>Diagnose it</b>
+<p>During a planned failover test, the standby is promoted and immediately publishes a book for one instrument that differs from what participants rebuilt from market data: one resting order at 100.25 is missing. Primary and standby run the same build. Replaying the journal on a test machine reproduces the primary's book, not the standby's. What are the likely causes and how do you confirm?</p>
+<details><summary>Answer</summary>
+<p>Since a fresh replay matches the primary, the journal is complete and the logic deterministic on replay; the standby diverged at run time. Likely causes: (1) the standby missed or reordered an input — for example it read from a different replication path that dropped a message and the gap check did not fire; (2) a non-deterministic input reached only the live engines, such as a wall-clock read deciding an order's expiry (replay uses the sequencer's timestamps and gets it right; the live standby, running slightly later, expired the order); (3) state loaded at standby start-up from a snapshot taken mid-update. Confirm by comparing per-sequence state hashes between primary and standby to find the first divergent sequence number, then inspect that message. Prevent it by streaming state hashes continuously and treating any mismatch as an incident before it matters, and by banning clock reads in engine code.</p>
+</details>
+</section>

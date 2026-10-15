@@ -9,6 +9,7 @@ import { Bank } from "./views/Bank";
 import { Cards } from "./views/Cards";
 import { Dsa } from "./views/Dsa";
 import { Landing } from "./views/Landing";
+import { LessonRoute } from "./views/Lesson";
 import { Mock } from "./views/Mock";
 import { Overview } from "./views/Overview";
 import { Roadmap } from "./views/Roadmap";
@@ -41,6 +42,7 @@ function Gate() {
           <Route path="/bank" element={<Bank />} />
           <Route path="/search" element={<Search />} />
           <Route path="/:view" element={<SectionRoute />} />
+          <Route path="/:view/:id" element={<LessonRoute />} />
         </Routes>
       </Layout>
     </ProgressProvider>

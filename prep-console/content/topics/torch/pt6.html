@@ -1,0 +1,611 @@
+<!-- topic source for torch/pt6; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "pt6",
+  "t": "The training loop done right: order of operations, schedules, clipping, accumulation, evaluation and determinism",
+  "tag": "Training",
+  "sum": "Every line of a correct PyTorch training step and why it is where it is: zero_grad, loss reduction, backward, clipping, optimizer.step, scheduler.step and warmup, gradient accumulation and the token-weighting bug Hugging Face fixed in 2024, the evaluation loop, and seeding for reproducibility.",
+  "prereq": [
+    [
+      "pt3",
+      "backward() adds into .grad on leaves; zero_grad sets .grad to None by default; no_grad and inference_mode stop recording."
+    ],
+    [
+      "pt4",
+      "train() and eval() flip the training flag that dropout and BatchNorm read; parameters() returns registered parameters to the optimiser."
+    ],
+    [
+      "dl5",
+      "SGD with momentum and AdamW keep per-parameter state; AdamW decouples weight decay from the gradient-based update."
+    ],
+    [
+      "ml4",
+      "The learning rate scales each update; too large diverges, too small crawls; warmup and decay schedules change it over training."
+    ]
+  ],
+  "myths": [
+    [
+      "Where zero_grad goes does not matter as long as it is in the loop.",
+      "It must run exactly once between consecutive optimiser steps and never between the backward passes you mean to accumulate. Before backward or after step are both fine; between backward and step it deletes the gradient you just computed, so the model never trains. Inside a micro-batch loop it throws away all but the last micro-batch."
+    ],
+    [
+      "Gradient accumulation over k micro-batches is identical to a k-times-larger batch if you divide each loss by k.",
+      "Only if every micro-batch contributes equally to the true loss. For token-level losses with padding, each micro-batch's mean is over a different number of real tokens, so the average of means over-weights tokens in short micro-batches. Hugging Face fixed exactly this in its Trainer in October 2024: the correct loss divides the summed loss by the total number of non-padding tokens across the whole accumulation step. BatchNorm also sees the small micro-batch, not the large one."
+    ],
+    [
+      "scheduler.step() can go anywhere in the step.",
+      "Since PyTorch 1.1 it must come after optimizer.step(); calling it first triggers a warning and skips the first value of the schedule. And it must be called at the granularity the schedule was designed for: a warmup defined in steps but stepped per epoch warms up for thousands of steps too long."
+    ],
+    [
+      "Gradient clipping is a fix for a learning rate that is too high.",
+      "Clipping caps the norm of a single update when a rare batch produces a huge gradient; it protects against spikes, not against a systematically wrong learning rate. If clipping engages on most steps, the effective learning rate is no longer what you set, and the run is telling you something is wrong."
+    ],
+    [
+      "torch.manual_seed(0) makes a run reproducible.",
+      "It seeds PyTorch's CPU and CUDA generators. NumPy and Python's random, DataLoader worker seeding, non-deterministic GPU kernels (atomic adds in scatter and index backward, some convolution algorithms), cuDNN's benchmark autotuning, and the number of GPUs all still change results. Bitwise reproducibility needs torch.use_deterministic_algorithms(True), CUBLAS_WORKSPACE_CONFIG, a seeded DataLoader generator and identical hardware and software."
+    ],
+    [
+      "The evaluation loss is comparable to the training loss printed in the same log.",
+      "The training loss printed at a step is usually a running mean over the past steps, computed in train mode (dropout on) on batches the model had not yet been updated on, while evaluation runs in eval mode at the end. They differ systematically; compare evaluation to evaluation, and if you need a training-set number, evaluate the training set in eval mode."
+    ]
+  ],
+  "recap": [
+    "A training step is: forward, loss, backward, (unscale and) clip, optimizer.step, scheduler.step, zero_grad — with exactly one zero_grad between optimiser steps.",
+    "Loss reduction decides what a step averages over; mean over tokens or examples makes the gradient independent of batch size, sum makes it scale with batch size.",
+    "Warmup raises the learning rate from near zero over the first steps because Adam's moment estimates and the network's activations start badly calibrated; cosine or linear decay lowers it toward the end.",
+    "clip_grad_norm_ rescales all gradients so their combined L2 norm is at most max_norm and returns the norm before clipping, which is worth logging.",
+    "Gradient accumulation sums gradients over micro-batches before one step; the per-micro-batch loss must be weighted so the total equals the full-batch loss — by 1/k for equal-size examples, by tokens for token-level losses.",
+    "The evaluation loop runs in eval mode under inference_mode, aggregates sums and counts rather than means of means, and restores the previous mode.",
+    "Reproducibility needs seeding of torch, NumPy and random, a seeded DataLoader generator, deterministic algorithms and fixed hardware; perfect bitwise equality across GPU types is not achievable.",
+    "Log loss, learning rate, gradient norm and throughput every few steps; most training bugs are visible in those four lines."
+  ],
+  "glossary": [
+    [
+      "Cosine decay",
+      "A schedule that lowers the learning rate along half a cosine curve from its peak to a floor over the training run."
+    ],
+    [
+      "Deterministic algorithms",
+      "torch.use_deterministic_algorithms(True): make PyTorch use only operations that give bitwise-identical results for identical inputs, or raise if none exists."
+    ],
+    [
+      "Early stopping",
+      "Stopping training when a validation metric has not improved for a set number of evaluations (the patience)."
+    ],
+    [
+      "Effective batch size",
+      "Micro-batch size × accumulation steps × number of data-parallel replicas: the number of examples behind one optimiser step."
+    ],
+    [
+      "EMA of weights",
+      "An exponential moving average copy of the parameters, updated after each step and often used for evaluation."
+    ],
+    [
+      "Gradient accumulation",
+      "Running several forward/backward passes and summing their gradients before one optimiser step, to simulate a larger batch."
+    ],
+    [
+      "Gradient clipping",
+      "Rescaling (by norm) or truncating (by value) gradients before the optimiser step to bound the size of an update."
+    ],
+    [
+      "Gradient norm",
+      "The L2 norm of all gradients concatenated into one vector; the standard health signal of a training run."
+    ],
+    [
+      "ignore_index",
+      "A label value (default −100 in cross_entropy) whose positions are excluded from the loss and from the mean's denominator."
+    ],
+    [
+      "L2 norm",
+      "The square root of the sum of squared elements of a vector; the length used by norm-based gradient clipping."
+    ],
+    [
+      "Label smoothing",
+      "Replacing one-hot targets with a mix of the one-hot vector and a uniform distribution, so the model is never pushed to infinite confidence."
+    ],
+    [
+      "LR scheduler",
+      "An object that changes the optimiser's learning rate each time its step() is called, following a schedule."
+    ],
+    [
+      "Micro-batch",
+      "One forward/backward pass's worth of data within a gradient-accumulation step."
+    ],
+    [
+      "Optimiser step",
+      "optimizer.step(): apply the update rule to every parameter using its current .grad and the optimiser's state."
+    ],
+    [
+      "Reduction",
+      "How a loss over many elements is combined: 'mean', 'sum' or 'none' (return per-element losses)."
+    ],
+    [
+      "Running loss",
+      "A moving or cumulative average of recent training losses, used for logging."
+    ],
+    [
+      "Seed",
+      "The starting value of a pseudo-random number generator; the same seed gives the same sequence."
+    ],
+    [
+      "SGD",
+      "Stochastic gradient descent: update each parameter by minus the learning rate times its gradient on a mini-batch, optionally with momentum."
+    ],
+    [
+      "Warmup",
+      "Increasing the learning rate gradually from a small value over the first steps of training."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Write the core of a correct training step and explain the order.",
+      "for x, y in loader: logits = model(x); loss = F.cross_entropy(logits, y); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step(); scheduler.step(); optimizer.zero_grad(). backward must precede clipping and step because both read .grad; the scheduler steps after the optimiser so the first update uses the initial learning rate; zero_grad must run once before the next backward because gradients accumulate.",
+      "Follow-up: Is zero_grad at the top of the loop equivalent? — Yes, as long as it is exactly once between steps; at the top is more common and robust to early 'continue' statements."
+    ],
+    [
+      "E",
+      "What does loss reduction 'mean' versus 'sum' change?",
+      "With mean, the loss and gradient are averages over elements, so their scale does not depend on batch size and a learning rate transfers between batch sizes to first order. With sum, the gradient grows linearly with the number of elements, so doubling the batch doubles the effective learning rate. Mean is the default for PyTorch losses; sum is useful when you will normalise yourself, as in correct gradient accumulation."
+    ],
+    [
+      "E",
+      "Why use learning-rate warmup?",
+      "At step 0 Adam's second-moment estimates are based on a single gradient and the network's activations and gradients are badly scaled, so a full-size learning rate can produce huge, poorly directed updates and early divergence or loss spikes. Ramping the learning rate up over hundreds or thousands of steps lets those statistics settle. Transformers trained with Adam almost always use warmup followed by cosine or linear decay."
+    ],
+    [
+      "M",
+      "Explain gradient accumulation and the loss-scaling bug that comes with it.",
+      "To simulate batch B·k with memory for B, run k forward/backward passes before one optimiser step; gradients sum in .grad. Each micro-batch loss must be scaled so the sum equals the large-batch loss: divide by k when each micro-batch has the same number of loss elements. With padded token-level losses, each micro-batch's mean is over a different number of real tokens, so dividing means by k over-weights short micro-batches. The fix is to sum token losses (reduction='sum'), add up the real-token count over all k micro-batches, and divide by that total — the fix Hugging Face shipped in its Trainer in October 2024.",
+      "Follow-up: Give numbers. — Micro-batch A has 1,000 tokens with mean loss 2.0, B has 10 tokens with mean 4.0. Average of means = 3.0; the true token-level loss is (2,000 + 40)/1,010 ≈ 2.02. B's ten tokens get as much weight as A's thousand."
+    ],
+    [
+      "M",
+      "What does clip_grad_norm_ do exactly, and what should you log?",
+      "It computes the L2 norm of all the given parameters' gradients treated as one vector; if it exceeds max_norm it multiplies every gradient by max_norm / total_norm, otherwise leaves them alone. It returns the total norm before clipping. With gradients [3, 4, 0, 0] and max_norm 1 it returns 5 and rescales to [0.6, 0.8, 0, 0]. Log the returned norm every step and the fraction of steps where it exceeded max_norm.",
+      "Follow-up: With mixed-precision GradScaler, where does clipping go? — After scaler.unscale_(optimizer) and before scaler.step(optimizer); otherwise you clip the scaled gradients (pt7)."
+    ],
+    [
+      "M",
+      "You see 'Detected call of lr_scheduler.step() before optimizer.step()'. What is wrong and does it matter?",
+      "The scheduler was stepped first, so its first learning-rate value is skipped and the first real update uses the schedule's second value. With a long warmup that is harmless; with a very short one the first update is noticeably larger than intended. Either way it signals that the loop is out of order. It can also happen legitimately when the first optimiser step is skipped by GradScaler because of an inf gradient."
+    ],
+    [
+      "M",
+      "What must an evaluation loop do that a training loop does not?",
+      "Switch to eval mode, disable autograd recording with inference_mode, never call backward or step, aggregate metrics correctly (sum of losses and count of elements, not mean of per-batch means when batch sizes vary), use a sampler that does not repeat examples, and restore train mode afterwards. It should also be deterministic: no shuffling, and the same examples every time, so evaluations are comparable across checkpoints."
+    ],
+    [
+      "M",
+      "Why might two runs with the same seed diverge after a few hundred steps on GPU?",
+      "Some GPU kernels are not deterministic: atomic floating-point additions in scatter_add, index_add and the backward of embedding and gather happen in varying order, and cuDNN may pick different convolution algorithms, especially with benchmark=True. Floating-point addition is not associative, so tiny differences appear and grow chaotically through training. torch.use_deterministic_algorithms(True), cudnn.benchmark=False and CUBLAS_WORKSPACE_CONFIG=:4096:8 remove most of them at a speed cost.",
+      "Follow-up: Is that worth it in production training? — Usually not for the full run; teams use determinism to debug and to test that a refactor is numerically identical, and accept run-to-run noise otherwise."
+    ],
+    [
+      "H",
+      "Design the learning-rate schedule for a 100,000-step pretraining run and implement it in PyTorch.",
+      "A common choice: linear warmup from about 1% of peak to peak over 1–2% of training (say 2,000 steps), then cosine decay to about 10% of peak at step 100,000. In PyTorch either SequentialLR([LinearLR(opt, start_factor=0.01, total_iters=2000), CosineAnnealingLR(opt, T_max=98000, eta_min=0.1*peak)], milestones=[2000]) or one LambdaLR with the formula; call scheduler.step() once per optimiser step, not per micro-batch and not per epoch. Save the scheduler's state_dict in checkpoints so resumption continues the curve.",
+      "Follow-up: What alternative do some recent runs use? — Warmup-stable-decay: hold the peak for most of training and decay sharply at the end, which makes it cheap to branch off checkpoints at different lengths."
+    ],
+    [
+      "H",
+      "A loss curve is smooth for 30,000 steps and then spikes by 3× and slowly recovers, several times. How do you investigate from the training loop's side?",
+      "Look at the gradient norm and learning rate logged around each spike: a gradient-norm spike just before the loss spike suggests a pathological batch or an instability in attention logits or Adam's second-moment estimate for rarely updated parameters. Record the data indices of each step so the batches can be replayed; check whether the same samples recur. Mitigations from the loop: tighter gradient clipping, a lower peak learning rate or longer warmup, skipping updates whose gradient norm is an outlier, and raising Adam's epsilon or lowering beta2. pt9 covers the model-side causes.",
+      "Follow-up: Why are rarely updated parameters a risk with Adam? — Their second-moment estimate decays toward zero between updates, so when a large gradient arrives the update g/√v is enormous; a larger epsilon or lower beta2 bounds it."
+    ],
+    [
+      "H",
+      "Make a training run as reproducible as PyTorch allows. List everything you would set.",
+      "Seed torch.manual_seed (all devices), random.seed and np.random.seed; give the DataLoader its own seeded torch.Generator so shuffling and worker seeds are fixed, and seed any per-worker RNG from get_worker_info().seed; torch.use_deterministic_algorithms(True) with CUBLAS_WORKSPACE_CONFIG=:4096:8; torch.backends.cudnn.benchmark = False; fixed number and type of GPUs, same PyTorch, CUDA and driver versions; in_order=True in the DataLoader; and checkpoint all RNG states for resumption (pt8). Even then, results differ across GPU models and library versions, so the realistic goal is reproducibility on one fixed environment.",
+      "Follow-up: How do you check a refactor changed nothing? — Run a few hundred steps before and after under deterministic settings on CPU or one GPU and compare losses bitwise (or within a tight tolerance)."
+    ],
+    [
+      "H",
+      "Why can the same training script give a different result when you change the number of GPUs, even with the per-GPU batch size fixed?",
+      "The effective batch size changes (per-GPU batch × GPUs × accumulation), so the optimal learning rate and the noise of each step change; you must rescale the learning rate or keep the global batch fixed by changing accumulation. Gradient averaging across ranks happens in a different order, so floating-point results differ. BatchNorm statistics are per GPU unless synchronised. And the data order differs, because DistributedSampler splits indices by rank. A careful team fixes the global batch and token budget and treats the GPU count as an implementation detail."
+    ]
+  ],
+  "refs": [
+    [
+      "post",
+      "Hugging Face — Fixing Gradient Accumulation (16 October 2024)",
+      "The real-world case: Trainer's gradient accumulation did not match full-batch training for causal LMs because per-micro-batch means were averaged; the fix divides by the total number of non-padding tokens.",
+      "https://huggingface.co/blog/gradient_accumulation"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.optim (optimisers and learning-rate schedulers)",
+      "Optimizer.step/zero_grad, parameter groups, and the scheduler classes, with the required order of optimizer.step() and scheduler.step().",
+      "https://docs.pytorch.org/docs/2.14/optim.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — Reproducibility",
+      "Seeding, cuDNN settings, use_deterministic_algorithms, CUBLAS_WORKSPACE_CONFIG and DataLoader worker seeding.",
+      "https://docs.pytorch.org/docs/2.14/notes/randomness.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.nn.utils.clip_grad_norm_",
+      "Total-norm clipping, foreach and error_if_nonfinite.",
+      "https://docs.pytorch.org/docs/2.14/generated/torch.nn.utils.clip_grad_norm_.html"
+    ],
+    [
+      "post",
+      "Karpathy — A Recipe for Training Neural Networks",
+      "Fixing random seeds, verifying loss at initialisation, overfitting one batch, and the habit of logging everything.",
+      "https://karpathy.github.io/2019/04/25/recipe/"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — CrossEntropyLoss",
+      "reduction, ignore_index and label_smoothing, and how the mean is computed over non-ignored targets.",
+      "https://docs.pytorch.org/docs/2.14/generated/torch.nn.CrossEntropyLoss.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>In October 2024, Unsloth, a company that builds fine-tuning tools, reported something odd to Hugging Face: training a causal language model with gradient accumulation — running several small batches and stepping the optimiser once, a standard trick to fit a larger batch into memory — did not give the same loss curve as training with one big batch. It was supposed to be mathematically identical. The cause, which Hugging Face explained in a post titled "Fixing Gradient Accumulation" on 16 October 2024, was one line of loss arithmetic: each micro-batch's loss was a mean over its own non-padding tokens, and those means were averaged. Micro-batches with few real tokens got as much weight as those with many. The fix: divide the total loss over all micro-batches by the total number of non-padding tokens. Millions of fine-tuning runs had been slightly wrong because of where a division happened.</p>
+<p>That is the nature of training-loop bugs. The loop is ten lines long, everyone has written it, and nearly every line has a way to be subtly wrong that does not crash: <code>zero_grad</code> in the wrong place, a scheduler stepped before the optimiser or per epoch instead of per step, clipping applied to the wrong gradients, a loss reduced over the wrong thing, an evaluation loop that averages per-batch means or forgets to switch modes, seeds that make you believe a change helped when it was noise. The model trains, the loss goes down, and the result is a few percent worse than it should be — or a few percent better on paper than it really is.</p>
+<p>In an ML-debugging round, the training loop is where interviewers plant half the bugs, because candidates who have only used high-level trainers have never had to think about the order of operations. This lesson takes every line of a correct step and explains why it is where it is: gradients and when to clear them, loss reduction and what it means for the learning rate, warmup and decay schedules and how PyTorch's schedulers work, gradient clipping and what its return value tells you, gradient accumulation done correctly (including the token-weighting fix), an evaluation loop that produces numbers you can trust, and seeding and determinism — what PyTorch can and cannot make reproducible.</p>
+</section>
+
+<section data-field="primer">
+<p>Think of one training step as a short assembly line with a strict order, where each station reads what the previous one produced:</p>
+<ol>
+<li><strong>Forward</strong>: run the model on a batch to get predictions (and, through autograd, record the graph — pt3).</li>
+<li><strong>Loss</strong>: compare predictions with targets and reduce to one number. How you reduce (mean over what?) decides how big the gradient is.</li>
+<li><strong>Backward</strong>: compute the gradient of that number with respect to every parameter, <em>adding</em> it into each parameter's <code>.grad</code>.</li>
+<li><strong>Clip</strong> (optional but standard): if the gradient as a whole is unusually large, shrink it.</li>
+<li><strong>Optimiser step</strong>: use <code>.grad</code> (and the optimiser's memory of past gradients) to update every parameter.</li>
+<li><strong>Scheduler step</strong>: move the learning rate to its next value.</li>
+<li><strong>Zero the gradients</strong>, so the next backward starts from nothing.</li>
+</ol>
+<p>The analogy to an assembly line is useful because the bugs are all "a station ran at the wrong time": clearing gradients after backward but before the step (the step sees nothing), stepping the schedule before the optimiser (the first update uses the wrong learning rate), clipping after the step (too late to matter). Gradient accumulation is the one deliberate exception — stations 1–3 run several times before stations 4–7 run once — which is why it needs extra care with the loss arithmetic.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Order of operations in a training step with gradient accumulation: k micro-batches of forward, loss divided appropriately, backward; then clip, optimizer step, scheduler step, zero_grad">
+  <defs><marker id="pt6-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="30" width="300" height="150" rx="8" style="fill:none;stroke:var(--s1);stroke-dasharray:5 3"/>
+    <text x="170" y="22" text-anchor="middle" style="fill:var(--ink);font-weight:600">repeat k times (micro-batches)</text>
+    <rect x="40" y="50" width="80" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="80" y="75" text-anchor="middle" style="fill:var(--ink)">forward</text>
+    <rect x="135" y="50" width="80" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="175" y="68" text-anchor="middle" style="fill:var(--ink)">loss ×</text><text x="175" y="83" text-anchor="middle" style="fill:var(--ink)">weight</text>
+    <rect x="230" y="50" width="80" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="270" y="75" text-anchor="middle" style="fill:var(--ink)">backward</text>
+    <line x1="120" y1="70" x2="135" y2="70" marker-end="url(#pt6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="215" y1="70" x2="230" y2="70" marker-end="url(#pt6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="170" y="118" text-anchor="middle" style="fill:var(--ink-2)">.grad += ∂(weighted loss)/∂θ</text>
+    <text x="170" y="138" text-anchor="middle" style="fill:var(--ink-2)">weight = 1/k (equal examples)</text>
+    <text x="170" y="156" text-anchor="middle" style="fill:var(--ink-2)">or tokens_i / total tokens</text>
+    <rect x="350" y="40" width="120" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="410" y="62" text-anchor="middle" style="fill:var(--ink)">clip_grad_norm_</text>
+    <rect x="350" y="84" width="120" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="410" y="106" text-anchor="middle" style="fill:var(--ink)">optimizer.step()</text>
+    <rect x="350" y="128" width="120" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="410" y="150" text-anchor="middle" style="fill:var(--ink)">scheduler.step()</text>
+    <rect x="350" y="172" width="120" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="410" y="194" text-anchor="middle" style="fill:var(--ink)">zero_grad()</text>
+    <line x1="320" y1="70" x2="350" y2="57" marker-end="url(#pt6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="410" y1="74" x2="410" y2="84" marker-end="url(#pt6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="410" y1="118" x2="410" y2="128" marker-end="url(#pt6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="410" y1="162" x2="410" y2="172" marker-end="url(#pt6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="490" y="62" style="fill:var(--ink-2)">reads .grad, returns norm</text>
+    <text x="490" y="106" style="fill:var(--ink-2)">reads .grad, lr</text>
+    <text x="490" y="150" style="fill:var(--ink-2)">changes lr for next</text>
+    <text x="490" y="194" style="fill:var(--ink-2)">.grad = None</text>
+    <text x="20" y="232" style="fill:var(--crit)">Wrong-station bugs: zero_grad inside the k-loop (keeps only the last micro-batch),</text>
+    <text x="20" y="250" style="fill:var(--crit)">scheduler before optimizer (skips first lr), clip after step (no effect).</text>
+  </g>
+</svg>
+<figcaption>Everything right of the dashed box reads the accumulated .grad, so it runs once per optimiser step; zero_grad belongs exactly once per step, never inside the micro-batch loop.</figcaption>
+</figure>
+
+<p>It is worth knowing what each station costs and what it protects you from, because that is how you judge a change to the loop. Forward and backward are almost all of the time — backward roughly twice forward (pt3). The loss is cheap unless the vocabulary is huge, in which case the logits and their softmax are a large slice of memory. Clipping costs one pass over all gradients to compute a norm — a few milliseconds even for large models — and protects against the single bad batch that would otherwise wreck the run. The optimiser step reads and writes every parameter and its state: for AdamW that is the weight, the gradient and two moments, about 16 bytes per parameter of memory traffic in float32, which is why fused optimiser kernels exist (pt12). The scheduler and zero_grad are essentially free. Logging is free unless it synchronises the GPU on every step.</p>
+<p>The other thing to hold in mind is that every station has a "mode" question. The forward pass behaves differently in train and eval mode (dropout, BatchNorm — pt4); autograd records or does not (pt3); the loss averages over examples, tokens or something else. Most training-loop bugs are not wrong code in a station but a station running in the wrong mode or averaging over the wrong thing. When you read someone else's loop in an interview, check each line for <em>when</em> it runs and <em>what</em> it averages.</p>
+<p>Where the assembly-line picture breaks: the optimiser has memory. Adam's update depends not only on this step's gradient but on running averages of past gradients and squared gradients, so a single bad step (a huge gradient, a wrong learning rate) can affect many later steps. That is why clipping and warmup matter more than the one-step picture suggests, and why the optimiser's state must be saved with checkpoints (pt8).</p>
+<p>If you remember one sentence: <em>forward, loss, backward as often as you accumulate; then clip, step, schedule, and zero exactly once — and make the loss arithmetic say precisely what average you mean</em>.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The reference loop</h4>
+<p>Here is a complete, correct single-device loop, which the rest of the lesson takes apart line by line.</p>
+<pre>model.train()
+for step, (x, y) in enumerate(train_loader):
+    x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
+    logits = model(x)                                   # (B, V)
+    loss = F.cross_entropy(logits, y)                   # mean over B
+    loss.backward()                                     # .grad += dloss/dθ
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)               # the 2.14 default
+    if step % 50 == 0:
+        log(step=step, loss=loss.item(), lr=scheduler.get_last_lr()[0], gnorm=gnorm.item())
+    if step % eval_every == 0:
+        evaluate(model, val_loader)                     # restores train mode itself</pre>
+<p>Logging uses <code>.item()</code>, which synchronises with the GPU (pt1, pt12); doing it every 50 steps rather than every step keeps the cost negligible.</p>
+
+<h4>2. Clearing gradients</h4>
+<p>Because backward adds into <code>.grad</code> (pt3), gradients must be cleared once per optimiser step. <code>optimizer.zero_grad()</code> clears the parameters that optimiser manages; <code>model.zero_grad()</code> clears every parameter in the model. On 2.14 both default to <code>set_to_none=True</code>: they set <code>.grad = None</code> rather than filling it with zeros. That skips a memory write per parameter, lets the allocator reuse the memory until backward needs it, and lets optimisers skip parameters that received no gradient this step. The behavioural difference: code that reads <code>p.grad</code> after zeroing (custom logging, a gradient penalty) gets <code>None</code> instead of zeros and must handle it.</p>
+<p>Correct placements are "at the top of the loop, before forward" or "after <code>optimizer.step()</code>". Wrong placements, each a planted bug you should recognise instantly:</p>
+<ul>
+<li><strong>Between backward and step</strong> — the step sees no gradients (with set_to_none, the optimiser skips every parameter), and the model never trains. The loss stays flat at its initial value.</li>
+<li><strong>Missing</strong> — gradients accumulate forever. Each step's update includes every previous gradient, so updates grow, the loss falls fast for a few steps and then explodes.</li>
+<li><strong>Inside an accumulation loop</strong> — only the last micro-batch survives; you train with a k-times smaller batch than you think.</li>
+</ul>
+
+<h4>3. Loss reduction: what are you averaging over?</h4>
+<p>Losses in <code>torch.nn</code> take <code>reduction="mean"</code> (default), <code>"sum"</code> or <code>"none"</code> (return one loss per element). The choice sets the gradient's scale:</p>
+<ul>
+<li><strong>mean</strong> divides by the number of elements, so the gradient is an average and does not grow with batch size. A learning rate tuned at batch 32 is roughly sensible at batch 64 (larger batches usually want somewhat larger learning rates, but not twice as large).</li>
+<li><strong>sum</strong> makes the gradient grow linearly with the number of elements; doubling the batch doubles the effective learning rate. It is useful as a building block when you normalise yourself.</li>
+<li><strong>none</strong> returns per-element losses for weighting, masking or per-example logging.</li>
+</ul>
+<p>"Elements" depends on the loss. For <code>F.cross_entropy(logits.view(-1, V), targets.view(-1))</code> on a language model, the mean is over <em>tokens</em>, and positions whose target equals <code>ignore_index</code> (default −100) are excluded from both the numerator and the denominator. So the mean is over real tokens in this batch. A model whose loss is "mean over examples of the mean over tokens" weights a 10-token example as much as a 1,000-token one; "mean over all tokens" weights every token equally. Neither is wrong, but they are different objectives, and mixing them — the pattern behind the accumulation bug in section 7 — is wrong.</p>
+<p>Two smaller reduction traps. <code>label_smoothing</code> in <code>F.cross_entropy</code> changes the minimum achievable loss, so a smoothed loss never reaches 0 and is not comparable to an unsmoothed one. And class weights (<code>weight=</code>) change the mean's denominator to the sum of the weights of the targets present, so the loss value changes with the batch's class mix.</p>
+
+<h4>4. Optimiser step and parameter groups</h4>
+<p><code>optimizer.step()</code> applies the update rule to every parameter it manages that has a non-None <code>.grad</code>. AdamW on 2.14 defaults to <code>lr=1e-3</code>, <code>betas=(0.9, 0.999)</code>, <code>eps=1e-8</code>, <code>weight_decay=0.01</code>, and accepts <code>foreach</code> and <code>fused</code> options that change speed, not results (pt12). It keeps two state tensors per parameter (the first and second moment estimates, dl5) — the reason AdamW costs 8 extra bytes per parameter in float32.</p>
+<p>Parameter groups let different tensors use different hyperparameters: a list of dicts, each with <code>"params"</code> and any overrides, such as no weight decay for biases and normalisation weights, or a smaller learning rate for a pretrained backbone than for a new head. The scheduler scales each group's learning rate by the same factor, so their ratio is preserved.</p>
+
+<h4>5. Learning-rate schedules and warmup</h4>
+<p>A <strong>scheduler</strong> wraps an optimiser and changes each group's <code>lr</code> when you call <code>scheduler.step()</code>. Since PyTorch 1.1 the order is fixed: <code>optimizer.step()</code> then <code>scheduler.step()</code>. Reversing them triggers, on 2.14, "Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order… Failure to do this will result in PyTorch skipping the first value of the learning rate schedule."</p>
+<p><strong>Warmup</strong> exists because the start of training is fragile. Adam divides each gradient by the square root of a running average of squared gradients; at step 1 that average is based on one gradient, so the normalised update is large and noisy. Activations and gradients in a freshly initialised transformer are also poorly scaled. Starting with a full-size learning rate can produce early loss spikes or divergence; ramping it over the first hundreds or thousands of steps lets the statistics settle. Toward the end, <strong>decay</strong> (cosine or linear) reduces the step size so the model settles into a minimum.</p>
+<p>Two ways to write warmup + cosine. Composing built-ins:</p>
+<pre>from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+sched = SequentialLR(opt, [
+    LinearLR(opt, start_factor=0.01, total_iters=4),        # 1e-5 → 1e-3 over 4 steps
+    CosineAnnealingLR(opt, T_max=6, eta_min=1e-5)],          # then down over 6 steps
+    milestones=[4])</pre>
+<p>Or one <code>LambdaLR</code> whose function returns a multiplier of the base learning rate:</p>
+<pre>def lr_mult(s, warmup=4, total=10):
+    if s &lt; warmup:
+        return (s + 1) / warmup
+    return 0.5 * (1 + math.cos(math.pi * (s - warmup) / (total - warmup)))
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_mult)</pre>
+<p>Run on 2.14 for 10 steps, reading the learning rate before each step: the SequentialLR version gives 1.0e-5, 2.58e-4, 5.05e-4, 7.53e-4, 1.0e-3, 9.34e-4, 7.53e-4, 5.05e-4, 2.58e-4, 7.6e-5; the LambdaLR version gives 2.5e-4, 5.0e-4, 7.5e-4, 1.0e-3, 1.0e-3, 9.33e-4, 7.5e-4, 5.0e-4, 2.5e-4, 6.7e-5. Same shape, slightly different details — exactly why you should print the first few learning rates of any schedule rather than trust that you configured it correctly.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Learning rate over ten steps: linear warmup from 1e-5 to 1e-3 over four steps, then cosine decay toward 1e-5">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="60" y1="210" x2="610" y2="210" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="60" y1="20" x2="60" y2="210" style="fill:none;stroke:var(--line-2)"/>
+    <text x="52" y="44" text-anchor="end" style="fill:var(--muted)">1e-3</text>
+    <text x="52" y="128" text-anchor="end" style="fill:var(--muted)">5e-4</text>
+    <text x="52" y="212" text-anchor="end" style="fill:var(--muted)">0</text>
+    <polyline points="80,208 140,167 200,125 260,84 320,40 380,51 440,84 500,125 560,167 600,197" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+    <g style="fill:var(--accent)">
+      <circle cx="80" cy="208" r="3.5"/><circle cx="140" cy="167" r="3.5"/><circle cx="200" cy="125" r="3.5"/><circle cx="260" cy="84" r="3.5"/><circle cx="320" cy="40" r="3.5"/>
+      <circle cx="380" cy="51" r="3.5"/><circle cx="440" cy="84" r="3.5"/><circle cx="500" cy="125" r="3.5"/><circle cx="560" cy="167" r="3.5"/><circle cx="600" cy="197" r="3.5"/>
+    </g>
+    <line x1="320" y1="30" x2="320" y2="210" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="190" y="30" text-anchor="middle" style="fill:var(--ink-2)">LinearLR warmup</text>
+    <text x="470" y="30" text-anchor="middle" style="fill:var(--ink-2)">CosineAnnealingLR</text>
+    <text x="80" y="228" text-anchor="middle" style="fill:var(--muted)">0</text>
+    <text x="320" y="228" text-anchor="middle" style="fill:var(--muted)">4 (milestone)</text>
+    <text x="600" y="228" text-anchor="middle" style="fill:var(--muted)">9</text>
+    <text x="340" y="246" text-anchor="middle" style="fill:var(--ink-2)">optimiser step →  (values measured on PyTorch 2.14 with SequentialLR)</text>
+  </g>
+</svg>
+<figcaption>Warmup then cosine, as SequentialLR produced it. The schedule only advances when scheduler.step() is called — once per optimiser step, not per micro-batch and not per epoch.</figcaption>
+</figure>
+
+<p>Granularity is the other classic bug: a schedule defined in optimiser steps must be stepped once per optimiser step. Stepping per epoch stretches a 2,000-step warmup over 2,000 epochs; stepping per micro-batch with accumulation compresses it by k. Schedulers have state (<code>last_epoch</code>, which despite its name counts calls to step()), so save <code>scheduler.state_dict()</code> with checkpoints.</p>
+
+<h4>6. Gradient clipping</h4>
+<p><code>torch.nn.utils.clip_grad_norm_(params, max_norm)</code> treats the gradients of all the given parameters as one long vector, computes its L2 norm, and if the norm exceeds <code>max_norm</code>, multiplies every gradient by <code>max_norm / norm</code>. The direction of the update is unchanged; only its length is capped. It returns the norm <em>before</em> clipping. On 2.14, gradients [3, 4, 0, 0] with max_norm 1.0 return a norm of 5 and become [0.6, 0.8, 0, 0].</p>
+<p>Clipping is insurance against rare huge gradients — a pathological batch, an attention logit that blew up — which would otherwise take one enormous step and undo hours of training. A max_norm of 1.0 is a common default for transformers. The returned norm is the single most useful health metric in a training log: steady and slowly declining is normal; a spike before a loss spike is the classic warning (pt9); a norm permanently above max_norm means clipping is engaged on every step, so you are effectively training with a smaller, varying learning rate. <code>clip_grad_value_</code> clamps each element instead and changes the direction; it is rarely the right choice. Pass <code>error_if_nonfinite=True</code> to fail immediately on a NaN or inf norm rather than clipping garbage.</p>
+
+<h4>7. Gradient accumulation, and getting the weighting right</h4>
+<p><strong>Gradient accumulation</strong> runs k micro-batches before one optimiser step. Since <code>.grad</code> accumulates, the only question is how to scale each micro-batch's loss so that the summed gradient equals the gradient of the full-batch loss.</p>
+<p>When every micro-batch has the same number of loss elements (images, fixed-length examples, no padding), dividing each mean loss by k is exact:</p>
+<pre>for i, (x, y) in enumerate(loader):
+    loss = F.cross_entropy(model(x), y) / k     # each micro-batch: mean over B
+    loss.backward()
+    if (i + 1) % k == 0:
+        clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step(); scheduler.step(); optimizer.zero_grad()</pre>
+<p>When micro-batches have different numbers of real tokens, that is not exact. A worked example: micro-batch A has 1,000 real tokens with mean loss 2.0; micro-batch B has 10 real tokens with mean loss 4.0. The full-batch token-level loss is (1,000 × 2.0 + 10 × 4.0) / 1,010 = 2,040 / 1,010 ≈ 2.02. Averaging the two means gives (2.0 + 4.0) / 2 = 3.0 — B's ten tokens weigh as much as A's thousand. The gradient is distorted in the same way. This is the bug Hugging Face described: "the correct loss should be computed by the total loss across all batches in a gradient accumulation step divided by the total number of all non padding tokens in those batches. This is not the same as the average of the per-batch loss values."</p>
+<p>The fix is to know the token count for the whole accumulation step before backward, and to use a sum reduction:</p>
+<pre>micro = [next(it) for _ in range(k)]                        # pre-fetch k micro-batches
+n_tok = sum((b["labels"] != -100).sum() for b in micro)      # real tokens in the step
+for b in micro:
+    logits = model(b["input_ids"])
+    loss = F.cross_entropy(logits.view(-1, V), b["labels"].view(-1),
+                           reduction="sum") / n_tok          # weight by tokens
+    loss.backward()
+clip_grad_norm_(model.parameters(), 1.0)
+optimizer.step(); scheduler.step(); optimizer.zero_grad()</pre>
+<p>In data-parallel training the denominator should be the token count across all ranks too (an all-reduce of <code>n_tok</code>, pt11), and DDP's <code>no_sync()</code> avoids synchronising gradients on every micro-batch. Two things accumulation cannot reproduce: BatchNorm statistics, which are computed per micro-batch, and anything that depends on the batch as a whole (in-batch negatives in contrastive learning see only the micro-batch).</p>
+
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Two micro-batches: A with 1000 tokens mean 2.0 and B with 10 tokens mean 4.0; average of means 3.0 versus token-weighted 2.02">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">Two micro-batches in one accumulation step</text>
+    <rect x="20" y="40" width="500" height="34" style="fill:var(--s1);opacity:0.35"/>
+    <text x="30" y="62" style="fill:var(--ink)">A: 1,000 real tokens, mean loss 2.0</text>
+    <rect x="530" y="40" width="10" height="34" style="fill:var(--s3);opacity:0.8"/>
+    <text x="548" y="62" style="fill:var(--ink)">B: 10 tokens, 4.0</text>
+    <rect x="20" y="100" width="290" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="165" y="118" text-anchor="middle" style="fill:var(--crit);font-weight:600">mean of means = 3.0</text>
+    <text x="165" y="136" text-anchor="middle" style="fill:var(--ink-2)">B's 10 tokens weigh as much as A's 1,000</text>
+    <rect x="330" y="100" width="290" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="475" y="118" text-anchor="middle" style="fill:var(--good);font-weight:600">token-weighted = 2,040 / 1,010 ≈ 2.02</text>
+    <text x="475" y="136" text-anchor="middle" style="fill:var(--ink-2)">what one big batch would compute</text>
+    <text x="20" y="176" style="fill:var(--ink)">Fix: reduction="sum" per micro-batch, divide by total real tokens in the whole step.</text>
+    <text x="20" y="198" style="fill:var(--ink-2)">The same error, across ranks, if each rank divides by its own token count.</text>
+  </g>
+</svg>
+<figcaption>Dividing each micro-batch's mean by k is exact only when every micro-batch has the same number of loss elements. With padded text, weight by tokens.</figcaption>
+</figure>
+
+<h4>8. Combining several losses</h4>
+<p>Real loops often optimise a weighted sum: a main loss plus an auxiliary one (a mixture-of-experts load-balancing loss, a distillation term, a regulariser). Three rules keep it correct. Sum the terms and call backward once (pt3): <code>loss = main + 0.01 * aux; loss.backward()</code>, rather than two backward passes with <code>retain_graph=True</code>. Make sure each term is reduced over the same thing — a per-token main loss plus a per-example auxiliary loss changes their relative weight whenever sequence length changes. And log each term separately as a Python number, because a total that looks healthy can hide an auxiliary term that has exploded or collapsed to zero. With gradient accumulation, every term needs the same weighting treatment as the main loss.</p>
+<p>Two common modifiers also live in the loss line. <code>label_smoothing=0.1</code> in <code>F.cross_entropy</code> mixes the one-hot target with a uniform distribution, which regularises over-confident classifiers but raises the minimum achievable loss (so a smoothed training loss and an unsmoothed validation loss are not comparable). <code>weight=class_weights</code> rebalances classes, and with <code>reduction="mean"</code> it divides by the sum of the weights of the targets present rather than by the count — so the loss value shifts with the class mix of each batch, which shows up as extra noise in the curve.</p>
+<h4>9. The evaluation loop</h4>
+<p>A trustworthy evaluation function:</p>
+<pre>def evaluate(model, loader):
+    was_training = model.training
+    model.eval()
+    total_loss, total_tok = 0.0, 0
+    try:
+        with torch.inference_mode():
+            for b in loader:
+                logits = model(b["input_ids"].to(dev))
+                labels = b["labels"].to(dev)
+                total_loss += F.cross_entropy(logits.view(-1, V), labels.view(-1),
+                                              reduction="sum").item()
+                total_tok += (labels != -100).sum().item()
+    finally:
+        model.train(was_training)
+    return total_loss / total_tok</pre>
+<p>Each detail answers a bug: <code>eval()</code> turns off dropout and freezes BatchNorm (pt4); <code>inference_mode</code> stops graph recording and saves memory (pt3); sums and counts give the true mean over tokens, whereas averaging per-batch means is biased when the last batch is smaller or lengths vary; <code>finally</code> restores the previous mode even if evaluation raises, so training never silently continues in eval mode. The validation loader must not shuffle, must not drop the last batch, and in distributed runs must not repeat examples (pt5).</p>
+<p>Comparing training and validation loss needs care. The logged training loss is usually a running mean over recent steps, computed in train mode with dropout active and on each batch <em>before</em> the update for that batch, while validation runs in eval mode. A small gap in either direction is normal; a validation loss consistently <em>below</em> training loss often just means dropout is strong, not that something is wrong.</p>
+
+<h4>10. Early stopping and choosing the checkpoint</h4>
+<p>The evaluation loop's output usually drives two decisions: whether to stop, and which checkpoint to keep. Early stopping stops when the validation metric has not improved for a set number of evaluations (the "patience"). Implemented carelessly it has three failure modes. Noise: a single evaluation that is lucky or unlucky by chance moves the "best" checkpoint, so the validation set must be large enough that the metric's run-to-run spread is smaller than the improvements you care about. Selection bias: picking the best of many evaluations on the same validation set makes that number optimistic, so report a separate test set. And schedule interaction: with cosine decay, the loss often improves fastest near the end as the learning rate falls, so stopping early can stop just before the best part; many large-scale runs therefore train for a fixed budget and keep the last (or the EMA) checkpoint rather than early-stopping.</p>
+<h4>11. Seeding and determinism</h4>
+<p>Random numbers enter training through parameter initialisation, data shuffling, augmentation, dropout and sampling. Each has a generator:</p>
+<ul>
+<li><code>torch.manual_seed(s)</code> seeds PyTorch's CPU generator and every CUDA device's generator.</li>
+<li><code>random.seed(s)</code> and <code>np.random.seed(s)</code> seed Python's and NumPy's global generators.</li>
+<li>The DataLoader's shuffle and worker seeds come from the main process's torch RNG unless you pass <code>generator=torch.Generator().manual_seed(s)</code> (pt5).</li>
+</ul>
+<p>Seeding makes a run repeatable only if every operation is deterministic, and some GPU operations are not: <code>index_add</code>, <code>scatter_add</code> and the backward passes of embedding, gather and advanced indexing use atomic additions whose order varies (pt2); cuDNN may choose convolution algorithms by benchmarking at run time (<code>torch.backends.cudnn.benchmark=True</code>). <code>torch.use_deterministic_algorithms(True)</code> makes PyTorch select deterministic implementations or raise an error naming the operation that has none; for CUDA matmuls it also requires the environment variable <code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code> (or <code>:16:8</code>). Set <code>cudnn.benchmark=False</code> as well.</p>
+<p>Even then, results are reproducible only on the same hardware and software: a different GPU model, CUDA version, number of GPUs or PyTorch version can change kernel choices and summation orders. The practical uses of determinism are debugging (a bug that appears every time is far easier to find) and regression testing (proving a refactor changed nothing). For the science, the honest approach is several seeds and error bars: a change that improves a metric by less than the seed-to-seed spread has not been shown to help.</p>
+<h4>12. A pre-flight check you can run in five minutes</h4>
+<p>Before launching a long run, a short scripted check catches most of this lesson's bugs. Run 20 steps on a tiny configuration and assert the following. The step-0 loss is close to ln of the number of classes (pt4), so initialisation and the loss line are sane. The learning rate printed before each step follows the intended warmup values, so the scheduler is stepped at the right granularity and in the right order. The gradient norm is finite, non-zero and not growing step over step, so zero_grad is in place and backward reaches the parameters. Every trainable parameter's checksum changes after the first step, so the optimiser holds the right tensors. The accumulated gradient over k micro-batches equals the gradient of the concatenated batch (the lab's test), so the loss weighting is right. Two evaluations of the same weights return identical numbers, so the evaluation loop is in eval mode and deterministic. And the model can overfit a single small batch to near-zero loss within a few hundred steps — Karpathy's "overfit one batch", which pt9 builds on — so the whole pipeline, from data to update, can actually learn. Each check takes seconds; together they cost less than one minute of a real run.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why warmup works: Adam's early updates and the scale of the residual stream</h4>
+<p>Adam's update for a parameter is roughly lr × m / (√v + ε), where m and v are running averages of the gradient and its square with bias correction. At step 1, bias correction makes m/√v equal to g/|g| — a unit-size step in every coordinate, regardless of how small the gradient was. With a full learning rate, every weight moves by lr at once, which in a deep transformer can push activations far from the range normalisation layers were calibrated for. Warmup keeps those early steps small until v has averaged over enough gradients to reflect the true scale. Empirically, the needed warmup grows with model size and learning rate, and a too-short warmup shows up as loss spikes in the first few thousand steps.</p>
+
+<h4>Batch size, learning rate and the noise scale</h4>
+<p>Increasing the batch size (through accumulation or more GPUs) reduces gradient noise. Up to a point — sometimes called the critical batch size — a larger batch lets you take proportionally larger steps and reach the same loss in fewer steps; beyond it, extra examples per step mostly waste compute. For SGD a linear scaling rule (double the batch, double the learning rate) with warmup works up to fairly large batches; for Adam the relationship is closer to square-root scaling and saturates earlier. The practical consequence for loop design: when you change the effective batch size — more GPUs, different accumulation — retune or at least rescale the learning rate, and keep the token budget fixed when comparing runs.</p>
+
+<h4>The step and the GPU: foreach, fused and capturable optimisers</h4>
+<p>A naive optimiser step loops over parameters in Python and launches several small CUDA kernels per parameter — for a model with 500 parameter tensors that is thousands of launches per step. <code>foreach=True</code> (the default on CUDA when available) groups tensors and uses multi-tensor kernels; <code>fused=True</code> goes further, doing the whole update for many tensors in one kernel. They change speed, not mathematics (up to floating-point order). <code>capturable=True</code> keeps the step count on the GPU so the step can be captured in a CUDA graph (pt12). The learning rate can be passed as a tensor for the same reason — a Python float changed by the scheduler would otherwise force recompilation or re-capture.</p>
+
+<h4>Skipping bad steps</h4>
+<p>Large-scale runs often add a guard after computing the gradient norm: if it is non-finite, or an outlier (say, more than several times its recent moving average), skip the optimiser step for this batch and log the batch's data indices. Mixed-precision training already does the first part automatically, because GradScaler skips steps whose gradients contain inf or NaN (pt7). The second part is a policy decision: it prevents a single pathological batch from damaging Adam's moment estimates, at the cost of training on slightly less data and possibly hiding a systematic problem — so count and alert on skips rather than skipping silently.</p>
+
+<h4>Exponential moving averages of weights</h4>
+<p>Many training recipes keep an <strong>EMA</strong> copy of the weights, updated after every optimiser step as θ<sub>ema</sub> ← d·θ<sub>ema</sub> + (1 − d)·θ with d around 0.999–0.9999, and evaluate or ship the EMA weights, which are smoother than the raw ones. Implementation details are where the bugs live: the update must run under <code>torch.no_grad()</code> (or it records a graph every step, pt3); buffers such as BatchNorm statistics need copying, not averaging; with very high d the EMA lags far behind early in training, so implementations warm d up; and the EMA copy doubles weight memory unless it is kept on the CPU or sharded. <code>torch.optim.swa_utils.AveragedModel</code> with an EMA averaging function implements the pattern.</p>
+
+<h4>Reading a noisy loss curve</h4>
+<p>A per-step training loss is noisy because each step sees a different batch: with batch size B, the standard error of the batch-mean loss shrinks only as 1/√B. That noise is why logs show a smoothed loss (a running mean or an exponential moving average of the per-step values) and why judging "is it still improving?" from a few hundred raw steps is unreliable. Two practical consequences. First, compare runs on smoothed curves plotted against tokens seen, not steps, when batch sizes differ. Second, distinguish noise from signal by the shape: a sharp single-step spike that recovers immediately is usually one hard batch; a spike that takes thousands of steps to recover means the weights or the optimiser state were damaged, which is when clipping, a lower learning rate or skipping bad steps are worth considering (pt9).</p>
+<h4>What determinism cannot fix: chaotic sensitivity</h4>
+<p>Training a neural network is a long iterated computation, and tiny differences grow: two runs that differ in the last bit of one gradient on step 1 will, after thousands of steps, have measurably different weights and, often, final metrics that differ by a few tenths of a percent. That is not a bug; it is the variance of the procedure. It is why "same seed, same result" is a debugging tool and not a scientific claim, and why a careful comparison of two training-loop variants uses several seeds per variant.</p>
+</section>
+
+<section data-field="prod">
+<h4>The four lines to log</h4>
+<p>Loss, learning rate, gradient norm and throughput (tokens or samples per second), every few steps. Most training-loop bugs are visible there: a learning rate that does not change (scheduler never stepped) or changes once per epoch (stepped at the wrong granularity); a loss that never moves (zero_grad between backward and step); a gradient norm that grows steadily (missing zero_grad) or sits at max_norm (clipping always engaged); throughput that drops (synchronisations, data stalls, memory fragmentation). Log the evaluation metric with the step count and the number of tokens seen, so runs with different batch sizes can be compared.</p>
+
+<h4>Failure mode: the accumulation that does not match</h4>
+<p>Symptom: a run with gradient accumulation behaves differently from the same effective batch without it — a slightly higher loss, a different curve. Causes: per-micro-batch means averaged with padded or variable-length data (the Hugging Face case), zero_grad inside the accumulation loop, the scheduler stepped per micro-batch, BatchNorm seeing small micro-batches, or in distributed runs each rank dividing by its own token count. Test: on a small model, compare the gradient after k accumulated micro-batches with the gradient of one concatenated batch; they should match to floating-point tolerance.</p>
+
+<h4>Failure mode: evaluation numbers that move when nothing changed</h4>
+<p>Symptom: the validation metric of the same checkpoint varies between evaluations, or changes with the evaluation batch size. Causes: dropout active (no eval()), BatchNorm in training mode updating its statistics with validation data, shuffled validation data with a mean of per-batch means, a DistributedSampler padding the validation set, or non-deterministic kernels. Fix with the evaluate() pattern in the body and a regression test that evaluates one checkpoint twice and asserts equality.</p>
+
+<h4>Failure mode: resumed runs that drift</h4>
+<p>Symptom: after a restart from a checkpoint, the loss jumps or the learning rate is wrong. Causes: optimiser state not saved (Adam restarts with zero moments — effectively a new warmup-free start), scheduler state not saved (the learning rate restarts the warmup or jumps to the end), data position not restored (the run re-trains on the first part of the epoch), or GradScaler state lost. pt8 lists everything a checkpoint must contain.</p>
+
+<h4>Knobs and their usual ranges for transformer training</h4>
+<table>
+<thead><tr><th>Knob</th><th>Typical choice</th><th>Sign it is wrong</th></tr></thead>
+<tr><td>Warmup</td><td>1–5% of steps, hundreds to a few thousand</td><td>Loss spikes in the first few thousand steps</td></tr>
+<tr><td>Peak LR (AdamW)</td><td>1e-4 to 6e-4 for medium models, lower for larger</td><td>Divergence, or a long plateau</td></tr>
+<tr><td>Decay floor</td><td>≈10% of peak (cosine) or 0 (linear)</td><td>Loss still falling steeply at the end</td></tr>
+<tr><td>Clip max_norm</td><td>1.0</td><td>Clipping engaged on most steps</td></tr>
+<tr><td>AdamW betas</td><td>(0.9, 0.95) for large LMs; (0.9, 0.999) default</td><td>Instability with rarely updated parameters</td></tr>
+<tr><td>Weight decay</td><td>0.1 on matrices, 0 on biases and norms</td><td>Norm weights shrinking toward zero</td></tr>
+</table>
+
+<h4>The public case: Hugging Face's October 2024 fix</h4>
+<p>The gradient accumulation issue is worth knowing in detail because it happened in the most widely used training library and was found by comparing two configurations that should have been identical. Hugging Face's post explains that each model's default loss was a mean over the non-padding tokens in its own batch, and that the Trainer's accumulation averaged those, so "losses did not match between training runs where the setting was toggled on and off". The fix passes the total number of items in the accumulation step into the loss so that it sums and divides by the global count. The lesson for your own loops is the test they implicitly ran: whenever you implement accumulation, data parallelism or any other way of splitting a batch, check that the split and unsplit versions produce the same loss and gradient.</p>
+</section>
+
+<section data-field="lab">
+<p>CPU, PyTorch 2.14 in <code>gpt_env</code>; about 15 minutes. Save as <code>pt6_lab.py</code>.</p>
+<pre>import math, torch, torch.nn.functional as F
+torch.manual_seed(0)
+V = 5
+model = torch.nn.Linear(4, V)
+def make(n_tok):                                   # a micro-batch with n_tok real tokens of 8
+    x = torch.randn(8, 4); y = torch.randint(0, V, (8,)); y[n_tok:] = -100
+    return x, y
+micro = [make(8), make(1)]                         # 8 real tokens, then 1
+
+def grad_of(loss_fn):
+    model.zero_grad(); loss_fn().backward()
+    return model.weight.grad.clone()
+
+# reference: one concatenated batch, mean over all real tokens
+X = torch.cat([m[0] for m in micro]); Y = torch.cat([m[1] for m in micro])
+g_ref = grad_of(lambda: F.cross_entropy(model(X), Y))
+
+# naive accumulation: mean per micro-batch, divided by k
+model.zero_grad()
+for x, y in micro: (F.cross_entropy(model(x), y) / len(micro)).backward()
+g_naive = model.weight.grad.clone()
+
+# token-weighted accumulation
+n_tok = sum((y != -100).sum() for _, y in micro)
+model.zero_grad()
+for x, y in micro: (F.cross_entropy(model(x), y, reduction="sum") / n_tok).backward()
+g_tok = model.weight.grad.clone()
+print("naive  max diff:", (g_naive - g_ref).abs().max().item())
+print("tokens max diff:", (g_tok - g_ref).abs().max().item())
+
+# schedule: print lr before each step
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+sched = torch.optim.lr_scheduler.LambdaLR(
+    opt, lambda s: (s + 1) / 4 if s &lt; 4 else 0.5 * (1 + math.cos(math.pi * (s - 4) / 6)))
+for s in range(10):
+    print(s, f"{opt.param_groups[0]['lr']:.2e}"); opt.step(); sched.step()
+
+# clipping returns the pre-clip norm
+p = torch.nn.Parameter(torch.zeros(4)); p.grad = torch.tensor([3., 4., 0., 0.])
+print("norm", torch.nn.utils.clip_grad_norm_([p], 1.0).item(), p.grad.tolist())</pre>
+<ol>
+<li>The naive difference is clearly non-zero (the 1-token micro-batch is over-weighted); the token-weighted difference is about 1e-8 — floating-point noise.</li>
+<li>The learning rates match the body's LambdaLR list: 2.5e-4 rising to 1e-3, then cosine decay.</li>
+<li>Clipping prints norm 5.0 and gradients [0.6, 0.8, 0, 0].</li>
+<li>Swap <code>opt.step()</code> and <code>sched.step()</code> and read the warning PyTorch prints; note the first learning rate actually used.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Find the bug: a fine-tuning loop with accumulation</b>
+<p>This loop fine-tunes a language model with padded batches, micro-batch 4, accumulation 8. Its loss curve is noisier and worse than a reference run with batch 32 and no accumulation; the learning rate in the logs reaches its peak after about 250 steps although warmup was set to 2,000 steps; and the validation loss changes when the validation batch size changes. Find the bugs.</p>
+<pre>sched = get_warmup_cosine(opt, warmup=2000, total=50000)
+for i, b in enumerate(train_loader):
+    out = model(b["input_ids"])
+    loss = F.cross_entropy(out.view(-1, V), b["labels"].view(-1)) / 8
+    loss.backward()
+    sched.step()
+    if (i + 1) % 8 == 0:
+        opt.step()
+        clip_grad_norm_(model.parameters(), 1.0)
+        opt.zero_grad()
+
+def validate():
+    model.eval()
+    with torch.no_grad():
+        losses = [F.cross_entropy(model(b["input_ids"]).view(-1, V),
+                                  b["labels"].view(-1)).item() for b in val_loader]
+    return sum(losses) / len(losses)</pre>
+<details><summary>Answer</summary>
+<p><strong>Bug 1 — the scheduler steps per micro-batch.</strong> <code>sched.step()</code> runs 8 times per optimiser step, so the 2,000-step warmup completes after 2,000 / 8 = 250 optimiser steps, and the whole cosine decay finishes 8 times too early. Symptom: peak learning rate at ~250 steps, as observed. Fix: move <code>sched.step()</code> inside the <code>if</code>, after <code>opt.step()</code>.</p>
+<p><strong>Bug 2 — clipping after the step.</strong> <code>clip_grad_norm_</code> runs after <code>opt.step()</code>, so it rescales gradients that are about to be zeroed; the update itself was never clipped. Symptom: noisier training, occasional spikes. Fix: clip, then step.</p>
+<p><strong>Bug 3 — mean-of-means accumulation with padding.</strong> Each micro-batch's loss is a mean over its own real tokens, divided by 8, so micro-batches with few real tokens are over-weighted — the bug Hugging Face fixed in October 2024. Fix: compute the total real-token count for the 8 micro-batches, use <code>reduction="sum"</code>, and divide by that count.</p>
+<p><strong>Bug 4 — validation is a mean of per-batch means and leaves the model in eval mode.</strong> Averaging per-batch means weights the last (smaller) batch and short-sequence batches wrongly, so the result depends on batch size; sum the losses and count tokens instead. And <code>validate()</code> never calls <code>model.train()</code>, so training continues without dropout after the first validation. (Using <code>no_grad</code> rather than <code>inference_mode</code> is fine.)</p>
+</details>
+<b>Estimate: how long is warmup in tokens?</b>
+<p>A run uses 64 GPUs, micro-batch 8 sequences of 4,096 tokens, accumulation 4, and 2,000 warmup steps. How many tokens does warmup cover, and what happens to warmup if the team moves to 128 GPUs with accumulation 2 and keeps 2,000 warmup steps?</p>
+<details><summary>Answer</summary>
+<p>Tokens per optimiser step = 64 × 8 × 4,096 × 4 = 8,388,608 ≈ 8.4M. Warmup = 2,000 × 8.4M ≈ 16.8B tokens. With 128 GPUs and accumulation 2, tokens per step are unchanged (128 × 8 × 4,096 × 2 = 8.4M), so the same 2,000 steps still cover 16.8B tokens — the change is safe for the schedule. Had they kept accumulation 4, the global batch would double to 16.8M tokens; warmup in tokens would double and the learning rate would need retuning.</p>
+</details>
+</section>

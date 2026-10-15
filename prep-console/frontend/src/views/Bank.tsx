@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { Collapsible } from "../components/Card";
 import { StatusButtons, StatusChip } from "../components/Status";
 import { BANK, CATS } from "../content";
+import { lessonPath } from "../lesson";
 import { useProgress } from "../store";
 import { DIFF_CLS, DIFF_NAME, matches } from "../util";
 
@@ -40,7 +41,7 @@ export function Bank() {
           <div className="prose"><p style={{ marginTop: 12 }}>{b.a}</p></div>
           <div className="fcontrols">
             <StatusButtons id={b.id} />
-            {b.src && <Link className="btn ghost" to={`/${b.srcView}?open=${encodeURIComponent(b.src)}`} style={{ padding: "5px 11px", fontSize: 12.5 }}>
+            {b.src && <Link className="btn ghost" to={lessonPath(b.src)} style={{ padding: "5px 11px", fontSize: 12.5 }}>
               Read the topic: {b.srcTitle}</Link>}
           </div>
         </Collapsible>

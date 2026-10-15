@@ -1,0 +1,345 @@
+<!-- topic source for llm/lm22; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "lm22",
+  "t": "Long context: extending and using it",
+  "tag": "Architecture",
+  "sum": "Why models fail past their training length, RoPE scaling (interpolation, NTK-aware, YaRN) worked frequency by frequency, progressive-length training with document masking, ring attention, sliding-window and sparse attention, needle tests vs RULER, the KV bill at 128K and 1M by hand, and long context vs RAG as a cost and quality call.",
+  "prereq": [
+    ["lm2", "Attention scores each query against every allowed key and softmaxes the scores, so with n keys the weights must share a total of 1."],
+    ["lm4", "RoPE rotates each pair of query and key dimensions by an angle proportional to position, with one frequency per pair from fast to slow; position interpolation divides positions by the extension factor so angles stay in the trained range."],
+    ["lm5", "The KV cache stores 2 × layers × KV heads × head dimension numbers per token per sequence, and every decode step reads all of it."],
+    ["lm9", "Retrieval-augmented generation fetches a few relevant chunks from an index and puts only those in the prompt, instead of the whole corpus."],
+    ["lm13", "Serving engines batch requests, page the KV cache and reuse the cache for shared prompt prefixes (prefix caching)."],
+    ["gpu7", "FlashAttention computes exact attention tile by tile in on-chip memory, so the n × n score matrix is never stored, but the arithmetic still grows with n²."],
+    ["dl9", "Large models are trained by splitting work across GPUs: data parallelism splits the batch, tensor parallelism splits weight matrices, pipeline parallelism splits layers."]
+  ],
+  "myths": [
+    ["If a model accepts 128K tokens, it works well up to 128K tokens.", "The advertised window is what the model accepts. RULER found that of 17 models claiming 32K or more, only about half stayed above a fixed quality threshold at 32K; Llama 3.1 70B scored 96.5 at 4K and 66.6 at 128K on its 13 tasks. The usable, or effective, length is usually well below the claimed one and has to be measured for your task."],
+    ["A perfect needle-in-a-haystack score proves long-context ability.", "Single-needle tests find one out-of-place sentence by near-literal matching, which almost every modern model passes. RULER's multi-key retrieval, variable tracking and aggregation tasks show large drops on the same models, and real tasks (synthesising across a contract, finding every instance) are harder still."],
+    ["Long context makes RAG obsolete.", "It changes the trade-off, not the answer. Putting a 500K-token corpus in every request costs hundreds of times more per query than retrieving 8K tokens, adds seconds of prefill, and still suffers lost-in-the-middle effects. Long context wins for a single large document, a codebase that fits, or when retrieval keeps missing; RAG wins for large or changing corpora and high query volume. Often the best design retrieves generously into a long window."],
+    ["Extending context is just a matter of changing the RoPE settings.", "Scaling RoPE stops the model breaking at new lengths, but it does not teach the model to use distant information. Every serious extension also trains on long documents (Llama 3 used about 800B tokens across six length stages) and mixes long data into fine-tuning; without that, a model can read 128K tokens and still ignore most of them."],
+    ["Sliding-window attention lets the model remember beyond the window.", "Information can travel further than one window through layers, because each layer extends the reach by another window (Mistral 7B's 4,096 window over 32 layers gives a theoretical span of about 131K), but in practice it degrades quickly. StreamingLLM keeps generation stable over millions of tokens, yet anything that has left the window is gone; stability is not memory."],
+    ["Long context is mostly a compute problem.", "For serving it is mostly a memory problem. Llama 3.1 70B needs 40 GiB of KV cache for one 128K-token sequence and 320 GiB for a 1M-token one, more than the weights. Cache capacity limits concurrency and cache reads set the time per output token, long before decode compute matters."]
+  ],
+  "recap": [
+    "Models fail past their training length for three reasons: positions and RoPE angles they never saw, attention spreading more thinly over more keys, and training data that rarely required using distant information.",
+    "RoPE scaling keeps positions in range: position interpolation divides every position by the scale factor s, NTK-aware scaling raises the base so slow frequencies are interpolated while fast ones are almost untouched, and YaRN interpolates by wavelength (fully below about one rotation per training length, not at all above 32) and sharpens attention by 0.1 ln s + 1.",
+    "Training is what makes long context usable: Llama 3 405B grew from 8K to 128K in six stages on about 800B tokens, advancing only when short-context scores recovered and needle tests were perfect, and mixed 0.1% long synthetic data into fine-tuning.",
+    "Packing several documents into one long training sequence needs a document mask so tokens do not attend across unrelated documents; Llama 3 found this important for long continued pretraining.",
+    "Ring attention and context parallelism split one sequence across devices: each holds a block of queries while key-value blocks circulate or are gathered, so the maximum length grows with the device count.",
+    "Sliding-window attention bounds the cache to a window W per layer; production models interleave local and global layers (Gemma 3: five 1,024-token local layers per global layer) to shrink the cache while keeping some full-range attention.",
+    "Models use the start and end of a long context better than the middle; needle-in-a-haystack tests are easy, and RULER's 13 tasks show effective lengths far below claimed ones.",
+    "The KV bill is 2 × layers × KV heads × head dimension × bytes per token: 128 KiB for Llama 3.1 8B, so 16 GiB at 128K and 128 GiB at 1M tokens per sequence; prefill at 1M tokens is about 3 × 10¹⁷ FLOPs for an 8B model.",
+    "Long context versus RAG is a cost, latency and quality decision: long context costs tokens and seconds per query and degrades in the middle; RAG costs engineering and can miss; prompt caching changes the arithmetic for repeated large prefixes."
+  ],
+  "glossary": [
+    ["Attention sink", "The first few tokens of a sequence, which receive large attention weight regardless of content; keeping them in a sliding-window cache keeps generation stable."],
+    ["Attention temperature", "A divisor applied to attention scores before the softmax; YaRN scales scores up slightly at long context so attention does not become too diffuse."],
+    ["Claimed context length", "The maximum number of tokens a model or API accepts."],
+    ["Context parallelism", "Splitting one sequence across several GPUs along its length during training or inference, so each holds only part of the activations."],
+    ["Document masking", "An attention mask that stops tokens of one packed document from attending to tokens of another document in the same training sequence."],
+    ["Effective context length", "The longest input at which a model still performs above a chosen quality threshold; RULER uses Llama 2 7B's score at 4K tokens (85.6%)."],
+    ["Lost in the middle", "The finding that models use information at the beginning and end of a long input much better than information in the middle."],
+    ["Needle in a haystack (NIAH)", "A test that hides one fact in long filler text and asks the model to retrieve it."],
+    ["NTK-aware scaling", "A RoPE extension that raises the base so the slowest frequencies are compressed by the full scale factor while the fastest are almost unchanged."],
+    ["Packing", "Concatenating several shorter documents into one fixed-length training sequence so no compute is wasted on padding."],
+    ["Position interpolation (PI)", "Extending a RoPE model by dividing every position by the scale factor so all angles stay inside the trained range."],
+    ["Progressive length training", "Raising the training sequence length in stages, adapting the model at each length before moving on."],
+    ["Ring attention", "A blockwise attention scheme in which devices arranged in a ring each hold one block of queries and pass key-value blocks around, overlapping communication with computation."],
+    ["RoPE base", "The constant b in RoPE's frequencies θ_i = b^(−2i/d); a larger base makes the slow pairs rotate more slowly, covering longer distances."],
+    ["RULER", "NVIDIA's synthetic long-context benchmark of 13 tasks in four categories (retrieval, multi-hop tracing, aggregation, question answering) at configurable lengths."],
+    ["Scale factor s", "The ratio of the target context length to the original training length, for example 8 for 4K to 32K."],
+    ["Sliding-window attention", "Attention in which each token sees only the previous W tokens, so the per-layer cache is capped at W entries."],
+    ["Sparse attention", "Attention restricted to a chosen pattern of pairs (local windows, a few global tokens, random links) instead of all pairs."],
+    ["Wavelength", "The number of tokens it takes a RoPE pair to complete one full rotation, 2π/θ."],
+    ["YaRN", "A RoPE extension that interpolates each frequency according to its wavelength and slightly sharpens attention; reported to need 10× fewer tokens and 2.5× fewer steps than earlier methods."]
+  ],
+  "qa": [
+    ["E", "Why does a model trained at 8K tokens often break at 32K?", "Three things change. Positions beyond 8K produce RoPE angles in the slow-rotating dimensions that the model never saw, so attention scores for distant pairs can take values it never learned to handle. With four times more keys, attention spreads more thinly. And training never required it to use information 20K tokens back. The first is fixed by RoPE scaling, the second partly by attention temperature, and the third only by training on long data."],
+    ["E", "What is the difference between claimed and effective context length?", "Claimed length is what the model accepts; effective length is the longest input at which it still performs well enough on a given task. RULER defines it as the longest length at which a model's average over 13 tasks stays above Llama 2 7B's 4K score of 85.6%. In its 2024 tests, GPT-4 claimed 128K but was effective to 64K, and Llama 3.1 8B claimed 128K and was effective to 32K."],
+    ["E", "What does 'lost in the middle' mean, with numbers?", "Liu et al. gave models 20 retrieved documents with one containing the answer and moved that document around. GPT-3.5-Turbo answered correctly 75.8% of the time with the answer first, 63.2% with it last and 53.8% with it in the middle, below its 56.1% closed-book score with no documents at all. Models attend best to the start and the end."],
+    ["M", "Compare position interpolation, NTK-aware scaling and YaRN.", "Position interpolation divides every position by s, compressing all frequencies equally: it keeps every angle in range but blurs the fast pairs that distinguish neighbouring tokens. NTK-aware scaling raises the base by s^(d/(d−2)), which compresses the slowest pair by exactly s and the fastest almost not at all. YaRN chooses per frequency by wavelength: pairs that rotate many times within the training length (more than 32 rotations for Llama) are left alone, pairs that rotate less than once are fully interpolated, and those between are blended; it also multiplies attention logits slightly (by (0.1 ln s + 1)²) to counter diffusion.", "Follow-up: Which needs the least fine-tuning? — YaRN reports matching or beating earlier methods with 10× fewer tokens and 2.5× fewer steps, and works reasonably without fine-tuning for modest s; all of them improve with some long-data training."],
+    ["M", "Work out the KV cache for Llama 3.1 8B and 70B at 128K and 1M tokens.", "Both use 8 KV heads of dimension 128 in 16-bit, so bytes per token = 2 × layers × 8 × 128 × 2. The 8B has 32 layers: 128 KiB per token, 16 GiB at 131,072 tokens and 128 GiB at 1,048,576. The 70B has 80 layers: 320 KiB per token, 40 GiB at 128K and 320 GiB at 1M. A single 1M-token sequence on the 70B needs four 80 GB GPUs for its cache alone, before weights.", "Follow-up: How do you cut that? — An 8-bit cache halves it; sliding-window layers cap most layers' share; fewer KV heads or latent caches shrink it architecturally; offloading cold blocks to CPU memory trades bandwidth for capacity."],
+    ["M", "How was Llama 3 trained to 128K context?", "Pretraining ran at 8K, because attention cost grows with the square of length. In a dedicated long-context stage, the 405B model's length was raised in six steps from 8K to 128K using about 800B tokens, moving on only when short-context evaluations had fully recovered and needle-in-a-haystack retrieval was perfect at the current length. The RoPE base was set to 500,000, documents packed into a sequence were masked from each other, and fine-tuning mixed 0.1% synthetic long-context data with short data, because short-only fine-tuning caused regressions."],
+    ["M", "What is document masking in packed training, and why does it matter more at long lengths?", "Packing concatenates documents so every training sequence is full. Without a mask, tokens of document three attend to documents one and two, which are unrelated: the model learns to look at irrelevant context and gets noisy gradients. With a block-diagonal causal mask each document only attends to itself. At 8K it changed little for Llama 3, but in long continued pretraining a 128K sequence may hold dozens of documents, and training the model to attend over all of them teaches it the wrong lesson about long range. The mask also saves compute: three documents of 1,000, 2,500 and 500 tokens need 7.5M score entries instead of 16.8M for the full 4,096²."],
+    ["M", "What do sliding-window and interleaved local/global attention buy you?", "Sliding-window attention caps each layer's cache at W tokens and its compute at n × W. Mistral 7B used W = 4,096 with a rolling buffer cache. Interleaving keeps a few full-attention layers: Gemma 3 uses five local layers with a 1,024-token window per global layer, so at 128K tokens the cache is about one sixth of a full model's plus a little, around 17%, and the Gemma 3 ablations showed minimal perplexity impact even at 7:1."],
+    ["M", "Explain ring attention.", "Split a sequence of n tokens into P blocks across P devices in a ring. Each device keeps its block of queries. Key-value blocks then rotate: at each of P steps a device computes blockwise attention of its queries against the key-value block it holds (combining partial softmax results the FlashAttention way) while sending that block to the next device and receiving one from the previous. If computing a block takes longer than sending it, the communication is hidden, and the maximum length grows linearly with the number of devices without approximation."],
+    ["H", "Long context or RAG for a product that answers questions over a 500K-token handbook, 20,000 queries a day?", "Cost first: at an illustrative $3 per million input tokens, sending 500K tokens costs $1.50 per query, $30,000 a day; retrieving 8K tokens costs $0.024, $480 a day. Prompt caching of the fixed handbook at, say, a tenth of the input price brings long context to about $0.15 per query, still 6× RAG, and it requires the prefix to stay cached. Latency: prefilling 500K tokens takes seconds even when cached reads are fast. Quality: long context avoids retrieval misses but suffers lost-in-the-middle; RAG can miss the right chunk. I would build RAG with generous retrieval (20–50K tokens of context into a long-window model) and evaluate against the full-context answer on a sample to measure what retrieval misses.", "Follow-up: When would you flip to full context? — When the document set is small and stable, queries need synthesis across the whole document, retrieval recall on an evaluation set stays poor, and caching makes repeated prefixes cheap."],
+    ["H", "Why does YaRN multiply attention logits by a factor that grows with s?", "With s times more keys competing in the softmax, weights spread out and the entropy of attention rises, so each head attends more diffusely than it did in training. Multiplying the logits by a factor above 1 is like lowering the softmax temperature: it sharpens the distribution back towards its trained entropy. YaRN fits √(1/t) = 0.1 ln s + 1, about 1.21 at s = 8, applied by scaling the rotary embeddings so no attention code changes."],
+    ["H", "A customer reports that your 128K model ignores instructions placed at the start of very long prompts. Diagnose and fix.", "Likely causes: the instruction is far from the generation point and buried under 100K tokens of document, where attention is diluted; long-context training data rarely had instructions that far away; and the serving path may truncate silently if the prompt exceeds a limit. Check truncation first in logs (token counts in and out). Then test by length: move the instruction to the end, or repeat it after the document, and measure adherence at 16K, 64K and 128K. Fixes: put instructions after the document (or both before and after), shorten context with retrieval, and add long-context instruction-following cases to evaluation and fine-tuning data."],
+    ["H", "How would you evaluate whether a model's long context is good enough for your product?", "Build an evaluation at the lengths you actually serve, not just at the maximum. Include the operations your product needs: single and multi-key retrieval, retrieving every occurrence, reasoning that chains facts from different places, and synthesis. Vary the position of relevant information to measure the middle dip. Use RULER-style synthetic tasks for coverage and real documents with known answers for realism, and report accuracy against length so you find the effective length. Compare against a retrieval baseline with the same model and short context, because that is the alternative you would ship."]
+  ],
+  "refs": [
+    ["paper", "RULER: What's the Real Context Size of Your Long-Context Language Models?", "Hsieh et al., NVIDIA, COLM 2024. The public case: 13 tasks, 17 models, claimed versus effective length.", "https://arxiv.org/abs/2404.06654"],
+    ["paper", "The Llama 3 Herd of Models", "Llama Team, Meta, 2024. Six-stage long-context pretraining to 128K on ~800B tokens, document masking, context parallelism, 0.1% long SFT data.", "https://arxiv.org/abs/2407.21783"],
+    ["paper", "YaRN: Efficient Context Window Extension of Large Language Models", "Peng et al., 2023. NTK-by-parts interpolation with α = 1, β = 32 and the 0.1 ln s + 1 attention scaling.", "https://arxiv.org/abs/2309.00071"],
+    ["paper", "Extending Context Window of Large Language Models via Position Interpolation", "Chen et al., Meta, 2023. Interpolation's error bound at least ~600× smaller than extrapolation's.", "https://arxiv.org/abs/2306.15595"],
+    ["paper", "Ring Attention with Blockwise Transformers for Near-Infinite Context", "Liu, Zaharia and Abbeel, 2023. Sequence length scaling with device count by overlapping KV transfer with blockwise attention.", "https://arxiv.org/abs/2310.01889"],
+    ["paper", "Lost in the Middle: How Language Models Use Long Contexts", "Liu et al., TACL 2024. The U-shaped position curve.", "https://arxiv.org/abs/2307.03172"],
+    ["paper", "Efficient Streaming Language Models with Attention Sinks", "Xiao et al., 2023. StreamingLLM: stable generation over millions of tokens with a window plus sink tokens.", "https://arxiv.org/abs/2309.17453"],
+    ["paper", "Gemma 3 Technical Report", "Gemma Team, Google, 2025. Five 1,024-token local layers per global layer, RoPE base 1M on global layers, 128K context.", "https://arxiv.org/abs/2503.19786"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A product team is asked to add "chat with your codebase" to a developer tool. The model they use advertises a 128K-token context window, and an average customer repository is about 90K tokens, so the plan is simple: put the whole repository in the prompt. In the demo it works beautifully on small repositories. In the pilot, three things go wrong at once. Each question takes eight to twelve seconds before the first word appears. The monthly inference bill for twenty pilot customers already exceeds the budget for the whole year. And the answers are subtly worse on large repositories: the model confidently describes a function as it was in one file while ignoring the file that overrides it, which sat somewhere in the middle of the prompt.</p>
+<p>None of that is a bug in the model. It is what long context is: a window that accepts a lot of text, costs time and memory in proportion to how much you put in, and is used unevenly by the model. Senior interviews probe exactly this gap between the number on the model card and what the window does in practice, from two directions. Model builders ask "how do you get a model to 1M tokens?", which is about positions, training data, memory and parallelism. Application builders ask "would you just put it all in the context, or use RAG?", which is about cost, latency and how well models actually use long inputs.</p>
+<p>This lesson covers both. It starts with why a model breaks past its training length, then works through RoPE scaling (building on the position interpolation already met in lm4) frequency by frequency: plain interpolation, NTK-aware scaling and YaRN. It then covers what actually makes long context usable, training: progressive length schedules, packing with document masks, and long-context fine-tuning, with Llama 3's published recipe. It explains how one sequence too long for a GPU is split across many (ring attention, context parallelism), and how sliding-window and sparse attention cut cost by not attending to everything. Then it turns to using long context: lost in the middle, why needle-in-a-haystack tests flatter models and what RULER measures instead, the KV-cache bill at 128K and 1M tokens worked by hand, and how to decide between long context and retrieval.</p>
+</section>
+
+<section data-field="primer">
+<h4>Three different "lengths"</h4>
+<p>When people say a model "has a 128K context", they can mean three different things, and confusing them causes most long-context mistakes. The <strong>training length</strong> is the longest sequence the model actually trained on. The <strong>claimed length</strong> is the maximum the model or API will accept. The <strong>effective length</strong> is the longest input at which the model still does your task well. For a model released well, claimed equals training length; for a model stretched after training, claimed can far exceed training length. Effective length is almost always the smallest of the three, and it depends on the task: finding one odd sentence works much further out than tracing a chain of facts.</p>
+<h4>An analogy: a reader with a ruler</h4>
+<p>Picture a reader who learned to read using pages exactly 8 inches long, with a ruler marked 0 to 8 to keep track of where each line is. Hand her a 32-inch scroll and two things go wrong. Her ruler has no marks past 8, so positions beyond it mean nothing to her (that is the position problem). And even with a longer ruler, she has never had to connect a sentence at inch 3 with one at inch 29, so she skims (that is the training problem). There are two families of fixes. Relabel the ruler so that 32 inches fit into the 0–8 marks she knows, which is what RoPE scaling does, and then give her practice on long scrolls, which is long-context training. Relabelling alone gets her reading without confusion; only practice makes her good at it.</p>
+<p>The analogy breaks in one important way: a person reading a long scroll pays the same effort per line, but a transformer's cost grows faster than the length. Attending over 4× the tokens costs 16× the attention arithmetic in prefill, and the KV cache that every generated token must read grows 4× too. So long context is a cost and capacity problem as well as a quality one.</p>
+<h4>The picture in four parts</h4>
+<p>Getting to long context needs four things to go right. <strong>Positions</strong>: the model must handle position numbers it never saw, which for RoPE models means rescaling the rotation frequencies. <strong>Training</strong>: it must learn to use distant information, from long documents, in stages. <strong>Systems</strong>: a sequence of a million tokens must fit somewhere during training and serving, which needs splitting sequences across devices and controlling the KV cache. <strong>Evaluation and use</strong>: you must measure the effective length and decide, per product, whether to fill the window or retrieve.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Accuracy versus input length for three tests: needle-in-a-haystack stays near 100%, a RULER-style average declines steadily, and a realistic synthesis task declines fastest. Effective length is where a curve crosses a quality threshold.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="70" y1="180" x2="610" y2="180" style="stroke:var(--line-2);fill:none"/>
+    <line x1="70" y1="30" x2="70" y2="180" style="stroke:var(--line-2);fill:none"/>
+    <text x="60" y="40" text-anchor="end" style="fill:var(--muted)">100%</text>
+    <text x="60" y="180" text-anchor="end" style="fill:var(--muted)">50%</text>
+    <text x="100" y="198" text-anchor="middle" style="fill:var(--muted)">4K</text>
+    <text x="200" y="198" text-anchor="middle" style="fill:var(--muted)">8K</text>
+    <text x="300" y="198" text-anchor="middle" style="fill:var(--muted)">16K</text>
+    <text x="400" y="198" text-anchor="middle" style="fill:var(--muted)">32K</text>
+    <text x="500" y="198" text-anchor="middle" style="fill:var(--muted)">64K</text>
+    <text x="600" y="198" text-anchor="middle" style="fill:var(--muted)">128K</text>
+    <text x="340" y="215" text-anchor="middle" style="fill:var(--ink-2)">input length (log scale)</text>
+    <line x1="70" y1="80" x2="610" y2="80" style="stroke:var(--crit);stroke-dasharray:5 4;fill:none"/>
+    <text x="606" y="74" text-anchor="end" style="fill:var(--crit)">quality threshold</text>
+    <polyline points="100,40 200,41 300,41 400,42 500,43 600,45" style="fill:none;stroke:var(--s3);stroke-width:2"/>
+    <text x="110" y="34" style="fill:var(--s3)">single needle</text>
+    <polyline points="100,52 200,56 300,62 400,72 500,86 600,120" style="fill:none;stroke:var(--s1);stroke-width:2"/>
+    <text x="470" y="120" style="fill:var(--s1)">RULER-style average</text>
+    <polyline points="100,62 200,72 300,88 400,108 500,130 600,160" style="fill:none;stroke:var(--s2);stroke-width:2"/>
+    <text x="250" y="122" style="fill:var(--s2)">multi-fact synthesis</text>
+    <line x1="440" y1="80" x2="440" y2="180" style="stroke:var(--ink-2);stroke-dasharray:2 3;fill:none"/>
+    <text x="444" y="172" style="fill:var(--ink-2)">effective length</text>
+  </g>
+</svg>
+<figcaption>Illustrative shape, not one model's data. Easy tests stay flat to the claimed length, harder ones fall, and the effective length is where your task's curve crosses the quality you need. RULER's real numbers appear in the body.</figcaption>
+</figure>
+<h4>Why this matters to an application engineer</h4>
+<p>Even if you never train a model, you choose models by their context windows, decide how much to put in a prompt, and own the cost. Three habits follow from this lesson. Treat the claimed window as an upper bound, not a promise. Measure quality against length on your own task. And price the context you send: every extra 100K tokens in a prompt is paid for in money, in prefill seconds, and in the GPU memory that decides how many users a server can hold.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Why a model breaks past its training length</h4>
+<p>Run a RoPE model trained at 4,096 tokens on a 16,000-token input without changes, and quality usually collapses past about 4K: perplexity shoots up and the output degenerates. Three separate mechanisms are at work, and keeping them apart is what lets you reason about fixes.</p>
+<p><strong>Unseen positions.</strong> RoPE (lm4) rotates each pair of query and key dimensions by an angle position × θ_i, with frequencies θ_i = b^(−2i/d) running from fast (θ₀ = 1 radian per token) to very slow. During training, the slow pairs only ever covered a small arc of their circle, because 4,096 tokens is a fraction of their wavelength. At 16K they reach angles never seen in training, and the attention scores they produce for distant pairs are values the network never learned to interpret. Chen et al. showed these extrapolated scores can become very large, which is why things fail suddenly rather than gradually.</p>
+<p><strong>Attention dilution.</strong> The softmax divides weight among all keys. With 4× as many keys, a head whose scores are similar across many tokens gives each about a quarter of the weight it used to. The entropy of attention rises with length, so heads become more diffuse than anything seen in training, even if every position were perfectly encoded.</p>
+<p><strong>No practice.</strong> Most text is short. A model trained on 4K sequences, many of them packed short documents, has had few chances to learn that something 3,000 tokens back matters, and none for 30,000. Even with positions handled, it has not learned to use them. This is the deepest of the three problems, and only training fixes it.</p>
+
+<h4>2. The RoPE frequency table, by hand</h4>
+<p>Everything in RoPE scaling is a statement about this table, so it is worth computing once. Take the usual setting: head dimension d = 128, so 64 rotating pairs i = 0 … 63, base b = 10,000, training length L = 4,096. Pair i rotates at θ_i = b^(−2i/d) radians per token; its <strong>wavelength</strong> λ_i = 2π/θ_i is the number of tokens for one full turn; and r_i = L/λ_i is how many full turns it makes within the training length.</p>
+<table>
+<thead><tr><th>Pair i</th><th>θ_i (rad/token)</th><th>Wavelength λ_i (tokens)</th><th>Turns in 4,096 tokens, r_i</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>1</td><td>6.3</td><td>652</td></tr>
+<tr><td>16</td><td>0.1</td><td>63</td><td>65</td></tr>
+<tr><td>24</td><td>0.032</td><td>199</td><td>20.6</td></tr>
+<tr><td>32</td><td>0.01</td><td>628</td><td>6.5</td></tr>
+<tr><td>40</td><td>0.0032</td><td>1,987</td><td>2.1</td></tr>
+<tr><td>48</td><td>0.001</td><td>6,283</td><td>0.65</td></tr>
+<tr><td>56</td><td>0.00032</td><td>19,869</td><td>0.21</td></tr>
+<tr><td>63</td><td>0.000115</td><td>54,410</td><td>0.075</td></tr>
+</tbody>
+</table>
+<p>Read it from both ends. Pair 0 turns 652 times in the training length: it has seen every angle hundreds of times, and it encodes fine local order (is this token one or two places back?). It has nothing to fear from longer inputs. Pair 63 turns only 0.075 of a circle in 4,096 tokens: at 32K tokens it would reach 0.6 of a circle, eight times further round than training ever went. The pairs with r below about 1 are the ones that see unseen angles and cause the blow-up. Pairs in between have seen all angles, but only a few times.</p>
+
+<h4>3. Position interpolation, NTK-aware scaling and YaRN</h4>
+<p>Let the scale factor be s = target length ÷ training length; extending 4K to 32K gives s = 8.</p>
+<p><strong>Position interpolation</strong> (Chen et al., 2023, the public case of lm4) divides every position by s, which is the same as dividing every frequency θ_i by s. Position 32,000 is treated like 4,000, so every pair stays inside its trained arc. The paper proved the resulting score error is bounded by a value at least about 600× smaller than extrapolation's, and extended LLaMA models to 32,768 tokens with under 1,000 fine-tuning steps. Its cost is visible in the table: pair 0 now turns at 1/8 radian per token, so neighbouring tokens differ by an angle the model never used for "adjacent", and fine local order gets blurred. Quality on short inputs drops a little, and fine-tuning is needed to recover it.</p>
+<p><strong>NTK-aware scaling</strong> (an idea posted by the community in 2023, analysed in the YaRN paper) changes the base instead of the positions: b′ = b · s^(d/(d−2)). Why that exponent? The slowest pair's frequency is b^(−(d−2)/d); with the new base it becomes b^(−(d−2)/d) · s^(−1), exactly 1/s of the original: fully interpolated. The fastest pair's frequency, b⁰ = 1, does not change at all. In between, compression rises smoothly from none to s. For s = 8, d = 128: b′ = 10,000 × 8^(128/126) ≈ 82,700. It works noticeably better than plain interpolation without fine-tuning, but still compresses the middle pairs somewhat, and some slow pairs end up slightly beyond their trained range.</p>
+<p><strong>YaRN</strong> (Peng et al., 2023) decides per pair from its turn count r_i, with two thresholds α and β (the paper recommends α = 1, β = 32 for Llama models). Pairs that turn more than β times in the training length are left alone, because they have seen every angle. Pairs that turn less than α times are fully interpolated (frequency divided by s), because they are the ones that would otherwise see new angles. Pairs between are blended linearly in r. In the table: pairs 0 to about 22 (r above 32) are untouched; pairs from about 46 to 63 (r below 1) are divided by 8; pairs 23 to 45 are partly compressed, from about 1.5× at pair 24 to 6.5× at pair 40. YaRN then adds an <strong>attention temperature</strong>: it multiplies the logits so that √(1/t) = 0.1 ln s + 1, which is 1.21 for s = 8 and 1.28 for s = 16. This counters the dilution of section 1 by sharpening the softmax slightly, and it is implemented by scaling the rotary embeddings, so the attention code does not change. The paper reports reaching the same or better results as earlier methods with 10× fewer tokens and 2.5× fewer training steps, and extended Llama 2 7B and 13B to 128K.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Compression applied to each RoPE pair for an 8x extension: position interpolation divides every pair by 8; NTK-aware scaling rises smoothly from 1 for the fastest pair to 8 for the slowest; YaRN leaves pairs with more than 32 turns alone, divides pairs with fewer than one turn by 8, and ramps in between.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="70" y1="190" x2="600" y2="190" style="stroke:var(--line-2);fill:none"/>
+    <line x1="70" y1="30" x2="70" y2="190" style="stroke:var(--line-2);fill:none"/>
+    <text x="60" y="44" text-anchor="end" style="fill:var(--muted)">÷8</text>
+    <text x="60" y="190" text-anchor="end" style="fill:var(--muted)">÷1</text>
+    <text x="70" y="208" text-anchor="middle" style="fill:var(--muted)">pair 0</text>
+    <text x="335" y="208" text-anchor="middle" style="fill:var(--muted)">pair 32</text>
+    <text x="600" y="208" text-anchor="middle" style="fill:var(--muted)">pair 63</text>
+    <text x="335" y="224" text-anchor="middle" style="fill:var(--ink-2)">fast (local order) → slow (long range)</text>
+    <line x1="70" y1="40" x2="600" y2="40" style="stroke:var(--s1);stroke-width:2;fill:none"/>
+    <text x="90" y="34" style="fill:var(--s1)">position interpolation: every pair ÷8</text>
+    <path d="M70,190 C250,170 420,100 600,40" style="fill:none;stroke:var(--s2);stroke-width:2"/>
+    <text x="300" y="160" style="fill:var(--s2)">NTK-aware: smooth rise</text>
+    <polyline points="70,188 260,188 440,40 600,40" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+    <text x="110" y="180" style="fill:var(--accent)">YaRN: untouched (r &gt; 32)</text>
+    <text x="455" y="60" style="fill:var(--accent)">fully ÷8 (r &lt; 1)</text>
+    <text x="330" y="112" style="fill:var(--accent)">ramp</text>
+  </g>
+</svg>
+<figcaption>The three methods differ only in how much they compress each frequency. Fast pairs already saw every angle, so YaRN leaves them alone; slow pairs would see new angles, so everything compresses them fully. The ramp positions are schematic; the lab computes the real ones.</figcaption>
+</figure>
+<p><strong>Base changes in pretraining.</strong> If you control pretraining, the simplest move is to pick a larger base from the start, so slow pairs have long wavelengths before any extension. Llama 3 set b = 500,000 (citing results that this value works up to 32K); Gemma 3 uses 1,000,000 on its global-attention layers and 10,000 on its local ones. A larger base gives the model room to grow, but it still has to be trained at length.</p>
+<p><strong>Dynamic scaling at inference.</strong> Some serving stacks pick s per request from the actual length, leaving short prompts unscaled. That protects short-context quality, but the same token gets different rotations at different request lengths, which interferes with prefix caching; many deployments therefore fix s.</p>
+
+<h4>4. Training makes it usable: progressive length</h4>
+<p>Attention cost grows with n², so nobody pretrains a whole model at 128K. The standard recipe pretrains at a modest length, then adds a long-context stage. Llama 3 is the clearest public example. Pretraining ran at 8K. In the long-context stage, the 405B model's length was raised "in six stages", from 8K to 128K, using about 800B tokens. The team only moved to the next length when two checks passed: short-context evaluations had fully recovered (long training must not damage normal ability), and the model solved needle-in-a-haystack retrieval perfectly at the current length. The final 40M tokens were trained at 128K with learning-rate annealing.</p>
+<p>Two other lessons from that report matter. First, the data mix: long-context training needs genuinely long documents (books, long code repositories, long reports), upsampled, but not so much that the domain mix shifts and short-context ability degrades. Second, fine-tuning: applying the existing supervised fine-tuning recipe with only short examples caused "significant regressions" in long-context ability. Mixing in 0.1% of synthetic long-context examples (question answering over long documents, summarisation, code reasoning) restored it; preference tuning with short data alone did not hurt, as long as the fine-tuned model was already good at long context.</p>
+
+<h4>5. Packing and document masks</h4>
+<p>Training sequences have a fixed length, and most documents are shorter. <strong>Packing</strong> concatenates documents, separated by an end-of-document token, until the sequence is full, so no compute is wasted on padding. The catch: with an ordinary causal mask, a token in document 3 can attend to documents 1 and 2, which are unrelated. At short lengths this mostly teaches the model to ignore irrelevant preceding text. At 128K, a sequence may contain dozens of unrelated documents, and the model spends its long-context training learning to look at things that are not connected, which is the opposite of the skill you want.</p>
+<p>A <strong>document mask</strong> makes the attention mask block-diagonal: each document's tokens attend causally within their own document only. Llama 3 used one and reported limited impact in standard pretraining but importance during long continued pretraining. Worked example: three documents of 1,000, 2,500 and 500 tokens packed into a 4,000-token sequence. A plain causal mask allows about 4,000²/2 = 8M query-key pairs. With document masking, the allowed pairs are 1,000²/2 + 2,500²/2 + 500²/2 ≈ 0.5M + 3.1M + 0.1M = 3.75M, so a kernel that skips masked blocks also does less than half the work. Implementations also decide whether position numbers restart at 0 for each document; restarting means a short document never sees large positions, which is another reason the long-context stage must include genuinely long documents.</p>
+
+<h4>6. Fitting one sequence: ring attention and context parallelism</h4>
+<p>At 1M tokens, even one sequence's activations do not fit on one GPU: every layer holds an n × d_model activation matrix, about 8 GiB per layer in 16-bit for d_model = 4,096, before attention workspace. The sequence itself must be split across devices, which is <strong>context parallelism</strong>. Splitting the MLP is easy, since it works on each token independently. Attention is the hard part, because every query needs every earlier key and value.</p>
+<p><strong>Ring attention</strong> (Liu, Zaharia and Abbeel, 2023) arranges P devices in a ring. The sequence is cut into P blocks; device k holds block k's queries, keys and values. Then P rounds: in each round, every device computes attention between its own queries and the key-value block it currently holds, folding the result into a running softmax (the same online-softmax trick FlashAttention uses, gpu7), and simultaneously sends that key-value block to the next device and receives one from the previous. After P rounds, every query has seen every key-value block. If computing one block takes longer than transferring one, the communication is completely hidden, so the maximum length grows with the number of devices, with exact attention and no extra arithmetic. Worked: 1,048,576 tokens on 16 GPUs gives 65,536 tokens per device, a length one GPU can process.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Four devices in a ring each keep their query block; key-value blocks move one device along the ring each round, so after four rounds every device has attended to every block.">
+  <defs><marker id="lm22-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="60" y="30" width="150" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="135" y="52" text-anchor="middle" style="fill:var(--ink);font-weight:600">GPU 0: Q₀</text>
+    <text x="135" y="72" text-anchor="middle" style="fill:var(--s1)">holds KV₀ → KV₃ → KV₂ → KV₁</text>
+    <rect x="430" y="30" width="150" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="505" y="52" text-anchor="middle" style="fill:var(--ink);font-weight:600">GPU 1: Q₁</text>
+    <text x="505" y="72" text-anchor="middle" style="fill:var(--s1)">holds KV₁ → KV₀ → KV₃ → KV₂</text>
+    <rect x="430" y="140" width="150" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="505" y="162" text-anchor="middle" style="fill:var(--ink);font-weight:600">GPU 2: Q₂</text>
+    <text x="505" y="182" text-anchor="middle" style="fill:var(--s1)">holds KV₂ → KV₁ → KV₀ → KV₃</text>
+    <rect x="60" y="140" width="150" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="135" y="162" text-anchor="middle" style="fill:var(--ink);font-weight:600">GPU 3: Q₃</text>
+    <text x="135" y="182" text-anchor="middle" style="fill:var(--s1)">holds KV₃ → KV₂ → KV₁ → KV₀</text>
+    <line x1="214" y1="58" x2="426" y2="58" marker-end="url(#lm22-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="505" y1="90" x2="505" y2="136" marker-end="url(#lm22-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="426" y1="168" x2="214" y2="168" marker-end="url(#lm22-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="135" y1="136" x2="135" y2="90" marker-end="url(#lm22-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="320" y="50" text-anchor="middle" style="fill:var(--ink-2)">send KV block</text>
+    <text x="320" y="112" text-anchor="middle" style="fill:var(--ink)">each round: attend Q_local × KV_held</text>
+    <text x="320" y="128" text-anchor="middle" style="fill:var(--ink)">while passing KV_held to the next GPU</text>
+  </g>
+</svg>
+<figcaption>Queries stay put and key-value blocks travel. Communication overlaps with computation, so P devices handle a sequence P times longer than one device could, with exact attention.</figcaption>
+</figure>
+<p>Two practical wrinkles. With a causal mask, the device holding the first block has almost nothing to do (its queries only see themselves) while the last does the most. Llama 3's context parallelism fixed the imbalance by cutting the sequence into 2 × CP chunks, where CP is the number of context-parallel GPUs, and giving rank i both chunk i and chunk 2·CP − 1 − i, pairing an early, cheap chunk with a late, expensive one. And Llama 3 chose to all-gather keys and values rather than pass them around a ring: the communication is exposed rather than hidden, but it made masks such as document masking easier to support, and the exposed time was small at their sizes. At inference, the same ideas let a serving system prefill a million-token prompt across several GPUs.</p>
+
+<h4>7. Attending to less: sliding-window and sparse attention</h4>
+<p>The other route is to not compute all pairs. <strong>Sliding-window attention</strong> lets each token attend only to the previous W tokens. Cost per layer becomes n × W instead of n², and the per-layer KV cache never exceeds W entries; Mistral 7B used W = 4,096 with a "rolling buffer" cache that overwrites position i mod W. Information can still travel further, because layer 2's window covers tokens that themselves saw W tokens back in layer 1: after k layers the theoretical reach is k × W, about 131K for Mistral 7B's 32 layers. In practice that relayed information fades, so pure sliding-window models do not behave like true long-context models.</p>
+<p><strong>Sparse attention</strong> generalises the idea with a fixed pattern of allowed pairs. Longformer combined a local window with a few global tokens that attend to and are attended by everything; BigBird added random links. These patterns kept quality on many tasks but complicated kernels and generalised less reliably than dense attention, and they faded from large LLMs.</p>
+<p>What did catch on is <strong>interleaving</strong>: most layers local, a few global. Gemma 3 uses five sliding-window layers with a span of only 1,024 tokens for every global layer, supports 128K tokens, and reported minimal perplexity impact in ablations even at 7 local layers per global one. The cache arithmetic shows why: at 128K tokens, the global layers (one in six) hold the full 131,072 entries and the local layers hold 1,024 each, so the cache is about (1 × 131,072 + 5 × 1,024) ÷ (6 × 131,072) ≈ 17% of a fully global model's. Hybrids with state-space layers (lm21) are the same idea taken further, replacing the local layers with fixed-size recurrent ones.</p>
+<p><strong>Attention sinks.</strong> One discovery from sliding windows is useful on its own. Xiao et al. found that when the first tokens of a sequence slide out of the window, quality collapses, because models put large attention weight on the first few tokens regardless of content, using them as a place to "park" attention when nothing else is relevant. Keeping just those initial tokens' keys and values alongside the window (StreamingLLM) kept Llama 2, MPT, Falcon and Pythia stable over 4 million tokens without fine-tuning. Note what this does not do: tokens that left the window are forgotten. It is a way to stream indefinitely, not a way to remember indefinitely.</p>
+
+<h4>8. Do models use long context? Needles, RULER and the middle</h4>
+<p><strong>Lost in the middle.</strong> Liu et al. (2023) gave models a question with 20 retrieved documents, one containing the answer, and moved that document from first to last. GPT-3.5-Turbo answered correctly 75.8% of the time with the answer first and 63.2% with it last, but only 53.8% with it in the middle, worse than its 56.1% closed-book score with no documents at all. Models attend best to the beginning (primacy) and the end (recency) of their input. Newer models have flattened the U, but position effects remain worth testing for.</p>
+<p><strong>Needle in a haystack.</strong> The popular NIAH test hides one sentence ("the magic number is 7,481,203") in filler text and asks for it, sweeping length and depth to draw a heat map. It is useful as a smoke test, and Llama 3 used it as a gate. But it is easy: the needle differs in style from the haystack and can be found by near-literal matching, a skill attention has from the first layers. Gemini 1.5 Pro reported over 99.7% needle recall up to 1M tokens and maintained it to 10M in text; impressive, and also a sign that the test is saturated.</p>
+<p><strong>RULER</strong> (Hsieh et al., NVIDIA, 2024) expands the needle into 13 synthetic tasks in four categories: retrieval with multiple keys, multiple values and multiple queries, and with distractor needles; multi-hop tracing (variable tracking: X1 = 12345, X2 = X1, … which variables equal 12345?); aggregation (the most common or frequent words in a long list); and question answering with distractor passages. It defines <strong>effective length</strong> as the longest length at which a model's 13-task average stays above Llama 2 7B's score at 4K, 85.6%. Of 17 long-context models, all claiming 32K or more and nearly all perfect on plain needles, only about half passed at 32K.</p>
+<table>
+<thead><tr><th>Model (as tested in 2024)</th><th>Claimed</th><th>Effective</th><th>4K</th><th>32K</th><th>128K</th></tr></thead>
+<tbody>
+<tr><td>Gemini 1.5 Pro</td><td>1M</td><td>&gt;128K</td><td>96.7</td><td>95.9</td><td>94.4</td></tr>
+<tr><td>GPT-4</td><td>128K</td><td>64K</td><td>96.6</td><td>93.2</td><td>81.2</td></tr>
+<tr><td>Llama 3.1 70B</td><td>128K</td><td>64K</td><td>96.5</td><td>94.8</td><td>66.6</td></tr>
+<tr><td>Llama 3.1 8B</td><td>128K</td><td>32K</td><td>95.5</td><td>87.4</td><td>77.0</td></tr>
+<tr><td>Qwen2 72B</td><td>128K</td><td>32K</td><td>96.9</td><td>94.1</td><td>53.7</td></tr>
+</tbody>
+</table>
+<p>The lesson is not "model X is bad"; these are 2024 versions, and models move on. The lesson is the method: average accuracy against length on tasks harder than one needle, with a threshold that defines "good enough", reveals where a model's useful window really ends.</p>
+
+<h4>9. The KV bill at 128K and 1M tokens, by hand</h4>
+<p>Use lm5's formula: bytes per token = 2 (key and value) × layers × KV heads × head dimension × bytes per number. The Llama 3.1 family uses 8 KV heads of dimension 128 and 16-bit values:</p>
+<table>
+<thead><tr><th>Model</th><th>Layers</th><th>Per token</th><th>128K tokens</th><th>1M tokens</th></tr></thead>
+<tbody>
+<tr><td>Llama 3.1 8B</td><td>32</td><td>128 KiB</td><td>16 GiB</td><td>128 GiB</td></tr>
+<tr><td>Llama 3.1 70B</td><td>80</td><td>320 KiB</td><td>40 GiB</td><td>320 GiB</td></tr>
+<tr><td>Llama 3.1 405B</td><td>126</td><td>504 KiB</td><td>63 GiB</td><td>504 GiB</td></tr>
+</tbody>
+</table>
+<p>Per sequence. One 128K conversation on the 8B model needs as much memory as its own 16 GB of weights; on an 80 GB GPU, after weights, roughly four such conversations fit. A single 1M-token sequence on the 70B needs four 80 GB GPUs for the cache alone. And every generated token reads the whole cache: at 128K on the 8B model, 16 GiB per step for that sequence, about 5 ms at an H100's 3.35 TB/s just for one sequence's cache, more than reading the weights.</p>
+<p>Prefill compute grows faster. For the 8B model (d_model 4,096, 32 layers), causal attention-score FLOPs are about 2n² × d_model × layers, plus 2 × 8 × 10⁹ × n for the weights. At n = 131,072: about 4.5 × 10¹⁵ + 2.1 × 10¹⁵ ≈ 6.6 × 10¹⁵ FLOPs, roughly 13 seconds on one H100 at 50% of its 989 dense BF16 TFLOP/s. At n = 1,048,576: about 2.9 × 10¹⁷ + 1.7 × 10¹⁶ ≈ 3.0 × 10¹⁷ FLOPs, around 10 minutes on one GPU, or over a minute on eight. This is why million-token prompts are served with context parallelism, why providers charge for every input token, and why prompt caching (reusing the prefill of an unchanged prefix, lm13) matters so much for long contexts.</p>
+<p>The levers on the bill are the ones you have met: an 8-bit KV cache halves it; GQA, MLA or hybrids shrink it architecturally (lm5, lm21); sliding-window layers cap most layers' share; paging avoids reserving the maximum for every request; and offloading cold blocks to CPU memory trades bandwidth for capacity.</p>
+
+<h4>10. Long context versus RAG</h4>
+<p>Retrieval-augmented generation (lm9) and long context answer the same need, getting the right information in front of the model, at different costs. Work an example: a 500K-token handbook and 20,000 questions a day, at an illustrative input price of $3 per million tokens. Full context costs 0.5 × $3 = $1.50 per query, $30,000 a day. RAG sending 8K tokens costs $0.024 per query, $480 a day. If the provider caches the handbook prefix and charges a tenth of the input price for cached reads, full context falls to about $0.15 per query, $3,000 a day: much better, still about six times RAG, and only while the cache stays warm. Latency follows the same shape: even a cached 500K-token prefix has to be read by attention for every generated token, while an 8K prompt is fast.</p>
+<p>Quality is the interesting part, because both fail differently. Long context never misses a document, but suffers dilution and the middle dip, and grows worse at synthesis as length grows. RAG keeps the prompt short and focused, but if retrieval misses the relevant chunk, the model cannot recover. The practical rules: use long context for one large artefact that fits comfortably inside the effective length (a contract, a codebase subset, a long transcript), when the question needs the whole thing, or when the volume is low. Use RAG for large or changing corpora and high volume. And consider the middle path that many production systems use: retrieve generously, say 20–50K tokens, into a long-context model, which cuts retrieval misses while keeping cost and dilution bounded. Measure it: compare answers from RAG and from full context on a sample, and you learn exactly what retrieval misses.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why interpolation is so much safer than extrapolation</h4>
+<p>An attention score under RoPE is a sum over pairs of cosine and sine terms, a(s) = Σ_i h_i e^{i s θ_i}, as a function of relative distance s. Chen et al. bounded how far this can stray between two integer positions inside the trained range (interpolation) versus beyond it (extrapolation). Inside the range, the function is pinned down on both sides by trained values and can only wiggle a bounded amount; outside, nothing constrains it, and for the slow pairs it can grow to values far larger than anything seen. Their bound for interpolation was at least about 600× tighter. This is the formal version of "the model has seen angles on both sides of a new interpolated angle, but never beyond the last one".</p>
+
+<h4>Attention entropy and log-n scaling</h4>
+<p>If n keys all have similar logits, softmax entropy is about ln n, so moving from 4K to 32K keys raises the maximum entropy by ln 8 ≈ 2.1 nats. A head trained to be sharp becomes diffuse, mixing in irrelevant tokens. Multiplying logits by a factor greater than 1 counters this. YaRN's fitted factor, (0.1 ln s + 1)² on the logits, grows logarithmically with s for the same reason. Some architectures build it in from the start ("log-n scaling", multiplying logits by log of the position or of the training length), and some newer models gate attention outputs so a head can effectively attend to nothing, which also reduces the pressure that creates attention sinks.</p>
+
+<h4>Why effective length lags claimed length</h4>
+<p>Three causes compound. Data: truly long documents are rare and skewed (books, code, legal text), and few of them contain dependencies that require reaching back 100K tokens, so the model gets little training signal for it; synthetic long tasks help but can teach shortcuts. Positions: extended positions are trained for far fewer tokens than short ones. And evaluation: models are tuned until they pass needle tests, which saturate early, so developers get little feedback on harder long-range skills. RULER's observation that the best open models shared large base frequencies and more long-context training data is consistent with all three.</p>
+
+<h4>Load balancing in causal context parallelism</h4>
+<p>With a causal mask, block k's queries attend to blocks 0 … k, so work grows linearly across blocks: the last device does P times the work of the first. Two common fixes: assign each device a pair of chunks from opposite ends (Llama 3's 2 × CP split, also called "zigzag"), so every device gets an equal sum; or skip the masked block computations entirely and rebalance the ring order. Without balancing, a ring of 16 GPUs runs at the speed of its busiest member and wastes nearly half its compute.</p>
+
+<h4>KV-cache compression and eviction</h4>
+<p>Beyond quantisation, a family of methods drops cache entries that matter little. Some keep tokens that received high attention so far (on the theory that past importance predicts future importance); others pick, after reading the prompt, the positions each head attended to from the prompt's final tokens, and evict the rest before decoding. They can cut cache size several times for summarisation-like tasks, but they are a bet: a token evicted now cannot be retrieved later, which recreates the fixed-state problem of lm21 for exactly the cases (an unpredictable later question) where long context was supposed to help. Treat them as tunable approximations and evaluate on retrieval tasks.</p>
+
+<h4>Chunked prefill and time to first token</h4>
+<p>A 128K-token prefill takes seconds and, if run as one block, stalls decoding for every other request on the GPU. Serving engines split long prefills into chunks of a few thousand tokens interleaved with decode steps (chunked prefill, lm13). This keeps other users' token streams smooth at a small cost in the long request's time to first token. For very long prompts, prefill can also be split across GPUs with context parallelism, trading more hardware for lower first-token latency.</p>
+
+<h4>Instruction placement and recency</h4>
+<p>Because models attend best to the end, the position of instructions relative to a long document matters. Providers' guidance for long documents generally recommends putting the documents first and the question or instruction at the end. A useful mental model: the model reads the document "in light of" whatever comes after it only through attention from later tokens, so a question placed last can direct attention back into the document, while a question placed first must be remembered across the whole document.</p>
+</section>
+
+<section data-field="prod">
+<h4>The public case: RULER (NVIDIA, COLM 2024)</h4>
+<p>By early 2024 every model release claimed long context and showed a green needle-in-a-haystack heat map. Hsieh and colleagues at NVIDIA asked what those claims meant for harder tasks. RULER generates 13 synthetic tasks at any length, so models can be compared without data contamination, and defines effective length against a fixed threshold, Llama 2 7B's 4K score of 85.6%. Across 17 models, nearly all perfect at plain needle retrieval, performance fell steadily with length; only about half kept satisfactory performance at 32K, though all claimed 32K or more. Gemini 1.5 Pro stayed above the threshold at every length tested (to 128K); GPT-4 claimed 128K and was effective to 64K; Llama 3.1 8B claimed 128K and was effective to 32K. The paper also analysed Yi-34B (claimed 200K) and found large drops as task complexity grew. RULER has since become a standard part of long-context model reports, and its method, accuracy against length on non-trivial tasks with a threshold, is the one to copy for your own evaluations.</p>
+
+<h4>Failure modes in practice</h4>
+<p><strong>Silent truncation.</strong> Gateways, SDKs and serving engines often have their own length limits. A request that exceeds one may be truncated from the start or the middle without an error, and the model answers confidently from partial input. Log input token counts at every hop and alert on requests near any limit.</p>
+<p><strong>Cost and latency blowups.</strong> Context grows quietly: conversation history, tool results, retrieved documents. A chat that starts at 2K tokens can reach 100K after an hour of agent steps, with prefill time and per-request cost rising in proportion. Track tokens per request as a distribution, not an average, and cap or compact history (ag5 covers compaction for agents).</p>
+<p><strong>Quality cliffs at length.</strong> A model can pass your evaluation at 8K and degrade badly at 60K. Bucket quality metrics by input length; a dashboard with one line per length bucket finds regressions that an overall average hides.</p>
+<p><strong>Memory exhaustion in self-hosting.</strong> Admitting a few maximum-length requests can exhaust the KV cache and force preemption or recomputation for everyone else. Set a per-request context limit below the model's maximum, reserve capacity for long requests separately, or route long requests to a dedicated pool.</p>
+<p><strong>Prefix-cache misses.</strong> Long-context economics depend on caching the stable part. Anything that changes the prefix (a timestamp at the top of the system prompt, reordered documents, per-request position scaling) turns every request into a full-price prefill.</p>
+
+<h4>What to measure and tune</h4>
+<p>Measure time to first token against input length (it should be roughly linear in length below the attention crossover and steeper above), cache memory per request, accuracy by length bucket and by position of the relevant information, and cost per request. Tune the context limit, the amount retrieved, compaction thresholds, and where instructions sit relative to documents. When choosing a model, ask for its RULER-style curve or measure one: the right question is not "how long is the window?" but "how long is the window at which my task still works?"</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> compute the RoPE frequency table and see exactly how position interpolation, NTK-aware scaling and YaRN treat each pair for a 4K → 32K extension. About 10 minutes, NumPy only.</p>
+<ol>
+<li>Use <code>C:\ra_projects\how-to-train-your-gpt\gpt_env\Scripts\python.exe</code> (any Python 3.12 with NumPy).</li>
+<li>Save and run as <code>lm22_lab.py</code>:</li>
+</ol>
+<pre>import numpy as np
+d, base, L, s = 128, 10_000.0, 4096, 8
+alpha, beta = 1.0, 32.0                           # YaRN thresholds for Llama
+
+i = np.arange(d // 2)
+theta = base ** (-2 * i / d)                      # rad per token
+lam = 2 * np.pi / theta                           # wavelength in tokens
+r = L / lam                                       # turns within training length
+
+pi_theta = theta / s                              # position interpolation
+ntk_base = base * s ** (d / (d - 2))
+ntk_theta = ntk_base ** (-2 * i / d)              # NTK-aware
+gamma = np.clip((r - alpha) / (beta - alpha), 0, 1)   # 0 = interpolate, 1 = keep
+yarn_theta = (1 - gamma) * theta / s + gamma * theta
+
+print(f"NTK base = {ntk_base:,.0f};  YaRN logit factor = {(0.1*np.log(s)+1)**2:.3f}")
+print(" i   wavelen   turns   PI÷    NTK÷   YaRN÷   max angle@32K(YaRN) vs trained")
+for k in [0, 8, 16, 24, 32, 40, 48, 56, 63]:
+    print(f"{k:2d} {lam[k]:9.0f} {r[k]:7.2f} {theta[k]/pi_theta[k]:5.1f} "
+          f"{theta[k]/ntk_theta[k]:6.2f} {theta[k]/yarn_theta[k]:6.2f}   "
+          f"{min(s*L*yarn_theta[k], 2*np.pi):6.2f} vs {min(L*theta[k], 2*np.pi):5.2f}")</pre>
+<p><strong>What to look for.</strong> The NTK base should print about 82,700 and the YaRN logit factor about 1.46 (that is 1.208²). In the table, PI divides every pair by 8. NTK's divisor rises smoothly from 1.00 at pair 0 to exactly 8.00 at pair 63. YaRN's divisor is 1.00 for pairs with more than 32 turns, 8.00 for pairs with fewer than 1, and in between for pairs 23–45. The last two columns show the point of it all: for every slow pair, the largest angle reached at 32K tokens after YaRN scaling matches the largest angle the pair reached in training, while fast pairs (capped at 2π because they already cycle) are untouched. Try s = 32 and see which pairs move into the ramp.</p>
+</section>
+
+<section data-field="drill">
+<b>Estimate and decide: a 1M-token feature</b>
+<p>Product wants "upload your whole data room (up to 1M tokens) and ask anything". You self-host a model with Llama 3.1 70B's shape (80 layers, 8 KV heads of 128, 16-bit) on 8 × 80 GB GPUs. Expected load: 200 sessions a day, each with about 10 questions on the same uploaded data room. Is it feasible, and how would you build it?</p>
+<details><summary>Answer</summary>
+<p><strong>Memory.</strong> KV per token = 2 × 80 × 8 × 128 × 2 = 320 KiB, so 1M tokens = 320 GiB of cache per session. Weights in 16-bit are about 140 GB. Total about 480 GB against 640 GB of GPU memory: one full-length session fits on the whole node, with little room for a second. An 8-bit cache (160 GiB) makes two or three concurrent sessions possible.</p>
+<p><strong>Prefill.</strong> Causal attention FLOPs ≈ 2n² × d_model × layers = 2 × (1.05 × 10⁶)² × 8,192 × 80 ≈ 1.4 × 10¹⁸, plus 2 × 70 × 10⁹ × 10⁶ = 1.4 × 10¹⁷ for weights: about 1.6 × 10¹⁸ FLOPs. At 50% of 989 TFLOP/s across 8 GPUs (about 4 × 10¹⁵ FLOP/s), roughly 400 seconds, nearly seven minutes, before the first answer. It has to be done once per session and kept (prefix caching), never repeated per question.</p>
+<p><strong>Quality.</strong> Models of this class were effective to well under 128K on RULER in 2024; a 1M window obtained by scaling RoPE without long training will be far worse in the middle of the input. You must measure effective length on data-room questions before promising anything.</p>
+<p><strong>Recommendation.</strong> Do not serve raw 1M-token prompts per question. Build retrieval over the data room and send the top 30–60K tokens of relevant material into a 128K-capable model, with prefix caching for the conversation. Offer a slow "deep read" mode that processes the data room once per session (map-reduce summaries per document, or a long-context pass) and caches the results. Evaluate retrieval recall against full-context answers on a sample to quantify what retrieval misses.</p>
+</details>
+</section>

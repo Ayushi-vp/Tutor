@@ -1,0 +1,488 @@
+<!-- topic source for dataeng/de6; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "de6",
+  "t": "Joins and skew at scale: broadcast vs sort-merge vs shuffle-hash joins, skew detection, salting, AQE skew handling, spill and executor OOM",
+  "tag": "Compute",
+  "sum": "How distributed engines join billions of rows: the three physical join strategies and what each moves over the network and holds in memory, how Spark picks one and how AQE changes it, exploding joins on duplicate keys, how skewed keys create stragglers, and the fixes — broadcasting, AQE skew splits, salting, isolating hot keys, pre-aggregation — each worked with sizes, plus spill and executor OOM arithmetic and Facebook's 60 TB Spark pipeline.",
+  "prereq": [
+    [
+      "de5",
+      "Spark splits work into stages at shuffles; each task handles one partition on one core with roughly a gigabyte or two of execution memory; AQE re-plans between stages using real partition sizes; the slowest task ends the stage."
+    ],
+    [
+      "db7",
+      "A hash join builds a hash table on the smaller input and probes it with the larger; a sort-merge join sorts both inputs on the key and walks them together; the optimiser picks by estimated sizes."
+    ],
+    [
+      "de3",
+      "Bucketing both tables on the join key with the same bucket count lets an engine join bucket by bucket without a shuffle."
+    ],
+    [
+      "ml9",
+      "Leakage: features joined from the wrong time or with duplicated rows silently change what a model learns."
+    ]
+  ],
+  "myths": [
+    [
+      "Broadcast joins are always the fastest.",
+      "They are fastest when the broadcast side is small enough that copying it to every executor costs less than shuffling the big side, and it fits comfortably in each executor's memory. A 2 GB table broadcast to 300 executors moves 600 GB and occupies 2 GB plus hash-table overhead in every executor; past a few hundred megabytes to a few gigabytes, a shuffle join is often cheaper and safer."
+    ],
+    [
+      "Salting fixes skew for free.",
+      "Salting splits a hot key across N tasks on the large side but requires replicating the matching rows of the other side N times, and the final result may need a second aggregation to recombine. It adds code, more shuffle data and a tuning knob; apply it to the few hot keys only, or let AQE's skew handling do the splitting when it applies."
+    ],
+    [
+      "If a join is slow, increase spark.sql.shuffle.partitions.",
+      "More partitions shrink every partition except the skewed one: a single hot key always hashes to a single partition, however many there are. If the slowest task's shuffle read is far above the median, the problem is skew, and only key-level techniques (broadcast, AQE skew split, salting, isolation) help."
+    ],
+    [
+      "An inner join can only reduce the number of rows.",
+      "If the join key is not unique on either side, each left row matches every right row with the same key, so output rows are the sum over keys of left count times right count. Two tables of a million rows each, joined on a key where one value appears 10,000 times on each side, produce 100 million rows for that key alone."
+    ],
+    [
+      "Null keys are harmless in a join.",
+      "In an inner or left join, null never equals null, so null-keyed rows never match — but before the join they are still shuffled, and since they all hash to the same partition they form one giant skewed partition that does useless work. Filter or handle null keys before the join."
+    ]
+  ],
+  "recap": [
+    "A distributed join must bring rows with equal keys to the same task, either by copying the small side to every task (broadcast) or by redistributing both sides by key (shuffle).",
+    "A broadcast hash join sends the small table to every executor and joins each partition of the big table locally; it moves the small side once per executor and never shuffles the big side, but the small side must fit in memory everywhere.",
+    "A sort-merge join shuffles both sides by key, sorts each partition and merges them; it handles any size and spills gracefully, at the cost of a full shuffle and sort of both sides.",
+    "A shuffle hash join shuffles both sides and builds a hash table on one side's partition; it skips the sort but needs each build partition to fit in memory.",
+    "Spark broadcasts a side estimated below spark.sql.autoBroadcastJoinThreshold (10 MB by default), otherwise prefers sort-merge; hints override this, and AQE can switch strategies after seeing real sizes.",
+    "Output size is the sum over keys of left count times right count, so duplicate keys can make a join explode; check key uniqueness before joining.",
+    "Skew means a few keys own most of the rows; hash partitioning puts each key in one partition, so its task becomes a straggler that more partitions cannot fix.",
+    "Fixes for skew: broadcast the other side; let AQE split skewed partitions; salt hot keys and replicate the matching rows; process hot keys separately; pre-aggregate before joining; drop or handle null keys.",
+    "Memory arithmetic decides spill and OOM: a hash-join build side expands to several times its on-disk size in memory, and each task shares the executor's unified memory with the other running tasks."
+  ],
+  "glossary": [
+    [
+      "Anti join",
+      "A join that keeps the left rows that have no match on the right, e.g. events from users not on a blocklist."
+    ],
+    [
+      "AQE",
+      "Adaptive query execution: Spark's runtime re-planning between stages using measured shuffle sizes (de5)."
+    ],
+    [
+      "Broadcast hash join",
+      "A join where the smaller table is copied to every executor and loaded into a hash table, and each partition of the larger table probes it locally, with no shuffle of the larger table."
+    ],
+    [
+      "Build side",
+      "The input of a hash join that is loaded into the hash table; ideally the smaller one."
+    ],
+    [
+      "Cardinality (join output)",
+      "The number of rows a join produces: for each key, the number of matching left rows times matching right rows."
+    ],
+    [
+      "Data skew",
+      "A distribution in which a small number of key values account for a large fraction of rows, causing uneven partitions."
+    ],
+    [
+      "Dynamic partition pruning",
+      "Using the keys of a filtered small side at runtime to skip storage partitions of the large side before scanning it."
+    ],
+    [
+      "Exploding join",
+      "A join whose output is much larger than its inputs because keys are duplicated on both sides."
+    ],
+    [
+      "Hot key",
+      "A key value with far more rows than typical, such as a test account, a default category or null."
+    ],
+    [
+      "HyperLogLog",
+      "A small probabilistic sketch that estimates the number of distinct values with a few percent error, mergeable across partitions."
+    ],
+    [
+      "Join hint",
+      "An instruction in SQL or the DataFrame API (BROADCAST, MERGE, SHUFFLE_HASH, SHUFFLE_REPLICATE_NL) that tells Spark which join strategy to use."
+    ],
+    [
+      "OOM",
+      "Out of memory: a task or process exceeded the memory it may use, either inside the JVM heap or at the container limit."
+    ],
+    [
+      "Partial aggregation",
+      "Aggregating within each map task before the shuffle, so fewer rows cross the network."
+    ],
+    [
+      "Probe side",
+      "The input of a hash join whose rows are looked up in the hash table; usually the larger one."
+    ],
+    [
+      "Salting",
+      "Adding a random or computed suffix to a hot key on the large side and replicating the matching rows of the other side once per suffix, so the key's work spreads across several tasks."
+    ],
+    [
+      "Semi join",
+      "A join that keeps left rows that have at least one match on the right, without adding right columns or duplicating left rows."
+    ],
+    [
+      "Shuffle hash join",
+      "A join where both sides are shuffled by key and each task builds a hash table from its partition of one side and probes it with the other."
+    ],
+    [
+      "SMJ / SHJ",
+      "Abbreviations for sort-merge join and shuffle hash join."
+    ],
+    [
+      "Sort-merge join",
+      "A join where both sides are shuffled by key, each partition is sorted, and the two sorted streams are merged; Spark's default for large joins."
+    ],
+    [
+      "Spill",
+      "Writing part of an in-memory structure (sort buffer, hash table) to local disk when memory runs out, then merging it back."
+    ],
+    [
+      "Straggler",
+      "A task that runs much longer than its peers and delays the end of its stage."
+    ],
+    [
+      "TPC-DS",
+      "A standard decision-support benchmark of about a hundred SQL queries over a retail star schema, used to compare analytical engines."
+    ],
+    [
+      "Zipf distribution",
+      "A heavy-tailed distribution where the k-th most frequent value occurs roughly in proportion to 1/k; common for user activity, products and words."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Describe the three main join strategies in Spark and when each is used.",
+      "Broadcast hash join copies the small side to every executor and joins each partition of the big side locally — used when one side is small (under 10 MB estimated by default, or forced by a hint). Sort-merge join shuffles both sides by key, sorts each partition and merges — the default for two large inputs, robust because sorting spills gracefully. Shuffle hash join shuffles both sides and builds a hash table per partition of the smaller side — faster than sort-merge when partitions are small enough to hash in memory, chosen by hint or by AQE when partitions are small."
+    ],
+    [
+      "E",
+      "What is data skew and how do you detect it?",
+      "Skew is when a few key values hold a large share of the rows, so after hash partitioning their partitions are much bigger than the rest and their tasks run far longer. In the Spark UI, a stage's max task duration and max shuffle read are many times the median. To confirm, count rows per key on the join or group-by column and look at the top few: SELECT key, count(*) … ORDER BY 2 DESC LIMIT 20 — nulls, test accounts and default values are the usual suspects."
+    ],
+    [
+      "E",
+      "Why can a join produce more rows than either input?",
+      "Because every left row pairs with every right row that has the same key. If a key appears 1,000 times on the left and 500 times on the right, it produces 500,000 output rows. When joining features to a training set, an unexpected duplicate on the feature side multiplies training examples and biases the model, so assert key uniqueness on the side you expect to be unique."
+    ],
+    [
+      "M",
+      "Why do null join keys cause trouble, and what do you do with them?",
+      "In SQL equality, null is never equal to null, so null-keyed rows never match in an inner or left equi-join. But if they are shuffled, they all hash to the same partition, creating a large skewed partition that does useless work. Filter null keys out before the join; for a left join where you must keep them, split them off and union them back with null right-side columns. Also check why there are so many nulls — it is often an upstream bug.",
+      "Follow-up: What about null-safe equality (<=>)? — With null-safe equality nulls do match each other, which is occasionally intended (joining on optional attributes), and then the null group really is a hot key that needs skew handling."
+    ],
+    [
+      "M",
+      "Estimate the cost of broadcasting a 500 MB table versus shuffling both sides when joining it to a 3 TB table on a cluster of 200 executors.",
+      "Broadcast moves 500 MB to each of 200 executors — about 100 GB of network in total — and each executor holds the table as a hash table, often 2–3× its file size, so 1–1.5 GB of memory per executor; the 3 TB side is never shuffled. A sort-merge join shuffles and sorts both sides: around 3.5 TB (or whatever survives filtering and projection) written to local disk, sent over the network and sorted. The broadcast is much cheaper in bytes as long as 1–1.5 GB per executor fits alongside the tasks' execution memory; Spark's default threshold of 10 MB is conservative, and teams commonly raise it to tens or a few hundred megabytes.",
+      "Follow-up: What else limits a broadcast? — The driver collects and builds the broadcast first, so it needs the memory too, the broadcast must finish within spark.sql.broadcastTimeout (300 s), and Spark refuses to broadcast tables over 8 GB."
+    ],
+    [
+      "M",
+      "How does AQE handle a skewed sort-merge join?",
+      "After the shuffle map stages finish, AQE knows each partition's size. A partition larger than 5 times the median and larger than 256 MB (the defaults) is split into several sub-partitions of roughly the advisory size, by grouping map-output blocks, and the corresponding partition of the other side is duplicated so each sub-partition joins against the full matching rows. The hot partition's work then runs as several parallel tasks. It works only at the shuffle boundary and, by default, is skipped if splitting would require an extra shuffle later in the plan."
+    ],
+    [
+      "M",
+      "Walk through salting a skewed join with numbers.",
+      "Suppose events (2 TB) join merchants on merchant_id, and one merchant has 400 GB of events. Choose a salt count N, say 20, for that hot key. On the events side, add salt = rand() mod 20 to rows of the hot merchant (0 for all others); on the merchants side, replicate the hot merchant's row 20 times with salt 0–19 (others get salt 0). Join on (merchant_id, salt). The hot merchant's 400 GB now spreads over 20 partitions of 20 GB, at the cost of 19 extra copies of one small row. With a large right side, the replication cost is N times that key's right-side rows, so salt only the hot keys.",
+      "Follow-up: When does salting not help? — When the downstream operation needs all of a key's rows together and is not decomposable (an exact median per merchant); then you need a two-step algorithm or approximate method, not just more tasks."
+    ],
+    [
+      "M",
+      "A join that used to be a broadcast join became a sort-merge join and the job got 10× slower. Why might that happen and what do you do?",
+      "The broadcast side's estimated size crossed the broadcast threshold — the dimension table grew, statistics changed, or a filter Spark used to see through became opaque (a UDF), so the estimate rose. Now both sides shuffle, and if the big side has a hot key, the sort-merge join also brings back skew that the broadcast join avoided. Confirm in the SQL plan, then add a broadcast hint or raise the threshold if the table really is small, and add an alert or plan-diff check so strategy changes are noticed."
+    ],
+    [
+      "M",
+      "What causes executor OOM in joins and how do you estimate memory needs?",
+      "Hash-join build sides and broadcast tables must fit in memory, and in-memory representation is larger than Parquet: decoded, uncompressed rows plus hash-table overhead are often several times the file size. An executor with a 16 GB heap and 8 cores has about 9.4 GB of unified memory, about 1.2 GB per running task. A shuffle hash join whose build partition is 3 GB on disk, perhaps 9 GB in memory, will spill or fail; a sort-merge join with a 3 GB partition will spill but survive. Estimate per-task build size as shuffle bytes per partition times an expansion factor, compare with memory per task, and adjust partitions, strategy or executor size."
+    ],
+    [
+      "H",
+      "You build a training set by joining 5 billion impressions to user features (200 M users, 2 KB each) and item features (10 M items, 1 KB each). Design the joins.",
+      "Item features are 10 GB on disk — too big for the default broadcast but borderline; if projected to the columns needed they may drop to 1–2 GB, which is broadcastable on executors with ample memory, avoiding a shuffle of 5 billion rows. User features at 400 GB must be shuffle-joined: shuffle impressions (say 1.5 TB projected) and user features by user_id, ideally pre-bucketed on user_id so that side need not be reshuffled every day. Check key distributions: power users and bots create skew on user_id, so enable AQE skew handling and drop known bots before the join. Join item features first via broadcast (cheap, no shuffle), then do the single shuffle join on user_id, and assert both feature tables are unique per key and point-in-time correct (de12).",
+      "Follow-up: How would you make the daily build cheaper? — Bucket both impressions and user features by user_id into the same bucket count so the join is storage-partitioned with no shuffle, and only process new impressions incrementally."
+    ],
+    [
+      "H",
+      "A stage's median task takes 30 seconds and the max takes 2 hours, with 300 GB shuffle read in that task. AQE is on. Walk through the diagnosis and fixes.",
+      "First identify the operator and key from the SQL tab: is it a join, a group-by or a window? Then find the hot key with a count by key. If it is null or a junk value, filter it before the shuffle. If it is a join and AQE's skew split did not apply, check whether the join type is supported, whether splitting was skipped because it would add a shuffle (forceOptimizeSkewedJoin), and whether the thresholds were met. If the other side is small for that key, broadcast it or handle the hot key separately with a broadcast join and union the results. If it is a group-by, use partial aggregation (automatic for decomposable aggregates) or a two-stage aggregation with a salt. Then add a skew alert: max-to-median ratio of shuffle read per stage.",
+      "Follow-up: The hot key is a real customer whose data must be included. What design changes upstream could help? — Pre-aggregate that customer's events to the grain the job needs, or partition the computation by a second key (day, region) so the customer's work naturally spreads."
+    ],
+    [
+      "H",
+      "How would you join two tables that are both 20 TB and both skewed, daily?",
+      "Avoid doing it from scratch each day. Bucket both tables on the join key with the same bucket count so the join is storage-partitioned and needs no shuffle; process only new or changed data incrementally and merge results. For skew, identify the hot keys and route them through a separate path — for example a salted join only for those keys, or pre-aggregation to the grain the output needs — and union with the main result. Size executors so a bucket's sort-merge comfortably spills rather than failing, enable AQE, and monitor per-bucket sizes as keys drift.",
+      "Follow-up: What breaks bucketing over time? — Growth makes buckets too large, writers that ignore the bucket spec break the guarantee, and engines with different hash functions cannot use each other's buckets; plan a re-bucketing path."
+    ]
+  ],
+  "refs": [
+    [
+      "post",
+      "Apache Spark @Scale: A 60 TB+ production use case",
+      "Facebook Engineering, August 2016 — replacing a three-stage Hive pipeline with one Spark job reading 60 TB and doing a 90 TB shuffle and sort, and the reliability and performance fixes needed.",
+      "https://engineering.fb.com/2016/08/31/core-infra/apache-spark-scale-a-60-tb-production-use-case/"
+    ],
+    [
+      "post",
+      "Adaptive Query Execution: Speeding Up Spark SQL at Runtime",
+      "Databricks, May 2020 — coalescing partitions, switching join strategies and splitting skewed joins, with TPC-DS results (32 queries above 1.1×, up to 8×).",
+      "https://www.databricks.com/blog/2020/05/29/adaptive-query-execution-speeding-up-spark-sql-at-runtime.html"
+    ],
+    [
+      "docs",
+      "Spark SQL performance tuning: join hints and AQE",
+      "Join strategy hints, broadcast thresholds, skew-join settings and storage-partitioned joins, Spark 4.2.",
+      "https://spark.apache.org/docs/latest/sql-performance-tuning.html"
+    ],
+    [
+      "docs",
+      "Spark SQL hints",
+      "Syntax for BROADCAST, MERGE, SHUFFLE_HASH and SHUFFLE_REPLICATE_NL join hints and partitioning hints.",
+      "https://spark.apache.org/docs/latest/sql-ref-syntax-qry-select-hints.html"
+    ],
+    [
+      "paper",
+      "Spark SQL: Relational Data Processing in Spark",
+      "Armbrust et al., SIGMOD 2015 — how Catalyst plans physical joins.",
+      "https://people.csail.mit.edu/matei/papers/2015/sigmod_spark_sql.pdf"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Almost every ML dataset is a join. A training set for a recommender joins billions of impressions to user features, item features and click labels. A fraud model joins transactions to card history, merchant profiles and chargebacks. An LLM fine-tuning pipeline joins documents to quality scores and deduplication clusters. On a laptop with pandas, a join is one line and finishes instantly. On a cluster, it is the operation most likely to make a job slow, expensive, wrong, or all three.</p>
+<p>Consider an ads team building a daily training table: 4 billion impressions joined to 50 million advertisers. The job usually runs in 25 minutes. One day it runs for nine hours and then dies with an executor out-of-memory error. Nothing in the code changed. What changed was that a single advertiser — a large retailer launching a campaign — accounted for 30% of the day's impressions. The engine sends every row with the same key to the same task so it can be joined; one task got 1.2 billion rows, its sort buffer overflowed to disk again and again, and eventually the hash table for its output did not fit at all. 1,999 tasks finished in 40 seconds; one ran all night.</p>
+<p>Another day, a different team's training set doubles in size overnight. The model's offline metrics jump — then the online test fails. Someone had added a second row per user to the user-features table (one per device); the join turned each impression into two, every user with two devices was counted twice, and the model learned from duplicated examples. No error, just a wrong result.</p>
+<p>Both failures come from not knowing what a distributed join physically does. This lesson fixes that. It shows the three strategies an engine like Spark uses — broadcast hash, sort-merge and shuffle hash — with the bytes each moves and the memory each needs; how Spark chooses and how adaptive execution changes its mind; why output can explode; what skew is and why it defeats more hardware; and the toolkit for fixing it: broadcasting, AQE's skew splits, salting, isolating hot keys and pre-aggregating, each worked with sizes. It ends with memory arithmetic for spill and OOM, and Facebook's account of running a 60 TB, 90 TB-shuffle Spark job.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: matching name tags at a conference</h4>
+<p>A conference has 20,000 attendees spread over 100 rooms, and 300 speakers who each need to meet the attendees registered for their session. Every attendee must end up in the same place as their speaker. There are two ways to arrange it.</p>
+<p><strong>Send the speakers everywhere.</strong> Print each speaker's details on a sheet and photocopy the whole booklet of 300 sheets into every room. Now each room can match its own attendees against the booklet, and no attendee has to move. This works because the booklet is small. That is a <strong>broadcast join</strong>: copy the small table to every worker, never move the big one.</p>
+<p><strong>Move everyone by session.</strong> If, instead, the "speakers" were 15,000 mentors, photocopying them into every room is absurd. So everyone — attendees and mentors — walks to the room assigned to their session number: session 1 to room 1, session 2 to room 2, and so on. Each room then matches its own people. That is a <strong>shuffle join</strong>: both sides are redistributed by key, then each worker matches its share. It always works, but everyone has to walk.</p>
+<p>Now the trouble. If one session is the keynote, with 8,000 registered attendees, then under "move everyone by session" one room receives 8,000 people while the other 99 average 120. The keynote room overflows into the corridor (that is <strong>spill</strong>), matching takes forever there, and the conference cannot start the next activity until it is done. That is <strong>skew</strong>. Adding more rooms does not help: the keynote is still one session going to one room. What helps is splitting the keynote across several rooms with a copy of the speaker's materials in each (<strong>salting</strong>, or Spark's automatic <strong>skew split</strong>), or handling the keynote separately (<strong>isolating the hot key</strong>), or using the photocopied-booklet approach if the speaker side is small (<strong>broadcast</strong>).</p>
+<p>The analogy also explains <strong>exploding joins</strong>. If a session has two speakers listed and 100 attendees, "matching" produces 200 attendee–speaker pairs. If the speaker list accidentally lists each speaker twice, every attendee appears twice in the output. Joins multiply.</p>
+<p>Where the analogy breaks: people can be counted at the door, but an engine must estimate sizes before it starts and often guesses wrong. That is why modern engines re-plan joins after they see real sizes (adaptive execution) — the equivalent of moving the keynote to the main hall once registrations come in.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Broadcast join copies the small table to every executor and moves nothing of the big table; shuffle join moves both tables by key">
+  <defs><marker id="de6-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="150" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Broadcast hash join</text>
+    <rect x="110" y="32" width="80" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="150" y="52" text-anchor="middle" style="fill:var(--ink)">small: 50 MB</text>
+    <rect x="20" y="110" width="80" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="60" y="134" text-anchor="middle" style="fill:var(--ink)">big part 1</text><text x="60" y="152" text-anchor="middle" style="fill:var(--s2)">+ copy</text>
+    <rect x="110" y="110" width="80" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="150" y="134" text-anchor="middle" style="fill:var(--ink)">big part 2</text><text x="150" y="152" text-anchor="middle" style="fill:var(--s2)">+ copy</text>
+    <rect x="200" y="110" width="80" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="240" y="134" text-anchor="middle" style="fill:var(--ink)">big part 3</text><text x="240" y="152" text-anchor="middle" style="fill:var(--s2)">+ copy</text>
+    <line x1="140" y1="62" x2="70" y2="108" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--s2)"/>
+    <line x1="150" y1="62" x2="150" y2="108" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--s2)"/>
+    <line x1="160" y1="62" x2="230" y2="108" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--s2)"/>
+    <text x="150" y="196" text-anchor="middle" style="fill:var(--ink-2)">moves: small × executors</text>
+    <text x="150" y="214" text-anchor="middle" style="fill:var(--ink-2)">big side never leaves its task</text>
+    <text x="150" y="232" text-anchor="middle" style="fill:var(--crit)">small side must fit in every executor</text>
+    <text x="480" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Shuffle (sort-merge / hash) join</text>
+    <rect x="350" y="32" width="70" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="385" y="56" text-anchor="middle" style="fill:var(--ink)">big map</text>
+    <rect x="430" y="32" width="70" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="465" y="56" text-anchor="middle" style="fill:var(--ink)">big map</text>
+    <rect x="540" y="32" width="80" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="580" y="56" text-anchor="middle" style="fill:var(--ink)">other map</text>
+    <rect x="350" y="120" width="80" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="390" y="142" text-anchor="middle" style="fill:var(--ink)">keys</text><text x="390" y="158" text-anchor="middle" style="fill:var(--ink)">hash = 0</text>
+    <rect x="445" y="120" width="80" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="485" y="142" text-anchor="middle" style="fill:var(--ink)">keys</text><text x="485" y="158" text-anchor="middle" style="fill:var(--ink)">hash = 1</text>
+    <rect x="540" y="120" width="80" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="580" y="142" text-anchor="middle" style="fill:var(--ink)">keys</text><text x="580" y="158" text-anchor="middle" style="fill:var(--ink)">hash = 2</text>
+    <line x1="385" y1="72" x2="390" y2="118" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="395" y1="72" x2="480" y2="118" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="465" y1="72" x2="575" y2="118" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="455" y1="72" x2="400" y2="118" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="570" y1="72" x2="495" y2="118" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--s2)"/>
+    <line x1="590" y1="72" x2="585" y2="118" marker-end="url(#de6-arrow)" style="fill:none;stroke:var(--s2)"/>
+    <text x="485" y="196" text-anchor="middle" style="fill:var(--ink-2)">moves: both sides, once each</text>
+    <text x="485" y="214" text-anchor="middle" style="fill:var(--ink-2)">works for any size</text>
+    <text x="485" y="232" text-anchor="middle" style="fill:var(--crit)">a hot key lands in ONE partition</text>
+    <text x="320" y="262" text-anchor="middle" style="fill:var(--accent)">rule of thumb: broadcast if small × executors &lt; shuffle bytes and it fits in memory</text>
+  </g>
+</svg>
+<figcaption>The two ways to bring matching keys together. A broadcast join pays a small, fixed copy per executor and leaves the big side where it is — which also makes it immune to skew in the big side. A shuffle join pays to move both sides, works at any size, and inherits every skew in the key distribution.</figcaption>
+</figure>
+<p>Keep three questions in mind for every join you write at scale. How big is each side <em>after</em> filtering and projection — is one small enough to copy everywhere? What is the grain of each side — is the side you expect to be unique really one row per key? And how are the keys distributed — does any single value own a large share of the rows? The answers decide the strategy, the correctness of the output, and whether the job finishes.</p>
+</section>
+
+<section data-field="body">
+<h4>1. What any distributed join must do</h4>
+<p>An equi-join (<code>ON a.key = b.key</code>) needs every pair of rows with equal keys to meet in one task. On a single machine (db7), a <strong>hash join</strong> loads the smaller input — the <strong>build side</strong> — into a hash table keyed on the join key, then streams the larger input — the <strong>probe side</strong> — and looks each row up; a <strong>sort-merge join</strong> sorts both inputs by key and walks them together like merging two sorted lists. Distributed engines use the same two algorithms, plus a decision about how to get matching rows into the same task: copy one side everywhere, or redistribute both by key.</p>
+
+<h4>2. Broadcast hash join</h4>
+<p>In a <strong>broadcast hash join</strong>, the small table is collected to the driver, serialised, and sent to every executor, which builds a hash table from it once and shares it across its tasks. Each task of the big table's stage then probes the hash table with its own partition — no shuffle of the big table at all. The whole join happens inside the scan stage of the big table.</p>
+<p>Worked costs. Join a 2 TB (after projection) events table to a 50 MB merchants table on a cluster of 200 executors. Network: 50 MB × 200 = 10 GB of broadcast traffic, versus shuffling 2 TB + 50 MB for a shuffle join. Memory: each executor holds the merchants hash table. In-memory rows are decoded and uncompressed and the hash table has overhead, so 50 MB of Parquet might occupy 150–250 MB in memory — trivial against a 16 GB heap. Time: the 2 TB scan stage proceeds as if there were no join, plus a fast lookup per row.</p>
+<p>Two further properties make broadcast joins special. They are <strong>immune to skew on the big side</strong>: a hot merchant's 400 GB of events are spread over many scan tasks by file layout, not gathered by key, so no task gets all of them. And they work for <strong>non-equi conditions</strong> too (a broadcast nested-loop join can evaluate <code>a.ts BETWEEN b.start AND b.end</code>), which a shuffle cannot partition on.</p>
+<p>Their limits are memory and the driver. Every executor needs the whole small side in memory alongside its running tasks, and the driver must collect and build it first. Spark refuses to broadcast a relation larger than 8 GB, and in practice anything above a gigabyte or two risks executor or driver memory pressure; the broadcast must also finish within <code>spark.sql.broadcastTimeout</code> (300 seconds by default). Spark broadcasts automatically when the estimated size of a side is below <code>spark.sql.autoBroadcastJoinThreshold</code> — 10 MB by default in Spark 4.2 — a conservative number that teams with large executors commonly raise to tens or a few hundred megabytes. You can also force it with a hint: <code>big.join(F.broadcast(small), "merchant_id")</code> or <code>/*+ BROADCAST(m) */</code> in SQL.</p>
+<p>A broadcast join can only broadcast the side that is not "preserved" by an outer join: for <code>big LEFT JOIN small</code>, Spark can broadcast <code>small</code>; for <code>small LEFT JOIN big</code>, broadcasting <code>big</code> is required, which is usually impossible, so that join must shuffle.</p>
+
+<h4>3. Sort-merge join</h4>
+<p>A <strong>sort-merge join</strong> (SMJ) is Spark's default when neither side is small. Both sides are shuffled by <code>hash(key) mod N</code> into N partitions (two map stages, one per side, which can run concurrently). In the join stage, each task receives partition <em>i</em> of both sides, sorts each by key, and walks the two sorted streams: when keys are equal, it emits the matching pairs; otherwise it advances the side with the smaller key.</p>
+<p>Its strength is robustness. Sorting can spill: if a partition does not fit in execution memory, the sorter writes sorted runs to disk and merges them, so a 20 GB partition is slow but completes. The merge phase itself needs to hold in memory only the rows for the current key on one side (Spark buffers the matching rows of one side for each key, spilling them too if a single key has a huge number of rows). Its costs are both shuffles and both sorts.</p>
+<p>Worked costs. Events (2 TB after projection) join user features (300 GB) on <code>user_id</code>. Shuffle write and read: about 2.3 TB, each byte written to a local disk, sent over the network, and read back. With 2,000 shuffle partitions (AQE coalescing as needed), each join task receives about 1 GB of events and 150 MB of user features. On executors with about 1.2 GB of execution memory per task, sorting 1 GB of compressed shuffle data that expands in memory will spill a few times — acceptable. With the default 200 partitions, each task would receive 11.5 GB: heavy spill, long tasks, high risk of failure. Choosing N so that partitions are a few hundred megabytes is the main tuning lever for SMJ, and AQE helps by coalescing small ones.</p>
+
+<h4>4. Shuffle hash join</h4>
+<p>A <strong>shuffle hash join</strong> (SHJ) shuffles both sides like SMJ but, instead of sorting, builds a hash table from one side's partition in each task and probes it with the other. Skipping the sort saves CPU — often a lot when partitions are small. The risk is memory: the whole build-side partition must fit in the task's memory as a hash table (Spark's implementation can fall back in some cases, but it is far less spill-friendly than sorting). Spark prefers SMJ by default (<code>spark.sql.join.preferSortMergeJoin</code> is true) and uses SHJ when hinted (<code>/*+ SHUFFLE_HASH(u) */</code>) or when AQE sees that all post-shuffle partitions are below <code>spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold</code> — which is 0 (disabled) by default in Spark 4.2, so you must opt in. SHJ is a good choice when one side is moderately sized (too big to broadcast) and partitions are small and evenly sized.</p>
+
+<table>
+<thead><tr><th></th><th>Broadcast hash</th><th>Sort-merge</th><th>Shuffle hash</th></tr></thead>
+<tr><td>Shuffle of big side</td><td>None</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Network bytes</td><td>small × executors</td><td>both sides</td><td>both sides</td></tr>
+<tr><td>Memory need</td><td>whole small side per executor</td><td>sort buffers (spillable)</td><td>build partition per task</td></tr>
+<tr><td>Skew on big side</td><td>Immune</td><td>Hot key → one task</td><td>Hot key → one task (may OOM)</td></tr>
+<tr><td>Default use in Spark</td><td>Side &lt; 10 MB estimated</td><td>Everything else</td><td>Hint or AQE opt-in</td></tr>
+</table>
+
+<h4>5. How Spark chooses, and how to override it</h4>
+<p>At planning time, for an equi-join Spark roughly does the following: if a hint is present, use it (when both sides carry different hints, BROADCAST takes priority over MERGE, which takes priority over SHUFFLE_HASH, over SHUFFLE_REPLICATE_NL); otherwise, if one side's estimated size is under the broadcast threshold and the join type allows broadcasting that side, broadcast it; otherwise, if both sides are bucketed or partitioned compatibly in storage, join without a shuffle (de3); otherwise sort-merge join. Estimated sizes come from file sizes and table statistics, adjusted for filters and projections, and can be badly wrong — especially after other joins, aggregations or UDFs.</p>
+<p>AQE corrects some of this at runtime. After the shuffle map stages, it knows each side's real size and can convert a planned SMJ into a broadcast hash join if one side came in under <code>spark.sql.adaptive.autoBroadcastJoinThreshold</code> (which defaults to the same value as the static threshold), and it can convert SMJ to SHJ when partitions are small enough and the threshold is set. Note the asymmetry: converting to broadcast <em>after</em> both sides were shuffled saves the sort and the reduce-side shuffle read (Spark can read the big side's shuffle output locally), but not the map-side shuffle write already done. Getting the broadcast right at planning time — with a hint, a higher threshold or good statistics — saves more.</p>
+<p>Always check the chosen strategy in <code>explain()</code> or the SQL tab: <code>BroadcastHashJoin</code>, <code>SortMergeJoin</code> or <code>ShuffledHashJoin</code>, and whether <code>BroadcastExchange</code> or <code>Exchange hashpartitioning</code> nodes appear beneath it.</p>
+
+<h4>6. Output size and exploding joins</h4>
+<p>For an inner equi-join, the output has, for each key <em>k</em>, <em>L<sub>k</sub></em> × <em>R<sub>k</sub></em> rows, where <em>L<sub>k</sub></em> and <em>R<sub>k</sub></em> are the counts of <em>k</em> on each side. When one side is unique per key (a dimension table, a features table with one row per user), output ≤ the other side's size. When both sides have duplicates, output can be enormous.</p>
+<p>Worked example. A table of 50 million product views is joined to a 2 million-row table of product reviews on <code>product_id</code>, intending to attach each product's average rating. But reviews has one row per review, not per product. A popular product with 200,000 views and 5,000 reviews produces 1 billion rows by itself. The job runs for hours and writes terabytes. The fix is to aggregate reviews to one row per product <em>before</em> the join. The general rule: <strong>know the grain of both sides</strong>, and assert uniqueness of the side you believe is unique (<code>SELECT key, count(*) … HAVING count(*) &gt; 1</code>, or a data test, de11).</p>
+<p>In ML pipelines, exploding joins are worse than slow; they are silently wrong. Duplicated training examples change class balance and the effective weight of users with more devices or more rows. A training-set builder should check row counts before and after each feature join: a left join of impressions to unique-per-user features must produce exactly as many rows as impressions.</p>
+<p>Two related tools avoid explosions. A <strong>semi join</strong> (<code>LEFT SEMI JOIN</code>, or <code>WHERE EXISTS</code>) keeps left rows that have at least one match, without duplicating them — the right tool for "keep events from users who are in the test group". An <strong>anti join</strong> (<code>LEFT ANTI JOIN</code>) keeps left rows with no match — "events from users not in the blocklist".</p>
+
+<h4>7. Skew: why one key ruins a stage</h4>
+<p>Real key distributions are rarely uniform. User activity, product popularity, merchant volume, words and URLs follow heavy-tailed distributions, often close to a <strong>Zipf</strong> distribution, where the <em>k</em>-th most common key occurs in proportion to roughly 1/<em>k</em>. Add the artificial hot keys every dataset has — nulls, empty strings, a "default" or "unknown" category, test and bot accounts, a placeholder merchant ID — and a few keys can own a large fraction of all rows.</p>
+<p>A shuffle join or group-by sends all rows of one key to one partition, so the partition holding a hot key is as large as that key's data, however many partitions there are. Worked example: 2 TB of events over 2,000 shuffle partitions should be 1 GB per partition. If one advertiser owns 30% of events, its partition receives 600 GB. Its task, with about 1.2 GB of execution memory, must sort 600 GB — spilling hundreds of times its memory to disk — and runs for hours, while the other 1,999 tasks finish in about a minute each. The stage, and so the job, takes as long as that one task. Doubling the cluster or the partition count makes the other tasks faster and leaves the straggler unchanged.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Bar chart of shuffle partition sizes: most around 1 GB, one at 600 GB; after an AQE skew split the hot partition becomes several tasks of a few GB each">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Shuffle read per task (GB), 2,000 partitions</text>
+    <line x1="40" y1="200" x2="620" y2="200" style="fill:none;stroke:var(--line-2)"/>
+    <rect x="50" y="194" width="14" height="6" style="fill:var(--s1)"/><rect x="68" y="195" width="14" height="5" style="fill:var(--s1)"/><rect x="86" y="194" width="14" height="6" style="fill:var(--s1)"/><rect x="104" y="193" width="14" height="7" style="fill:var(--s1)"/><rect x="122" y="194" width="14" height="6" style="fill:var(--s1)"/>
+    <rect x="140" y="40" width="14" height="160" style="fill:var(--crit)"/>
+    <rect x="158" y="194" width="14" height="6" style="fill:var(--s1)"/><rect x="176" y="195" width="14" height="5" style="fill:var(--s1)"/><rect x="194" y="194" width="14" height="6" style="fill:var(--s1)"/><rect x="212" y="194" width="14" height="6" style="fill:var(--s1)"/>
+    <text x="147" y="34" text-anchor="middle" style="fill:var(--crit)">600 GB</text>
+    <text x="135" y="220" text-anchor="middle" style="fill:var(--ink-2)">median ≈ 0.7 GB, max 600 GB</text>
+    <text x="135" y="238" text-anchor="middle" style="fill:var(--ink-2)">stage time = the red task</text>
+    <line x1="270" y1="120" x2="320" y2="120" style="fill:none;stroke:var(--ink-2);stroke-width:2"/>
+    <path d="M320,114 L330,120 L320,126 z" style="fill:var(--ink-2)"/>
+    <text x="300" y="108" text-anchor="middle" style="fill:var(--muted)">AQE split</text>
+    <text x="300" y="142" text-anchor="middle" style="fill:var(--muted)">or salting</text>
+    <rect x="360" y="194" width="10" height="6" style="fill:var(--s1)"/><rect x="374" y="195" width="10" height="5" style="fill:var(--s1)"/>
+    <rect x="388" y="180" width="10" height="20" style="fill:var(--accent)"/><rect x="402" y="180" width="10" height="20" style="fill:var(--accent)"/><rect x="416" y="180" width="10" height="20" style="fill:var(--accent)"/><rect x="430" y="180" width="10" height="20" style="fill:var(--accent)"/><rect x="444" y="180" width="10" height="20" style="fill:var(--accent)"/><rect x="458" y="180" width="10" height="20" style="fill:var(--accent)"/><rect x="472" y="180" width="10" height="20" style="fill:var(--accent)"/><rect x="486" y="180" width="10" height="20" style="fill:var(--accent)"/>
+    <text x="500" y="176" style="fill:var(--accent)">… 150 tasks × 4 GB</text>
+    <rect x="560" y="194" width="10" height="6" style="fill:var(--s1)"/><rect x="574" y="195" width="10" height="5" style="fill:var(--s1)"/>
+    <text x="480" y="220" text-anchor="middle" style="fill:var(--ink-2)">hot partition becomes many tasks;</text>
+    <text x="480" y="238" text-anchor="middle" style="fill:var(--ink-2)">other side's matching rows copied to each</text>
+  </g>
+</svg>
+<figcaption>Skew in one picture. The left side is what the Spark UI shows: a flat field of normal tasks and one enormous one. The right side is what skew handling achieves — the hot partition's data spread over many tasks — at the cost of copying the other side's matching rows into each of them.</figcaption>
+</figure>
+
+<h4>8. Fixing skew</h4>
+<p>Work through the options in roughly the order you should consider them.</p>
+<p><strong>(a) Remove junk keys.</strong> If the hot key is null, empty or a placeholder, it usually should not be joined at all: nulls never match in an inner or left equi-join (null ≠ null), yet they are shuffled into one partition anyway. Filter them before the join (for a left join, handle them separately and union them back with null columns). This is the cheapest fix and the most common.</p>
+<p><strong>(b) Broadcast the other side.</strong> If the side without the hot key is small enough, broadcasting it removes the shuffle and therefore the skew. 14 MB of merchants is a broadcast; 300 GB of user features is not — but the <em>hot keys' rows</em> of user features may be tiny, which leads to (d).</p>
+<p><strong>(c) Let AQE split skewed partitions.</strong> With AQE on (Spark 3.2+ default), a sort-merge join partition is treated as skewed when it is larger than <code>spark.sql.adaptive.skewJoin.skewedPartitionFactor</code> (5.0) times the median partition size <em>and</em> larger than <code>skewedPartitionThresholdInBytes</code> (256 MB). AQE splits it into sub-partitions of about the advisory size (64 MB) by grouping the map-output blocks, and duplicates the other side's corresponding partition for each sub-partition. In the example, the 600 GB partition becomes thousands of 64 MB pieces, or fewer larger ones, each joined against a copy of the matching user-features partition. It applies to the join types where splitting is valid (for example, the skewed side of an inner join, or the left side of a left outer join), and by default it is skipped if splitting would force an extra shuffle downstream (<code>spark.sql.adaptive.forceOptimizeSkewedJoin</code>, false). It also cannot help skew inside a group-by on the hot key if the aggregate needs all rows together. Check the SQL tab: a skew-split join is marked as such.</p>
+<p><strong>(d) Isolate hot keys.</strong> Find the hot keys (count by key, take those above a threshold). Split the big side into hot and normal rows. Join the normal rows with the usual shuffle join. Join the hot rows against <em>only the hot keys' rows of the other side</em>, which are few, using a broadcast join — no shuffle, no skew. Union the two results. This is explicit, predictable, and fast; its cost is code complexity and a list of hot keys that must be recomputed as data drifts.</p>
+<p><strong>(e) Salt the hot keys.</strong> When the other side's hot-key rows are too big to broadcast (both sides are large for that key), spread the key over N partitions artificially. On the big side, add a column <code>salt = floor(rand() * N)</code> for hot-key rows (0 for others). On the other side, replicate each hot-key row N times with <code>salt = 0 … N−1</code> (others get 0). Join on <code>(key, salt)</code>. Worked numbers: the hot advertiser's 600 GB of events with N = 150 becomes 150 partitions of 4 GB; if that advertiser has 2 GB of rows on the other side, replication adds 150 × 2 GB = 300 GB of shuffle — significant, but far better than one 600 GB task. Salting multiplies the other side by N for hot keys, so choose N from the hot key's size divided by a target partition size, and salt only hot keys.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Salting: the hot key's rows on the big side get salts 0 to 3 and go to four partitions; the other side's hot-key row is replicated four times, once per salt">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="130" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Big side (hot key A)</text>
+    <text x="510" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Other side</text>
+    <g style="font-family:var(--mono)">
+      <text x="40" y="48" style="fill:var(--ink)">A, salt=0</text><text x="40" y="66" style="fill:var(--ink)">A, salt=3</text><text x="40" y="84" style="fill:var(--ink)">A, salt=1</text><text x="40" y="102" style="fill:var(--ink)">A, salt=2</text><text x="40" y="120" style="fill:var(--ink)">A, salt=0 …</text>
+      <text x="150" y="48" style="fill:var(--muted)">B, salt=0</text><text x="150" y="66" style="fill:var(--muted)">C, salt=0</text>
+      <text x="440" y="48" style="fill:var(--ink)">A, salt=0</text><text x="440" y="66" style="fill:var(--ink)">A, salt=1</text><text x="440" y="84" style="fill:var(--ink)">A, salt=2</text><text x="440" y="102" style="fill:var(--ink)">A, salt=3</text>
+      <text x="540" y="48" style="fill:var(--muted)">B, salt=0</text><text x="540" y="66" style="fill:var(--muted)">C, salt=0</text>
+    </g>
+    <text x="510" y="128" text-anchor="middle" style="fill:var(--s2)">A's row replicated ×4</text>
+    <rect x="40" y="150" width="120" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="100" y="175" text-anchor="middle" style="fill:var(--ink)">task (A,0)</text>
+    <rect x="180" y="150" width="120" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="240" y="175" text-anchor="middle" style="fill:var(--ink)">task (A,1)</text>
+    <rect x="320" y="150" width="120" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="380" y="175" text-anchor="middle" style="fill:var(--ink)">task (A,2)</text>
+    <rect x="460" y="150" width="120" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="520" y="175" text-anchor="middle" style="fill:var(--ink)">task (A,3)</text>
+    <text x="320" y="218" text-anchor="middle" style="fill:var(--ink-2)">join on (key, salt): A's work runs as 4 parallel tasks; every A row still meets A's other-side row exactly once</text>
+  </g>
+</svg>
+<figcaption>Salting with N = 4. Random salts spread the hot key's many rows; replicating the other side's matching row once per salt guarantees every big-side row still finds its partner exactly once. The price is N copies of the other side's hot-key rows.</figcaption>
+</figure>
+<p><strong>(f) Pre-aggregate.</strong> If the job joins and then aggregates per key (spend per advertiser with advertiser attributes), aggregate the big side to one row per key <em>first</em> — the partial aggregation before the shuffle (de5) makes this cheap and skew-resistant because each map task sends one partial result per key — and join the small aggregate. Many skewed joins disappear once you notice the output grain was coarser than the input.</p>
+<p><strong>(g) Change the grain or the key.</strong> Sometimes the skew comes from joining at the wrong grain: joining impressions to "campaign" when "campaign × day" would spread the load and is what the features actually need.</p>
+
+<h4>9. Spill and executor OOM, with arithmetic</h4>
+<p>Memory decides whether a join is slow (spill) or dead (OOM). Two numbers matter: memory available per task, and the in-memory size of what a task must hold.</p>
+<p><strong>Memory per task.</strong> From de5: a 16 GB heap gives about 9.4 GB of unified memory; with 8 cores, about 1.2 GB per concurrent task if nothing is cached. A 32 GB heap with 4 cores gives about 4.7 GB per task.</p>
+<p><strong>In-memory size.</strong> Shuffle data is compressed and serialised; Parquet is encoded and compressed. In memory, rows are decoded into Spark's binary row format (each row with a null bitmap, fixed 8-byte slots for fixed-width fields and variable-length data appended), and hash tables add pointers and empty slots. A rough planning factor is that data expands 2–5× from compressed file or shuffle size to in-memory hash-table size, depending on column types and compression ratio — measure on your data.</p>
+<p>Worked: a shuffle hash join where the build-side partition is 800 MB of shuffle data. At a 3× expansion it needs about 2.4 GB of memory, which does not fit in 1.2 GB per task; on an executor with 4 cores and 4.7 GB per task, it fits. A broadcast of a 1.5 GB table (on disk) may need 4–6 GB in every executor plus on the driver while building it — on 16 GB executors that leaves little room for tasks, causing heavy spill everywhere, and at worst an OOM in the driver. A sort-merge join with a 10 GB partition and 1.2 GB per task will spill roughly eight times its memory to disk and survive, slowly.</p>
+<p>When joins OOM, the order of remedies is: fix skew (most "OOM" joins are skewed joins); reduce what each task holds (more partitions for even data, project fewer columns before the join, filter earlier); prefer SMJ over SHJ for large partitions; reduce concurrency per executor (fewer cores per executor, so each task gets more memory); only then add memory. For PySpark jobs, also check whether the error is a container kill from Python worker memory rather than the JVM heap (de5).</p>
+
+<h4>10. A worked training-set join</h4>
+<p>Build a daily training table: 3 billion impressions (projected to 12 columns, about 600 GB in shuffle format) joined to item features (5 million items, 400 MB projected), advertiser features (2 million advertisers, 150 MB), and user features (250 million users, 250 GB projected). Cluster: 100 executors, 8 cores, 32 GB heap (about 2.3 GB of execution memory per task).</p>
+<ol>
+<li><strong>Item and advertiser features</strong>: broadcast both. 550 MB × 100 executors = 55 GB of network; in memory perhaps 2 GB per executor — acceptable on a 32 GB heap. Raise the broadcast threshold or use hints, since the defaults would not broadcast them. These joins happen inside the impressions scan with no shuffle, and the hot advertiser problem from the introduction disappears.</li>
+<li><strong>User features</strong>: shuffle join on <code>user_id</code>. 850 GB of shuffle; 4,000 partitions gives about 210 MB per partition, comfortable for sort-merge. Check skew: bots and power users. Filter known bots first; let AQE split any remaining skewed partitions.</li>
+<li><strong>Checks</strong>: assert features tables are unique per key; assert output row count equals impressions; record null rates for each joined feature (a sudden jump means a key mismatch, such as a type change from integer to string IDs).</li>
+</ol>
+<p>Better still for a daily job: bucket impressions and user features by <code>user_id</code> into the same number of buckets so the user join needs no shuffle at all (de3), and make the features point-in-time correct (de12).</p>
+</section>
+
+<section data-field="deep">
+<h4>Why the planner's size estimates are so often wrong</h4>
+<p>A planner estimates a join input's size from file sizes or table statistics and then multiplies by estimated selectivities of every filter and join on the way. Each estimate assumes independence and uniformity — "the filter keeps 10% of rows", "each key matches 1.2 rows" — and errors compound multiplicatively through a plan. After two or three joins, estimates can be off by orders of magnitude in either direction. That is why Spark's static broadcast threshold is conservative (a wrongly broadcast 5 GB table is a disaster, a missed broadcast of a 50 MB table only a slowdown), and why AQE's runtime statistics are such a large improvement: it replaces estimates with measurements at every shuffle boundary. The residual risk is decisions made <em>before</em> the first shuffle, such as the broadcast of a scanned table; good table statistics and explicit hints remain the tools there.</p>
+
+<h4>AQE's skew split, mechanically</h4>
+<p>A sort-merge join partition on the reduce side is the concatenation of one block from each map task. AQE splits a skewed partition by grouping those map-output blocks into contiguous ranges whose total is about the target size, creating sub-partitions that each read a subset of map outputs. Each sub-partition must still meet every matching row from the other side, so the other side's corresponding partition is read in full by each sub-task — "replicated". Two consequences follow. First, if a single map task's block for the hot partition is itself enormous (because the input was clustered by that key), AQE cannot split below one block. Second, if both sides are skewed on the same key, splitting both would require pairing every left piece with every right piece — a cross-product of sub-tasks — which is why skew in both inputs for the same key is the hardest case and often needs pre-aggregation or redesign.</p>
+
+<h4>Join ordering and the size of intermediates</h4>
+<p>In a multi-way join, the order matters as much as the strategy. Joining a 3-billion-row fact table first to a selective dimension filter (say, "campaigns in the experiment", 2% of rows) and only then to large feature tables means the expensive joins process 60 million rows instead of 3 billion. Catalyst applies some reordering (and the cost-based optimiser, when enabled with statistics, applies more), but analysts and pipeline authors should consciously put the most selective joins and filters first, turn "filter by membership" joins into semi joins or broadcasts, and avoid accumulating wide intermediate rows — projecting columns away before each join reduces both shuffle bytes and memory per row.</p>
+
+<h4>Bloom-filter joins and runtime filtering</h4>
+<p>When a selective small side joins a large one, much of the large side's data is shuffled only to find no match. Runtime filtering builds a compact summary of the small side's keys — a min/max range, an IN-list, or a Bloom filter — and applies it to the large side's scan before the shuffle, sometimes even pruning files and row groups (dynamic partition pruning prunes whole storage partitions when the join key is a partition column of the large table). Spark includes dynamic partition pruning and, in recent versions, runtime Bloom-filter injection for some joins; the effect can be dramatic for star-schema queries. Check the plan for <code>dynamicpruning</code> or Bloom-filter expressions on scans to see whether it applied.</p>
+
+<h4>Skew in aggregations and windows</h4>
+<p>Joins are not the only skewed operations. A <code>groupBy</code> on a hot key is usually rescued by partial aggregation, because each map task reduces its share of the key to one partial result before the shuffle — but only for decomposable aggregates (sum, count, min, max, average via sum and count). Exact distinct counts, medians, <code>collect_list</code> and window functions partitioned by the hot key need all of a key's rows in one task. Remedies: approximate algorithms (HyperLogLog for distinct counts, t-digest or KLL for quantiles), two-stage aggregation with a salt (aggregate by key and salt, then by key), or redesigning the computation to a finer grain. Window functions over a skewed partition column are a particular trap in feature engineering ("for each user, the previous 50 events") — bot users with millions of events create gigantic window partitions; capping events per user before the window is often both correct and necessary.</p>
+
+<h4>When a different engine or layout is the real fix</h4>
+<p>Repeated daily joins of the same huge tables are a design smell. Options that remove the join cost rather than tuning it: storage-partitioned joins on co-bucketed tables (no shuffle); incremental processing that joins only new rows against stable tables; denormalising slowly changing attributes into the fact table at write time (de10); serving lookups from a key-value store during feature computation for small, frequently joined dimensions; or, for data that fits on one large machine, a single-node engine whose in-memory hash join avoids network shuffles entirely (de13).</p>
+</section>
+
+<section data-field="prod">
+<h4>Failure modes and their symptoms</h4>
+<p><strong>The straggler.</strong> A stage at 99% for hours. UI: max shuffle read and duration far above median, spill on one task. Cause: skewed key. Fix: section 8, starting with junk keys.</p>
+<p><strong>The plan flip.</strong> A job's runtime jumps by 5–20× with no code change. UI/SQL plan: a <code>BroadcastHashJoin</code> became <code>SortMergeJoin</code> (dimension grew past the threshold, or statistics changed), or the reverse — a broadcast that is now too big fails with a broadcast timeout or driver OOM. Fix: hints or thresholds based on measured sizes; keep plans of critical jobs and alert on strategy changes.</p>
+<p><strong>The explosion.</strong> Output rows or bytes far exceed inputs; jobs run out of disk on shuffle; training sets double. Cause: non-unique keys on a side believed unique, or a missing join condition. Fix: uniqueness tests, row-count assertions, and aggregating to the right grain before joining.</p>
+<p><strong>Silent key mismatch.</strong> Join succeeds but most feature columns are null. Causes: type mismatch (string <code>"00123"</code> versus integer 123), case or whitespace differences, IDs from different systems, time-zone shifted date keys. Fix: null-rate checks per joined feature, explicit casts and normalisation in silver.</p>
+<p><strong>Executor and driver OOM.</strong> Containers killed or Java OOMs during joins. Causes: skew, oversized broadcasts, shuffle hash joins on big partitions, too many cores per executor for the memory. Fix: section 9.</p>
+<p><strong>Shuffle fetch failures at scale.</strong> Very large shuffles with many map tasks and partitions stress shuffle services and networks; lost executors cause map-stage recomputation. Fix: fewer, larger tasks; external or remote shuffle; tuned shuffle-service thread and connection settings.</p>
+
+<h4>What to watch</h4>
+<p>For each join-heavy stage: the ratio of max to median shuffle read (alert above about 10–20), spill per task, the chosen join strategy, input and output row counts of each join (from the SQL tab's metrics), and null rates of joined columns in the output. For each table that is frequently a join's small side: its size over time relative to your broadcast threshold.</p>
+
+<h4>The case: Facebook's 60 TB Spark pipeline (2016)</h4>
+<p>In "Apache Spark @Scale: A 60 TB+ production use case" (Facebook Engineering blog, 31 August 2016, by Avery Ching, Sital Kedia and Shuojie Wang), Facebook described replacing an entity-ranking data pipeline built as three logical stages, each split into hundreds of smaller Hive jobs sharded by <code>entity_id</code>, which took roughly three days to run and offered no easy way to track progress. The Spark replacement combined the stages into one job, eliminating two temporary tables, and at full scale read 60 TB of compressed input and performed a 90 TB shuffle and sort — the core of a join-and-aggregate pipeline at a scale where every effect in this lesson is magnified.</p>
+<p>The post is valuable because it lists what broke. Task counts: with a 256 MB HDFS block size the job had over 250,000 tasks; raising the input split size to 2 GB cut the task count 8× (de5's partition sizing). Fetch failures in a 90 TB shuffle were common enough that they raised the maximum number of fetch failures per stage from 4 to 20 and fixed a case where fetch failures caused duplicate task runs. The driver became unresponsive from O(N²) bookkeeping when adding tasks (fixed in SPARK-13279). Executors hit out-of-memory errors in the sorter when its pointer array could not grow; forcing a spill instead raised capacity from 4 to 24 tasks per host (SPARK-13958) — exactly the spill-versus-OOM boundary of section 9. Performance fixes included a sorter memory leak worth about 30% CPU, caching shuffle index files to cut total shuffle fetch time by 50% (reducers had spent 10–15% of their time waiting on fetches), and avoiding reopening a file per partition in shuffle writes, worth up to 50% CPU at high partition counts. After several months in production the Spark pipeline showed 4.5–6× less CPU time, 3–4× less reserved CPU time and about 5× lower latency than the Hive pipeline.</p>
+<p>Many of these fixes are now in Spark itself, and AQE (Databricks' May 2020 post reports 32 TPC-DS queries sped up by more than 1.1× and up to 8×) automates partition coalescing, join conversion and skew splitting. But the shape of the problems is unchanged: at scale, the cost of a join is its shuffle, its memory per task and its slowest partition.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> see skew appear from a realistic key distribution, and watch salting and isolation flatten it. Python 3.12 standard library; about 15 minutes.</p>
+<ol>
+<li>Generate 2,000,000 join keys for a "big" table from a Zipf-like distribution over 100,000 keys: weight key <em>k</em> by <code>1 / k</code> and use <code>random.choices(range(1, 100_001), weights=w, k=2_000_000)</code>. Add 100,000 <code>None</code> keys to mimic nulls.</li>
+<li>Hash-partition into 200 partitions (<code>hash(k) % 200</code>, with nulls going to partition 0 as a single hash value would). Print the min, median and max partition sizes and the top 5 keys by count.</li>
+<li>Drop the null keys and recompute. Then isolate the top 10 keys (send them to a separate "broadcast" path) and recompute the remaining partition sizes.</li>
+<li>Instead of isolating, salt the top 10 keys with N = 20 (<code>(k, random.randrange(20))</code>) and recompute. Count how many extra rows the "small" side would need: 19 extra copies of each of the 10 hot keys' rows.</li>
+<li>Try next: change the partition count to 2,000 before any fix and note which statistic does not improve.</li>
+</ol>
+<p><strong>What to look for.</strong> With 1/<em>k</em> weights, key 1 alone holds about 8% of rows (1 / H(100,000) ≈ 1/12.1), so the max partition is many times the median — and the null partition is the biggest of all. Dropping nulls, then isolating or salting the hot keys, should bring max/median close to 1–2. Raising the partition count shrinks the median but leaves the max almost untouched, because one key cannot be split by hashing.</p>
+</section>
+
+<section data-field="drill">
+<p><b>Estimate and design: a skewed ads join</b></p>
+<p>A daily job joins <code>impressions</code> (4 billion rows, 1.6 TB after projection) to <code>advertiser_features</code> (50 million rows, one per advertiser, 40 GB after projection) on <code>advertiser_id</code>, then writes the joined training rows. Cluster: 150 executors, 8 cores each, 16 GB heap. Today one advertiser has 30% of impressions; 2% of impressions have a null <code>advertiser_id</code>. The job planned a sort-merge join with 2,000 shuffle partitions. Estimate what happens, then propose a fix with numbers.</p>
+<details><summary>Answer</summary>
+<p><strong>What happens.</strong> Both sides are shuffled by <code>advertiser_id</code>: about 1.64 TB. Evenly spread, 2,000 partitions would be about 820 MB each. But the hot advertiser's 30% is 480 GB, all in one partition, and the 2% nulls (32 GB) all hash to one partition too. With 16 GB heaps and 8 cores, each task has about 1.2 GB of execution memory, so the hot task sorts 480 GB through 1.2 GB — hundreds of spill rounds — and runs for hours; 1,998 tasks finish in about a minute each. AQE's skew split would qualify (480 GB is far above 5 × the median and 256 MB) and is the first thing to verify in the SQL plan; if the job writes directly after the join, no extra shuffle is needed and the split should apply.</p>
+<p><strong>Fix 1: nulls.</strong> Null never matches in the join; filter those 80 million rows out before the shuffle (or, if the training set needs them, union them back with null features after the join). Saves 32 GB of shuffle and removes the second straggler.</p>
+<p><strong>Fix 2: the hot advertiser.</strong> The other side has one row per advertiser, so the hot advertiser's features are one row. Isolate it: split impressions into the hot advertiser's rows and the rest; join the hot rows to that single features row with a broadcast (a 1-row table) — no shuffle; join the rest with the normal sort-merge join; union. The remaining shuffle is about 1.1 TB + 40 GB over 2,000 partitions: about 570 MB each, comfortable. Alternatively, notice that 40 GB of advertiser features is close to broadcastable if projected further: if the model needs 6 columns totalling 2 GB, broadcasting it (2 GB × 150 executors = 300 GB of network, perhaps 5–6 GB in memory per executor) removes the impressions shuffle entirely — but on a 16 GB heap that leaves too little room, so with these executors isolation is the better choice.</p>
+<p><strong>Fix 3: guardrails.</strong> Recompute the hot-key list daily from a cheap count by advertiser; alert when any key exceeds, say, 1% of rows; assert output row count equals filtered input impressions (one features row per advertiser).</p>
+</details>
+</section>

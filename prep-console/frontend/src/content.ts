@@ -7,6 +7,21 @@ import llm from "@content/tracks/llm.json";
 import aieng from "@content/tracks/aieng.json";
 import ts from "@content/tracks/ts.json";
 import swe from "@content/tracks/swe.json";
+import algo from "@content/tracks/algo.json";
+import product from "@content/tracks/product.json";
+import safety from "@content/tracks/safety.json";
+import dataeng from "@content/tracks/dataeng.json";
+import torch from "@content/tracks/torch.json";
+import cloud from "@content/tracks/cloud.json";
+import auth from "@content/tracks/auth.json";
+import recsys from "@content/tracks/recsys.json";
+import agent from "@content/tracks/agent.json";
+import evals from "@content/tracks/evals.json";
+import beh from "@content/tracks/beh.json";
+import k8s from "@content/tracks/k8s.json";
+import math from "@content/tracks/math.json";
+import db from "@content/tracks/db.json";
+import os from "@content/tracks/os.json";
 import gpu from "@content/tracks/gpu.json";
 import rs from "@content/tracks/rs.json";
 import mm from "@content/tracks/mm.json";
@@ -34,6 +49,8 @@ export type Ref = [kind: string, title: string, note: string, url: string];
 /** A learning topic or a design case — designs add primer and deep. */
 export interface Item {
   id: string; t: string; tag: string; sum: string; body: string;
+  /** Required on learning topics (sets their XP); design cases do not have one yet. */
+  difficulty?: Level;
   viz?: string; drill?: string; primer?: string; deep?: string;
   qa?: QA[]; refs?: Ref[];
   /* Long-form lesson fields (topic-writer schema); all optional so older topics still render. */
@@ -43,7 +60,7 @@ export interface Item {
   recap?: string[];
   glossary?: [term: string, definition: string][];
 }
-export interface Pattern { k: string; n: string; when: string; cx: string; tpl: string; trap: string }
+export interface Pattern { k: string; n: string; when: string; cx: string; tpl: string; trap: string; learn?: string }
 export interface Problem { id: string; t: string; p: string; d: Level; c: string; k: string }
 export interface BankQ { id: string; cat: string; d: Level; q: string; a: string; src?: string; srcView?: string; srcTitle?: string }
 export interface Week { w: number; t: string; focus: string; items: [string, string][] }
@@ -60,6 +77,21 @@ export const TRACKS = {
   ml: cast<Item[]>(ml), dl: cast<Item[]>(dl), llm: cast<Item[]>(llm),
   aieng: cast<Item[]>(aieng), ts: cast<Item[]>(ts),
   swe: cast<Item[]>(swe),
+  algo: cast<Item[]>(algo),
+  product: cast<Item[]>(product),
+  safety: cast<Item[]>(safety),
+  dataeng: cast<Item[]>(dataeng),
+  torch: cast<Item[]>(torch),
+  cloud: cast<Item[]>(cloud),
+  auth: cast<Item[]>(auth),
+  recsys: cast<Item[]>(recsys),
+  agent: cast<Item[]>(agent),
+  evals: cast<Item[]>(evals),
+  beh: cast<Item[]>(beh),
+  k8s: cast<Item[]>(k8s),
+  math: cast<Item[]>(math),
+  db: cast<Item[]>(db),
+  os: cast<Item[]>(os),
   gpu: cast<Item[]>(gpu),
   rs: cast<Item[]>(rs),
   mm: cast<Item[]>(mm),
@@ -88,7 +120,7 @@ export const VIEWS = cast<Record<string, ViewText>>(views);
 
 /* Quick checks on topics and designs also feed the question bank, flashcards and
    mock rounds. Which bank category each section's checks land in: */
-const TRACK_CAT: Record<TrackKey, string> = { ml: "ml", dl: "dl", llm: "llm", aieng: "sys", ts: "ts", swe: "swe", gpu: "gpu", rs: "rs", mm: "mm", net: "net", scale: "scale", py: "py" };
+const TRACK_CAT: Record<TrackKey, string> = { ml: "ml", dl: "dl", llm: "llm", aieng: "sys", ts: "ts", swe: "swe", algo: "algo", product: "product", safety: "safety", dataeng: "dataeng", torch: "torch", cloud: "cloud", auth: "auth", recsys: "recsys", agent: "agent", evals: "evals", beh: "beh", k8s: "k8s", math: "math", db: "db", os: "os", gpu: "gpu", rs: "rs", mm: "mm", net: "net", scale: "scale", py: "py" };
 const DESIGN_CAT: Record<DesignKey, string> = { hld: "sys", lld: "code", classic: "sys", infra: "sys", mlc: "mlc" };
 
 function derived(): BankQ[] {
@@ -110,15 +142,15 @@ export const BANK: BankQ[] = cast<BankQ[]>(bank).concat(derived());
 
 /* Pillars on the overview: each groups the tracked ids of one area. */
 export const PILLARS = [
-  { k: "dsa", n: "DSA", view: "dsa", color: "var(--s1)", ids: DSA.map(q => q.id) },
+  { k: "dsa", n: "DSA", view: "dsa", color: "var(--s1)", ids: [...DSA.map(q => q.id), ...TRACKS.algo.map(t => t.id)] },
   { k: "mlc", n: "ML coding", view: "mlc", color: "var(--s1)", ids: DESIGNS.mlc.map(t => t.id) },
-  { k: "ml", n: "ML foundations", view: "ml", color: "var(--s3)", ids: TRACKS.ml.map(t => t.id) },
-  { k: "dl", n: "Deep learning", view: "dl", color: "var(--s7)", ids: [...TRACKS.dl, ...TRACKS.gpu].map(t => t.id) },
-  { k: "llm", n: "LLM & GenAI", view: "llm", color: "var(--s2)", ids: [...TRACKS.llm, ...TRACKS.aieng, ...TRACKS.mm, ...TRACKS.rs].map(t => t.id) },
+  { k: "ml", n: "ML foundations", view: "ml", color: "var(--s3)", ids: [...TRACKS.ml, ...TRACKS.math, ...TRACKS.recsys].map(t => t.id) },
+  { k: "dl", n: "Deep learning", view: "dl", color: "var(--s7)", ids: [...TRACKS.dl, ...TRACKS.gpu, ...TRACKS.torch].map(t => t.id) },
+  { k: "llm", n: "LLM & GenAI", view: "llm", color: "var(--s2)", ids: [...TRACKS.llm, ...TRACKS.aieng, ...TRACKS.mm, ...TRACKS.rs, ...TRACKS.evals, ...TRACKS.agent, ...TRACKS.safety].map(t => t.id) },
   { k: "ts", n: "Time series", view: "ts", color: "var(--s6)", ids: TRACKS.ts.map(t => t.id) },
-  { k: "eng", n: "Engineering", view: "swe", color: "var(--s8)", ids: [...TRACKS.swe, ...TRACKS.py, ...TRACKS.scale, ...TRACKS.net].map(t => t.id) },
+  { k: "eng", n: "Engineering", view: "swe", color: "var(--s8)", ids: [...TRACKS.swe, ...TRACKS.py, ...TRACKS.scale, ...TRACKS.net, ...TRACKS.os, ...TRACKS.db, ...TRACKS.k8s, ...TRACKS.beh, ...TRACKS.auth, ...TRACKS.cloud, ...TRACKS.dataeng].map(t => t.id) },
   { k: "des", n: "System design", view: "classic", color: "var(--s4)",
-    ids: [...DESIGNS.classic, ...DESIGNS.infra, ...DESIGNS.hld, ...DESIGNS.lld].map(t => t.id) },
+    ids: [...DESIGNS.classic, ...DESIGNS.infra, ...DESIGNS.hld, ...DESIGNS.lld, ...TRACKS.product].map(t => t.id) },
   { k: "bank", n: "Question bank", view: "bank", color: "var(--s5)", ids: BANK.map(b => b.id) },
 ];
 export const ROADMAP_IDS = ROADMAP.flatMap(w => w.items.map(i => i[0]));
@@ -140,26 +172,41 @@ export const NAV: { g: string; items: NavItem[] }[] = [
     { v: "account", n: "Account & data", i: "AC" } ] },
   { g: "Drill", items: [
     { v: "dsa", n: "DSA problems", i: "DS", count: DSA.length },
+    { v: "algo", n: "DSA patterns", i: "AP", count: TRACKS.algo.length },
     { v: "mlc", n: "ML coding", i: "MC", count: DESIGNS.mlc.length },
     { v: "bank", n: "Question bank", i: "QB", count: BANK.length } ] },
   { g: "Learn", items: [
+    { v: "math", n: "Math for ML", i: "MA", count: TRACKS.math.length },
     { v: "ml", n: "ML foundations", i: "ML", count: TRACKS.ml.length },
+    { v: "recsys", n: "Search & recsys", i: "RC", count: TRACKS.recsys.length },
     { v: "dl", n: "Deep learning", i: "DL", count: TRACKS.dl.length },
+    { v: "torch", n: "PyTorch", i: "PT", count: TRACKS.torch.length },
     { v: "llm", n: "LLM & GenAI", i: "LM", count: TRACKS.llm.length },
     { v: "aieng", n: "AI engineering", i: "AE", count: TRACKS.aieng.length },
+    { v: "evals", n: "Evals & data", i: "EV", count: TRACKS.evals.length },
+    { v: "agent", n: "Agentic systems", i: "AG", count: TRACKS.agent.length },
     { v: "mm", n: "Multimodal AI", i: "MM", count: TRACKS.mm.length },
     { v: "rs", n: "Reasoning models", i: "RS", count: TRACKS.rs.length },
+    { v: "safety", n: "AI safety", i: "SF", count: TRACKS.safety.length },
     { v: "gpu", n: "GPU performance", i: "GP", count: TRACKS.gpu.length },
     { v: "ts", n: "Time series & AI", i: "TS", count: TRACKS.ts.length } ] },
   { g: "Engineering", items: [
     { v: "swe", n: "Software engineering", i: "SE", count: TRACKS.swe.length },
     { v: "py", n: "Python", i: "PY", count: TRACKS.py.length },
     { v: "scale", n: "Engineering at scale", i: "SC", count: TRACKS.scale.length },
-    { v: "net", n: "Networking", i: "NW", count: TRACKS.net.length } ] },
+    { v: "net", n: "Networking", i: "NW", count: TRACKS.net.length },
+    { v: "auth", n: "Auth & identity", i: "AU", count: TRACKS.auth.length },
+    { v: "os", n: "Operating systems", i: "OS", count: TRACKS.os.length },
+    { v: "k8s", n: "Docker & Kubernetes", i: "K8", count: TRACKS.k8s.length },
+    { v: "cloud", n: "Cloud fundamentals", i: "CL", count: TRACKS.cloud.length },
+    { v: "db", n: "Databases (DBMS)", i: "DB", count: TRACKS.db.length },
+    { v: "dataeng", n: "Data engineering", i: "DE", count: TRACKS.dataeng.length },
+    { v: "beh", n: "Behavioural interviews", i: "BI", count: TRACKS.beh.length } ] },
   { g: "Design", items: [
     { v: "classic", n: "Classic designs", i: "CD", count: DESIGNS.classic.length },
     { v: "infra", n: "Building blocks", i: "BB", count: DESIGNS.infra.length },
     { v: "hld", n: "AI system design", i: "HD", count: DESIGNS.hld.length },
+    { v: "product", n: "Product sense", i: "PS", count: TRACKS.product.length },
     { v: "lld", n: "Machine coding", i: "LD", count: DESIGNS.lld.length } ] },
 ];
 for (const it of NAV.flatMap(g => g.items)) {

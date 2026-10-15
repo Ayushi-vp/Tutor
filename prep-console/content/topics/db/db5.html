@@ -1,0 +1,563 @@
+<!-- topic source for db/db5; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "db5",
+  "t": "Storage engines: pages, heap files, B+ trees vs LSM trees, and write/read amplification",
+  "tag": "Internals",
+  "sum": "How a database lays bytes on disk: slotted pages and tuple headers, heap files and TOAST, B+ tree nodes, splits and the fan-out arithmetic for 100 million rows, LSM memtables, SSTables, Bloom filters and compaction, and how write, read and space amplification decide which engine fits a workload.",
+  "prereq": [
+    [
+      "sc4",
+      "Rows live in fixed-size pages cached in a buffer pool; a B-tree index finds one row in a few page reads; LSM trees trade read cost for write speed."
+    ],
+    [
+      "os10",
+      "The OS reads and writes storage in blocks through the page cache; fsync forces data to stable storage."
+    ],
+    [
+      "db1",
+      "Tables have primary keys; surrogate keys can be sequential integers or random UUIDs."
+    ]
+  ],
+  "myths": [
+    [
+      "A B-tree and a B+ tree are the same thing.",
+      "In a classic B-tree, internal nodes hold keys and their data, so a lookup may stop high in the tree. In a B+ tree, all data (or row pointers) live in the leaves, internal nodes hold only separator keys, and leaves are linked to their neighbours. That gives internal nodes a much higher fan-out and makes range scans a walk along the leaf level, which is why database 'B-tree' indexes are almost always B+ trees."
+    ],
+    [
+      "LSM trees are faster than B-trees.",
+      "They are faster at absorbing writes, because they turn random writes into sequential ones and batch them. Point reads may check several files (Bloom filters make most checks cheap), range scans must merge several sorted runs, and background compaction rewrites data many times, consuming disk bandwidth that competes with foreground work. Which is faster depends on the read/write mix and the hardware."
+    ],
+    [
+      "Writing a 100-byte row writes 100 bytes to disk.",
+      "A B-tree engine writes a WAL record and eventually the whole 8 KB (or 16 KB) page; after a checkpoint, PostgreSQL also logs a full-page image on the first change to a page. An LSM engine writes the WAL, then the same bytes again at flush and at every compaction level. Real write amplification is commonly 10x or more for both designs, just for different reasons."
+    ],
+    [
+      "Random UUID primary keys only cost a few extra bytes.",
+      "In a B+ tree, random keys spread inserts across every leaf page, so each insert touches a different page; once the index is bigger than memory, inserts need random reads, splits leave pages half full, and the write-ahead log grows with full-page images. Sequential or time-ordered keys keep inserts on the rightmost pages, which stay hot in cache."
+    ],
+    [
+      "Deleting rows frees disk space immediately.",
+      "In PostgreSQL a delete marks the row version dead; space is reclaimed for reuse by VACUUM but the file rarely shrinks. In an LSM engine a delete writes a tombstone, and the old value is only removed when compaction merges the tombstone with it, possibly much later. Disk usage after a big delete can even go up first."
+    ]
+  ],
+  "recap": [
+    "Databases read and write fixed-size pages (8 KB in PostgreSQL, 16 KB in InnoDB); a slotted page keeps a header, an array of line pointers growing down and tuples growing up, so rows can move inside the page without changing their address.",
+    "A heap file stores rows in no particular order; a row's address is (page, slot), and oversized values in PostgreSQL are compressed or moved out of line by TOAST above about 2 kB.",
+    "A B+ tree keeps data in linked leaves and only separator keys in internal nodes; fan-out of several hundred keeps a 100-million-row index at about four levels.",
+    "Inserting into a full leaf splits it in two and pushes a separator up; sequential keys fill pages at the right edge, random keys spread writes and leave pages partly empty.",
+    "An LSM tree writes to a WAL and an in-memory memtable, flushes sorted immutable SSTables, and merges them in the background by compaction.",
+    "LSM reads check the memtable and then each level, newest first; Bloom filters at about 10 bits per key cut wasted file reads to about 1%.",
+    "Write amplification is bytes written to storage per byte written by the user, read amplification is reads per query, space amplification is disk used per byte of live data.",
+    "B+ trees favour reads and in-place updates; LSM trees favour high write rates and compression; no structure minimises all three amplifications at once.",
+    "O'Neil's 1996 LSM paper was motivated by exactly this: a B-tree index on a fast-growing history table doubled the disk arms a 1,000-transactions-per-second system needed."
+  ],
+  "glossary": [
+    [
+      "B+ tree",
+      "A balanced search tree whose internal nodes hold only separator keys and whose leaves hold all entries, linked left to right for range scans."
+    ],
+    [
+      "Bloom filter",
+      "A compact bit array that answers 'definitely not present' or 'possibly present' for a key, used to skip files that cannot contain it."
+    ],
+    [
+      "Compaction",
+      "The background process in an LSM tree that merges sorted files, discarding overwritten values and deleted keys."
+    ],
+    [
+      "Fan-out",
+      "The number of children of an internal tree node; higher fan-out means a shallower tree."
+    ],
+    [
+      "Fill factor",
+      "The fraction of a page filled on insert or index build, leaving room for later updates; PostgreSQL B-tree leaves default to 90%."
+    ],
+    [
+      "Heap file",
+      "A table storage format in which rows are placed wherever there is free space, in no key order."
+    ],
+    [
+      "HOT update",
+      "Heap-only tuple update: a PostgreSQL update whose new row version fits on the same page and changes no indexed column, so no index needs a new entry (db10)."
+    ],
+    [
+      "Leveled compaction",
+      "An LSM strategy where each level is one sorted run about ten times bigger than the previous, giving low space and read amplification but higher write amplification."
+    ],
+    [
+      "Line pointer",
+      "A 4-byte slot in a PostgreSQL page header area giving the offset and length of one tuple; a row's address names the slot, not the byte offset."
+    ],
+    [
+      "LSM tree",
+      "Log-structured merge tree: writes go to memory and are flushed as immutable sorted files that are merged in the background."
+    ],
+    [
+      "LSN",
+      "Log sequence number: a position in the write-ahead log; each page records the LSN of its last change."
+    ],
+    [
+      "Memtable",
+      "The in-memory sorted structure an LSM engine writes to before flushing it to disk as an SSTable."
+    ],
+    [
+      "Page",
+      "The fixed-size unit (for example 8 KB) in which a database reads, caches and writes data."
+    ],
+    [
+      "Page split",
+      "Dividing a full B+ tree node into two nodes and inserting a new separator key into the parent."
+    ],
+    [
+      "Read amplification",
+      "The number of page or block reads needed to answer one query."
+    ],
+    [
+      "RUM conjecture",
+      "The observation that an access method can minimise at most two of read, update and memory (space) overhead."
+    ],
+    [
+      "Slotted page",
+      "A page layout with an array of slots pointing to variable-length records stored from the end of the page backwards."
+    ],
+    [
+      "Space amplification",
+      "Disk space used divided by the size of the live data."
+    ],
+    [
+      "SSD",
+      "Solid-state drive: flash storage with fast random reads, which erases in large blocks and wears out with writes."
+    ],
+    [
+      "SSTable",
+      "Sorted string table: an immutable file of key-value pairs in key order, with an index and usually a Bloom filter."
+    ],
+    [
+      "TID / ctid",
+      "A tuple identifier, the (page number, slot number) address of a row version in a PostgreSQL heap."
+    ],
+    [
+      "Tiered compaction",
+      "An LSM strategy that merges several similar-sized runs into one larger run, giving lower write amplification but more runs to read and more space."
+    ],
+    [
+      "TOAST",
+      "PostgreSQL's mechanism for compressing large values and storing them out of line in a separate table."
+    ],
+    [
+      "Tombstone",
+      "A marker written to an LSM tree to record a deletion; the key disappears only when compaction merges the tombstone with older versions."
+    ],
+    [
+      "Write amplification",
+      "Bytes written to storage divided by bytes the application asked to write."
+    ],
+    [
+      "Write-ahead log (WAL)",
+      "An append-only log of changes written and flushed before the changed pages, so a crash can be recovered (db8)."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why do databases use pages instead of reading individual rows?",
+      "Storage devices and the OS transfer data in blocks, and fetching 8 KB costs nearly the same as fetching 100 bytes, so grouping many rows per page amortises each I/O. Pages are also the unit of caching in the buffer pool and of logging and recovery, which keeps those mechanisms simple."
+    ],
+    [
+      "E",
+      "What is the difference between a B-tree and a B+ tree?",
+      "A B+ tree stores all entries in its leaves and only separator keys in internal nodes, and links leaves together. That raises internal fan-out (more keys per node because no data is stored there), keeps every lookup the same depth, and turns range scans into a sequential walk along the leaves."
+    ],
+    [
+      "E",
+      "Explain write amplification.",
+      "It is the ratio of bytes the storage device writes to bytes the application asked to write. A 100-byte update that causes an 8 KB page write and a WAL record has write amplification near 80; an LSM engine that rewrites data at each compaction level often has 10 to 30. High write amplification wears SSDs and caps throughput because the disk's bandwidth is spent rewriting."
+    ],
+    [
+      "M",
+      "How many levels does a B+ tree index on 100 million bigint keys need with 8 KB pages?",
+      "Each entry is about 20 bytes (key, row pointer, tuple header, line pointer), so an 8 KB page holds about 400 entries, or about 366 in a 90%-full leaf. 100 million / 366 ≈ 273,000 leaves; 273,000 / 407 ≈ 672 pages at the next level; 672 / 407 → 2; then one root: four levels. The top three levels are under 6 MB and stay in memory, so a lookup costs about one disk read for the leaf plus one for the heap row.",
+      "Follow-up: What changes with 16-byte UUID keys? — Entries grow to about 28 bytes, fan-out drops to around 290, and the tree has more leaves, but it is still four levels; the bigger effect of random UUIDs is insert locality, not height."
+    ],
+    [
+      "M",
+      "Walk through an LSM tree write and a point read.",
+      "Write: append to the WAL for durability, insert into the in-memory memtable, acknowledge. When the memtable fills, it becomes immutable and is flushed as a sorted SSTable to level 0; compaction later merges it into lower levels. Read: check the active and immutable memtables, then level-0 files newest first, then one file per lower level, using each file's Bloom filter to skip files that cannot contain the key; the first version found wins."
+    ],
+    [
+      "M",
+      "What do Bloom filters cost and buy in an LSM tree?",
+      "About 10 bits per key gives roughly a 1% false-positive rate, so a lookup for a key that a file does not contain reads the file's data only 1% of the time. For a billion keys that is about 1.25 GB of filters, which should stay in memory. They do nothing for range scans, which must merge every level, unless prefix filters are configured."
+    ],
+    [
+      "M",
+      "Compare leveled and tiered compaction.",
+      "Leveled keeps one sorted run per level, each about ten times larger than the one above, so reads check one file per level and space overhead is about 10%, but each byte is rewritten roughly ten times per level it moves through. Tiered (size-tiered) waits until there are several runs of similar size and merges them, writing each byte fewer times but leaving several overlapping runs per tier, so reads and temporary space are higher. Leveled suits read-heavy and space-sensitive workloads; tiered suits write-heavy ones."
+    ],
+    [
+      "M",
+      "Why do random UUIDv4 primary keys slow inserts down in PostgreSQL or InnoDB?",
+      "Each insert goes to a random leaf, so once the index outgrows memory most inserts need a random page read, every leaf page is dirtied repeatedly, and after each checkpoint the first change to each page writes a full-page image to the WAL. Splits in the middle of the key space leave many half-full pages. Sequential or time-ordered keys (bigint identity, UUIDv7) keep inserts on a few hot rightmost pages."
+    ],
+    [
+      "M",
+      "What is TOAST in PostgreSQL and why does it exist?",
+      "Rows must fit in an 8 KB page, so when a row exceeds about 2 kB, PostgreSQL first compresses large variable-length values and, if still too big, moves them to a separate TOAST table, leaving an 18-byte pointer in the row. Queries that do not select those columns never read the TOAST data, which keeps wide columns such as long text or JSON from slowing scans of the rest."
+    ],
+    [
+      "H",
+      "When would you choose an LSM-based store over a B+ tree database?",
+      "When writes dominate and arrive fast, especially as inserts of new keys: event and log ingestion, time series, message stores, metrics, write-heavy key-value workloads. LSM engines also compress better because files are immutable and written in large blocks. Choose a B+ tree when reads, range scans and in-place updates dominate and predictable read latency matters, or when you need the mature transactional features of PostgreSQL or InnoDB.",
+      "Follow-up: What is the operational risk unique to LSM? — Compaction debt: if writes outpace compaction, level-0 files pile up, reads slow down and the engine eventually stalls writes; you must provision disk bandwidth for compaction, not just for ingest."
+    ],
+    [
+      "H",
+      "Estimate the write amplification of a leveled LSM tree holding 1 TB with a size ratio of 10.",
+      "Levels are roughly 1 TB, 100 GB, 10 GB, 1 GB plus L0. Each byte is written to the WAL once and flushed once; then, moving down each of the four levels, merging a file into the next level rewrites about ten times its size of overlapping data in the worst case. That gives an upper estimate of 2 + 4 × 10 ≈ 42, and in practice RocksDB reports leveled write amplification often above 10, commonly 10-30.",
+      "Follow-up: How would you lower it? — A larger size ratio reduces levels but raises per-level cost; tiered or hybrid compaction lowers it substantially at the cost of read and space amplification; and larger memtables reduce the number of small L0 files."
+    ],
+    [
+      "H",
+      "What is the RUM conjecture?",
+      "It states that an access method can optimise for at most two of Read overhead, Update overhead and Memory (space) overhead, and must pay in the third. A B+ tree optimises reads and space, paying on updates; an LSM tree optimises updates and, with leveled compaction, space, paying on reads; a hash index with lots of free space optimises reads and updates, paying in memory. It is a useful frame for interview trade-off questions."
+    ],
+    [
+      "H",
+      "You store LLM call logs (append-only, 50,000 rows a second, queried by time range and user) in PostgreSQL and inserts are starting to lag. What do you look at in the storage layer?",
+      "Check index count and key locality first: each secondary index is another B+ tree to update per insert, and an index on a random key (a UUIDv4 id, a hash) touches random pages and produces full-page WAL images; switch ids to identity or UUIDv7 and drop unused indexes. Partition by time so each day's indexes are small and hot, and old partitions can be dropped instead of deleted. If the write rate keeps growing, a log-structured store (an LSM-based database or a columnar warehouse fed by a stream) fits append-heavy time-range workloads better."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "O'Neil, Cheng, Gawlick, O'Neil — The Log-Structured Merge-Tree (Acta Informatica, 1996)",
+      "The original LSM paper, motivated by a B-tree index on a history table that doubled a system's disk arms.",
+      "https://www.cs.umb.edu/~poneil/lsmtree.pdf"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Database Page Layout",
+      "The 24-byte page header, 4-byte line pointers, 23-byte tuple header and how they fit together.",
+      "https://www.postgresql.org/docs/current/storage-page-layout.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — TOAST",
+      "When large values are compressed or moved out of line, and the 2 kB thresholds.",
+      "https://www.postgresql.org/docs/current/storage-toast.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — B-Tree Indexes",
+      "PostgreSQL's B+ tree implementation, including deduplication and bottom-up deletion.",
+      "https://www.postgresql.org/docs/current/btree.html"
+    ],
+    [
+      "docs",
+      "RocksDB wiki — Leveled Compaction",
+      "Level targets, the size multiplier, L0 triggers and why write amplification is often above 10.",
+      "https://github.com/facebook/rocksdb/wiki/Leveled-Compaction"
+    ],
+    [
+      "docs",
+      "RocksDB wiki — Tuning Guide",
+      "Definitions of write, read and space amplification with worked numbers, memtables and flushing.",
+      "https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide"
+    ],
+    [
+      "docs",
+      "RocksDB wiki — Bloom Filter",
+      "Bits per key versus false-positive rate: about 10 bits per key for 1%.",
+      "https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>In 1995, Patrick O'Neil and his colleagues did a cost calculation for a bank-like system running the TPC-A benchmark at 1,000 transactions per second. Each transaction updated an account balance and appended a 50-byte row to a History table. The account updates alone already needed about 2,000 disk I/Os per second, which at roughly 40 I/Os per second per disk arm of the time meant about 50 disk arms. Then they asked: what does it cost to add an index on the History table by account id, so a customer can see their recent activity?</p>
+<p>The answer was startling. Twenty working days of history is 576 million index entries, 9.2 GB, about 2.3 million leaf pages, far more than memory. Because account ids arrive in random order, every new history row lands on a random leaf page of the B-tree, which must be read from disk and later written back. That is another 2,000 I/Os per second, another 50 disk arms. One index doubled the disk cost of the whole system. Their paper, published in 1996, proposed a different structure for exactly this situation: the <strong>log-structured merge tree</strong>, which collects new index entries in memory and merges them into disk in large sequential batches, the way a merge sort does.</p>
+<p>The disks have changed since then, but the tension has not. A B+ tree, the structure behind nearly every relational index, updates data in place and is superb for reads. An LSM tree, the structure behind RocksDB, Cassandra, ScyllaDB, LevelDB and many time-series and log stores, appends and merges and is superb for writes. Every storage engine is a set of choices about how bytes are laid out on pages, and those choices decide how many times each byte you write is rewritten, how many pages each query reads, and how much disk is wasted.</p>
+<p>The engineering-at-scale lesson sc4 introduced pages, the buffer pool, B-trees and LSM trees as tools for system design. This lesson opens them up. You will see the exact layout of a PostgreSQL page and row, why a row has a two-part address, how a B+ tree node splits, the arithmetic that gives a 100-million-row index its height, how an LSM tree's memtable, SSTables, Bloom filters and compaction work together, and how to reason about write, read and space amplification with real numbers. That vocabulary is what lets you explain, rather than guess, why a UUID key slowed down inserts or why a Cassandra cluster's disk bandwidth is mostly spent on compaction.</p>
+</section>
+
+<section data-field="primer">
+<h4>Two filing strategies</h4>
+<p>Imagine a library that receives thousands of new index cards a day. One librarian keeps a single, perfectly sorted card catalogue: each new card is walked to its exact place among the drawers and slotted in. Finding a card is fast, since the catalogue is always sorted and you can jump straight to the right drawer. But every new card means a walk to a different drawer, and when a drawer is full it must be split into two, which means relabelling. That is a <strong>B+ tree</strong>: in-place, always sorted, read-friendly.</p>
+<p>A second librarian keeps an inbox on the desk. New cards go into the inbox, which is kept sorted because it is small. When the inbox is full, its cards are bound into a small sorted booklet and put on a shelf. Every so often, several booklets are merged into one bigger sorted booklet, and the old ones are thrown away. Adding a card is nearly free. Finding a card means checking the inbox, then the newest booklet, then older ones, until you find it, although a quick index on each booklet's cover ("definitely not in here") lets you skip most of them. That is an <strong>LSM tree</strong>: append, sort in memory, merge later, write-friendly.</p>
+<p>The analogy breaks in one place that matters: the second librarian's merging is not free. Every card is copied into a new booklet each time booklets are merged, so over its life a card may be copied ten or twenty times. That hidden copying is <strong>write amplification</strong>, and it is the price the LSM pays for cheap inserts.</p>
+<h4>Everything happens in pages</h4>
+<p>Both strategies work in fixed-size blocks called <strong>pages</strong>: 8 KB in PostgreSQL, 16 KB by default in MySQL's InnoDB, 4 KB by default in SQLite. A page is the unit read from disk, cached in memory (the buffer pool), written back and logged. Because reading 8 KB from an SSD costs about the same as reading 100 bytes, the whole design of a storage engine is about putting the rows a query needs into as few pages as possible, and touching as few pages as possible on each write.</p>
+<p>So three questions describe any engine, and this lesson answers them for both designs. How are rows laid out inside a page? How are pages organised so the right one can be found? And when data changes, which pages are rewritten, and how many times?</p>
+<h4>The three amplifications</h4>
+<p>The answers boil down to three ratios, named in RocksDB's tuning guide. <strong>Write amplification</strong> is bytes written to storage divided by bytes written by the application: if you write 10 MB/s and the disk writes 30 MB/s, it is 3. <strong>Read amplification</strong> is the number of page reads per query: five pages to answer a lookup is 5. <strong>Space amplification</strong> is disk used divided by live data: 100 MB on disk for 10 MB of data is 10. A B+ tree has low read and space amplification and pays in write amplification on updates; an LSM tree has low write cost per insert and pays in reads and in compaction rewrites. Keep these three numbers in mind; every design choice below moves them.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Inside a page: the slotted layout</h4>
+<p>A page must hold variable-length rows, let rows be added and removed, and give each row an address that does not change when other rows move. The standard solution is the <strong>slotted page</strong>. PostgreSQL's documentation gives its exact layout for an 8 KB page:</p>
+<ul>
+<li>A <strong>page header</strong> of 24 bytes: the page's position in the WAL (its LSN, used in recovery, db8), a checksum, flags, and two offsets, <code>pd_lower</code> and <code>pd_upper</code>, marking the start and end of free space.</li>
+<li>An array of <strong>line pointers</strong> (item identifiers), 4 bytes each, growing <em>forward</em> from the header. Each holds the offset and length of one tuple.</li>
+<li><strong>Free space</strong> in the middle.</li>
+<li><strong>Tuples</strong> (row versions) stored from the <em>end</em> of the page backwards.</li>
+<li>An optional <strong>special space</strong> at the very end, used by index pages (a B-tree page keeps sibling pointers there) and empty on heap pages.</li>
+</ul>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Slotted page: 24-byte header, line pointers growing right, free space, tuples growing left from the end, special space at the end">
+  <defs><marker id="db5-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="40" width="600" height="70" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <rect x="20" y="40" width="60" height="70" style="fill:var(--s1);fill-opacity:.2;stroke:var(--s1)"/>
+    <text x="50" y="70" text-anchor="middle" style="fill:var(--ink)">header</text>
+    <text x="50" y="86" text-anchor="middle" style="fill:var(--muted)">24 B</text>
+    <rect x="80" y="40" width="36" height="70" style="fill:var(--accent);fill-opacity:.15;stroke:var(--accent)"/>
+    <rect x="116" y="40" width="36" height="70" style="fill:var(--accent);fill-opacity:.15;stroke:var(--accent)"/>
+    <rect x="152" y="40" width="36" height="70" style="fill:var(--accent);fill-opacity:.15;stroke:var(--accent)"/>
+    <text x="98" y="80" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">1</text>
+    <text x="134" y="80" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">2</text>
+    <text x="170" y="80" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">3</text>
+    <text x="300" y="80" text-anchor="middle" style="fill:var(--muted)">free space</text>
+    <line x1="200" y1="75" x2="240" y2="75" marker-end="url(#db5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="400" y1="75" x2="360" y2="75" marker-end="url(#db5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="410" y="40" width="60" height="70" style="fill:var(--s3);fill-opacity:.2;stroke:var(--s3)"/>
+    <rect x="470" y="40" width="80" height="70" style="fill:var(--s3);fill-opacity:.2;stroke:var(--s3)"/>
+    <rect x="550" y="40" width="70" height="70" style="fill:var(--s3);fill-opacity:.2;stroke:var(--s3)"/>
+    <text x="440" y="80" text-anchor="middle" style="fill:var(--ink)">tuple 3</text>
+    <text x="510" y="80" text-anchor="middle" style="fill:var(--ink)">tuple 2</text>
+    <text x="585" y="80" text-anchor="middle" style="fill:var(--ink)">tuple 1</text>
+    <path d="M98,110 C98,170 585,170 585,112" marker-end="url(#db5-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <path d="M134,110 C134,155 510,155 510,112" marker-end="url(#db5-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <path d="M170,110 C170,140 440,140 440,112" marker-end="url(#db5-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="80" y="30" style="fill:var(--ink-2)">line pointers (4 B each) grow →</text>
+    <text x="400" y="30" style="fill:var(--ink-2)">← tuples grow from the end</text>
+    <text x="20" y="200" style="fill:var(--ink)">A row's address is (page, slot), e.g. ctid (7, 2). Compacting the page moves tuple bytes; the slot keeps the address valid.</text>
+  </g>
+</svg>
+<figcaption>The two-ended layout lets the page hold any mix of row sizes until the line pointers and tuples meet in the middle. The indirection through slots is what lets the engine defragment a page without updating any index that points into it.</figcaption>
+</figure>
+<p>A row's physical address is therefore (page number, slot number), which PostgreSQL calls the <strong>TID</strong> or <code>ctid</code>. You can see it with <code>SELECT ctid, * FROM t</code>. Indexes store TIDs, not byte offsets, so when the engine compacts a page to reclaim the space of deleted tuples, only the line pointers change, and every index entry pointing to (7, 2) is still correct.</p>
+<p>Each tuple has its own overhead: a fixed header of 23 bytes on most machines (padded to 24 by alignment), holding the transaction ids that created and deleted this version, flags and a pointer to a newer version (the machinery of MVCC, db9), then a null bitmap if any column is NULL, then the column data, each column aligned to its type's boundary. Do the arithmetic for a narrow table of three bigints: 24 bytes of header plus 24 of data plus a 4-byte line pointer is 52 bytes per row, so about 156 rows fit in an 8 KB page, and nearly half of each row is overhead. That is why the per-row cost of PostgreSQL tables is often surprising, and why ordering columns from widest to narrowest can save the padding bytes that alignment inserts between, say, a 1-byte boolean and an 8-byte bigint.</p>
+
+<h4>2. Heap files and large values</h4>
+<p>A PostgreSQL table is a <strong>heap file</strong>: a sequence of pages in which rows are placed wherever there is room, in no key order. To insert, the engine consults the <strong>free space map</strong>, a small structure recording roughly how much space each page has, finds a page with enough room, and appends the tuple there. A full table scan reads pages in order; a lookup through an index follows the stored TID straight to the right page and slot. MySQL's InnoDB is different: its tables are stored <em>inside</em> the primary key's B+ tree, with rows in the leaves in key order, a design called a clustered index that db6 and db10 compare in detail.</p>
+<p>A row must fit in a page, so what about a 50 KB JSON document or a 1 MB text field? PostgreSQL's answer is <strong>TOAST</strong> (The Oversized-Attribute Storage Technique). When a row would be wider than <code>TOAST_TUPLE_THRESHOLD</code>, normally 2 kB, PostgreSQL first compresses its large variable-length values, and if the row is still too wide, moves them into a separate TOAST table in chunks, leaving an 18-byte pointer in the row. Two consequences matter in practice. Queries that do not select the big column never read the TOAST table, so wide columns do not slow scans of the narrow ones. But updating any column of a row whose large value is TOASTed usually leaves the TOAST data in place (the docs note unchanged fields are preserved as-is), whereas fetching that value costs extra reads. Storing prompt and completion texts of LLM calls in the same table as their metadata works well for exactly this reason: the metadata scans stay fast.</p>
+
+<h4>3. The B+ tree: structure</h4>
+<p>A <strong>B+ tree</strong> is a balanced tree of pages. <strong>Leaf pages</strong> hold the index entries, each a key and a pointer to the row (a TID in PostgreSQL), sorted by key, and each leaf links to its left and right neighbours. <strong>Internal pages</strong> hold only <em>separator keys</em> and pointers to child pages: a separator says "keys below me go left, keys at or above me go right". The <strong>root</strong> is the single top page. Every leaf is the same distance from the root, so every lookup costs the same number of page reads.</p>
+<p>A lookup for key 42 starts at the root, binary-searches its separators to find which child covers 42, reads that child, repeats, and arrives at a leaf, where it binary-searches for 42 and follows the TID to the heap. A range scan for keys 40 to 60 does one descent to the leaf containing 40, then walks right along the leaf chain until it passes 60, without returning to the upper levels. That leaf chain is the "+" in B+ tree and the reason these indexes handle <code>BETWEEN</code>, <code>ORDER BY</code> and <code>LIMIT</code> so well.</p>
+<p>The power of the structure is its <strong>fan-out</strong>, the number of children per internal page. Because internal pages hold only small separators, one 8 KB page can point to hundreds of children, and the height of the tree grows with the logarithm of the row count in base several hundred.</p>
+
+<h4>4. Fan-out and height, worked for 100 million rows</h4>
+<p>Compute it for a PostgreSQL index on a bigint column. Each leaf entry is an index tuple: an 8-byte header (which holds the TID), the 8-byte key, plus a 4-byte line pointer, so about 20 bytes. Usable space per page is 8,192 minus the 24-byte page header and 16 bytes of B-tree special space, about 8,152 bytes. Internal pages therefore hold about 8,152 / 20 ≈ 407 entries. Leaves are built 90% full by default (the B-tree <strong>fill factor</strong>, which leaves room for later inserts), so about 366 entries per leaf.</p>
+<ul>
+<li>Leaves: 100,000,000 / 366 ≈ 273,225 pages, about 2.1 GB.</li>
+<li>Level above: 273,225 / 407 ≈ 672 pages, about 5.3 MB.</li>
+<li>Level above that: 672 / 407 → 2 pages.</li>
+<li>Root: 1 page.</li>
+</ul>
+<p>Four levels. The lab computes the same thing and shows that a million rows need three levels and ten billion still need only four (27 million leaves, then about 67,000, then 165, then one root), which is the logarithm at work: each extra level multiplies capacity by about 400. The practical point is about memory. The upper three levels together are about 5 MB and will be in the buffer pool after the first few queries, so a lookup costs one leaf read (and one heap read) from disk at worst. That is the "find one row among billions in four reads" from sc4, with the numbers behind it.</p>
+<p>Wider keys lower the fan-out. A 16-byte UUID makes entries about 28 bytes, fan-out about 290 and leaves about 3.1 GB for 100 million rows, still four levels. Key size affects index size and cache efficiency far more than height. A text key of 60 bytes, though, drops fan-out to about 120 and makes everything bigger, which is one reason to index short surrogate keys and keep long strings out of composite indexes when possible.</p>
+
+<h4>5. Inserts and page splits</h4>
+<p>To insert a key, descend to the leaf where it belongs and add the entry in sorted position. If the leaf has room, that is the whole write: one page modified. If the leaf is full, it <strong>splits</strong>: a new page is allocated, roughly half the entries move to it, the leaf chain is relinked, and a new separator key (the first key of the new page) is inserted into the parent. If the parent is also full, it splits too, and in the rare case the root splits, a new root is created and the tree grows one level taller. Growth always happens at the top, which is why every leaf stays at the same depth.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Leaf split: inserting key 25 into a full leaf holding 10 20 30 40 splits it into 10 20 25 and 30 40, and separator 30 is added to the parent">
+  <defs><marker id="db5-down" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Before: insert 25 into a full leaf</text>
+    <rect x="60" y="34" width="140" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="130" y="53" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">parent: 50 | 90</text>
+    <rect x="20" y="96" width="200" height="28" rx="4" style="fill:var(--crit);fill-opacity:.1;stroke:var(--crit)"/>
+    <text x="120" y="115" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">10 20 30 40 (full)</text>
+    <line x1="100" y1="62" x2="100" y2="94" marker-end="url(#db5-down)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="20" y="150" style="fill:var(--muted)">One leaf, four slots for this example</text>
+    <line x1="250" y1="80" x2="300" y2="80" marker-end="url(#db5-down)" style="fill:none;stroke:var(--ink-2);stroke-width:1.5"/>
+    <text x="330" y="20" style="fill:var(--ink);font-weight:600">After: split and push up a separator</text>
+    <rect x="400" y="34" width="170" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="485" y="53" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">parent: 30 | 50 | 90</text>
+    <rect x="330" y="96" width="140" height="28" rx="4" style="fill:var(--good);fill-opacity:.1;stroke:var(--good)"/>
+    <text x="400" y="115" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">10 20 25</text>
+    <rect x="490" y="96" width="130" height="28" rx="4" style="fill:var(--good);fill-opacity:.1;stroke:var(--good)"/>
+    <text x="555" y="115" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">30 40</text>
+    <line x1="430" y1="62" x2="410" y2="94" marker-end="url(#db5-down)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="460" y1="62" x2="540" y2="94" marker-end="url(#db5-down)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="470" y1="110" x2="488" y2="110" marker-end="url(#db5-down)" style="fill:none;stroke:var(--accent)"/>
+    <text x="330" y="150" style="fill:var(--muted)">leaf chain relinked: left → right</text>
+    <text x="20" y="190" style="fill:var(--ink)">Pages written by one insert: the old leaf, the new leaf, the parent (and its WAL records).</text>
+    <text x="20" y="210" style="fill:var(--ink)">Random keys: splits happen anywhere and leave both halves about half full.</text>
+    <text x="20" y="230" style="fill:var(--ink)">Increasing keys: PostgreSQL splits the rightmost leaf unevenly, keeping the left page nearly full.</text>
+  </g>
+</svg>
+<figcaption>A split costs three page writes instead of one and leaves room in both halves. Where the splits happen depends entirely on the order keys arrive, which is why key choice shapes insert performance.</figcaption>
+</figure>
+<p>Key order now matters a great deal. With <strong>increasing keys</strong> (an identity column, a timestamp, a UUIDv7), every insert goes to the rightmost leaf. Only that one page and its parent are hot, they stay in memory, and PostgreSQL recognises the pattern and splits the rightmost page so the left half stays nearly full, so the index ends up densely packed. With <strong>random keys</strong> (UUIDv4, hashes), every insert goes to a different leaf. Once the index exceeds memory, each insert needs a random page read; splits occur everywhere, leaving pages around half to three-quarters full on average; and every leaf is dirtied repeatedly. The lab measures it in SQLite: inserting 300,000 random 16-byte keys took about 1.9 s versus about 0.5 s for sequential keys, roughly 3.5 times slower, even though both files ended up about the same size (SQLite redistributes entries among sibling pages on a split, so its fill penalty is smaller than PostgreSQL's 50/50 split). In PostgreSQL the gap widens further because of full-page writes, explained in section 9.</p>
+<p>Deletes are handled more lazily than textbooks suggest. Real engines rarely merge underfull pages eagerly; PostgreSQL marks index entries dead and removes them during VACUUM or opportunistically when a page would otherwise split ("bottom-up deletion", added in version 14), and only fully empty pages are removed from the tree. An index that has had most of its rows deleted can therefore stay large until it is rebuilt with <code>REINDEX</code>.</p>
+
+<h4>6. The LSM tree: the write path</h4>
+<p>An LSM tree never updates data in place. Follow one write, <code>put("user:42", "Ana")</code>, through a RocksDB-style engine:</p>
+<ol>
+<li><strong>WAL.</strong> The change is appended to a write-ahead log on disk, a sequential append, so it survives a crash.</li>
+<li><strong>Memtable.</strong> The key and value are inserted into the <strong>memtable</strong>, an in-memory sorted structure (RocksDB uses a skip list). The write is now acknowledged. No data page was read or written.</li>
+<li><strong>Flush.</strong> When the memtable reaches its size limit (RocksDB's <code>write_buffer_size</code>), it becomes immutable, a new memtable takes its place, and a background thread writes the immutable one to disk as an <strong>SSTable</strong> (sorted string table): an immutable file of key-value pairs in key order, divided into blocks, with a block index and a Bloom filter. This file lands in <strong>level 0</strong>. Its WAL segment can now be discarded.</li>
+<li><strong>Compaction.</strong> Level-0 files overlap each other in key range, since each is a separate memtable dump. When their number reaches a trigger (<code>level0_file_num_compaction_trigger</code>), compaction merges them with the overlapping files of level 1, producing new non-overlapping files in level 1 and deleting the inputs. When level 1 exceeds its target size, some of its files are merged into level 2, and so on. Each level's target is about ten times the previous one (<code>max_bytes_for_level_multiplier</code> = 10).</li>
+</ol>
+<p>Updates and deletes follow the same path. An update is just a newer version of the key; the old version stays in an older file until compaction merges the two and keeps only the newest. A delete writes a <strong>tombstone</strong>, a marker saying "this key is deleted", which hides older versions from reads and is itself dropped once compaction has carried it to the bottom level. This is what "log-structured" means: the storage is a sequence of immutable sorted runs, newest on top, rather than a set of pages edited in place.</p>
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="LSM write path: write goes to WAL and memtable, memtable flushes to level 0 SSTables, compaction merges into levels 1, 2 and 3, each about ten times larger">
+  <defs><marker id="db5-lsm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="20" width="110" height="36" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="75" y="43" text-anchor="middle" style="fill:var(--ink)">put(k, v)</text>
+    <line x1="130" y1="38" x2="178" y2="28" marker-end="url(#db5-lsm)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="130" y1="38" x2="178" y2="62" marker-end="url(#db5-lsm)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="180" y="12" width="150" height="28" rx="4" style="fill:var(--s4);fill-opacity:.15;stroke:var(--s4)"/>
+    <text x="255" y="31" text-anchor="middle" style="fill:var(--ink)">WAL (sequential append)</text>
+    <rect x="180" y="50" width="150" height="28" rx="4" style="fill:var(--s1);fill-opacity:.15;stroke:var(--s1)"/>
+    <text x="255" y="69" text-anchor="middle" style="fill:var(--ink)">memtable (in RAM, sorted)</text>
+    <text x="345" y="69" style="fill:var(--muted)">memory</text>
+    <line x1="20" y1="90" x2="620" y2="90" style="fill:none;stroke:var(--line-2);stroke-dasharray:5 4"/>
+    <text x="345" y="106" style="fill:var(--muted)">disk</text>
+    <line x1="255" y1="78" x2="255" y2="114" marker-end="url(#db5-lsm)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="262" y="102" style="fill:var(--ink-2)">flush</text>
+    <text x="20" y="133" style="fill:var(--ink);font-weight:600">L0</text>
+    <rect x="200" y="118" width="40" height="22" rx="3" style="fill:var(--s2);fill-opacity:.2;stroke:var(--s2)"/>
+    <rect x="245" y="118" width="40" height="22" rx="3" style="fill:var(--s2);fill-opacity:.2;stroke:var(--s2)"/>
+    <rect x="290" y="118" width="40" height="22" rx="3" style="fill:var(--s2);fill-opacity:.2;stroke:var(--s2)"/>
+    <text x="345" y="133" style="fill:var(--muted)">overlapping SSTables</text>
+    <text x="20" y="168" style="fill:var(--ink);font-weight:600">L1</text>
+    <rect x="200" y="153" width="200" height="22" rx="3" style="fill:var(--s3);fill-opacity:.2;stroke:var(--s3)"/>
+    <text x="410" y="168" style="fill:var(--muted)">1 sorted run, e.g. 1 GB</text>
+    <text x="20" y="203" style="fill:var(--ink);font-weight:600">L2</text>
+    <rect x="140" y="188" width="320" height="22" rx="3" style="fill:var(--s5);fill-opacity:.2;stroke:var(--s5)"/>
+    <text x="470" y="203" style="fill:var(--muted)">× 10 → 10 GB</text>
+    <text x="20" y="238" style="fill:var(--ink);font-weight:600">L3</text>
+    <rect x="60" y="223" width="480" height="22" rx="3" style="fill:var(--s6);fill-opacity:.2;stroke:var(--s6)"/>
+    <text x="550" y="238" style="fill:var(--muted)">× 10 → 100 GB</text>
+    <path d="M335,140 C360,145 360,150 340,155" marker-end="url(#db5-lsm)" style="fill:none;stroke:var(--accent)"/>
+    <path d="M405,175 C430,180 430,185 420,190" marker-end="url(#db5-lsm)" style="fill:none;stroke:var(--accent)"/>
+    <path d="M465,210 C490,215 490,220 480,224" marker-end="url(#db5-lsm)" style="fill:none;stroke:var(--accent)"/>
+    <text x="440" y="150" style="fill:var(--accent)">compaction merges down</text>
+    <text x="20" y="264" style="fill:var(--ink-2)">A read checks memtable → L0 files (newest first) → one file per level; first version found wins.</text>
+  </g>
+</svg>
+<figcaption>Writes touch only the WAL and memory; everything below the dashed line is written in large sequential batches by background work. The cost reappears as compaction, which rewrites data as it moves down levels that are each ten times larger.</figcaption>
+</figure>
+
+<h4>7. The LSM tree: the read path and Bloom filters</h4>
+<p>A point read for <code>user:42</code> must find the newest version. It checks the active memtable, then any immutable memtables, then each level-0 file from newest to oldest (they overlap, so any of them might hold the key), then, in each lower level, the single file whose key range covers <code>user:42</code> (levels below 0 are non-overlapping, so a binary search over file boundaries picks one). The first version found, possibly a tombstone, is the answer.</p>
+<p>Without help, a key that exists only in the bottom level costs a read in every level above it. The help is a <strong>Bloom filter</strong> per file: a bit array built from every key in the file by setting a few bit positions chosen by hash functions. To test a key, compute the same positions; if any bit is 0, the key is <em>definitely not</em> in the file and the file is skipped without reading its data. If all are 1, the key is <em>probably</em> there. RocksDB's documentation gives the trade-off: about 10 bits per key yields roughly a 1% false-positive rate, and 15.5 bits per key about 0.1%, with diminishing returns beyond that. With 10 bits per key, a lookup that passes through five levels before finding its key wastes on average 0.05 data-block reads. The cost is memory: a billion keys at 10 bits each is about 1.25 GB of filters, which must stay cached to be useful.</p>
+<p>Range scans get no help from Bloom filters, since "keys between a and b" is not a single key to test. A range scan opens an iterator on the memtable and on every relevant file in every level and merges them, like the merge step of merge sort, skipping versions shadowed by newer ones and tombstones. That is why read amplification for range scans in an LSM tree is fundamentally higher than in a B+ tree, where the range is one contiguous walk along the leaves.</p>
+
+<h4>8. Compaction strategies</h4>
+<p>Compaction is where an LSM engine decides its amplification profile. <strong>Leveled compaction</strong>, RocksDB's default, keeps each level below level 0 as a single sorted run of non-overlapping files, each level about ten times larger than the one above. When a level is over its target, one file is picked and merged with the files it overlaps in the next level. Reads check at most one file per level; and since the levels above the last together hold only about 1/10 + 1/100 + … ≈ 11% of the last level's size, obsolete versions waste little space (space amplification about 1.1). The cost is writing: merging one file from level n into level n+1 rewrites the overlapping part of level n+1, which in the worst case is about ten times as much data.</p>
+<p><strong>Tiered</strong> (or size-tiered) <strong>compaction</strong>, the traditional default in Cassandra, lets several runs of similar size accumulate in a tier and then merges them all into one run in the next tier. Each byte is rewritten once per tier rather than up to ten times per level, so write amplification is much lower. But each tier holds several overlapping runs, so reads check more files, and a merge temporarily needs space for both the inputs and the output, so space amplification can approach 2x during large compactions. Engines offer hybrids (RocksDB's universal compaction, Cassandra's leveled and time-window strategies) that tune between the two, and time-window compaction for time-series data avoids merging old data at all, simply dropping whole files when their time range expires.</p>
+
+<h4>9. Write amplification, worked for both</h4>
+<p><strong>LSM, leveled.</strong> Take 1 TB of data with a size ratio of 10: levels of roughly 1 GB, 10 GB, 100 GB and 1 TB below level 0. Follow one byte. It is written to the WAL (1) and flushed to level 0 (1). Compacting into level 1 rewrites it once (about 1). Then for each move down a level, merging its file into the next level rewrites up to about ten times as much overlapping data per byte moved: roughly 10 for each of the three moves to levels 2, 3 and 4. Upper estimate: 1 + 1 + 1 + 3 × 10 = 33. In practice, overlap is often less than the worst case, and RocksDB's own documentation describes the usual write amplification of leveled compaction as often larger than 10. At 100 MB/s of user writes, a write amplification of 25 means the disks absorb 2.5 GB/s of writes, which is why compaction bandwidth, not ingest bandwidth, is what LSM clusters are sized for.</p>
+<p><strong>B+ tree.</strong> The B+ tree's write amplification comes from page granularity. Updating one 100-byte row modifies one 8 KB heap page plus one leaf page per affected index. Each change writes a WAL record of roughly the row size. The dirty pages are eventually written back by a checkpoint or the background writer, 8 KB each. If successive updates hit different pages (random keys again), each 100-byte change costs at least one 8 KB page write per page it touches: write amplification of 80 or more per page. Then there are <strong>full-page writes</strong>: PostgreSQL, by default, writes the entire 8 KB image of a page to the WAL the first time the page is modified after each checkpoint, to protect against torn pages (half-written pages after a power failure, db8). With random keys and frequent checkpoints, nearly every change triggers a full-page image, which can multiply WAL volume several times. Sequential keys and longer checkpoint intervals reduce both effects because many changes land on the same few pages.</p>
+<p>So the honest comparison is not "B-trees write once, LSM writes many times". Both amplify. B+ trees amplify by page size when updates are scattered; LSM trees amplify by level count times size ratio regardless of pattern, but write sequentially in large blocks, which SSDs and disks handle far better than scattered 8 KB writes, and compress well because files are immutable.</p>
+
+<h4>10. Choosing between them</h4>
+<table>
+<thead><tr><th></th><th>B+ tree (PostgreSQL, InnoDB)</th><th>LSM tree (RocksDB, Cassandra)</th></tr></thead>
+<tr><td>Insert of new key</td><td>Read leaf (maybe from disk), modify, maybe split</td><td>WAL append + memtable insert</td></tr>
+<tr><td>Point read</td><td>Height page reads, upper levels cached: ~1 disk read</td><td>Memtable + one file per level, Bloom filters skip most</td></tr>
+<tr><td>Range scan</td><td>One descent, then walk leaves</td><td>Merge iterators over all levels</td></tr>
+<tr><td>Write amplification</td><td>Page size ÷ change size when scattered; full-page images</td><td>Often 10-30 (leveled), lower (tiered)</td></tr>
+<tr><td>Space amplification</td><td>Partly empty pages after splits and deletes</td><td>~1.1 (leveled) up to ~2 (tiered, during merges)</td></tr>
+<tr><td>Background work</td><td>Checkpoints, vacuum</td><td>Flushes and compaction, continuously</td></tr>
+<tr><td>Best fit</td><td>Read-heavy OLTP, range queries, in-place updates</td><td>Write-heavy ingest, time series, logs, key-value</td></tr>
+</table>
+<p>A useful framing from the research literature is the <strong>RUM conjecture</strong> (Athanassoulis and colleagues, 2016): an access method can minimise at most two of Read overhead, Update overhead and Memory or space overhead, and pays in the third. B+ trees choose reads and space; LSM trees choose updates and, with leveled compaction, space, paying on reads; tiered LSM chooses updates over both. Interviewers who ask "B-tree or LSM?" are looking for exactly this reasoning tied to a workload: what is the read/write ratio, are writes inserts of new keys or updates of old ones, are reads point lookups or ranges, and what is the hardware?</p>
+</section>
+
+<section data-field="deep">
+<h4>Why fan-out beats binary trees on disk</h4>
+<p>A balanced binary search tree over 100 million keys has height about log₂(10⁸) ≈ 27. In memory, 27 pointer hops are fine. On disk, if each node were a separate page, a lookup would cost up to 27 random reads, which on a spinning disk at around 10 ms each is a quarter of a second. The B-tree, invented by Bayer and McCreight in 1970-72, fixes this by making each node a whole page holding hundreds of keys, so the same 100 million keys need four levels. The idea generalises: whenever the cost of fetching a block is high relative to the cost of searching inside it, choose a structure with node size equal to the block size. It also explains why B+ tree performance depends on key size: fan-out is page size divided by entry size, and every halving of fan-out adds height and, more importantly, doubles the number of pages that must be cached to keep the upper levels in memory.</p>
+
+<h4>Index deduplication and suffix truncation</h4>
+<p>PostgreSQL 13 added B-tree <strong>deduplication</strong>: when many index entries share the same key (a status column, a foreign key with many children), the leaf stores the key once followed by a sorted list of TIDs, a "posting list", instead of repeating the key per row. Indexes on low-cardinality columns can shrink several-fold. PostgreSQL 12 added <strong>suffix truncation</strong> of separator keys in internal pages: a separator only needs enough of the key to distinguish its two children, so for composite or text keys internal entries become shorter and fan-out rises. Both are examples of a general principle: a storage engine's real-world efficiency comes from many such details layered on the textbook structure, and they are why benchmarks across major versions of the same database can differ substantially.</p>
+
+<h4>Write-optimised B-trees and the middle ground</h4>
+<p>The B+ tree and the LSM tree are two ends of a spectrum, and several designs sit between them. <strong>B<sup>ε</sup>-trees</strong> (used in the TokuDB and PerconaFT engines) give each internal node a buffer of pending changes; inserts go into the root's buffer, and when a buffer fills, its messages are flushed one level down in a batch. Writes are batched like an LSM tree, yet the data stays in one tree, so range scans remain efficient. InnoDB's <strong>change buffer</strong> applies the same idea narrowly: changes to secondary index pages that are not in the buffer pool are recorded and merged later, when the page is read for another reason, avoiding a random read per insert into non-unique secondary indexes. And <strong>WiredTiger</strong> (MongoDB's engine) uses a B-tree whose in-memory pages are not updated in place but carry lists of updates and are reconciled into new disk images when written, which gives it some log-structured properties. When an interviewer asks how to get LSM-like write performance without giving up B-tree reads, buffering at internal nodes is the answer they are looking for.</p>
+
+<h4>LSM read optimisations beyond Bloom filters</h4>
+<p>Production LSM engines add several layers to reduce read amplification. <strong>Block caches</strong> keep recently read data blocks, index blocks and filter blocks in memory, with filters and indexes often pinned. <strong>Partitioned filters and indexes</strong> split the metadata of very large files so only the needed partition is loaded. <strong>Prefix Bloom filters</strong> index a key prefix (for example a user id), so a range scan within one prefix can skip files that contain no keys with that prefix, recovering some of the range-scan cost. <strong>Ribbon filters</strong>, a newer alternative to Bloom filters in RocksDB, save roughly 30% of filter memory for the same false-positive rate at some CPU cost. And for workloads where most keys are read soon after being written, the memtable itself serves many reads. The net effect is that well-tuned LSM point-read latency is close to a B+ tree's when filters and indexes are cached; the remaining gap shows up in range scans and under compaction pressure.</p>
+
+<h4>Compaction debt and write stalls</h4>
+<p>An LSM engine accepts writes faster than it can permanently organise them, and the gap is <strong>compaction debt</strong>: data sitting in too many level-0 files or oversized levels. Debt raises read amplification (more L0 files to check) and space amplification (more obsolete versions). To prevent unbounded debt, engines throttle themselves. RocksDB slows writes when the number of level-0 files reaches a slowdown threshold and stops them entirely at a higher threshold, and similarly stalls when the number of unflushed memtables reaches <code>max_write_buffer_number</code> or estimated pending compaction bytes exceed limits. The symptom in production is a write latency graph that is flat for hours, then has sudden plateaus of high latency or errors. The fixes are more compaction threads and disk bandwidth, larger memtables to reduce L0 file count, or, if the workload is fundamentally beyond the hardware, a compaction strategy with lower write amplification.</p>
+
+<h4>Hardware changes the trade-off</h4>
+<p>O'Neil's 1996 analysis was driven by disk arms: random I/O was a hundred times more expensive than sequential, so turning random writes into sequential ones was worth almost any amount of extra copying. NVMe SSDs narrowed that gap enormously for reads, which made B+ trees' random leaf reads cheaper, but SSDs introduced their own concern: flash cells wear out after a limited number of program/erase cycles and must be erased in large blocks, so the device's internal garbage collection adds another layer of write amplification underneath the database's. Large sequential writes, which LSM trees produce, are kind to the SSD's internals; scattered small writes are not. Cloud block storage adds yet another dimension: you often pay per provisioned IOPS and throughput, so write amplification shows up directly on the bill. The right engine for a workload can therefore change with the storage it runs on.</p>
+</section>
+
+<section data-field="prod">
+<h4>The UUIDv4 primary key slowdown</h4>
+<p>A very common production story: a service launches with UUIDv4 primary keys because they can be generated in the application and reveal nothing. Insert latency is fine for months. Then the primary key index outgrows the buffer pool and insert throughput falls off a cliff, with disk read I/O climbing in step with the insert rate (each insert reads a random leaf) and WAL volume far higher than the data volume (full-page images on first touch after each checkpoint). The symptoms visible in monitoring are rising buffer-pool miss rates on the index, rising <code>wal_bytes</code> per transaction in <code>pg_stat_wal</code> (or redo log volume in InnoDB), and checkpoints writing many more pages. The fixes, in rising order of effort: switch new ids to a time-ordered format (UUIDv7, or a bigint identity), which keeps existing ids valid; increase memory so the index fits; lengthen the checkpoint interval (<code>checkpoint_timeout</code>, <code>max_wal_size</code>) to reduce full-page images, at the cost of longer crash recovery.</p>
+
+<h4>Bloat and fill factor</h4>
+<p>B+ tree indexes and heaps accumulate free space: half-empty pages after random splits, space from deleted or updated row versions not yet reused, pages emptied by mass deletes. PostgreSQL calls the excess <strong>bloat</strong>. Moderate bloat is harmless, but a table or index that is several times larger than its live data wastes cache and makes scans slower. Monitoring tools such as the <code>pgstattuple</code> extension report live versus dead space. Remedies include tuning autovacuum so dead space is reused promptly (db10), rebuilding indexes with <code>REINDEX CONCURRENTLY</code>, and for tables, tools that rewrite them online. Conversely, for tables with many in-place updates, PostgreSQL lets you lower the heap <code>fillfactor</code> (for example to 80) so pages keep free room; an updated row version can then stay on the same page, which enables heap-only tuple (HOT) updates that skip index maintenance entirely, a large write saving that db10 explains.</p>
+
+<h4>Running an LSM store in production</h4>
+<p>The metrics that matter for LSM engines are different from those for B+ tree databases. Watch the number of level-0 files and pending compaction bytes (compaction debt), write stall counts and durations, compaction read and write throughput relative to user write throughput (that ratio is your live write amplification), Bloom filter useful rate, block cache hit rate, and disk space headroom. Disk headroom deserves special emphasis: compaction needs temporary space for its outputs before deleting its inputs, and size-tiered compaction of the largest tier can need as much free space as the data itself; Cassandra operators have long been advised to keep substantial free disk for this reason. Tombstones are the other classic trap: a workload that deletes heavily (a queue implemented on Cassandra, for example) accumulates tombstones that reads must skip until compaction removes them, and reads that scan many tombstones can become very slow or fail, which is why LSM stores are a poor fit for queue-like delete-heavy patterns.</p>
+
+<h4>Choosing storage for AI workloads</h4>
+<p>AI systems produce a few characteristic storage patterns, and the amplification lens maps each to an engine. LLM call logs, traces and metrics are append-only, time-ordered and queried by time range: a B+ tree with time-ordered keys and time partitioning handles moderate rates, and LSM-based or columnar stores handle very high rates. Feature stores serving online lookups by entity key are read-heavy point lookups with periodic bulk refreshes: LSM-based key-value stores are common because the bulk refresh is a large write burst, while reads are point lookups that Bloom filters serve well. Conversation state for chat applications is read and updated per session: a B+ tree OLTP database is the natural fit. Embedding storage for vector search uses specialised index structures (db15), but the metadata alongside it still lives in one of these engines. In each case, the question is the same as in O'Neil's paper: what is written, how fast, in what key order, and how is it read?</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> compute B+ tree heights from page and entry sizes, and measure how key order changes insert cost in a real B+ tree. Python 3.12 standard library only (SQLite tables declared <code>WITHOUT ROWID</code> are stored as a B+ tree on the primary key, like InnoDB). Save as <code>db5.py</code>.</p>
+<pre>import math, os, random, sqlite3, tempfile, time
+
+# Part 1: B+ tree height from page size and entry size
+def height(rows, page=8192, entry=20, leaf_fill=0.9):
+    usable = page - 24 - 16                  # page header + btree special space
+    leaf_cap = int(usable * leaf_fill // entry)
+    inner_cap = usable // entry
+    pages, levels = math.ceil(rows / leaf_cap), 1
+    while pages &gt; 1:
+        pages, levels = math.ceil(pages / inner_cap), levels + 1
+    return leaf_cap, inner_cap, levels
+
+for rows in (10**6, 10**8, 10**10):
+    print(f"{rows:&gt;14,} rows -&gt; leaf cap, fan-out, levels = {height(rows)}")
+
+# Part 2: sequential vs random keys in a real B-tree (SQLite WITHOUT ROWID table)
+def load(keys, label):
+    path = os.path.join(tempfile.mkdtemp(), "t.db")
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA page_size = 4096")
+    db.execute("CREATE TABLE t (k BLOB PRIMARY KEY, v TEXT) WITHOUT ROWID")
+    t0 = time.perf_counter()
+    with db:
+        db.executemany("INSERT INTO t VALUES (?, 'x')", ((k,) for k in keys))
+    secs = time.perf_counter() - t0
+    pages = db.execute("PRAGMA page_count").fetchone()[0]
+    db.close()
+    print(f"{label:&lt;11} {pages:&gt;6} pages  {pages * 4096 / 2**20:6.1f} MiB  {secs:5.2f} s")
+
+N = 300_000
+seq = [i.to_bytes(16, "big") for i in range(N)]       # like a sequence or UUIDv7
+rnd = [os.urandom(16) for _ in range(N)]              # like UUIDv4
+load(seq, "sequential")
+load(rnd, "random")</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li>Part 1 prints leaf capacity 366, fan-out 407, and 3, 4 and 4 levels for a million, 100 million and ten billion rows: each extra level multiplies capacity by about 400.</li>
+<li>Part 2 inserts 300,000 16-byte keys in sequential and random order. On the test machine the random load took about 1.9 s versus 0.5 s for sequential, while page counts were similar (about 1,900 pages of 4 KB). The time gap comes from random inserts touching a different leaf each time, thrashing SQLite's small default page cache; sequential inserts keep hitting the same rightmost pages.</li>
+</ol>
+<p><strong>Try next.</strong> Change <code>entry=20</code> to 28 (UUID keys) and 68 (60-byte text keys) and watch fan-out fall to about 290 and 120. In Part 2, add <code>db.execute("PRAGMA cache_size = -64000")</code> (64 MB) before inserting and rerun: when the whole index fits in cache, the random-key penalty shrinks sharply, which is exactly why UUIDv4 keys seem fine until a table outgrows memory. Finally, set <code>N = 1_000_000</code> and compare again.</p>
+</section>
+
+<section data-field="drill">
+<b>Estimate and choose: a telemetry store</b>
+<p>A fleet of devices sends 200,000 readings per second, each about 100 bytes, keyed by (device_id, timestamp). Data is kept 30 days. Queries are "last hour for one device" (frequent) and "daily aggregates for all devices" (a few per day). Estimate the data volume, compare a PostgreSQL B+ tree design with a leveled LSM design for the write path, and recommend one.</p>
+<details><summary>Answer</summary>
+<p><strong>Volume.</strong> 200,000 × 100 B = 20 MB/s of user data, about 1.7 TB per day, about 52 TB for 30 days before compression or overheads.</p>
+<p><strong>B+ tree.</strong> The key (device_id, timestamp) is not globally increasing: each device's readings are increasing, but devices interleave, so inserts land on as many different leaf pages as there are active devices. With, say, 1 million devices, the index's insert working set is a million leaf pages (8 GB), which may fit in memory, but every page is dirtied constantly and WAL carries full-page images after each checkpoint. Partitioning by day keeps each day's index small. Per-row overhead (about 24-byte tuple header plus line pointer) adds over 25% to 100-byte rows. Feasible on large hardware, but this is at the upper end of what one PostgreSQL primary handles comfortably.</p>
+<p><strong>Leveled LSM.</strong> Writes are WAL appends and memtable inserts. At an assumed write amplification of 15, disks absorb about 300 MB/s of compaction writes, which a few NVMe drives sustain. Immutable files compress well; time-series data often compresses 5-10x. "Last hour for one device" is a prefix range scan on recent data that mostly sits in the memtable and upper levels.</p>
+<p><strong>Recommendation.</strong> An LSM-based or purpose-built time-series store (with time-window compaction so expired days are dropped as whole files rather than deleted row by row), plus a pre-aggregated daily rollup table for the analytics queries, ideally in a columnar store (db12). Mention the operational cost: provision disk bandwidth for compaction, alert on L0 file count and pending compaction bytes, and keep free space for compaction outputs.</p>
+</details>
+</section>

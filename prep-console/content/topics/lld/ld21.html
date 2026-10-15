@@ -1,0 +1,746 @@
+<!-- topic source for lld/ld21; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld21",
+  "t": "A tool-calling agent loop: registry, validation, budgets and parallel calls",
+  "tag": "AI systems",
+  "sum": "Build the loop at the heart of every agent: a tool registry with JSON-schema validation, the model → tool call → result cycle against a fake model, step, token, time and tool-call budgets, parallel tool calls with per-tool timeouts, errors fed back to the model instead of raised, a repeated-call guard and a trace log — tested without a network.",
+  "prereq": [
+    ["ag2", "The agent loop: the model proposes an action, the harness executes it and returns the observation, and the loop stops on a final answer or a stopping condition."],
+    ["ag3", "Good tools have clear names, descriptions and schemas, and return errors the model can act on."],
+    ["ld4", "A resilient client classifies errors, retries with backoff, uses a fake clock in tests, and treats a timeout as an unknown outcome."],
+    ["py9", "ThreadPoolExecutor runs callables on worker threads and returns futures; future.result(timeout) waits at most that long."],
+    ["ae4", "Structured output: JSON Schema describes the shape of arguments, and outputs must be validated before use."],
+    ["swe2", "Dependency injection: pass collaborators (a model, a clock) in, so tests can substitute fakes."]
+  ],
+  "myths": [
+    ["If a tool fails, the loop should raise an exception.", "Raising ends the whole run over something the model could often fix: a misspelled city, a missing argument, a transient timeout. The loop should turn tool failures into tool results marked as errors, with a message precise enough to act on, and let the model decide what to do next. Exceptions are for the harness's own bugs and for budgets running out."],
+    ["The model's arguments always match the schema, so validation is redundant.", "Without strict decoding, models occasionally produce arguments of the wrong type, miss required fields, or invent extra ones, and with streamed or truncated output the JSON can be incomplete. Validating before running the tool turns a crash or a wrong action into a precise error message the model can correct on the next step. Even with provider-side strict mode, validate anything that has side effects."],
+    ["A step limit is enough of a budget.", "Ten steps can be cheap or ruinous: one step may carry a 200,000-token context, and one tool call may hang for minutes. Real loops bound steps, tokens (cost), wall-clock time (latency) and tool calls (side effects) separately, because each protects against a different failure."],
+    ["Parallel tool calls can be returned as they finish.", "Each result must be paired with the call that produced it by id, and all results for one model turn go back together in a single message. Returning them across several messages, or dropping a failed one, confuses the model; Anthropic's documentation notes that splitting parallel results across messages teaches the model to stop making parallel calls. Keep results in call order and include every one, errors too."],
+    ["Timing out a Python thread stops the tool.", "future.result(timeout=…) stops waiting; it does not stop the work. The thread keeps running and holds a pool worker until the function returns. Tools that can hang need their own timeouts (on the HTTP call, the subprocess, the query), and side-effecting tools need idempotency, because a 'timed out' call may still complete."]
+  ],
+  "recap": [
+    "An agent loop alternates between asking the model what to do and executing the tools it asks for, until the model answers or a budget runs out.",
+    "A tool registry holds each tool's name, description, input schema, function and timeout, and presents the tool list in a stable order.",
+    "Every tool call's arguments are validated against its JSON schema before the tool runs; failures become precise, path-qualified error messages.",
+    "Every tool_use block gets exactly one tool_result with the same id, all results for a turn go back in one message, in call order, errors included with is_error set.",
+    "Unknown tools, invalid arguments, exceptions and timeouts are fed back to the model as error results rather than raised.",
+    "Parallel calls are submitted to a thread pool together and collected with per-tool timeouts measured from submission.",
+    "Budgets bound model steps, tokens, wall time and tool calls separately, and the result says which one stopped the run.",
+    "A repeated-call guard refuses an identical call after a few repeats, breaking the commonest agent loop.",
+    "A trace log records every model call and tool call with timing and outcome, which is the agent's main debugging tool.",
+    "A fake model that plays scripted turns, and an injected clock, make every behaviour testable without a network."
+  ],
+  "glossary": [
+    ["Agent loop", "The cycle in which a model chooses an action, a harness executes it, and the result is fed back, repeated until a stop condition."],
+    ["Budget", "A limit on a resource the loop consumes — model calls, tokens, time, tool calls — after which the run stops."],
+    ["Fake model", "A test double that returns scripted responses instead of calling a real model, optionally computing them from the messages it receives."],
+    ["Future", "An object representing a computation running elsewhere, whose result can be waited for with a timeout."],
+    ["Harness", "The code around the model that sends requests, executes tools, manages context and enforces limits."],
+    ["Idempotent", "Safe to repeat: doing it twice has the same effect as doing it once."],
+    ["is_error", "A flag on a tool result telling the model the tool failed and the content is an error message."],
+    ["JSON Schema", "A vocabulary for describing the allowed shape of JSON data: types, required properties, ranges, enumerations."],
+    ["Parallel tool calls", "Several tool calls requested in one model response, which the harness may execute concurrently."],
+    ["Stop reason", "The model response field that says why it stopped generating, such as tool_use (it wants tools run) or end_turn (it is done)."],
+    ["Strict tool use", "A provider feature that constrains the model's generated arguments to match the tool's schema exactly."],
+    ["Tool registry", "The collection of tools available to the agent, with their schemas and implementations."],
+    ["tool_result", "The content block carrying a tool's output back to the model, linked to its call by tool_use_id."],
+    ["tool_use", "The content block in which the model requests a tool call, with an id, the tool's name and its input."],
+    ["Trace", "An ordered log of the run's model calls and tool calls with timings, inputs, outcomes and token counts."]
+  ],
+  "qa": [
+    ["E", "Walk through one iteration of a tool-calling loop.", "Send the conversation and the tool definitions to the model. If the response's stop reason is tool_use, append the assistant message as-is, execute each tool_use block, and append one user message containing a tool_result for each call, matched by tool_use_id. Then call the model again. If the stop reason is end_turn, the text is the answer. Check budgets before each model call."],
+    ["E", "Why validate tool arguments yourself?", "Because the model can produce arguments that do not match the schema — wrong types, missing fields, invented fields, or truncated JSON — and running a tool with bad input either crashes or does the wrong thing. Validation turns that into a precise error the model can fix, like '$.city: expected string, got int'. Strict tool use at the provider reduces this but anything with side effects still deserves a check."],
+    ["E", "What should the loop do when a tool raises an exception?", "Catch it, and return a tool_result with is_error true and a message the model can act on (the exception type and message, not a stack trace). The model may retry with different input, try another tool or explain the failure. Only the harness's own bugs and exhausted budgets should end the run."],
+    ["M", "How do you execute parallel tool calls?", "Validate each call, submit all valid ones to a thread pool at once, then collect each future with a timeout measured from its submission, so a slow call does not extend the others' waits. Return all results in a single message in the original call order, each tied to its id, including errors. The test proves concurrency with a barrier that only releases if all three calls are running together.", "Follow-up: When should calls not run in parallel? — When they depend on each other or touch the same resource, such as two writes to one file; mark such tools as serial or let the model use disable_parallel_tool_use."],
+    ["M", "What budgets would you put on an agent loop and why each?", "Steps, because loops can repeat forever. Tokens, because cost and context grow with every step and one step can be huge. Wall time, because users and upstream deadlines wait. Tool calls, because tools have side effects and external costs. Check them before each model call, stop with a status saying which one ran out, and return the transcript so far.", "Follow-up: What should the user see when a budget stops the run? — A partial answer or summary, not an exception; some harnesses make one final model call asking it to summarise progress."],
+    ["M", "How does the model learn about tool errors?", "Through the tool_result: content holds the error message and is_error is set. The message should say what went wrong and how to fix it — which field, what type was expected, which tools exist if the name was wrong. Vague errors ('failed') lead to the model repeating the same call."],
+    ["M", "How do you test an agent loop without calling a model?", "Inject the model as a callable and use a fake that plays scripted turns. Turns can be fixed responses or functions of the messages, so a test can assert on exactly what the model was shown — the tool_result ids, the error text — and react to it. Inject a clock for time budgets. Tests then run in milliseconds and are deterministic."],
+    ["M", "What is the repeated-call guard for?", "The commonest agent failure is calling the same tool with the same input again and again, because the result did not contain what the model hoped for. Counting identical (name, canonical input) pairs and refusing beyond a small limit, with a message telling the model to use the earlier result or change approach, breaks that loop cheaply."],
+    ["H", "A tool timed out but may have completed. What do you do?", "Report the timeout to the model as an error, but recognise the outcome is unknown, not failed. For read-only tools that is harmless. For side-effecting tools, attach an idempotency key per call (the tool_use id works) so a retry with the same key is deduplicated by the downstream service, or have the tool check whether the effect already happened before acting. Also remember a Python thread cannot be killed: give the tool its own timeouts on network and subprocess calls.", "Follow-up: How do you stop timed-out tools exhausting the pool? — Bound each tool's own I/O timeouts, size the pool for the worst case, or run risky tools in subprocesses that can be killed."],
+    ["H", "How would you extend this to human approval for dangerous tools?", "Mark tools with a risk level. Before executing a high-risk call, pause the loop: persist the transcript and pending calls, ask a human, and resume with either the real result or a tool_result saying the action was denied, which the model can work around. The loop must be resumable from saved state, which argues for keeping all state in the message list rather than in local variables.", "Follow-up: Where would you store the paused run? — In a durable store keyed by run id, with the messages, pending calls and budget counters, so any worker can resume it."],
+    ["H", "How would you make the loop async, and what changes?", "The model call and tool calls become coroutines; parallel calls use asyncio.gather or a TaskGroup with asyncio.wait_for per tool, and cancellation actually stops a coroutine at its next await, unlike threads. Blocking tool functions still need asyncio.to_thread. The loop logic, message shapes, validation and budgets are unchanged, which is the benefit of separating orchestration from execution."],
+    ["H", "Your agent's cost doubled after a prompt change though answers look the same. How do you investigate with this design?", "The trace has per-step token counts and tool calls. Compare traces before and after: more steps per run, larger inputs per step (tool results or history growing), repeated calls, or more parallel calls. Common causes: a tool description that now encourages exploratory calls, a tool returning larger results, or the tool list order changing and defeating prompt caching. Fix the cause, then add a regression check on steps and tokens per task in evaluation.", "Follow-up: Why does tool list order matter for cost? — Provider prompt caches match on the exact prefix, and tools come first; a changing order invalidates the cache every call, which is why the registry sorts its specs."]
+  ],
+  "refs": [
+    ["docs", "Claude API: tool use overview", "Tool definitions with input_schema, the tool_use stop reason, tool_result blocks with tool_use_id and is_error, parallel tool use, and strict tool use.", "https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview"],
+    ["docs", "Claude API: how to implement tool use", "Writing tool descriptions, handling tool results and errors, and returning all parallel results in one message.", "https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use"],
+    ["docs", "Understanding JSON Schema: reference", "The keywords this validator implements — type, enum, minimum, maximum, minLength, items, properties, required, additionalProperties.", "https://json-schema.org/understanding-json-schema/reference"],
+    ["docs", "Python: concurrent.futures", "ThreadPoolExecutor, futures, result(timeout) and why a timed-out call keeps running.", "https://docs.python.org/3/library/concurrent.futures.html"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>The interviewer opens with: "Every agent framework is a loop around a model call. Build that loop. You have a model that can request tools, a few tools, and 45 minutes. Make it robust." It sounds small, and the first version is: call the model, if it wants a tool, run it, append the result, repeat. Then the questions start. What if the model calls a tool that does not exist? What if it passes a number where the tool expects a string? What if the tool raises, or hangs for two minutes? What if the model asks for three tools at once — do you run them one after another? What if it calls the same search forty times? What stops a run from costing fifty dollars? How would you debug a run that went wrong last Tuesday? How do you test any of this without paying for model calls?</p>
+<p>These questions are the job. In production, the loop is where agents fail: an unvalidated argument that deletes the wrong record, a tool exception that ends a twenty-step task at step nineteen, an unbounded loop that burns a budget overnight, a hanging tool that blocks a user for minutes, a result split across messages that confuses the model. AI-engineer loops increasingly include exactly this round because it tests whether you have built one: the code is not hard, but the right decisions — feed errors back, validate before executing, bound four different resources, keep results paired and ordered, make everything testable — only come from having seen it break.</p>
+<p>This lesson builds the loop in the order an interview flows. It starts with the message shapes a tool-calling model uses (Anthropic's documented format: tool_use blocks with ids, tool_result blocks with matching ids and an is_error flag), then the entities and their responsibilities, then a naive loop and everything wrong with it. It adds, in stages, a tool registry with JSON-schema validation, errors fed back to the model, parallel execution with per-tool timeouts, four budgets, a repeated-call guard and a trace. The full solution is a single runnable Python 3.12 file with thirteen tests, including a barrier test that proves calls really run in parallel and a stress test with eight threads sharing one agent. The lesson closes with edge cases, the extensions interviewers ask for (human approval, async, streaming, persistence) and complexity.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: a manager, a phone and a team of specialists</h4>
+<p>Picture a manager who cannot do anything themselves but can phone specialists: a weather desk, a calculator, a records clerk. A request comes in. The manager thinks, then writes instructions on numbered slips: "slip 1: weather desk, city Paris"; "slip 2: records clerk, customer 4471". An assistant takes the slips, checks each is filled in properly (a weather slip with no city goes straight back with "missing city"), phones the specialists — all at once, not one after another — and staples each answer to its slip. If a specialist does not answer within a minute, the slip comes back marked "no answer". The manager reads the stapled answers and either writes more slips or writes the final reply. A supervisor watches the clock and the phone bill and stops the whole thing if either runs too high.</p>
+<p>The model is the manager. The slips are <strong>tool_use</strong> blocks, each with an id. The assistant is the <strong>harness</strong> — the code you are writing. Checking the slip is <strong>schema validation</strong>. Phoning everyone at once is <strong>parallel execution</strong>. "No answer" is a <strong>timeout</strong>. Stapling answers to slips is the <strong>tool_result</strong> with a matching <strong>tool_use_id</strong>. The supervisor is the <strong>budget</strong>. And the assistant's notebook of who was called, when and what came back is the <strong>trace</strong>.</p>
+<p>Where the analogy breaks: a human manager learns from a returned slip that says "missing city" and fixes it; a model does too, but only if the message is precise. And a human assistant can hang up on a specialist who talks too long; a Python thread cannot be forcibly stopped — the harness can stop waiting, but the work continues in the background.</p>
+
+<h4>The message format</h4>
+<p>Tool-calling APIs differ in detail but share a shape. In Anthropic's Messages API, which this solution mirrors, you send the conversation plus a list of tools, each with a <code>name</code>, a <code>description</code> and an <code>input_schema</code> (a JSON Schema object). When the model wants tools, its response has <code>stop_reason</code> equal to <code>"tool_use"</code> and its content includes one or more <code>tool_use</code> blocks, each with an <code>id</code>, the tool <code>name</code> and an <code>input</code> object. You append that assistant message unchanged, run the tools, and send back a <code>user</code> message whose content is a list of <code>tool_result</code> blocks, each carrying the <code>tool_use_id</code> it answers, the result as <code>content</code>, and <code>is_error: true</code> if the tool failed. The documentation is specific on two points this lesson relies on: a failed tool should be returned with <code>is_error</code> rather than dropped, and all results for one turn belong in a single user message.</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Sequence of one agent run. The harness sends messages and tool specs to the model. The model replies with stop_reason tool_use and two tool_use blocks, t1 get_weather and t2 add. The harness validates both, runs them in parallel on a thread pool, and sends one user message with two tool_result blocks in call order, t2 marked is_error because of invalid input. The model replies with a corrected call, then with end_turn and the final text.">
+  <defs><marker id="ld21-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="90" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Harness</text>
+    <text x="330" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Model</text>
+    <text x="545" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Tools (pool)</text>
+    <line x1="90" y1="28" x2="90" y2="290" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="330" y1="28" x2="330" y2="290" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="545" y1="28" x2="545" y2="290" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="90" y1="42" x2="328" y2="52" marker-end="url(#ld21-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="210" y="40" text-anchor="middle" style="fill:var(--ink-2)">messages + tool specs</text>
+    <line x1="330" y1="64" x2="92" y2="76" marker-end="url(#ld21-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="210" y="62" text-anchor="middle" style="fill:var(--accent)">stop_reason: tool_use</text>
+    <text x="210" y="90" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">t1 get_weather · t2 add</text>
+    <rect x="20" y="100" width="140" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="90" y="114" text-anchor="middle" style="fill:var(--ink)">validate each</text>
+    <text x="90" y="128" text-anchor="middle" style="fill:var(--crit)">t2: $.a not integer</text>
+    <line x1="160" y1="140" x2="543" y2="146" marker-end="url(#ld21-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="400" y="138" text-anchor="middle" style="fill:var(--ink-2)">submit t1 (timeout 5 s)</text>
+    <line x1="545" y1="166" x2="92" y2="172" marker-end="url(#ld21-arrow)" style="fill:none;stroke:var(--good)"/>
+    <text x="400" y="180" text-anchor="middle" style="fill:var(--good)">{"temp_c": 18}</text>
+    <line x1="90" y1="196" x2="328" y2="206" marker-end="url(#ld21-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="210" y="194" text-anchor="middle" style="fill:var(--ink-2)">ONE user message, call order:</text>
+    <text x="210" y="222" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">result t1 · result t2 is_error</text>
+    <line x1="330" y1="236" x2="92" y2="246" marker-end="url(#ld21-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="210" y="234" text-anchor="middle" style="fill:var(--accent)">tool_use t3 add (fixed)</text>
+    <line x1="330" y1="272" x2="92" y2="282" marker-end="url(#ld21-arrow)" style="fill:none;stroke:var(--good)"/>
+    <text x="210" y="270" text-anchor="middle" style="fill:var(--good)">end_turn + final text</text>
+  </g>
+</svg>
+<figcaption>The model never touches the tools; the harness does, and it owns everything that can go wrong in between. An invalid call never reaches the pool — it comes straight back as an error result in the same message as the valid one, in the order the model asked.</figcaption>
+</figure>
+
+<h4>What the round expects</h4>
+<p>A <code>ToolRegistry</code> with a decorator to register tools; a validator for a sensible subset of JSON Schema; an <code>Agent.run</code> loop with a clear stop status; parallel tool execution with per-tool timeouts; errors returned as results; budgets for steps, tokens, time and tool calls; a trace; a fake model and an injected clock for tests; and a confident explanation of what you would add for production (approval, persistence, streaming, async).</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Entities &amp; API</span></div><div class="ck"><span class="ck-m">10–15</span><span class="ck-t">Naive loop</span></div><div class="ck"><span class="ck-m">15–30</span><span class="ck-t">Validate, errors, parallel</span></div><div class="ck"><span class="ck-m">30–38</span><span class="ck-t">Budgets, guard, tests</span></div><div class="ck"><span class="ck-m">38–45</span><span class="ck-t">Extensions</span></div></div>
+
+<h4>1 · Clarify the requirements</h4>
+<p>Ask what the model interface is (does it return content blocks and a stop reason, as Anthropic's API does?), whether the model can request several tools in one turn, whether tools are I/O-bound (network, database) or CPU-bound, whether any tools have side effects, what limits matter (latency for an interactive user, cost for a batch job), whether runs must survive a process restart, and whether the loop will be shared by many concurrent requests.</p>
+<p>A typical agreed scope: synchronous <code>run(user_text) → RunResult</code>; tools are Python functions with JSON-schema inputs; the model may request parallel calls; tools are mostly I/O-bound so threads are fine; budgets on steps, tokens, wall time and tool calls; every failure the model could fix is fed back to it; a trace of every call; tests with a fake model, no network. Out of scope: streaming, human approval, persistence — but have an answer for each.</p>
+
+<h4>2 · Entities and responsibilities</h4>
+<p><strong>Tool</strong>: an immutable record of name, description, input schema, function and timeout. <strong>ToolRegistry</strong>: registers tools (rejecting duplicate names and non-object schemas), looks them up, and renders the tool specs sent to the model — in a stable, sorted order, because provider prompt caches key on an exact prefix and tools come first. <strong>validate</strong>: a function that checks a value against a schema and raises <code>SchemaError</code> with a path like <code>$.tags[1]</code>. <strong>ModelResponse</strong>: content blocks, stop reason, token usage. <strong>Model</strong>: any callable taking messages and tool specs and returning a ModelResponse — the seam that lets a fake replace the real API. <strong>Budget</strong>: four limits. <strong>Agent</strong>: owns the loop, the thread pool, the repeated-call counter and the trace, and returns a <strong>RunResult</strong> with a status, final text, the full transcript, steps, tokens and trace.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Class diagram: Agent uses a Model callable, a ToolRegistry, a Budget, a clock and a ThreadPoolExecutor, and returns RunResult. ToolRegistry holds many Tool records; validate checks inputs against Tool.input_schema. FakeModel implements Model for tests.">
+  <defs><marker id="ld21-dia" viewBox="0 0 12 12" refX="1" refY="6" markerWidth="10" markerHeight="10" orient="auto"><path d="M1,6 L6,1 L11,6 L6,11 z" style="fill:var(--ink-2)"/></marker><marker id="ld21-tri" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--surface);stroke:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="220" y="10" width="200" height="70" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="320" y="28" text-anchor="middle" style="fill:var(--ink);font-weight:600">Agent</text>
+    <text x="230" y="48" style="fill:var(--ink);font-family:var(--mono)">run(user_text) → RunResult</text>
+    <text x="230" y="66" style="fill:var(--ink-2);font-family:var(--mono)">_execute(calls) → results</text>
+    <rect x="20" y="120" width="170" height="62" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="105" y="138" text-anchor="middle" style="fill:var(--ink);font-weight:600">ToolRegistry</text>
+    <text x="30" y="156" style="fill:var(--ink-2);font-family:var(--mono)">register() · get()</text>
+    <text x="30" y="172" style="fill:var(--ink-2);font-family:var(--mono)">specs() sorted</text>
+    <rect x="20" y="200" width="170" height="40" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="105" y="218" text-anchor="middle" style="fill:var(--ink);font-weight:600">Tool (frozen)</text>
+    <text x="105" y="233" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">schema · fn · timeout</text>
+    <rect x="235" y="120" width="170" height="50" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="320" y="140" text-anchor="middle" style="fill:var(--ink);font-weight:600">Model (callable)</text>
+    <text x="320" y="158" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">(messages, tools) → resp</text>
+    <rect x="235" y="200" width="170" height="40" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="320" y="225" text-anchor="middle" style="fill:var(--ink)">FakeModel (tests)</text>
+    <line x1="320" y1="198" x2="320" y2="172" marker-end="url(#ld21-tri)" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <rect x="450" y="120" width="170" height="62" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="535" y="138" text-anchor="middle" style="fill:var(--ink);font-weight:600">Budget</text>
+    <text x="460" y="156" style="fill:var(--ink-2);font-family:var(--mono)">steps · tokens</text>
+    <text x="460" y="172" style="fill:var(--ink-2);font-family:var(--mono)">seconds · tool_calls</text>
+    <rect x="450" y="200" width="170" height="40" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="535" y="218" text-anchor="middle" style="fill:var(--ink)">validate(value, schema)</text>
+    <text x="535" y="233" text-anchor="middle" style="fill:var(--crit);font-family:var(--mono)">raises SchemaError</text>
+    <line x1="250" y1="82" x2="120" y2="118" marker-start="url(#ld21-dia)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="320" y1="82" x2="320" y2="118" marker-start="url(#ld21-dia)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="390" y1="82" x2="520" y2="118" marker-start="url(#ld21-dia)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="105" y1="184" x2="105" y2="198" marker-start="url(#ld21-dia)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="440" y="20" style="fill:var(--muted)">+ clock, ThreadPoolExecutor,</text>
+    <text x="440" y="36" style="fill:var(--muted)">repeat counter, trace</text>
+  </g>
+</svg>
+<figcaption>The Model is a callable, not a client class, which is the single decision that makes the whole loop testable. The registry owns schemas; the agent owns orchestration; validation is a pure function both can trust.</figcaption>
+</figure>
+
+<h4>3 · Stage one: the naive loop, and what is wrong with it</h4>
+<pre>def run(model, tools, user_text):
+    messages = [{"role": "user", "content": user_text}]
+    while True:
+        resp = model(messages, tools)
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason != "tool_use":
+            return resp.content[0]["text"]
+        for call in [b for b in resp.content if b["type"] == "tool_use"]:
+            out = TOOLS[call["name"]](**call["input"])          # KeyError, TypeError, hangs…
+            messages.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": call["id"], "content": str(out)}]})</pre>
+<p>Count the problems. <code>while True</code> has no bound: a model that keeps calling tools runs forever. An unknown tool name raises <code>KeyError</code> and kills the run. Bad arguments raise <code>TypeError</code> inside the tool, or worse, are accepted and do the wrong thing. A tool exception kills the run. A hanging tool hangs the run. Parallel calls run one after another, so three 2-second lookups take 6 seconds. Each result goes in its own user message, which the provider's documentation warns against. A huge result (a 5 MB file) goes straight into the context. Nothing records what happened. And the only way to test it is with a real model. Each stage below fixes a group of these.</p>
+
+<h4>4 · Stage two: the registry and validation</h4>
+<p>Tools are registered with a decorator that records the schema next to the function. The registry refuses duplicate names (two tools named <code>search</code> would make the model's choice ambiguous) and schemas that are not objects (tool inputs are always objects of named arguments). <code>specs()</code> returns the tool list sorted by name, because the list is part of every request's prefix and a changing order would defeat prompt caching on every call.</p>
+<p>Before running any call, validate its input against the schema. A full JSON Schema implementation is large; an interview needs the subset tool schemas actually use: <code>type</code> (object, array, string, integer, number, boolean, null), <code>enum</code>, <code>minimum</code>/<code>maximum</code>, <code>minLength</code>/<code>maxLength</code>, <code>items</code>, <code>properties</code>, <code>required</code> and <code>additionalProperties: false</code>. Two details show care. First, Python's <code>bool</code> is a subclass of <code>int</code>, so <code>isinstance(True, int)</code> is true; an integer field must explicitly reject booleans, and the test checks that <code>{"k": true}</code> fails with "expected integer". Second, errors carry a path — <code>$.tags[1]: 'c' is not one of ['a', 'b']</code> — because the message is for the model, and the model can only fix what it can locate.</p>
+
+<h4>5 · Stage three: errors are results, not exceptions</h4>
+<p>Every way a call can fail becomes a <code>tool_result</code> with <code>is_error: true</code>: an unknown tool ("unknown tool 'get_wether'; available tools: add, get_weather" — listing the real names lets the model correct a typo), invalid input ("invalid input: $.city: expected string, got int"), an exception inside the tool ("ConnectionError: upstream reset" — type and message, not a traceback full of file paths) and a timeout. The loop continues, and the model decides: retry with fixed input, try another tool, or explain. The test <code>test_validation_error_is_fed_back_and_model_recovers</code> scripts a model that first passes <code>city=5</code>, then — in a turn written as a function of the messages — asserts it was shown exactly that error, and corrects the call. What still raises: bugs in the harness itself, and running out of scripted turns in the fake model, which is a test failure.</p>
+
+<h4>6 · Stage four: parallel calls with per-tool timeouts</h4>
+<p>When a response contains several <code>tool_use</code> blocks, they are independent by the model's own judgement, so run them concurrently. The implementation has two phases. First, for each call, look up the tool, check the repeat guard and validate; valid calls are <em>submitted</em> to a <code>ThreadPoolExecutor</code> immediately, and the submission time is recorded. Second, walk the calls in order and collect each future with <code>result(timeout=remaining)</code>, where <code>remaining</code> is the tool's timeout minus the time already elapsed since submission. Measuring from submission matters: if you gave each future its full timeout while waiting in order, a slow first call would extend the waiting time of every later one.</p>
+<p>Results are appended in <em>call order</em>, each with its <code>tool_use_id</code>, all in one user message. The test proves both properties. Three calls to a <code>wait</code> tool meet at a <code>threading.Barrier(3, timeout=2)</code>, which only releases when all three threads are inside it at once — so if the harness ran them one by one, the first would time out at the barrier. They then finish in reverse order (sleeps of 60, 30 and 0 ms), and the test asserts the results still come back as w0, w1, w2. Threads suit I/O-bound tools (HTTP calls, database queries), which release Python's global interpreter lock while waiting; CPU-bound tools would need a process pool.</p>
+<p>A timeout stops the <em>waiting</em>, not the <em>work</em>. Python cannot kill a thread; the timed-out function keeps running and occupies a pool worker until it returns. The test with a 0.05-second timeout on a 0.5-second tool asserts the run finishes in under 0.4 seconds — the harness moved on — but the worker is busy for the rest of the half second. That is why real tools need their own timeouts on network and subprocess calls, and why side-effecting tools need idempotency: a "timed out" payment may have gone through.</p>
+
+<h4>7 · Stage five: four budgets</h4>
+<p>Each budget protects against a different failure, so each is separate. <strong>Steps</strong> (model calls) stop infinite loops. <strong>Tokens</strong>, summed from each response's input and output counts, bound cost — and cost per step grows as the transcript grows, so a 10-step run is not 10× a 1-step run. <strong>Wall time</strong> bounds latency; it reads an injected clock so tests can make a model call "take" 40 seconds without waiting. <strong>Tool calls</strong> bound side effects and external costs (a paid search API), and are checked before executing a turn's calls so a turn is never half-executed.</p>
+<p>Budgets are checked at the top of each step, before spending more, and the result's <code>status</code> says which one ended the run: <code>final</code>, <code>max_steps</code>, <code>token_budget</code>, <code>deadline</code> or <code>tool_budget</code>. Worked through the tests: with a 1,000-token budget and 600 tokens per model call, the first call leaves 600 used (under budget, so step 2 runs), the second brings it to 1,200, and the check before step 3 stops the run — two model calls, status <code>token_budget</code>. With a 100-second deadline and 40 seconds per call, steps 1-3 start at 0, 40 and 80 seconds; step 4 would start at 120, so the run stops after 3.</p>
+
+<h4>8 · Stage six: the repeated-call guard, truncation and the trace</h4>
+<p>The commonest real agent failure is calling the same tool with the same input repeatedly because the result did not contain what the model hoped for. The agent counts identical calls by a canonical key — the tool name plus its input serialised with sorted keys, so <code>{"a":1,"b":2}</code> and <code>{"b":2,"a":1}</code> match — and after <code>max_repeats</code> returns an error: "this exact call was already made 2 times with the same input; use the earlier result or change approach". It costs nothing and breaks the loop at its most typical point.</p>
+<p>Results longer than <code>max_result_chars</code> are cut with a marker saying how much was removed, so one huge tool output cannot fill the context window; a production version would summarise or store the full output and return a handle.</p>
+<p>The <strong>trace</strong> records, per step, the model call (stop reason, tokens, milliseconds) and each tool call (name, id, success, milliseconds), then the stop status. It is the agent's flight recorder: when a run misbehaves, the trace shows whether the model asked for the wrong tool, a tool failed, or a budget ran out.</p>
+
+<h4>9 · The full solution</h4>
+<p>Thirteen tests: the happy path and the exact message shape; validation errors fed back and corrected; unknown tools and extra properties; exceptions and timeouts as results; the barrier test for parallelism and order; each of the four budgets; the repeat guard; truncation; the validator and registry rules; and a stress test in which eight threads share one agent and run 400 conversations of five parallel calls each, checking every answer. Python 3.12, standard library only; it runs in about a second.</p>
+<pre>"""A tool-calling agent loop: a tool registry with JSON-schema validation, the model -&gt; tool -&gt; result
+loop against a fake model, budgets (steps, tokens, wall time, tool calls), parallel tool calls with
+per-tool timeouts, errors fed back to the model, a repeated-call guard and a trace log.
+Python 3.12, standard library only.  Run: python agent_loop.py"""
+from __future__ import annotations
+
+import json
+import threading
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+
+# ---------------------------------------------------------------- JSON Schema (a useful subset)
+class SchemaError(ValueError):
+    pass
+
+
+_PY_TYPES = {"object": dict, "array": list, "string": str, "boolean": bool, "null": type(None)}
+
+
+def validate(value: Any, schema: dict, path: str = "$") -&gt; None:
+    """Raise SchemaError with a path-qualified message if value does not match schema.
+    Supports type, enum, minimum/maximum, minLength/maxLength, items, properties,
+    required and additionalProperties: false."""
+    t = schema.get("type")
+    if t == "integer":
+        ok = isinstance(value, int) and not isinstance(value, bool)
+    elif t == "number":
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+    elif t is not None:
+        ok = isinstance(value, _PY_TYPES[t])
+    else:
+        ok = True
+    if not ok:
+        raise SchemaError(f"{path}: expected {t}, got {type(value).__name__}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise SchemaError(f"{path}: {value!r} is not one of {schema['enum']}")
+    if t in ("integer", "number"):
+        if "minimum" in schema and value &lt; schema["minimum"]:
+            raise SchemaError(f"{path}: {value} is below minimum {schema['minimum']}")
+        if "maximum" in schema and value &gt; schema["maximum"]:
+            raise SchemaError(f"{path}: {value} is above maximum {schema['maximum']}")
+    if t == "string":
+        if len(value) &lt; schema.get("minLength", 0):
+            raise SchemaError(f"{path}: shorter than {schema['minLength']} characters")
+        if "maxLength" in schema and len(value) &gt; schema["maxLength"]:
+            raise SchemaError(f"{path}: longer than {schema['maxLength']} characters")
+    if t == "array" and "items" in schema:
+        for i, item in enumerate(value):
+            validate(item, schema["items"], f"{path}[{i}]")
+    if t == "object":
+        props = schema.get("properties", {})
+        for name in schema.get("required", []):
+            if name not in value:
+                raise SchemaError(f"{path}: missing required property {name!r}")
+        for name, item in value.items():
+            if name in props:
+                validate(item, props[name], f"{path}.{name}")
+            elif schema.get("additionalProperties", True) is False:
+                raise SchemaError(f"{path}: unexpected property {name!r}")
+
+
+# ---------------------------------------------------------------- tools
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    description: str
+    input_schema: dict
+    fn: Callable[..., Any]
+    timeout_s: float = 5.0
+
+
+class ToolRegistry:
+    def __init__(self) -&gt; None:
+        self._tools: dict[str, Tool] = {}
+
+    def register(self, name: str, description: str, input_schema: dict,
+                 timeout_s: float = 5.0) -&gt; Callable:
+        if name in self._tools:
+            raise ValueError(f"tool {name!r} already registered")
+        if input_schema.get("type") != "object":
+            raise ValueError("a tool's input_schema must describe an object")
+
+        def deco(fn: Callable[..., Any]) -&gt; Callable[..., Any]:
+            self._tools[name] = Tool(name, description, input_schema, fn, timeout_s)
+            return fn
+        return deco
+
+    def get(self, name: str) -&gt; Tool | None:
+        return self._tools.get(name)
+
+    def specs(self) -&gt; list[dict]:
+        # Sorted, so the tool list is byte-identical every call (prompt caches key on the prefix).
+        return [{"name": t.name, "description": t.description, "input_schema": t.input_schema}
+                for t in sorted(self._tools.values(), key=lambda t: t.name)]
+
+
+# ---------------------------------------------------------------- model interface
+@dataclass
+class ModelResponse:
+    content: list[dict]                 # text and tool_use blocks
+    stop_reason: str                    # "tool_use" or "end_turn"
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+Model = Callable[[list[dict], list[dict]], ModelResponse]
+
+
+class FakeModel:
+    """Plays back scripted turns. A turn is a ModelResponse or a function(messages) -&gt; ModelResponse,
+    so a test can make the 'model' react to the tool results it was given."""
+
+    def __init__(self, turns: list[ModelResponse | Callable[[list[dict]], ModelResponse]]):
+        self.turns, self.seen = list(turns), []
+
+    def __call__(self, messages: list[dict], tools: list[dict]) -&gt; ModelResponse:
+        self.seen.append(json.loads(json.dumps(messages)))          # snapshot what it was shown
+        if not self.turns:
+            raise AssertionError("fake model ran out of scripted turns")
+        turn = self.turns.pop(0)
+        return turn(messages) if callable(turn) else turn
+
+
+def tool_use(id_: str, name: str, **inp: Any) -&gt; dict:
+    return {"type": "tool_use", "id": id_, "name": name, "input": inp}
+
+
+def text(s: str) -&gt; dict:
+    return {"type": "text", "text": s}
+
+
+# ---------------------------------------------------------------- the loop
+@dataclass
+class Budget:
+    max_steps: int = 10                 # model calls
+    max_tokens: int = 100_000           # input + output, summed over calls
+    max_seconds: float = 120.0          # wall time for the whole run
+    max_tool_calls: int = 50
+
+
+@dataclass
+class RunResult:
+    status: str                         # final | max_steps | token_budget | deadline | tool_budget
+    text: str | None
+    messages: list[dict]
+    steps: int
+    tokens: int
+    trace: list[dict] = field(default_factory=list)
+
+
+class Agent:
+    def __init__(self, model: Model, registry: ToolRegistry, budget: Budget | None = None,
+                 clock: Callable[[], float] = time.monotonic, max_workers: int = 8,
+                 max_result_chars: int = 4000, max_repeats: int = 2) -&gt; None:
+        self.model, self.registry = model, registry
+        self.budget = budget or Budget()
+        self.clock = clock
+        self.pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tool")
+        self.max_result_chars, self.max_repeats = max_result_chars, max_repeats
+
+    def run(self, user_text: str) -&gt; RunResult:
+        messages: list[dict] = [{"role": "user", "content": [text(user_text)]}]
+        trace: list[dict] = []
+        tokens = tool_calls = 0
+        seen_calls: Counter[str] = Counter()
+        start = self.clock()
+
+        def stop(status: str, step: int, final: str | None = None) -&gt; RunResult:
+            trace.append({"step": step, "event": "stop", "status": status})
+            return RunResult(status, final, messages, step, tokens, trace)
+
+        for step in range(1, self.budget.max_steps + 1):
+            if self.clock() - start &gt; self.budget.max_seconds:
+                return stop("deadline", step - 1)
+            if tokens &gt;= self.budget.max_tokens:
+                return stop("token_budget", step - 1)
+
+            t0 = time.perf_counter()
+            resp = self.model(messages, self.registry.specs())
+            tokens += resp.input_tokens + resp.output_tokens
+            trace.append({"step": step, "event": "model", "stop_reason": resp.stop_reason,
+                          "tokens": resp.input_tokens + resp.output_tokens,
+                          "ms": round((time.perf_counter() - t0) * 1000, 2)})
+            messages.append({"role": "assistant", "content": resp.content})
+
+            calls = [b for b in resp.content if b["type"] == "tool_use"]
+            if resp.stop_reason != "tool_use" or not calls:
+                final = "".join(b["text"] for b in resp.content if b["type"] == "text")
+                return stop("final", step, final)
+
+            if tool_calls + len(calls) &gt; self.budget.max_tool_calls:
+                return stop("tool_budget", step)
+            tool_calls += len(calls)
+
+            results = self._execute(calls, seen_calls, trace, step)
+            # Every tool_use gets exactly one tool_result, in one user message, in call order.
+            messages.append({"role": "user", "content": results})
+        return stop("max_steps", self.budget.max_steps)
+
+    # ---- tool execution: validate, then run all calls concurrently, each with its own timeout
+    def _execute(self, calls: list[dict], seen: Counter, trace: list[dict], step: int) -&gt; list[dict]:
+        pending: list[tuple[dict, Tool | None, Any, str | None, float]] = []
+        for call in calls:
+            key = call["name"] + json.dumps(call["input"], sort_keys=True)
+            seen[key] += 1
+            tool = self.registry.get(call["name"])
+            error = None
+            if tool is None:
+                names = ", ".join(t["name"] for t in self.registry.specs())
+                error = f"unknown tool {call['name']!r}; available tools: {names}"
+            elif seen[key] &gt; self.max_repeats:
+                error = (f"this exact call was already made {seen[key] - 1} times with the same input; "
+                         "use the earlier result or change approach")
+            else:
+                try:
+                    validate(call["input"], tool.input_schema)
+                except SchemaError as e:
+                    error = f"invalid input: {e}"
+            future = None if error else self.pool.submit(tool.fn, **call["input"])
+            pending.append((call, tool, future, error, time.monotonic()))
+
+        results = []
+        for call, tool, future, error, submitted in pending:
+            out = None
+            if future is not None:
+                remaining = tool.timeout_s - (time.monotonic() - submitted)
+                try:
+                    out = future.result(timeout=max(0.0, remaining))
+                except FutureTimeout:
+                    error = f"tool {tool.name!r} timed out after {tool.timeout_s}s"
+                except Exception as e:                       # the tool's bug becomes a message
+                    error = f"{type(e).__name__}: {e}"
+            if error is not None:
+                body, is_error = error, True
+            else:
+                body = out if isinstance(out, str) else json.dumps(out, sort_keys=True, default=str)
+                if len(body) &gt; self.max_result_chars:
+                    body = body[: self.max_result_chars] + f"... [truncated {len(body) - self.max_result_chars} chars]"
+                is_error = False
+            trace.append({"step": step, "event": "tool", "name": call["name"], "id": call["id"],
+                          "ok": not is_error, "ms": round((time.monotonic() - submitted) * 1000, 2)})
+            results.append({"type": "tool_result", "tool_use_id": call["id"],
+                            "content": body, "is_error": is_error})
+        return results
+
+
+# ---------------------------------------------------------------- tests
+def make_registry() -&gt; ToolRegistry:
+    reg = ToolRegistry()
+
+    @reg.register("get_weather", "Current temperature in Celsius for a city.",
+                  {"type": "object", "properties": {"city": {"type": "string", "minLength": 1}},
+                   "required": ["city"], "additionalProperties": False})
+    def get_weather(city: str) -&gt; dict:
+        return {"city": city, "temp_c": {"Paris": 18, "Oslo": 4}.get(city, 21)}
+
+    @reg.register("add", "Add two integers.",
+                  {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                   "required": ["a", "b"], "additionalProperties": False})
+    def add(a: int, b: int) -&gt; int:
+        return a + b
+
+    return reg
+
+
+def last_results(messages: list[dict]) -&gt; list[dict]:
+    return messages[-1]["content"]
+
+
+def test_happy_path_and_message_shape() -&gt; None:
+    model = FakeModel([
+        ModelResponse([text("Let me check."), tool_use("t1", "get_weather", city="Paris")], "tool_use", 50, 10),
+        lambda msgs: ModelResponse([text(f"It is {json.loads(last_results(msgs)[0]['content'])['temp_c']} C.")],
+                                   "end_turn", 80, 8),
+    ])
+    r = Agent(model, make_registry()).run("Weather in Paris?")
+    assert r.status == "final" and r.text == "It is 18 C." and r.steps == 2 and r.tokens == 148
+    res = model.seen[1][-1]["content"][0]
+    assert res == {"type": "tool_result", "tool_use_id": "t1", "content": '{"city": "Paris", "temp_c": 18}',
+                   "is_error": False}
+    assert [e["event"] for e in r.trace] == ["model", "tool", "model", "stop"]
+
+
+def test_validation_error_is_fed_back_and_model_recovers() -&gt; None:
+    def second(msgs):
+        res = last_results(msgs)[0]
+        assert res["is_error"] and "$.city: expected string, got int" in res["content"]
+        return ModelResponse([tool_use("t2", "get_weather", city="Oslo")], "tool_use")
+    model = FakeModel([ModelResponse([tool_use("t1", "get_weather", city=5)], "tool_use"), second,
+                       ModelResponse([text("4 C in Oslo.")], "end_turn")])
+    r = Agent(model, make_registry()).run("Weather in Oslo?")
+    assert r.status == "final" and r.steps == 3
+    assert [e["ok"] for e in r.trace if e["event"] == "tool"] == [False, True]
+
+
+def test_unknown_tool_and_extra_property() -&gt; None:
+    model = FakeModel([
+        ModelResponse([tool_use("a", "get_wether", city="Paris"),
+                       tool_use("b", "add", a=1, b=2, c=3)], "tool_use"),
+        ModelResponse([text("done")], "end_turn"),
+    ])
+    r = Agent(model, make_registry()).run("x")
+    res = model.seen[1][-1]["content"]
+    assert "unknown tool 'get_wether'; available tools: add, get_weather" in res[0]["content"]
+    assert "unexpected property 'c'" in res[1]["content"] and all(x["is_error"] for x in res)
+    assert r.status == "final"
+
+
+def test_tool_exception_and_timeout_become_errors() -&gt; None:
+    reg = make_registry()
+
+    @reg.register("flaky", "Always raises.", {"type": "object", "properties": {}})
+    def flaky() -&gt; str:
+        raise ConnectionError("upstream reset")
+
+    @reg.register("slow", "Takes too long.", {"type": "object", "properties": {}}, timeout_s=0.05)
+    def slow() -&gt; str:
+        time.sleep(0.5)
+        return "late"
+
+    model = FakeModel([ModelResponse([tool_use("f", "flaky"), tool_use("s", "slow"),
+                                      tool_use("g", "add", a=2, b=2)], "tool_use"),
+                       ModelResponse([text("ok")], "end_turn")])
+    t0 = time.monotonic()
+    r = Agent(model, reg).run("x")
+    res = model.seen[1][-1]["content"]
+    assert res[0]["content"] == "ConnectionError: upstream reset" and res[0]["is_error"]
+    assert "timed out after 0.05s" in res[1]["content"] and res[1]["is_error"]
+    assert res[2] == {"type": "tool_result", "tool_use_id": "g", "content": "4", "is_error": False}
+    assert time.monotonic() - t0 &lt; 0.4 and r.status == "final"      # did not wait for the slow tool
+
+
+def test_parallel_calls_run_concurrently_and_keep_call_order() -&gt; None:
+    reg, barrier = ToolRegistry(), threading.Barrier(3, timeout=2)
+
+    @reg.register("wait", "Waits at a barrier.",
+                  {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]})
+    def wait(n: int) -&gt; str:
+        barrier.wait()                  # only returns if all three calls are running at once
+        time.sleep(0.03 * (3 - n))      # finish in reverse order
+        return f"done {n}"
+
+    model = FakeModel([ModelResponse([tool_use(f"w{i}", "wait", n=i) for i in range(3)], "tool_use"),
+                       ModelResponse([text("ok")], "end_turn")])
+    Agent(model, reg).run("x")
+    res = model.seen[1][-1]["content"]
+    assert [x["tool_use_id"] for x in res] == ["w0", "w1", "w2"]
+    assert [x["content"] for x in res] == ["done 0", "done 1", "done 2"] and not any(x["is_error"] for x in res)
+
+
+def test_max_steps_stops_a_looping_model() -&gt; None:
+    model = FakeModel([ModelResponse([tool_use(f"t{i}", "add", a=i, b=1)], "tool_use") for i in range(10)])
+    r = Agent(model, make_registry(), Budget(max_steps=3)).run("x")
+    assert r.status == "max_steps" and r.steps == 3 and len(model.seen) == 3
+
+
+def test_token_budget() -&gt; None:
+    model = FakeModel([ModelResponse([tool_use(f"t{i}", "add", a=i, b=0)], "tool_use", 500, 100)
+                       for i in range(10)])
+    r = Agent(model, make_registry(), Budget(max_tokens=1000)).run("x")
+    assert r.status == "token_budget" and len(model.seen) == 2 and r.tokens == 1200
+
+
+def test_deadline_uses_injected_clock() -&gt; None:
+    now = [0.0]
+
+    def tick(msgs):
+        now[0] += 40                    # each model call 'takes' 40 s
+        return ModelResponse([tool_use(f"t{len(msgs)}", "add", a=len(msgs), b=1)], "tool_use")
+    r = Agent(FakeModel([tick] * 10), make_registry(), Budget(max_seconds=100),
+              clock=lambda: now[0]).run("x")
+    assert r.status == "deadline" and r.steps == 3
+
+
+def test_tool_call_budget() -&gt; None:
+    model = FakeModel([ModelResponse([tool_use(f"t{i}", "add", a=i, b=1) for i in range(4)], "tool_use")] * 3)
+    r = Agent(model, make_registry(), Budget(max_tool_calls=6)).run("x")
+    assert r.status == "tool_budget" and r.steps == 2
+
+
+def test_repeated_identical_call_is_refused() -&gt; None:
+    model = FakeModel([ModelResponse([tool_use(f"t{i}", "get_weather", city="Paris")], "tool_use")
+                       for i in range(3)] + [ModelResponse([text("ok")], "end_turn")])
+    Agent(model, make_registry(), max_repeats=2).run("x")
+    third = model.seen[3][-1]["content"][0]
+    assert third["is_error"] and "already made 2 times" in third["content"]
+
+
+def test_truncates_huge_results() -&gt; None:
+    reg = ToolRegistry()
+
+    @reg.register("dump", "Returns a lot.", {"type": "object", "properties": {}})
+    def dump() -&gt; str:
+        return "x" * 10_000
+
+    model = FakeModel([ModelResponse([tool_use("d", "dump")], "tool_use"), ModelResponse([text("ok")], "end_turn")])
+    Agent(model, reg, max_result_chars=100).run("x")
+    body = model.seen[1][-1]["content"][0]["content"]
+    assert body.startswith("x" * 100) and body.endswith("[truncated 9900 chars]")
+
+
+def test_schema_validator_and_registry_rules() -&gt; None:
+    s = {"type": "object", "required": ["tags"], "properties": {
+        "tags": {"type": "array", "items": {"type": "string", "enum": ["a", "b"]}},
+        "k": {"type": "integer", "minimum": 1, "maximum": 5}}}
+    validate({"tags": ["a", "b"], "k": 3}, s)
+    for bad, msg in [({"tags": ["a", "c"]}, "$.tags[1]: 'c' is not one of"), ({}, "missing required"),
+                     ({"tags": [], "k": 9}, "above maximum"), ({"tags": [], "k": True}, "expected integer")]:
+        try:
+            validate(bad, s)
+        except SchemaError as e:
+            assert msg in str(e), (msg, str(e))
+        else:
+            raise AssertionError(f"accepted {bad}")
+    reg = make_registry()
+    for args in [("add", "dup", {"type": "object"}), ("x", "not an object", {"type": "string"})]:
+        try:
+            reg.register(*args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("bad registration accepted")
+    assert [t["name"] for t in reg.specs()] == ["add", "get_weather"]
+
+
+def test_stress_one_agent_shared_by_threads() -&gt; None:
+    class EchoModel:                    # stateless: answers from the messages it is shown
+        def __call__(self, messages, tools):
+            last = messages[-1]["content"]
+            if last[0]["type"] == "text":                       # first turn: fan out 5 adds
+                n = int(last[0]["text"])
+                return ModelResponse([tool_use(f"{n}-{i}", "add", a=n, b=i) for i in range(5)], "tool_use")
+            total = sum(int(r["content"]) for r in last)
+            return ModelResponse([text(str(total))], "end_turn")
+    agent, out, errors = Agent(EchoModel(), make_registry(), max_workers=16), {}, []
+
+    def worker(k: int) -&gt; None:
+        try:
+            for n in range(k * 50, k * 50 + 50):
+                out[n] = agent.run(str(n)).text
+        except Exception as e:          # pragma: no cover
+            errors.append(e)
+    ts = [threading.Thread(target=worker, args=(k,)) for k in range(8)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert not errors and len(out) == 400
+    assert all(out[n] == str(5 * n + 10) for n in out)    # sum of n+i for i in 0..4
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
+    for t in tests:
+        t()
+        print("ok ", t.__name__)
+    print(f"{len(tests)} tests passed")</pre>
+
+<h4>10 · Edge cases</h4>
+<p><strong>A response with tool_use blocks but stop reason end_turn</strong> (or the reverse): trust the blocks you can act on and the documented stop reason together; the solution treats "no tool calls or not tool_use" as final. <strong>Truncated tool input</strong>: if the model hit its output limit mid-call (stop reason <code>max_tokens</code>), the input may be incomplete JSON or a valid-looking partial object; do not execute it — re-request with more room. <strong>Duplicate tool_use ids</strong> in one turn: reject the turn rather than answering one id twice. <strong>Tool returns non-JSON-serialisable data</strong>: <code>json.dumps(default=str)</code> keeps the loop alive. <strong>A tool that never returns</strong>: the harness moves on, but the worker is lost until it does; bound tool I/O. <strong>Empty final text</strong>: a model may end its turn with no text; return an empty string and let the caller decide. <strong>Budgets exhausted mid-turn</strong>: the tool-call budget is checked before executing any of a turn's calls, so the transcript never contains a tool_use without its result unless the run stopped deliberately.</p>
+
+<h4>11 · Extensions the interviewer will ask for</h4>
+<p><strong>Human approval</strong>: tag tools with a risk level; for risky calls, pause, persist the transcript and pending calls, and resume with the real result or a "denied by user" error result. <strong>Persistence and resumption</strong>: all state already lives in <code>messages</code> plus the budget counters, so checkpoint them after each step and a crashed run can resume from the last checkpoint. <strong>Streaming</strong>: stream the model's text to the user and accumulate tool_use input fragments; validate the complete input before running. <strong>Async</strong>: the same loop with <code>asyncio.gather</code> or a <code>TaskGroup</code> and <code>asyncio.wait_for</code> per tool; cancellation actually stops coroutines. <strong>Retries</strong>: wrap the model call in ld4's resilient client; retry idempotent tools on transient errors before reporting failure. <strong>Context management</strong>: when tokens per step grow, drop or summarise old tool results (ag5). <strong>Serial tools</strong>: mark tools that must not run concurrently and execute them one at a time.</p>
+
+<h4>12 · Complexity</h4>
+<p>Per step: one model call, plus O(k) work to dispatch k tool calls and validation linear in the size of each input. With a pool of w workers, a turn's wall time is about the slowest call when k ≤ w, and roughly ⌈k / w⌉ × the typical call time beyond that. The transcript grows by the size of each turn's content and results, so the tokens sent per model call grow linearly with steps and total tokens quadratically — the reason token budgets and context trimming matter more than step limits. Memory: O(transcript) per run plus the trace.</p>
+</section>
+
+<section data-field="deep">
+<h4>Errors are prompts</h4>
+<p>An error result is text the model reads and acts on, so it deserves the same care as a prompt. Good error messages say what failed, where, and what would succeed: "$.date: expected format YYYY-MM-DD, got '10/10/2026'"; "unknown tool 'search_web'; available tools: web_search, fetch_page"; "rate limited by the search API; retry after 20 seconds or use cached_search". Bad ones say "error" or dump a stack trace, and the model either repeats the call or gives up. Anthropic's tool-use guidance makes the same point from the provider side: return the error with is_error set and an informative message, and the model will typically try a different approach. In evaluation, the share of tool errors followed by a successful corrected call is a useful metric of error-message quality.</p>
+
+<h4>Validation layers: provider, harness, tool</h4>
+<p>There are three places to check arguments. Providers increasingly offer <strong>strict tool use</strong> — Anthropic's API accepts <code>strict: true</code> on a tool definition, constraining generation so the input matches the schema exactly. The <strong>harness</strong> validates against the registered schema, which catches anything the provider did not enforce and works for any provider. And the <strong>tool</strong> itself validates business rules no schema expresses (this customer exists; this amount is within the user's limit). Each layer catches different mistakes. With streamed tool input, partial JSON must be parsed strictly and validated after the block completes, because a lenient parser can return a silently truncated object.</p>
+
+<h4>Parallelism changes what the model does</h4>
+<p>Models make parallel calls when they judge actions independent, and harnesses influence that judgement. If results for one turn are returned across several messages, the transcript looks as if the calls were sequential, and the model learns from its own history to stop parallelising; if a failed call's result is dropped, the model may assume it succeeded. When some tools must not run concurrently (two writes to the same file), either serialise them in the harness or tell the API to allow at most one call per turn (Anthropic's <code>disable_parallel_tool_use</code> option on <code>tool_choice</code>). Parallel execution also changes failure semantics: if call 2 fails and call 3 succeeds, the model sees both outcomes and must reason about a partial success, which is one more reason for precise messages.</p>
+
+<h4>Why the loop must be append-only</h4>
+<p>The harness appends the model's response exactly as returned, including any reasoning or thinking blocks, and never rewrites earlier turns. Two reasons. Prompt caching matches on an unchanged prefix, so editing an early message invalidates the cache for everything after it, multiplying cost. And some current models bind reasoning blocks to the conversation that produced them, rejecting or ignoring them if earlier history was edited. Context management (dropping old tool results) is therefore done deliberately, rarely, and with the provider's supported mechanisms, not by mutating the list casually inside the loop.</p>
+
+<h4>Threads, processes or async</h4>
+<p>Threads are right for this round: tools are typically network calls, which release the global interpreter lock while waiting, and the code stays simple. Their limitation — no cancellation — matters when tools can hang. Processes allow killing a stuck tool and suit CPU-bound or untrusted code (a code-execution tool should run in a sandboxed subprocess or container, never in the harness's own process). Asyncio gives cheap concurrency for thousands of in-flight calls and real cancellation, at the cost of requiring every tool to be async or wrapped with <code>asyncio.to_thread</code>. Naming the trade-off and why you chose threads is worth more in the interview than the choice itself. A useful closing sentence: the orchestration logic does not change between the three, only the executor does, which is why the solution keeps execution inside one method.</p>
+
+<h4>Budgets as product decisions</h4>
+<p>Budget values come from the product, not the code. An interactive assistant might allow 8 steps and 30 seconds; a nightly research agent 100 steps and an hour; a coding agent a token budget sized to its cost per task. The harness should make hitting a budget a graceful outcome — return what is known, say what was not finished — and the trace should record which budget bound, so that limits can be tuned from data: if 20% of runs hit the step limit with correct partial answers, the limit may be too tight; if most of them were looping, the guard or the prompt needs work.</p>
+</section>
+
+<section data-field="prod">
+<h4>How agent loops fail in production</h4>
+<p><strong>Runaway loops.</strong> A model repeatedly calls a search tool with slight variations, each returning nothing useful, until the step budget ends the run. Detection: steps per run and repeated-call counts in the trace. Fix: the repeat guard, better tool results ("no results; try a broader query"), and prompts that tell the model when to stop.</p>
+<p><strong>Silent wrong actions.</strong> A model passes a customer id as a string with a leading space; the tool, without validation, looks up nothing and creates a new record. Detection: tool-level business validation failures and audit of side effects. Fix: schema validation in the harness plus semantic validation in the tool.</p>
+<p><strong>Hung runs.</strong> One tool's upstream stops responding; without timeouts, runs hang until the user gives up and the worker pool fills. Detection: tool latency percentiles and pool saturation. Fix: per-tool timeouts in the harness and real I/O timeouts inside tools.</p>
+<p><strong>Cost blow-ups.</strong> A tool starts returning much larger results (an API added fields), every subsequent step carries them, and token use per run triples. Detection: tokens per step in the trace, alerting on drift. Fix: result truncation or projection, and context trimming.</p>
+<p><strong>Provider drift.</strong> A model upgrade changes how often the model calls tools in parallel or how it escapes strings in tool inputs; a harness that string-matched serialised inputs instead of parsing them breaks. Detection: tool error rates by model version. Fix: always parse inputs as JSON, validate, and run the agent's evaluation suite on every model change.</p>
+<p><strong>Mismatched results.</strong> A harness bug returns results in completion order without ids, or drops a failed one; the model attributes results to the wrong calls. Detection: hard to see in outputs, obvious in the trace. Fix: always pair by tool_use_id, include every call's result.</p>
+
+<h4>What to measure</h4>
+<p>Per run: status (final versus each budget), steps, tokens, wall time, tool calls, error results and repeat refusals. Per tool: call rate, error rate by error type, latency percentiles, timeouts, result size. Per model call: input and output tokens, cache hit tokens if the provider reports them. Then the quality signals from evaluation (ag12): task success, and how often an error result is followed by a successful correction.</p>
+
+<h4>Knobs</h4>
+<p>Pool size (at least the largest expected parallel fan-out times concurrent runs, bounded by downstream limits); per-tool timeouts (from each tool's p99 latency plus margin); the four budgets (from product requirements and observed distributions); <code>max_repeats</code> (2-3); <code>max_result_chars</code> (sized against the context budget per step); and whether parallel calls are allowed at all for side-effecting tools.</p>
+
+<h4>The real reference: the provider's documented contract</h4>
+<p>The message shapes in this solution follow Anthropic's tool-use documentation: tools defined with <code>name</code>, <code>description</code> and <code>input_schema</code>; a response with <code>stop_reason</code> <code>"tool_use"</code> containing <code>tool_use</code> blocks with <code>id</code>, <code>name</code> and <code>input</code>; results sent back as <code>tool_result</code> blocks with <code>tool_use_id</code>, <code>content</code> and optional <code>is_error</code>; parallel tool use on by default, with all results for a turn returned in a single user message; and <code>strict: true</code> available on a tool definition to guarantee schema-valid inputs. The official SDKs also provide a tool runner that drives this loop for you; writing it by hand, as in this round, is what you do when you need control the runner does not give, and it is the best way to understand what any runner or framework is doing underneath.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then break it, measure it and extend it. Python 3.12, standard library only. Every exercise is judged by a test with the fake model, never by calling a real API, so each runs in milliseconds and costs nothing.</p>
+<ol>
+<li>Save the full solution as <code>agent_loop.py</code> and run it. Thirteen tests print <code>ok</code> in about a second.</li>
+<li><strong>Break the ordering.</strong> In <code>_execute</code>, collect futures with <code>concurrent.futures.as_completed</code> and append results in completion order. Which test fails, and what would the model have seen?</li>
+<li><strong>Break the timeout.</strong> Give every future its full <code>timeout_s</code> instead of the remaining time since submission. Make three tools each sleep 0.08 s with a 0.1 s timeout and measure the run time before and after.</li>
+<li><strong>Measure cost growth.</strong> Script a fake model that makes ten sequential calls whose input tokens equal the length of the transcript in characters ÷ 4. Plot (or print) tokens per step: it grows each step, and the total grows roughly quadratically.</li>
+<li><strong>Extend it: approval.</strong> Add <code>requires_approval</code> to <code>Tool</code> and an <code>approve(call) → bool</code> callback to <code>Agent</code>. Denied calls return an error result "denied by user". Write a test where the model, after a denial, chooses a safer tool.</li>
+<li><strong>Extend it: serial tools.</strong> Add <code>serial=True</code> tools that never run concurrently with each other; prove it with a test that fails if two are inside the function at once.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Design it</b>
+<p>Your team's support agent has three tools: <code>lookup_order(order_id)</code>, <code>refund(order_id, amount_cents)</code> and <code>send_email(to, body)</code>. Interactive users wait at most 20 seconds. Last week the agent refunded one order twice and emailed a customer an empty body. Which parts of this lesson's loop would have prevented each, and what else do you add?</p>
+<details><summary>Answer</summary>
+<p><strong>Double refund.</strong> Likely a timeout or retry: the first refund call timed out from the harness's point of view, the model saw an error and called refund again, but the first call had completed. Fixes: give <code>refund</code> an idempotency key derived from the tool_use id (or from order id + amount) and pass it to the payments API so a repeat is deduplicated; make <code>refund</code> check existing refunds before acting; tag it as requiring approval above a threshold; and have the repeat guard refuse identical refund calls after one. <strong>Empty email.</strong> Validation: the schema should require <code>body</code> with <code>minLength</code> (say 20) and <code>to</code> with a format check, and the tool should apply business validation (no placeholder text). <strong>Latency.</strong> A 20-second wall-time budget with per-tool timeouts (lookup 3 s, refund 8 s, email 5 s), and lookups for several orders run in parallel. Add tracing so every refund can be tied to the run, step and model decision that caused it.</p>
+</details>
+<b>Diagnose it</b>
+<p>After a harness refactor, the agent's tool calls per run dropped by 40% and task success fell, though no single error appears. In traces, turns that used to contain three parallel lookups now contain one lookup each. What changed?</p>
+<details><summary>Answer</summary>
+<p>The refactor probably changed how results are returned: sending each tool_result in its own user message (or interleaving text between them) instead of all results for a turn in one message. The model, seeing a history in which its parallel calls appear to have been answered one by one, stops making parallel calls; each lookup now takes its own step, steps run out sooner or latency budgets bind, and success falls. Confirm by diffing the message structure in traces before and after. Fix: return every result for a turn in a single user message, in call order, and add a test asserting that structure.</p>
+</details>
+</section>

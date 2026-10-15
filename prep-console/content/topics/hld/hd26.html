@@ -1,0 +1,619 @@
+<!-- topic source for hld/hd26; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "hd26",
+  "t": "Design a vector database",
+  "tag": "Infra",
+  "sum": "A multi-tenant vector database for 10 billion vectors: points with metadata, HNSW, IVF-PQ and DiskANN with memory arithmetic, why filtered HNSW recall collapses at 1% selectivity and how planners, ACORN and filter-aware edges fix it, LSM-style segments for writes, deletes and compaction, sharding, hybrid BM25 + vector queries, consistency, recall tuning and cost per million vectors.",
+  "prereq": [
+    [
+      "lm10",
+      "Embeddings put similar meanings close together; IVF, HNSW and product quantisation trade recall for speed and memory, and recall@k is measured against exact search."
+    ],
+    [
+      "db15",
+      "pgvector stores vectors in PostgreSQL with HNSW (m = 16, ef_construction = 64 by default) and IVFFlat indexes; approximate indexes apply WHERE filters after the index scan, so selective filters return too few rows."
+    ],
+    [
+      "rec5",
+      "Hybrid search runs lexical (BM25) and dense retrieval and fuses the rankings, usually with reciprocal rank fusion."
+    ],
+    [
+      "hd2",
+      "Enterprise RAG stores hundreds of millions of chunk vectors, filters retrieval by user permissions, and needs deletions to propagate in minutes."
+    ],
+    [
+      "hd25",
+      "Product quantisation compresses a vector into short codes searched with lookup tables; IVF-PQ fits a billion vectors in tens of gigabytes, and refinement with full vectors restores accuracy."
+    ],
+    [
+      "in3",
+      "A distributed system shards data by key, replicates each shard, and chooses how stale a read may be."
+    ]
+  ],
+  "myths": [
+    [
+      "A filter is just a WHERE clause; any vector index supports it.",
+      "Graph indexes are navigated through neighbours. If only 1% of vectors pass the filter and each node has 32 neighbours at the bottom layer, the expected number of passing neighbours is 0.32, and 72% of passing nodes have none at all, so a search restricted to passing nodes falls apart, while a search that ignores the filter and checks it afterwards finds one match per hundred visited. Filtered search needs a planner and filter-aware structures."
+    ],
+    [
+      "HNSW is always the best index.",
+      "HNSW gives excellent recall and latency but stores full vectors plus links in RAM: about 3.2 KB per 768-dimensional vector, 3.2 TB per billion. IVF-PQ needs about 104 bytes per vector with refinement on SSD, and DiskANN keeps 64-byte compressed vectors in RAM with the graph on SSD. The best index depends on size, recall target, update rate and budget."
+    ],
+    [
+      "Deleting a vector removes it.",
+      "In most engines a delete writes a tombstone; the vector stays in the index files until compaction rewrites the segment. That matters for erasure requests, for memory, and for search, since a segment full of tombstones wastes work. Physical deletion is a compaction policy with a deadline."
+    ],
+    [
+      "A vector database is consistent like a relational database.",
+      "Most are eventually consistent by default: a write is acknowledged once it is durable in the log, and becomes searchable when a replica applies it, often within a second. Read-your-writes needs a token or a leader read; transactions across vectors and other data usually do not exist. If you need joins and transactions with your vectors, a vector index inside your database (db15) may fit better."
+    ],
+    [
+      "Recall@10 of 0.99 on a public benchmark means my queries get 0.99.",
+      "Recall depends on the data distribution, the dimension, the filter mix and the parameters. Benchmarks use unfiltered queries on fixed datasets; production queries carry tenant and metadata filters, data drifts, and segments vary in size. Measure recall continuously on your own traffic by running a small share of queries exactly."
+    ]
+  ],
+  "recap": [
+    "A vector database stores points (an ID, one or more vectors and a metadata payload) and answers top-k nearest-neighbour queries with filters, fast enough for interactive use, while absorbing writes and deletes.",
+    "For a billion 768-dimensional vectors, raw float32 is 3.07 TB, HNSW about 3.2 TB in RAM, IVF-PQ with 96-byte codes about 104 GB in RAM plus full vectors on SSD, and DiskANN about 64 GB in RAM with about 3.3 TB on SSD.",
+    "Under stated assumptions (RAM $3 and SSD $0.15 per GB-month, two replicas), HNSW in RAM costs about $19 per million vectors a month, IVF-PQ and DiskANN about $1.40–1.50, and object-storage-backed cold namespaces a few cents.",
+    "Writes go through a replicated log into a mutable segment searched by brute force, which is sealed and indexed in the background; deletes are tombstones; compaction merges segments and purges deleted vectors.",
+    "Filtered search collapses on graph indexes at low selectivity: at 1% selectivity a node with 32 neighbours has 0.32 passing neighbours on average and a 72% chance of none.",
+    "A query planner estimates filter cardinality from payload indexes and chooses brute force over the matching set when it is small, in-graph filtering when the filter is loose, and filter-aware structures (ACORN's predicate subgraph traversal, Qdrant's extra edges per payload value) in between.",
+    "Multi-tenancy is best served by namespaces with their own segments, which turns the tenant filter into routing; tiny namespaces are searched by brute force, large ones get dedicated shards.",
+    "Hybrid queries run BM25 or sparse search alongside vector search and fuse rankings with reciprocal rank fusion (k = 60), because their scores are not comparable.",
+    "Consistency is eventual by default, with read-your-writes available through a log position token; the mutable segment keeps new writes searchable before indexing finishes.",
+    "Recall is tuned per workload with ef_search, nprobe and rescoring depth, and measured continuously by running a sample of real queries exactly."
+  ],
+  "glossary": [
+    [
+      "ACORN",
+      "A filtered-search method for HNSW that builds a denser graph and, at query time, traverses only nodes passing the predicate while expanding to neighbours of neighbours so the passing subgraph stays connected."
+    ],
+    [
+      "BM25",
+      "A lexical ranking formula that scores documents by how often query terms appear, discounted for common terms and long documents."
+    ],
+    [
+      "Brute-force (flat) search",
+      "Computing the distance from the query to every candidate vector; exact, and fast enough for small sets."
+    ],
+    [
+      "Compaction",
+      "Merging segments into fewer, larger ones and physically removing deleted vectors."
+    ],
+    [
+      "DiskANN",
+      "A graph index designed to live on SSD: compressed vectors in RAM guide the search, while the graph and full vectors are read from disk."
+    ],
+    [
+      "ef_search",
+      "The size of the candidate list in an HNSW search; larger values raise recall and cost."
+    ],
+    [
+      "Filter selectivity",
+      "The fraction of vectors that pass a filter; low selectivity (a strict filter) means few pass."
+    ],
+    [
+      "HNSW",
+      "Hierarchical navigable small world: a layered neighbour graph searched greedily from a sparse top layer down to a bottom layer that contains every vector."
+    ],
+    [
+      "IVF-PQ",
+      "An index that clusters vectors into lists (IVF) and stores product-quantised codes of each vector's offset from its list centroid."
+    ],
+    [
+      "Log sequence number (LSN)",
+      "A position in the write-ahead log; a replica that has applied up to an LSN has every write before it."
+    ],
+    [
+      "LSM (log-structured merge)",
+      "A storage design that buffers writes in memory, flushes them as immutable files and merges files in the background."
+    ],
+    [
+      "Mutable segment",
+      "The in-memory segment that receives new writes and is searched by brute force until it is sealed and indexed."
+    ],
+    [
+      "Namespace",
+      "A logically separate collection of points, usually one per tenant or use case, with its own segments."
+    ],
+    [
+      "Payload",
+      "The metadata stored with a vector (tenant, document ID, date, tags) and used for filtering."
+    ],
+    [
+      "Payload index",
+      "A conventional index (keyword, numeric range) over a payload field, used to evaluate filters and estimate how many points match."
+    ],
+    [
+      "Post-filtering",
+      "Running the vector search first and removing results that fail the filter afterwards; returns too few results when the filter is strict."
+    ],
+    [
+      "Pre-filtering",
+      "Finding the points that pass the filter first and searching only among them, typically by brute force."
+    ],
+    [
+      "Reciprocal rank fusion (RRF)",
+      "Combining ranked lists by summing 1 / (k + rank) for each item across lists, which needs no score normalisation."
+    ],
+    [
+      "Rescoring",
+      "Recomputing distances for the top candidates with full-precision vectors after a search on compressed vectors."
+    ],
+    [
+      "Scalar quantisation (SQ8)",
+      "Storing each dimension as one byte instead of a 4-byte float, a 4-fold compression with small accuracy loss."
+    ],
+    [
+      "Segment",
+      "An immutable chunk of a collection with its own vector index, payload indexes and deletion bitmap."
+    ],
+    [
+      "Sparse vector",
+      "A vector with mostly zero entries, such as term weights from BM25 or a learned sparse model, searched with an inverted index."
+    ],
+    [
+      "Tombstone",
+      "A marker recording that a point was deleted, applied at query time until compaction removes the data."
+    ],
+    [
+      "Write-ahead log (WAL)",
+      "An append-only log where every write is recorded durably before it is applied, used for recovery and replication."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What is in a vector database's data model?",
+      "Collections or namespaces of points; each point has an ID, one or more dense vectors (sometimes a sparse vector too), and a payload of metadata such as tenant, document ID, date and tags. A collection fixes the dimension and distance metric (cosine, dot product or Euclidean). Payload fields can be indexed for filtering. Queries ask for the top k points nearest a query vector, optionally with filters, and return IDs, scores and payloads."
+    ],
+    [
+      "E",
+      "Compare HNSW, IVF-PQ and DiskANN in one sentence each.",
+      "HNSW is a layered neighbour graph held in RAM with full vectors: best latency and recall, highest memory (about 3.2 KB per 768-dimensional vector). IVF-PQ clusters vectors and stores short product-quantised codes: tiny memory (about 100 bytes per vector), lower recall unless the top candidates are rescored with full vectors. DiskANN keeps compressed vectors in RAM to guide a graph search whose graph and full vectors are read from SSD: billion-scale on one machine at the cost of SSD reads per query."
+    ],
+    [
+      "E",
+      "Why do new writes not have to wait for index building?",
+      "Because they land in a small mutable segment that is searched by brute force alongside the indexed segments. When it reaches a size limit it is sealed and an index is built in the background; once built, the indexed segment replaces it in searches. New data is searchable within about a second either way."
+    ],
+    [
+      "M",
+      "Explain why filtered HNSW recall collapses with a 1% filter.",
+      "HNSW search moves from node to neighbour. If the search may only step through nodes that pass the filter, each passing node has, at 1% selectivity and 32 links on the bottom layer, about 0.32 passing neighbours, and 0.99^32 ≈ 72% of passing nodes have none, so the search gets stuck in tiny islands. If it steps through all nodes and keeps only passing ones, it sees about one passing node per hundred visited, so collecting ten results needs thousands of visits, far beyond a normal ef. Either way recall or latency collapses.",
+      "Follow-up: What does the planner do instead? — Estimate the number of matching points from the payload index; if it is small (say under 20,000), brute-force them exactly; if large, use in-graph filtering; in between use ACORN-style expansion or filter-aware edges, or partition the data on that field."
+    ],
+    [
+      "M",
+      "Walk through a write, a delete and a compaction.",
+      "A write is appended to the shard's replicated write-ahead log and acknowledged; replicas apply it to their mutable segment, where it is immediately searchable by brute force. A delete appends a tombstone, which hides the point from results at once. When the mutable segment fills it is sealed and indexed. Compaction later merges small segments or segments with many tombstones into new ones, rebuilding their indexes without the deleted points, and the old segments are dropped. Erasure deadlines force compaction of affected segments."
+    ],
+    [
+      "M",
+      "How do you serve 50,000 tenants of very different sizes?",
+      "Give each tenant a namespace with its own segments, so tenant isolation is routing rather than filtering. Pack many small namespaces onto shared shards; search tiny ones (under about 10,000 vectors) by brute force with no index at all; give large tenants dedicated shards and replicas. Apply per-tenant quotas on queries, writes and index-build time, and account cost by vectors scanned, so one tenant cannot degrade others."
+    ],
+    [
+      "M",
+      "How does a hybrid BM25 plus vector query work?",
+      "Each segment holds an inverted index for text (or sparse vectors) next to the vector index. The query runs both searches with the same filters, takes the top 100 or so from each, and fuses them with reciprocal rank fusion, scoring each point by the sum of 1 / (60 + rank) over the lists it appears in, because BM25 scores and cosine similarities are on different scales. Weighted score fusion is possible but needs per-query normalisation and tuning.",
+      "Follow-up: Why k = 60? — Cormack and colleagues found it worked well across collections in their 2009 study; it damps the influence of top ranks so one list cannot dominate. Treat it as a default to tune, not a law."
+    ],
+    [
+      "M",
+      "What does read-your-writes mean here and how do you provide it?",
+      "A client that has just upserted a point sees it in its next query. Writes return the log position (LSN) at which they were recorded; the client passes it with the query, and the serving replica waits (briefly, with a timeout) until it has applied that position before searching, or the query is routed to the leader. Without the token, queries are eventually consistent, typically within a second."
+    ],
+    [
+      "H",
+      "Estimate memory and cost for 1 billion 768-dimensional vectors under three index choices.",
+      "Raw float32 is 3,072 bytes per vector, 3.07 TB. HNSW with M = 16 adds 128 bytes of links: 3,200 bytes, 3.2 TB of RAM per replica. IVF-PQ with 96-byte codes plus an 8-byte ID is 104 GB of RAM, with full vectors on SSD for rescoring. DiskANN with 64-byte PQ codes in RAM is 64 GB, with about 3.3 TB of vectors and graph on SSD. At an assumed $3 per GB-month of RAM and $0.15 per GB-month of SSD with two replicas, that is about $19, $1.50 and $1.40 per million vectors a month respectively.",
+      "Follow-up: Then why does anyone use HNSW in RAM? — For the lowest latency and highest recall at high query rates, for frequent updates (graph indexes in RAM handle inserts well), and when the collection is small enough that memory cost does not matter."
+    ],
+    [
+      "H",
+      "Design sharding and replication for a 2-billion-vector tenant at 5,000 queries a second.",
+      "Hash point IDs into, say, 16 shards of 125 million vectors; each query fans out to all 16 and merges their top k. Each shard is a replicated log (a consensus group or a durable log service) with a leader for writes and replicas serving reads; segments are snapshotted to object storage so a new replica bootstraps by downloading segments and replaying the log tail. With IVF-PQ plus SSD rescoring each shard replica is about 13 GB of RAM; three replicas per shard give zone failure tolerance and spread 5,000 queries a second to about 1,700 per replica group. Tail latency comes from the slowest shard, so hedge slow shard requests."
+    ],
+    [
+      "H",
+      "How would you continuously measure recall in production?",
+      "Shadow a small sample of real queries (say 0.5%) with an exact brute-force search over the same filtered set, run asynchronously on spare capacity, and compare the top 10. Report recall@10 per namespace, per index type and per filter-selectivity bucket, since filtered queries fail differently. Alert when recall drops after a rebuild, a parameter change or data drift, and use the same harness to tune ef_search, nprobe and rescoring depth per namespace."
+    ],
+    [
+      "H",
+      "A customer complains that queries with a date filter return only three results instead of ten. Diagnose.",
+      "Classic post-filtering: the engine searched the index for the top candidates and then removed those outside the date range, and too few survived. Check the filter's selectivity (perhaps the last 7 days is 0.5% of the namespace) and the query plan. Fixes: make sure the date field has a payload index so the planner can estimate cardinality and switch to pre-filtered brute force for small matching sets; enable filter-aware search (ACORN or extra edges); or, if most queries filter by recent dates, partition segments by time so the filter becomes segment pruning."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs",
+      "Malkov and Yashunin: the HNSW algorithm; parameters M, Mmax0 (2M on the bottom layer is the recommended default), efConstruction; a reasonable range of M is 5 to 48.",
+      "https://arxiv.org/abs/1603.09320"
+    ],
+    [
+      "paper",
+      "DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node",
+      "Subramanya et al., NeurIPS 2019: a billion SIFT vectors on a workstation with 64 GB of RAM and an SSD, over 5,000 queries a second at under 3 ms mean latency and 95%+ 1-recall@1; PQ vectors in RAM, graph and full vectors on SSD.",
+      "https://proceedings.neurips.cc/paper_files/paper/2019/file/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Paper.pdf"
+    ],
+    [
+      "paper",
+      "ACORN: Performant and Predicate-Agnostic Search Over Vector Embeddings and Structured Data",
+      "Patel et al., SIGMOD 2024: predicate subgraph traversal over an HNSW-based index, supporting arbitrary filters, with 2–1,000× higher throughput at fixed recall than prior methods.",
+      "https://arxiv.org/abs/2403.04871"
+    ],
+    [
+      "docs",
+      "Qdrant: Indexing",
+      "Payload indexes for filtering and cardinality estimation; filterable HNSW with extra edges per indexed payload value (create payload indexes before ingesting); full_scan_threshold (10,000 KB by default) for switching to full scan; ACORN search since v1.16.0.",
+      "https://qdrant.tech/documentation/concepts/indexing/"
+    ],
+    [
+      "docs",
+      "Faiss wiki: Guidelines to choose an index",
+      "Memory formulas (HNSW uses d × 4 + M × 2 × 4 bytes per vector; HNSW does not support removing vectors), PQ and SQ code sizes, and index choices by dataset size.",
+      "https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index"
+    ],
+    [
+      "paper",
+      "Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods",
+      "Cormack, Clarke and Büttcher, SIGIR 2009: fusing rankings by summing 1 / (k + rank), with k = 60 chosen in a pilot study.",
+      "https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A company sells a platform for building AI applications. Each customer uploads documents, product catalogues or support tickets, the platform embeds them, and the customer's application retrieves the most relevant ones for every question (hd2 is one such application). After a year, the platform holds 10 billion vectors for 50,000 customers. The largest customer has 2 billion; the median has 50,000. The vectors sit in an off-the-shelf approximate nearest-neighbour library, one big index per region, with the customer ID stored next to each vector.</p>
+<p>The problems arrive together. Memory: an HNSW index over 768-dimensional vectors needs about 3.2 KB per vector, so 10 billion vectors need 32 TB of RAM per replica, and the cloud bill shows it. Filters: a small customer searching only its own 50,000 vectors in a shared index of hundreds of millions gets three results instead of ten, or the right ten after 400 ms, because the index searched everyone's vectors and threw away the ones that were not theirs. Writes: customers upsert documents all day, and the library they chose cannot delete vectors from an HNSW graph, so deleted documents keep appearing in answers until a weekly rebuild. A legal request to erase one customer's data takes a week. And when a node dies, rebuilding its index from scratch takes hours.</p>
+<p>These are the problems a vector database exists to solve, and designing one is a favourite senior interview question because it pulls together indexing, storage engines, distributed systems and query planning. The question: design a system that stores billions of vectors with metadata, answers filtered top-k queries in tens of milliseconds at a guaranteed recall, absorbs a stream of upserts and deletes, isolates thousands of tenants, scales out and survives failures, supports hybrid keyword and vector queries, and does it at a cost per million vectors that customers will pay.</p>
+<p>The lesson follows the interview: requirements; estimates with memory arithmetic for each index type; the data model and API; the high-level design; deep dives on index choice and cost, filtered search and why its recall collapses, writes, deletes and compaction, sharding and replication, hybrid queries, multi-tenancy and consistency; recall and latency tuning; evaluation; failure modes; and what changes at ten times the scale. The real cases are the HNSW, DiskANN and ACORN papers, the Faiss documentation's memory formulas, and Qdrant's documentation of how a production engine plans filtered queries. The basics of embeddings and approximate search are in lm10 and db15; product quantisation is worked in hd25.</p>
+</section>
+
+<section data-field="primer">
+<h4>What a vector database does</h4>
+<p>A <strong>vector database</strong> stores <strong>points</strong>, each an ID, one or more vectors (lists of a few hundred to a few thousand numbers produced by an embedding model) and a <strong>payload</strong> of metadata such as tenant, document ID, date and tags. Its main query is: given a query vector, return the <em>k</em> points whose vectors are nearest, among those whose payload passes a filter. "Nearest" is by a distance metric fixed per collection: cosine similarity, dot product or Euclidean distance. Because exact search over billions of vectors is too slow, it uses <strong>approximate nearest-neighbour</strong> (ANN) indexes that return most of the true nearest points while examining a small fraction, and it measures how many it got right as <strong>recall</strong>.</p>
+<h4>The mental model: a library with a map, an index card system, and a returns desk</h4>
+<p>Imagine a vast library where books are shelved not by title but by what they are about, so that books on similar subjects sit near each other. A reader arrives with a description and wants the ten closest books, but only those in a particular language and published after 2020. The library has three tools. A <strong>map</strong> of the shelves lets a librarian walk from any shelf toward the right neighbourhood in a few hops: that is a graph index like HNSW. A <strong>card catalogue</strong> by language and year tells the librarian how many books pass the reader's conditions and where they are: that is a payload index. And a <strong>returns desk</strong> collects newly arrived books and returned ones until they can be shelved, while a list at the entrance records books that have been withdrawn: that is the mutable segment and the tombstone list.</p>
+<p>The hard cases are visible in the analogy. If only one book in a hundred is in the requested language, walking the map and checking each book's language means looking at a hundred books to find one that qualifies; following only qualifying books may lead nowhere, because their neighbours on the map are mostly in other languages. A good librarian checks the card catalogue first: if only 200 books qualify, just look at all 200. That decision, made per query, is the <strong>query planner</strong>. The analogy breaks in one place: a real library has one copy of each book, while the database keeps several replicas on different machines and must keep them in step as books arrive and leave every second.</p>
+<figure>
+<svg viewBox="0 0 640 330" width="100%" role="img" aria-label="Vector database architecture. Clients send upserts, deletes and queries to a stateless router. Writes go to a shard leader's write-ahead log, replicated to followers; each replica applies writes to a mutable segment, which is sealed and indexed in the background into immutable segments with vector index, payload indexes and a delete bitmap; compaction merges segments; segments are snapshotted to object storage. Queries go to the router, which fans out to shards; each replica's planner estimates filter cardinality and chooses brute force, in-graph filtering or filter-aware search across segments; results are merged, rescored and returned.">
+<defs><marker id="hd26-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="10" y="130" width="80" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="50" y="155" text-anchor="middle" style="fill:var(--ink)">Clients</text>
+<text x="50" y="172" text-anchor="middle" style="fill:var(--muted)">upsert · query</text>
+<rect x="110" y="130" width="90" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+<text x="155" y="155" text-anchor="middle" style="fill:var(--ink)">Router</text>
+<text x="155" y="172" text-anchor="middle" style="fill:var(--muted)">namespace → shards</text>
+<line x1="90" y1="160" x2="108" y2="160" marker-end="url(#hd26-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<rect x="225" y="20" width="400" height="230" rx="8" style="fill:none;stroke:var(--accent);stroke-dasharray:5 3"/>
+<text x="425" y="38" text-anchor="middle" style="fill:var(--accent);font-weight:600">One shard replica (× shards × replicas)</text>
+<rect x="240" y="50" width="120" height="36" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/>
+<text x="300" y="66" text-anchor="middle" style="fill:var(--ink)">WAL</text>
+<text x="300" y="80" text-anchor="middle" style="fill:var(--muted)">replicated log</text>
+<rect x="380" y="50" width="110" height="36" rx="5" style="fill:var(--surface-2);stroke:var(--s3)"/>
+<text x="435" y="66" text-anchor="middle" style="fill:var(--ink)">Mutable seg.</text>
+<text x="435" y="80" text-anchor="middle" style="fill:var(--muted)">brute force</text>
+<rect x="505" y="50" width="110" height="36" rx="5" style="fill:var(--surface-2);stroke:var(--s4)"/>
+<text x="560" y="66" text-anchor="middle" style="fill:var(--ink)">Index build</text>
+<text x="560" y="80" text-anchor="middle" style="fill:var(--muted)">background</text>
+<line x1="360" y1="68" x2="378" y2="68" marker-end="url(#hd26-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="490" y1="68" x2="503" y2="68" marker-end="url(#hd26-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<rect x="240" y="110" width="375" height="56" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="427" y="128" text-anchor="middle" style="fill:var(--ink)">Immutable segments: vector index · payload indexes · delete bitmap</text>
+<rect x="252" y="136" width="70" height="22" rx="3" style="fill:var(--surface-2);stroke:var(--s4)"/>
+<rect x="330" y="136" width="70" height="22" rx="3" style="fill:var(--surface-2);stroke:var(--s4)"/>
+<rect x="408" y="136" width="50" height="22" rx="3" style="fill:var(--surface-2);stroke:var(--s4)"/>
+<rect x="466" y="136" width="40" height="22" rx="3" style="fill:var(--surface-2);stroke:var(--s4)"/>
+<text x="560" y="152" text-anchor="middle" style="fill:var(--muted)">compaction</text>
+<line x1="560" y1="88" x2="560" y2="108" marker-end="url(#hd26-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<rect x="240" y="186" width="180" height="50" rx="5" style="fill:var(--surface-2);stroke:var(--crit)"/>
+<text x="330" y="206" text-anchor="middle" style="fill:var(--ink)">Planner</text>
+<text x="330" y="222" text-anchor="middle" style="fill:var(--muted)">cardinality → strategy</text>
+<rect x="440" y="186" width="175" height="50" rx="5" style="fill:var(--surface-2);stroke:var(--s5)"/>
+<text x="527" y="206" text-anchor="middle" style="fill:var(--ink)">Search all segments</text>
+<text x="527" y="222" text-anchor="middle" style="fill:var(--muted)">merge · rescore · top k</text>
+<line x1="420" y1="211" x2="438" y2="211" marker-end="url(#hd26-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<path d="M200,150 L232,68" marker-end="url(#hd26-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<path d="M200,172 L238,208" marker-end="url(#hd26-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<rect x="225" y="270" width="400" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--s6)"/>
+<text x="425" y="291" text-anchor="middle" style="fill:var(--ink)">Object storage: segment snapshots · log archive · cold namespaces</text>
+<line x1="427" y1="168" x2="427" y2="268" style="stroke:var(--ink-2);fill:none;stroke-dasharray:3 3"/>
+<text x="320" y="324" text-anchor="middle" style="fill:var(--muted)">Writes become searchable in the mutable segment at once; indexing and compaction happen behind them.</text>
+</g>
+</svg>
+<figcaption>A vector database is a storage engine (log, segments, compaction) wrapped around ANN indexes, with a planner in front. Notice that the planner sits between the query and the indexes: the same index can be the right or the wrong tool depending on how many points the filter keeps.</figcaption>
+</figure>
+<h4>Three facts that shape the design</h4>
+<p>First, <strong>memory is the dominant cost</strong>, and index choice moves it by a factor of thirty: full-precision graphs in RAM against compressed codes with full vectors on SSD. Second, <strong>filters break the indexes' assumptions</strong>: ANN structures are built over all vectors, but most real queries ask about a subset (one tenant, recent documents, a category), and a strict filter can wreck recall or latency unless the planner adapts. Third, <strong>the data never stops changing</strong>: graph indexes are awkward to update and some libraries cannot delete at all, so the engine borrows the log-structured design of modern databases: append to a log, buffer in memory, flush immutable segments, merge them later. A reader who stops here has the shape: a sharded, replicated log-structured store of segments, each with a vector index and payload indexes, searched in parallel and planned per query by filter cardinality.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–17</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">17–23</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">23–47</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">47–55</span><span class="ck-t">Eval &amp; failures</span></div><div class="ck"><span class="ck-m">55–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> Namespaces (collections) with a fixed dimension and metric; upsert, delete and fetch points by ID; top-k queries with filters on payload fields (equality, ranges, sets, combinations); multiple named vectors per point and sparse vectors for hybrid search; payload indexes declared per field; batch import; snapshots and restore; per-namespace configuration of index type and recall target. Out of scope, said aloud: computing embeddings (the client or a separate service does that) and general SQL.</p>
+<p><strong>Scale.</strong> 10 billion vectors across 50,000 namespaces, mostly 768 dimensions; largest namespace 2 billion, median 50,000. 20,000 queries a second in total at peak; 50,000 upserts a second.</p>
+<p><strong>Latency and recall targets.</strong> In-memory tier: p99 under 50 ms at recall@10 of at least 0.95 for unfiltered and filtered queries. Disk tier: p99 under 150 ms at the same recall. Recall is measured against exact search with the same filter.</p>
+<p><strong>Freshness and consistency.</strong> Upserts searchable within 1 second at p99 by default; read-your-writes on request. Deletes hidden from results immediately; physically purged within 24 hours, faster on an erasure request.</p>
+<p><strong>Durability and availability.</strong> No acknowledged write lost; 99.95% availability for queries; a lost node's data back to full replication within 30 minutes.</p>
+<p><strong>Cost.</strong> A published price per million vectors per month for each tier, which the design must support with margin.</p>
+<p><strong>Clarifying questions.</strong> "What dimensions and how many vectors per tenant?" "What filters do customers use, and how selective?" "What recall do customers expect, and do they measure it?" "How write-heavy is it, and how fast must deletes disappear?" "Is there a cold tier for rarely queried namespaces?"</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p><strong>Memory per vector.</strong> For one billion 768-dimensional vectors:</p>
+<table>
+<thead><tr><th>Index</th><th>RAM per vector</th><th>RAM per 1B</th><th>SSD per 1B</th></tr></thead>
+<tbody>
+<tr><td>Raw float32 (flat)</td><td>768 × 4 = 3,072 B</td><td>3.07 TB</td><td>–</td></tr>
+<tr><td>HNSW, M = 16, float32</td><td>3,072 + 16 × 2 × 4 = 3,200 B</td><td>3.2 TB</td><td>–</td></tr>
+<tr><td>HNSW, SQ8 vectors, rescoring from SSD</td><td>768 + 128 = 896 B</td><td>0.9 TB</td><td>3.07 TB</td></tr>
+<tr><td>IVF-PQ, 96-byte codes + 8-byte ID</td><td>104 B</td><td>104 GB</td><td>3.07 TB</td></tr>
+<tr><td>DiskANN, 64-byte PQ in RAM</td><td>64 B</td><td>64 GB</td><td>≈ 3.33 TB</td></tr>
+</tbody>
+</table>
+<p>The HNSW figure uses the Faiss wiki's formula, (d × 4 + M × 2 × 4) bytes per vector: the vector itself plus about 2M links of 4 bytes, because the HNSW paper recommends twice as many links on the bottom layer as on the others (Mmax0 = 2M). DiskANN's SSD figure is the full vector plus up to R = 64 neighbour IDs of 4 bytes per node: 3,072 + 256 = 3,328 bytes. Across 10 billion vectors, HNSW in RAM would be 32 TB per replica; IVF-PQ or DiskANN about 0.6–1 TB of RAM per replica plus SSD.</p>
+<p><strong>Cost per million vectors per month.</strong> Assume, for illustration, $3 per GB-month for RAM on memory-optimised instances, $0.15 per GB-month for local NVMe SSD, about $0.023 per GB-month for object storage, and two replicas for the hot tiers.</p>
+<table>
+<thead><tr><th>Tier</th><th>Per 1M vectors</th><th>Monthly, 2 replicas</th></tr></thead>
+<tbody>
+<tr><td>HNSW float32 in RAM</td><td>3.2 GB RAM</td><td>≈ $19</td></tr>
+<tr><td>HNSW SQ8 + SSD rescoring</td><td>0.9 GB RAM + 3.1 GB SSD</td><td>≈ $6.30</td></tr>
+<tr><td>IVF-PQ96 + SSD rescoring</td><td>0.10 GB RAM + 3.1 GB SSD</td><td>≈ $1.54</td></tr>
+<tr><td>DiskANN</td><td>0.064 GB RAM + 3.3 GB SSD</td><td>≈ $1.38</td></tr>
+<tr><td>Cold namespace on object storage</td><td>3.1 GB object storage</td><td>≈ $0.07 + cache on access</td></tr>
+</tbody>
+</table>
+<p>Compute for queries and index building comes on top, and depends on query rate, but the storage spread is the headline: about fourteen times between all-RAM HNSW and the compressed tiers, and two orders of magnitude more for cold data.</p>
+<p><strong>Query compute.</strong> 20,000 queries a second, many fanning out to several segments and shards. A filtered HNSW search on one segment computes a few hundred to a few thousand distances; at 768 dimensions a distance is about 1,500 floating-point operations, so a query costs a few million operations per segment, under a millisecond on one core. The fleet is sized by memory first, then by cores for the query rate.</p>
+<p><strong>Writes.</strong> 50,000 upserts a second at 3 KB of vector plus payload is about 150 MB a second into the logs, replicated three times. Index building is the expensive part of writing: an HNSW insert computes hundreds to thousands of distances. Building segments in the background on separate cores (or separate nodes) keeps writes from stealing query latency.</p>
+<p><strong>The insight to say out loud.</strong> This is a memory-bound storage engine whose hardest query feature is filtering. Choosing the index per namespace, and the search strategy per query, is where most of the design lives.</p>
+
+<h4>3 · Data model and API</h4>
+<pre>PUT  /v1/namespaces/{ns}            { "dim": 768, "metric": "cosine",
+                                      "index": "hnsw" | "ivf_pq" | "diskann" | "auto",
+                                      "payload_indexes": { "tenant": "keyword",
+                                        "doc_date": "datetime", "tags": "keyword" } }
+POST /v1/namespaces/{ns}/points     { "points": [ { "id": "doc42#3", "vector": [...],
+                                      "sparse": {"indices": [...], "values": [...]},
+                                      "payload": {"doc_date": "2026-09-30", "tags": ["hr"]} } ] }
+  -&gt; { "lsn": 918273645 }                        # log position, for read-your-writes
+DELETE /v1/namespaces/{ns}/points   { "ids": [...] }   or   { "filter": {...} }
+POST /v1/namespaces/{ns}/query      { "vector": [...], "top_k": 10,
+                                      "filter": { "doc_date": {"gte": "2026-09-01"},
+                                                  "tags": {"any": ["hr", "legal"]} },
+                                      "hybrid": { "text": "parental leave", "fusion": "rrf" },
+                                      "consistency": { "min_lsn": 918273645 },
+                                      "params": { "ef": 128, "rescore": 4 } }
+  -&gt; { "results": [ { "id": "doc42#3", "score": 0.83, "payload": {...} }, ... ],
+       "plan": "filtered_hnsw", "segments": 7, "recall_target": 0.95 }</pre>
+<p>Three choices matter. <strong>Payload indexes are declared</strong>, because the planner needs them both to evaluate filters and to estimate how many points match, and because filter-aware graph structures must be built with knowledge of the indexed fields (Qdrant's documentation recommends creating payload indexes before ingesting data for exactly this reason). <strong>Writes return a log position</strong>, which a client can pass back for read-your-writes. And the response names the <strong>plan</strong> chosen, so users and support engineers can see why a query was slow or returned few results.</p>
+
+<h4>4 · High-level design</h4>
+<p>The architecture is the primer diagram. A stateless <strong>router</strong> maps namespaces to shards using a metadata service (namespace configuration, shard map, replica placement). Each <strong>shard</strong> is a replicated log: writes go to the leader's <strong>write-ahead log</strong> (WAL), are replicated to followers by a consensus protocol or a shared durable log service, and are acknowledged once durable on a majority. Each replica applies log entries to its <strong>mutable segment</strong>, an in-memory buffer of recent points searched by brute force. When the mutable segment reaches its size limit (say 200,000 points) it is sealed, and an <strong>index builder</strong> creates an immutable <strong>segment</strong> with its vector index, payload indexes and an empty delete bitmap. <strong>Compaction</strong> merges small segments and segments with many deletions. Segments are uploaded to <strong>object storage</strong> as snapshots, so a new replica can download segments and replay only the log tail. On the query path, each replica's <strong>planner</strong> estimates filter cardinality per segment and picks a strategy; all segments are searched in parallel, results are merged, optionally <strong>rescored</strong> with full-precision vectors, and returned to the router, which merges across shards.</p>
+
+<h4>5 · Deep dive: choosing the index</h4>
+<p><strong>HNSW</strong> (Malkov and Yashunin) builds a multi-layer graph: every vector is in the bottom layer, exponentially fewer in each layer above, and each node links to its nearest neighbours (up to M per layer, 2M on the bottom). Search starts at the top layer, greedily moves toward the query, drops a layer, and repeats; on the bottom layer it keeps a candidate list of size <strong>ef_search</strong> and returns the best k. It gives the best recall-latency trade-off for in-memory data and supports incremental inserts well. Its costs: full vectors plus links in RAM, slower builds, and awkward deletes (the Faiss wiki notes that its HNSW index does not support removing vectors at all; engines that support deletes mark nodes as deleted and repair or rebuild later).</p>
+<p><strong>IVF-PQ</strong> clusters vectors into lists, stores product-quantised codes of the residuals, and searches the <strong>nprobe</strong> nearest lists (the mechanics are worked in hd25). Memory is a small fraction of HNSW's, builds are fast once the codebooks are trained, and appends are easy (add codes to a list). Recall at a given latency is lower, so production systems oversample (fetch, say, 4k candidates) and <strong>rescore</strong> them with full vectors from SSD. Codebooks fitted to one distribution degrade as data drifts, so they are retrained when segments are rebuilt.</p>
+<p><strong>DiskANN</strong> (Subramanya et al., NeurIPS 2019) builds a graph (its Vamana algorithm) designed for few hops, stores the graph and full-precision vectors on SSD, and keeps only PQ-compressed vectors in RAM to decide which nodes to read next. Its paper reports serving the billion-vector SIFT1B dataset on a workstation with 64 GB of RAM and an inexpensive SSD at more than 5,000 queries a second with under 3 ms mean latency and 95%+ 1-recall@1, and indexing 5–10 times more points per node than in-memory graph indexes in the high-recall regime. The trade-off is SSD reads on every query (a few round trips of a few reads each), so latency depends on SSD performance and on keeping the number of hops small.</p>
+<p><strong>Brute force</strong> is the right index for small sets. Scanning 50,000 vectors of 768 dimensions is about 150 MB of float32 (or 38 MB at one byte per dimension), a few milliseconds on a modern core with vector instructions, and exact. Most of the 50,000 namespaces are this size, which is why "no index" is a first-class choice.</p>
+<p><strong>The policy.</strong> The namespace's index type defaults to <em>auto</em>: brute force below about 20,000 points, HNSW for small and medium namespaces where memory is cheap in absolute terms and updates are frequent, IVF-PQ or DiskANN with rescoring for large namespaces on the disk tier, and object storage for namespaces not queried for weeks, loaded into cache on first access. Customers can override per namespace, trading cost for latency.</p>
+
+<h4>6 · Deep dive: filtered search and why recall collapses</h4>
+<p><strong>The problem.</strong> Most real queries carry filters: this tenant, this user's permitted documents, the last 30 days, category = shoes. An ANN index is built over all vectors in a segment, without regard to any filter. Three naive strategies each fail at some selectivity (the fraction of points that pass).</p>
+<p><strong>Post-filtering</strong> searches the index as if there were no filter, then drops results that fail it. With a filter passing 1% of points, the top 100 candidates contain about one that passes. pgvector's documentation, discussed in db15, describes exactly this behaviour for approximate indexes: the WHERE clause is applied after the index scan, so selective filters return too few rows.</p>
+<p><strong>In-graph filtering, traversing only passing nodes.</strong> Navigate the graph but step only to neighbours that pass the filter. The arithmetic shows why this collapses. On HNSW's bottom layer each node has up to 2M = 32 links. If the filter passes a fraction <em>s</em> of points independently of where they sit in the graph, the expected number of passing neighbours of a passing node is 32<em>s</em>, and the probability that it has none is (1 − <em>s</em>)<sup>32</sup>:</p>
+<table>
+<thead><tr><th>Selectivity</th><th>Passing neighbours (of 32)</th><th>P(no passing neighbour)</th></tr></thead>
+<tbody>
+<tr><td>50%</td><td>16</td><td>≈ 0</td></tr>
+<tr><td>20%</td><td>6.4</td><td>0.1%</td></tr>
+<tr><td>10%</td><td>3.2</td><td>3.4%</td></tr>
+<tr><td>5%</td><td>1.6</td><td>19%</td></tr>
+<tr><td>2%</td><td>0.64</td><td>52%</td></tr>
+<tr><td>1%</td><td>0.32</td><td>72%</td></tr>
+<tr><td>0.1%</td><td>0.03</td><td>97%</td></tr>
+</tbody>
+</table>
+<p>Below about 5% selectivity, the subgraph of passing nodes falls apart into islands; a search restricted to it gets stuck in whichever island it entered and misses the true nearest neighbours in other islands. Recall collapses.</p>
+<p><strong>In-graph filtering, traversing all nodes.</strong> Navigate through every node but add only passing nodes to the result list. Connectivity is fine, but at 1% selectivity the search sees one qualifying node per hundred visited, so filling a result list of ten needs on the order of a thousand or more visits, where an unfiltered search needs a hundred or two. Latency grows roughly as 1/<em>s</em>. Recall holds only if the search is allowed to run that long; with a normal ef budget it stops early and recall collapses anyway.</p>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Chart of filter selectivity on a log axis from 100% to 0.1%, with three strategy zones. Expected passing neighbours per node, 32 times selectivity, falls from 32 to 0.03; the probability of no passing neighbour rises from 0 to 97%, crossing 50% near 2%. Zones: above about 10% selectivity, in-graph filtering works; between about 10% and the brute-force threshold, use ACORN or filter-aware edges; when the matching set is small in absolute terms, brute-force the matching points.">
+<g style="font-family:var(--sans);font-size:12px">
+<line x1="70" y1="200" x2="610" y2="200" style="stroke:var(--line-2);fill:none"/>
+<line x1="70" y1="30" x2="70" y2="200" style="stroke:var(--line-2);fill:none"/>
+<text x="64" y="204" text-anchor="end" style="fill:var(--muted)">0%</text>
+<text x="64" y="119" text-anchor="end" style="fill:var(--muted)">50%</text>
+<text x="64" y="34" text-anchor="end" style="fill:var(--muted)">100%</text>
+<text x="70" y="218" text-anchor="middle" style="fill:var(--muted)">100%</text>
+<text x="250" y="218" text-anchor="middle" style="fill:var(--muted)">10%</text>
+<text x="430" y="218" text-anchor="middle" style="fill:var(--muted)">1%</text>
+<text x="610" y="218" text-anchor="middle" style="fill:var(--muted)">0.1%</text>
+<text x="340" y="236" text-anchor="middle" style="fill:var(--muted)">filter selectivity (log scale) →</text>
+<path d="M70,200 L124,200 L196,199.8 L250,194.2 L304,167 L376,111.2 L430,76.8 L610,35.4" style="stroke:var(--crit);stroke-width:2;fill:none"/>
+<text x="440" y="70" style="fill:var(--crit)">P(passing node has no passing neighbour)</text>
+<rect x="70" y="244" width="180" height="10" style="fill:var(--good);opacity:0.6"/>
+<rect x="250" y="244" width="200" height="10" style="fill:var(--s3);opacity:0.7"/>
+<rect x="450" y="244" width="160" height="10" style="fill:var(--s1);opacity:0.6"/>
+<text x="160" y="160" text-anchor="middle" style="fill:var(--ink-2)">in-graph filtering works</text>
+<text x="350" y="185" text-anchor="middle" style="fill:var(--ink-2)">ACORN / filter-aware edges</text>
+<text x="530" y="185" text-anchor="middle" style="fill:var(--ink-2)">brute-force matches*</text>
+</g>
+</svg>
+<figcaption>The red curve is exact arithmetic for 32 bottom-layer links and an uncorrelated filter: islands appear below about 10% selectivity and dominate below 2%. Notice that the zone boundaries are set by different things: the left boundary by graph connectivity, the right by the absolute number of matching points (*brute force wins when the matching set is small enough to scan, whatever its percentage).</figcaption>
+</figure>
+<p><strong>The fixes, and the planner that chooses between them.</strong> The planner uses the <strong>payload index</strong> to estimate how many points in each segment pass the filter, then picks per segment:</p>
+<ul>
+<li><strong>Brute force over the matching points</strong> when the matching set is small in absolute terms: fetch matching IDs from the payload index and compute exact distances. Qdrant's documentation describes this as <code>full_scan_threshold</code>, measured in kilobytes of vectors (10,000 KB by default, noting that 1 KB is one 256-dimensional vector): when the estimated matching set is below it, the planner uses a full scan instead of HNSW traversal.</li>
+<li><strong>In-graph filtering</strong> when the filter is loose (above roughly 10–20% selectivity), where the passing subgraph stays connected and the extra visits are modest.</li>
+<li><strong>Filter-aware graph structures</strong> in between. <strong>ACORN</strong> (Patel et al., SIGMOD 2024) builds a denser HNSW-style graph and, at query time, traverses only passing nodes but expands to neighbours of neighbours, so the passing subgraph stays navigable for arbitrary predicates; its paper reports 2–1,000 times higher throughput at fixed recall than prior methods. Qdrant's <strong>filterable HNSW</strong> adds extra edges based on indexed payload values, so each value's subgraph is connected; its documentation notes that these edges are added per payload index, not for every combination, so combinations of strict filters can still disconnect the graph, which is why it added ACORN-style search (from version 1.16.0) for those cases.</li>
+<li><strong>Partitioning</strong> when one field dominates filters: segments or namespaces split by tenant, by time or by category, so the filter becomes routing or segment pruning and no index sees non-matching points.</li>
+</ul>
+<p><strong>Worked plan.</strong> A shared namespace holds 50 million points; a query filters <code>tenant = "acme"</code>, which matches 500,000 points (1%). Brute force would scan 500,000 × 3 KB = 1.5 GB of float32, around 100 ms of memory bandwidth on one node: too slow for the 50 ms target. Post-filtering or restricted traversal collapses at 1%. Traversing all nodes needs about 100 times the usual visits. The right answers are filter-aware edges on <code>tenant</code> or, better, giving large tenants their own namespace so this query never meets the other 99%. Now the same query with an added <code>doc_date &gt;= last week</code> matches 4,000 points: the planner brute-forces them in under a millisecond, exact. Same namespace, same index, two different plans.</p>
+<p><strong>Correlation makes it worse or better.</strong> The arithmetic above assumes the filter is unrelated to vector position. If passing points cluster together (a tenant's documents are all about the same topic), the passing subgraph is better connected than the formula says, but the query may be far from that cluster. If they are spread out and the query sits in a region with few passing points, restricted traversal fails even at moderate selectivity. This is why recall must be measured per selectivity bucket on real filters, not inferred.</p>
+
+<h4>7 · Deep dive: writes, updates, deletes and compaction</h4>
+<p><strong>Why log-structured.</strong> Graph indexes are expensive to modify in place: inserting a node means finding its neighbours (hundreds of distance computations) and updating their link lists; deleting one means repairing the links of nodes that pointed to it. Doing this synchronously on every write would make writes slow and queries jittery. So the engine borrows the design of log-structured merge (LSM) storage engines: writes are appended to a log and buffered; immutable files are produced in the background; files are merged later.</p>
+<p><strong>The write path.</strong> An upsert is appended to the shard's WAL and replicated; once a majority has it on durable storage, the client receives the log position. Each replica applies the entry: the point goes into the mutable segment (searched by brute force, so it is visible within milliseconds of being applied), and if the ID existed in an older segment, that segment's <strong>delete bitmap</strong> marks the old version. <strong>Updates are delete plus insert</strong>; vector databases rarely update in place.</p>
+<p><strong>Sealing and indexing.</strong> When the mutable segment reaches its limit, it becomes read-only and an index builder (on separate cores or a separate node) builds its vector and payload indexes. Until the build finishes, the sealed segment is still searched by brute force; at 200,000 points that is about 600 MB of vectors, slower than an index but still tens of milliseconds, which is why segment size and build speed are tuned together.</p>
+<p><strong>Deletes.</strong> A delete writes a tombstone: the point's bit is set in its segment's delete bitmap, and searches skip it at once. The vector remains in the segment file. Searches waste work on deleted points (a graph search may visit them as stepping stones and then discard them), so a segment with many deletions gets slower and less accurate.</p>
+<p><strong>Compaction.</strong> A background process picks segments to rewrite: small segments to merge (fewer segments means fewer searches to merge per query) and segments whose deleted fraction exceeds a threshold (say 20%). It builds a new segment containing only live points, indexes it, swaps it in atomically and deletes the old files. Compaction competes with queries for CPU and memory bandwidth, so it is throttled and scheduled; it also needs temporary space for the new segment while the old one still serves.</p>
+<p><strong>Erasure deadlines.</strong> A customer deleting a document, or a legal erasure request, requires the data to be physically gone within a deadline. The engine tracks the oldest unpurged tombstone per segment and forces compaction of segments whose tombstones approach the deadline; snapshots in object storage that still contain deleted points expire on the same schedule, and the log is truncated past them.</p>
+
+<h4>8 · Deep dive: sharding, replication and multi-tenancy</h4>
+<p><strong>Namespaces first.</strong> The cheapest way to make tenant filters fast is to make them unnecessary. Each tenant gets its own namespace, with its own segments, so a query for tenant A never touches tenant B's vectors. Small namespaces are packed many to a shard (thousands of tiny namespaces can share one shard's process), and namespaces under about 20,000 points get no ANN index at all, since brute force is exact and fast. The cost is per-namespace overhead (metadata, open files, a minimum segment), which is why namespaces are cheap but not free, and why very many tiny namespaces are sometimes grouped into one with a partition key the planner treats specially.</p>
+<p><strong>Sharding large namespaces.</strong> A 2-billion-vector namespace is split into shards by hashing point IDs, for example 16 shards of 125 million. Every query fans out to all 16 and the router merges their top k (each shard returns its own top k, which is sufficient for an exact merge). Hash sharding spreads load evenly; the alternative, sharding by vector region (each shard holds one area of the space, so a query visits only a few), reduces fan-out but creates hot shards for popular regions and complicates rebalancing, so it is used mainly at very large scale with replication of hot regions.</p>
+<p><strong>Replication.</strong> Each shard's log is replicated, either by a consensus protocol (Raft) among the shard's replicas or by a shared durable log service with replicas as consumers. Replicas serve reads; a write is acknowledged once durable on a majority. Segment snapshots in object storage mean a replacement replica downloads segments in parallel and replays only the log tail instead of rebuilding indexes, which is what makes the 30-minute recovery target achievable: at a few gigabytes per second of download, a shard of tens of gigabytes is back in minutes.</p>
+<p><strong>Noisy neighbours.</strong> Per-namespace quotas on query rate, write rate and stored vectors; per-query cost accounting in distances computed, so expensive queries (large k, huge ef, unselective filters on big namespaces) are visible and can be limited; fair-share scheduling of index builds and compaction across namespaces on a shard; and the option to move a heavy tenant to dedicated shards, which segment files in object storage make cheap.</p>
+<p><strong>Object-storage-backed cold tier.</strong> Many namespaces are written once and queried rarely. Keeping their indexes in RAM is waste. In a cold tier, segments live only in object storage; query nodes are stateless with a local SSD cache; the first query to a cold namespace downloads its segments (seconds), later queries hit the cache. Storage cost drops by two orders of magnitude, at the price of slow first queries, which suits archives and batch workloads but not interactive ones.</p>
+
+<h4>9 · Deep dive: hybrid queries</h4>
+<p>Dense vectors capture meaning but miss exact tokens: product codes, names, error messages. Lexical search (BM25, rec2) catches exact terms but misses paraphrases. Hybrid search runs both. Each segment keeps an <strong>inverted index</strong> over a text field, or a <strong>sparse vector</strong> per point (term weights from BM25 or a learned sparse model), searched with the same filters as the dense query. Each side returns its top candidates (say 100), and the engine fuses them. <strong>Reciprocal rank fusion</strong> (RRF) scores each point by the sum over lists of 1 / (k + rank), with k = 60 the value Cormack, Clarke and Büttcher chose in their 2009 study. Its virtue is that it ignores raw scores, which are on different scales (BM25 is unbounded; cosine lies between −1 and 1). A point ranked 1st lexically and 5th densely scores 1/61 + 1/65 ≈ 0.0318; one ranked 2nd densely and absent lexically scores 1/62 ≈ 0.0161. Weighted score fusion (normalise each list's scores, then α × dense + (1 − α) × lexical) can do better when tuned per workload, but it is brittle across queries. Filters must apply to both sides identically, or a fused result can include points the lexical side would have excluded.</p>
+
+<h4>10 · Consistency</h4>
+<p>The default is <strong>eventual consistency</strong>: a write is acknowledged when durable in the log, and becomes visible on each replica when that replica applies it, typically within tens of milliseconds and within a second at p99. Applications that write and immediately query (a user uploads a document and asks about it) need <strong>read-your-writes</strong>: the write returns its <strong>log sequence number</strong> (LSN), the query carries <code>min_lsn</code>, and the replica waits until it has applied that position (with a short timeout, after which it forwards to the leader). Index building does not affect visibility, because new points sit in the mutable segment, searched by brute force until indexed. What a vector database usually does not offer: multi-point transactions, or atomic updates across the vector store and the application's main database. Applications keep the main database as the source of truth and treat the vector store as an index that can lag and can be rebuilt; a periodic reconciliation job compares IDs and versions between the two.</p>
+
+<h4>11 · Recall and latency tuning</h4>
+<p>Every index has knobs that trade recall for latency: ef_search for HNSW, nprobe for IVF, beam width for DiskANN, plus the rescoring depth (how many candidates to rescore with full vectors) for compressed indexes. Good defaults are a start, but the right values depend on dimension, data distribution, segment size and filters. The engine therefore measures recall continuously: a small share of real queries (say 0.5%) is re-run asynchronously as exact brute-force searches over the same filtered set on spare capacity, and the overlap of the top 10 gives recall@10. Results are broken down by namespace, index type and filter-selectivity bucket. An <strong>auto-tuner</strong> per namespace raises ef or nprobe when recall falls below the target and lowers it when there is slack, within latency limits. Customers see their measured recall, which turns "approximate" from a vague promise into a reported number.</p>
+
+<h4>12 · Evaluation plan</h4>
+<p><strong>Offline benchmarks</strong> before each release: standard datasets plus synthetic filtered workloads at selectivities from 50% to 0.1%, with correlated and uncorrelated filters, measuring recall@10, p50 and p99 latency, throughput, memory and build time per index type. <strong>Production metrics</strong>: shadow-measured recall per namespace and selectivity bucket; latency percentiles per plan type; freshness (time from write acknowledgement to visibility on replicas); delete visibility and purge lag; compaction backlog; memory per shard; cost per million vectors by tier. <strong>Correctness tests</strong>: deleted points never returned (a randomised test inserts, deletes and queries continuously); read-your-writes honoured when requested; replica divergence (periodic checksums of segment contents across replicas).</p>
+
+<h4>13 · Failure modes and trade-offs</h4>
+<table>
+<thead><tr><th>Failure</th><th>Symptom</th><th>Defence</th></tr></thead>
+<tbody>
+<tr><td>Strict filter on shared index</td><td>Few results or slow queries</td><td>Planner with cardinality estimates, brute force, ACORN, namespaces</td></tr>
+<tr><td>Tombstone build-up</td><td>Slower, less accurate search</td><td>Compaction on deleted fraction; metrics per segment</td></tr>
+<tr><td>Compaction storms</td><td>Query latency spikes</td><td>Throttling, scheduling, separate build nodes</td></tr>
+<tr><td>Codebook drift</td><td>Recall slowly falls on IVF-PQ</td><td>Shadow recall; retrain on rebuild</td></tr>
+<tr><td>Replica lag</td><td>Fresh writes missing</td><td>LSN tokens, lag alerts, leader fallback</td></tr>
+<tr><td>Node loss</td><td>Reduced capacity</td><td>Replicas; snapshot download instead of rebuild</td></tr>
+<tr><td>Noisy tenant</td><td>Neighbours' latency rises</td><td>Quotas, cost accounting, dedicated shards</td></tr>
+</tbody>
+</table>
+<p>The trade-offs to name: memory against recall and latency (index choice); freshness against write amplification (segment size, compaction frequency); filter flexibility against index complexity (filter-aware edges cost memory and build time); consistency against latency (LSN waits); tenant isolation against per-namespace overhead.</p>
+
+<h4>14 · What changes at 10× scale</h4>
+<p>At 100 billion vectors, RAM-resident indexes for everything are unaffordable, so the default tier becomes disk-based (DiskANN-style or IVF-PQ with SSD rescoring), with RAM reserved for hot namespaces, and the cold object-storage tier holds most of the data. Fan-out to hundreds of shards for the largest namespaces makes tail latency the main problem, so very large namespaces move to region-partitioned sharding (route each query to the few shards covering its neighbourhood) with replication of hot regions. Index builds become a large compute workload of their own, run on separate GPU or CPU pools. And the planner grows into a cost-based optimiser that weighs strategies by estimated distance computations and I/O, much as relational planners weigh index scans against table scans.</p>
+</section>
+
+<section data-field="deep">
+<h4>The bottom layer's 2M links are what make filtering survivable at all</h4>
+<p>HNSW's paper found that setting the bottom layer's maximum degree to twice the upper layers' (Mmax0 = 2M) markedly improves search at high recall, and it became the standard default. For filtered search this doubling matters directly: the expected number of passing neighbours is degree × selectivity, so 32 links instead of 16 halve the selectivity at which the passing subgraph breaks apart. ACORN generalises the idea: build a denser graph than usual (more candidate edges per node), then at query time consider neighbours and neighbours of neighbours, which raises the effective degree seen by a filtered search by a large factor without storing a separate graph per filter.</p>
+<h4>Cardinality estimation is the planner's whole job</h4>
+<p>Every strategy choice hinges on one number: how many points in this segment pass this filter. For a single equality on an indexed keyword, the payload index gives it exactly. For combinations (tenant = A and date in last week and tag in {hr, legal}), the engine must estimate, and the classic database assumption of independence between predicates can be badly wrong: if tenant A's documents are all recent, the true count is far larger than the product of selectivities. Engines estimate by intersecting posting lists when they are small, sampling when they are large, and erring toward the safe plan: if the estimate is near the brute-force threshold, brute force is chosen, because its worst case is bounded and its recall is exact.</p>
+<h4>Quantisation and rescoring decouple memory from accuracy</h4>
+<p>Compressed vectors (scalar quantisation to one byte per dimension, product quantisation, binary codes) shrink memory four- to fifty-fold but distort distances. Rescoring separates the two concerns: search with compressed vectors to get, say, four times more candidates than needed, then recompute exact distances for those candidates from full vectors on SSD. If the true top 10 are almost always within the compressed top 40, recall is nearly that of full precision while RAM holds only compressed data. The oversampling factor is the knob: measured recall tells you how deep the true neighbours sit in the compressed ranking, and the factor is set just past that.</p>
+<h4>Segment size is a three-way trade-off</h4>
+<p>Small segments index quickly, compact cheaply and keep new data indexed sooner; but every query must search every segment and merge their results, so many small segments multiply per-query overhead and lower recall (each segment's graph is smaller and the top k must be found in each). Large segments search efficiently but take long to build, so new data sits longer in brute-force mode, and compaction rewrites more data each time. Engines settle on a target segment size (hundreds of thousands to a few million points) and a tiered merge policy that combines segments of similar size, the same idea LSM storage engines use for key-value data.</p>
+<h4>Deletion in graphs is a repair problem</h4>
+<p>Removing a node from a proximity graph leaves its neighbours with fewer links and can disconnect regions that routed through it. Marking deleted nodes and keeping them as stepping stones preserves connectivity but wastes work and memory; physically removing them requires reconnecting their neighbours, which is expensive. Engines therefore accept a deleted fraction up to a threshold, search through tombstoned nodes without returning them, and rebuild the segment's graph during compaction. FreshDiskANN and similar work studies in-place repair for disk-resident graphs, but rebuild-on-compaction remains the robust default.</p>
+<h4>Vector search inside an existing database versus a dedicated engine</h4>
+<p>pgvector and similar extensions (db15) put vectors next to the rest of the data: transactions, joins, one system to operate, and permissions in one place. A dedicated vector database earns its place when the collection is very large, query rates are high, filtered search must work at low selectivity, or memory cost demands disk-based indexes and tiering. The decision is the same as choosing a search engine versus full-text search in a relational database: start inside the database when the scale allows, and move when measured recall, latency or cost says so.</p>
+<h4>Fan-out turns per-shard tails into query tails</h4>
+<p>A query that fans out to 16 shards waits for the slowest. If each shard answers within 20 ms 99% of the time, the probability that all 16 do is 0.99<sup>16</sup> ≈ 85%, so the query's own p85 already touches the per-shard p99. Large namespaces therefore need per-shard tail control: hedged requests to a second replica after the shard's p95, timeouts with partial results when the application tolerates them, and keeping shards similar in size so none is systematically slow.</p>
+</section>
+
+<section data-field="prod">
+<h4>How it fails in practice</h4>
+<p><strong>The three-result query.</strong> A customer moved from separate namespaces to one shared namespace with a <code>tenant</code> payload field to reduce overhead, without declaring a payload index on it. Queries for small tenants started returning two or three results instead of ten, while large tenants were fine. Without the payload index, the planner could not estimate cardinality and defaulted to graph search with post-filtering. Declaring the index (and rebuilding segments so filter-aware edges were created, since they are only built when the payload index exists before indexing) fixed recall; moving the largest tenants back to their own namespaces fixed latency.</p>
+<p><strong>The compaction storm.</strong> A customer deleted 40% of a large namespace in one batch (re-embedding with a new model by deleting and reinserting). Every segment crossed the deleted-fraction threshold at once, compaction started everywhere, and query p99 rose from 30 ms to 400 ms for every tenant on those shards. Compaction is now throttled per shard with a global concurrency limit, bulk deletions are flagged so compaction is scheduled off-peak, and model migrations are done by building a new namespace and switching, not by in-place churn.</p>
+<p><strong>The drifting codebooks.</strong> A large namespace on IVF-PQ had its codebooks trained at creation, when the data was mostly English product descriptions. A year later half the data was multilingual, and shadow-measured recall had fallen from 0.96 to 0.89 without anyone noticing, because nobody watched it. Recall alerts per namespace now exist, and segment rebuilds retrain codebooks on a fresh sample.</p>
+<h4>What to monitor</h4>
+<p>Per namespace: shadow recall@10 overall and by selectivity bucket, query latency by plan type, results-returned distribution (queries returning fewer than k are a filter symptom), write rate, visibility lag, vectors stored and memory. Per shard: segment count and sizes, deleted fraction, compaction backlog and throughput, index build queue, replica lag in LSN, CPU and memory bandwidth. Fleet: cost per million vectors by tier, cache hit rate for the cold tier, recovery time after node loss.</p>
+<h4>Knobs people tune</h4>
+<p>Index type per namespace; HNSW M and ef_construction at build, ef_search at query; IVF list count and nprobe; PQ code size; rescoring oversampling; brute-force threshold; payload indexes and filter-aware edges; segment size and merge policy; deleted-fraction threshold; compaction throttle; replica count; cold-tier eviction age.</p>
+<h4>The real cases: HNSW, DiskANN, ACORN and Qdrant's planner</h4>
+<p>The HNSW paper (Malkov and Yashunin) defines the graph, recommends Mmax0 = 2M on the bottom layer and gives M between 5 and 48 as a reasonable range, with efConstruction set high enough that construction recall is close to one. The Faiss wiki gives the memory formula used here, (d × 4 + M × 2 × 4) bytes per vector, and notes that its HNSW index does not support removing vectors. DiskANN (Subramanya et al., NeurIPS 2019) shows SSD-resident graph search at billion scale on one machine with 64 GB of RAM: over 5,000 queries a second, under 3 ms mean latency, 95%+ 1-recall@1 on SIFT1B, with PQ-compressed vectors in RAM and full-precision rescoring from SSD. ACORN (Patel et al., SIGMOD 2024) introduces predicate subgraph traversal over a denser HNSW-style graph for arbitrary filters, reporting 2–1,000 times higher throughput at fixed recall. Qdrant's indexing documentation, checked on 10 October 2026, shows how a production engine puts these together: payload indexes that also estimate filter cardinality for query planning, a <code>full_scan_threshold</code> (10,000 KB by default) below which the planner scans rather than traverses, filterable HNSW with extra edges per indexed payload value (requiring payload indexes to exist before data is indexed), and an ACORN search option since version 1.16.0 for combinations of strict filters that the extra edges do not cover. Defaults and features change between versions; the design lesson is that filtered vector search is a planning problem with several strategies, not a single index.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> reproduce filtered-graph recall collapse on a small graph, and see how expanding to neighbours of neighbours (the ACORN idea) and brute force over the matching set fix it. Python 3.12 with NumPy from the gpt_env environment.</p>
+<ol>
+<li>Save as <code>filtered_graph.py</code> and run it with the gpt_env Python. It builds a k-nearest-neighbour graph over 5,000 random vectors (one layer, 32 links per node, like HNSW's bottom layer) and runs a beam search under three strategies at several selectivities.</li>
+<li>Read the <em>restricted</em> column: recall@10 when the search may step only through passing nodes. It should fall sharply below about 5% selectivity.</li>
+<li>Read the <em>all-nodes</em> column: recall stays higher, but the distance-computation count (cost) grows as selectivity falls, because most visited nodes do not pass.</li>
+<li>Read the <em>two-hop</em> column: restricted search that also considers neighbours of non-passing neighbours. Recall should hold much better at low selectivity for a moderate cost.</li>
+<li>Note the matching-set size at 1%: 50 points. Brute force over them is exact and costs 50 distances. Compare with every graph strategy.</li>
+</ol>
+<pre>"""Filtered graph search: recall collapse and fixes. Python 3.12 + NumPy (gpt_env)."""
+import heapq
+import numpy as np
+rng = np.random.default_rng(0)
+N, D, DEG, EF, K = 5000, 32, 32, 64, 10
+X = rng.standard_normal((N, D)).astype(np.float32)
+sq = (X ** 2).sum(1)
+nbrs = np.empty((N, DEG), dtype=np.int64)
+for i in range(0, N, 500):                          # exact kNN graph, built in blocks
+    d = sq[i:i + 500, None] - 2 * X[i:i + 500] @ X.T + sq[None, :]
+    d[np.arange(d.shape[0]), np.arange(i, i + d.shape[0])] = np.inf
+    nbrs[i:i + 500] = np.argpartition(d, DEG, axis=1)[:, :DEG]
+adj = [set(r) for r in nbrs.tolist()]
+for i, r in enumerate(nbrs.tolist()):               # make links two-way, like HNSW
+    for j in r: adj[j].add(i)
+adj = [np.fromiter(s, dtype=np.int64) for s in adj]
+
+def search(q, ok, mode):
+    """Beam search; returns (top-K ids, number of distance computations)."""
+    allowed = np.flatnonzero(ok)
+    entry = int(rng.choice(allowed if mode != "all" else N))
+    dist = lambda ids: ((X[ids] - q) ** 2).sum(1)
+    seen = {entry}; d0 = float(dist([entry])[0]); cost = 1
+    cand = [(d0, entry)]; res = [(-d0, entry)] if ok[entry] else []
+    while cand:
+        dc, c = heapq.heappop(cand)
+        if len(res) &gt;= EF and dc &gt; -res[0][0]: break
+        nb = adj[c]
+        if mode == "restricted": nb = nb[ok[nb]]
+        elif mode == "two_hop":                       # passing 1-hop plus passing 2-hop via failing nodes
+            hop2 = [adj[x] for x in nb[~ok[nb]]]
+            nb = np.concatenate([nb] + hop2) if hop2 else nb
+            nb = np.unique(nb[ok[nb]])
+        nb = [int(x) for x in nb if int(x) not in seen]
+        if not nb: continue
+        seen.update(nb); ds = dist(nb); cost += len(nb)
+        for x, dx in zip(nb, ds.tolist()):
+            if len(res) &lt; EF or dx &lt; -res[0][0]:
+                heapq.heappush(cand, (dx, x))
+                if ok[x]:
+                    heapq.heappush(res, (-dx, x))
+                    if len(res) &gt; EF: heapq.heappop(res)
+    return [x for _, x in sorted(res, reverse=True)][:K], cost
+
+print(f"{'select.':&gt;7} {'matches':&gt;7} | {'restricted':&gt;14} | {'all-nodes':&gt;14} | {'two-hop':&gt;14}")
+for s in (0.5, 0.2, 0.1, 0.05, 0.02, 0.01):
+    ok = rng.random(N) &lt; s; allowed = np.flatnonzero(ok)
+    out = {m: [0.0, 0] for m in ("restricted", "all", "two_hop")}
+    for _ in range(100):
+        q = rng.standard_normal(D).astype(np.float32)
+        truth = set(allowed[np.argsort(((X[allowed] - q) ** 2).sum(1))[:K]].tolist())
+        for m in out:
+            got, cost = search(q, ok, m)
+            out[m][0] += len(truth &amp; set(got)) / len(truth); out[m][1] += cost
+    cells = " | ".join(f"{out[m][0]/100:5.2f} r {out[m][1]/100:6.0f} c" for m in out)
+    print(f"{s:7.0%} {len(allowed):7} | {cells}")</pre>
+<p><strong>What to look for:</strong> restricted recall falling apart at low selectivity (islands); all-nodes recall holding up only by spending many more distance computations; two-hop recovering most of the recall at moderate cost; and the matching-set size telling you when brute force (cost = matches, recall = 1.0) beats all of them.</p>
+</section>
+
+<section data-field="drill">
+<b>Estimate it</b>
+<p>A customer has 300 million 1,024-dimensional vectors, needs p99 under 80 ms at recall@10 of 0.95, and runs 2,000 queries a second, 80% of them filtered to one of 400 product categories of roughly equal size. Using the lesson's assumptions ($3 per GB-month RAM, $0.15 SSD, two replicas): (a) memory and monthly storage cost for HNSW (M = 16, float32) versus IVF-PQ with 128-byte codes and SSD rescoring; (b) what plan should a category-filtered query use, and why; (c) what would you recommend?</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> HNSW: 1,024 × 4 + 16 × 2 × 4 = 4,224 bytes × 300 million ≈ <strong>1.27 TB RAM</strong> per replica, about $3,800 a month per replica, <strong>$7,600</strong> for two. IVF-PQ: 128 + 8 = 136 bytes × 300 million ≈ 41 GB RAM ($122 per replica) plus 4,096 bytes × 300 million ≈ 1.23 TB of float32 on SSD ($184 per replica), about <strong>$610</strong> a month for two replicas, roughly twelve times cheaper.</p>
+<p><strong>(b)</strong> Each category is 1/400 = 0.25% of the data, 750,000 vectors. That is far below the selectivity where in-graph filtering works (32 × 0.0025 = 0.08 passing neighbours per node) and far too many to brute-force within 80 ms (750,000 × 4 KB = 3 GB). So neither naive plan works on one shared index: partition by category (segments or sub-namespaces per category, each with its own index), or build filter-aware edges on the category field. With partitioning, a category query searches a 750,000-vector index directly.</p>
+<p><strong>(c)</strong> IVF-PQ with rescoring, partitioned by category, sharded by hash within large categories if needed; measure recall per category with shadow queries and tune nprobe and the rescoring depth to reach 0.95. The unfiltered 20% of queries fan out across category partitions or use a global index; if they matter, keep a global IVF-PQ index too, which at 41 GB is affordable.</p>
+</details>
+<b>Diagnose it</b>
+<p>After a weekend batch job deleted and reinserted 30% of a namespace, recall@10 dropped from 0.96 to 0.90 and p99 latency doubled, though query volume was unchanged. What happened and what do you do?</p>
+<details><summary>Answer</summary>
+<p>The deletes became tombstones in existing segments and the reinserts became many new small segments. Searches now traverse graphs where 30% of nodes are deleted (wasted visits, and the live subgraph is less well connected, lowering recall at the same ef), and every query must search and merge many more segments (higher latency). Check the deleted fraction per segment, segment counts and the compaction backlog. Short term: raise ef temporarily to restore recall, and run compaction at a controlled rate off-peak to rebuild affected segments and merge the small ones. Long term: treat bulk replacement as a migration (build a new namespace, switch, drop the old one), flag bulk deletes so compaction is scheduled, and alert on shadow recall and segment count per namespace.</p>
+</details>
+</section>

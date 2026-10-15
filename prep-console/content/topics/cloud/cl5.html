@@ -1,0 +1,573 @@
+<!-- topic source for cloud/cl5; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "cl5",
+  "t": "Serverless in depth: the Lambda execution model, cold starts, concurrency limits, event sources, timeouts, and when serverless is the wrong answer",
+  "tag": "Serverless",
+  "sum": "How a function platform actually runs your code: execution environments in microVMs, the init–invoke–freeze–shutdown lifecycle and what a cold start costs, concurrency as requests per second times duration, account and per-function scaling limits, synchronous, asynchronous and queue-polling invocation with their retry semantics, timeouts and payload limits, Lambda versus a container at 1 million and 100 million requests a month, and the cases where serverless is the wrong tool — with Prime Video's 2023 move from Step Functions and Lambda to a monolith as the case.",
+  "prereq": [
+    [
+      "cl4",
+      "Functions bill per request and GB-second and scale per event; containers on Fargate bill per vCPU-hour and GB-hour; the cheapest option depends on the load shape."
+    ],
+    [
+      "cl2",
+      "A Lambda function runs as an execution role that a trust policy lets lambda.amazonaws.com assume; resource-based policies decide who may invoke it."
+    ],
+    [
+      "sc10",
+      "Queues decouple producers from consumers; delivery is at-least-once so consumers must be idempotent; retries need backoff and dead-letter queues; visibility timeouts hide in-flight messages."
+    ],
+    [
+      "sc12",
+      "Timeouts, retries with exponential backoff and jitter, circuit breakers and bulkheads stop failures from cascading; retries without limits amplify overload."
+    ]
+  ],
+  "myths": [
+    [
+      "Cold starts happen on most requests.",
+      "AWS's documentation says cold starts typically occur in under 1% of invocations for production functions, because environments are reused for subsequent requests. They're common in development and low-traffic functions, and they cluster during sudden scale-outs, when many new environments start at once. That's exactly when they hurt, so measure the cold-start rate and P99 during bursts, not the average."
+    ],
+    [
+      "Lambda scales infinitely and instantly.",
+      "Each function can add up to 1,000 execution environments every 10 seconds, and the whole account shares a regional concurrency quota that starts at 1,000 (new accounts may get less). A burst that needs 3,000 concurrent executions takes at least 30 seconds to reach and needs a raised quota; beyond the quota, synchronous calls are throttled with HTTP 429."
+    ],
+    [
+      "Serverless is always cheaper.",
+      "It's cheaper when load is low or spiky, because you pay nothing when idle. At steady high volume, per-request and per-GB-second prices add up: in October 2026 a 512 MB Arm function averaging 120 ms behind an HTTP API cost about $200 per 100 million requests, against roughly $83 a month for two small Fargate tasks with a load balancer serving the same traffic."
+    ],
+    [
+      "If my async function fails, the event is lost.",
+      "For asynchronous invocations Lambda retries function errors twice (after about one and then two more minutes) and retries throttles and system errors for up to six hours by default; after that, events can go to an on-failure destination or a dead-letter queue if you configured one. The opposite risk is real too: the same event can be delivered more than once even when nothing failed, so handlers must be idempotent."
+    ],
+    [
+      "Global variables in a function are shared across all invocations.",
+      "They're shared only within one execution environment, which serves one request at a time (on standard Lambda) and is reused for later requests until it's recycled — AWS recycles environments every few hours even under constant load. Use globals for caches and connections that are safe to lose, never for state that must be consistent across requests."
+    ],
+    [
+      "Lambda's 15-minute limit is the only reason to avoid it for long work.",
+      "Long work also suffers from per-GB-second pricing on idle waiting, from the lack of control over the host, and from orchestration costs if you split it into many short steps. AWS has added options — durable functions that checkpoint and wait for up to a year, and Lambda Managed Instances with longer timeouts on EC2 capacity you choose — but each is a different trade, not the classic model with a bigger timeout."
+    ]
+  ],
+  "recap": [
+    "A function runs in an execution environment — a microVM with your configured memory and proportional CPU (one vCPU's worth at 1,769 MB) — that handles one request at a time on standard Lambda and is reused while warm.",
+    "The lifecycle is Init (start extensions and runtime, run code outside the handler, limited to 10 seconds on demand), Invoke (the handler, limited by the function timeout of up to 900 seconds), freeze between requests, and Shutdown; since 1 August 2025 the Init phase is billed for all configurations.",
+    "A cold start is a request that waits for Init; it's rare overall but bunches up during scale-out; reduce it with smaller packages, lazy loading, SnapStart, provisioned concurrency or keeping the function on a path that tolerates it.",
+    "Concurrency equals requests per second times average duration (Little's law); the account's regional quota (1,000 by default) and the per-function scale rate (1,000 environments per 10 seconds) bound it, and reserved concurrency carves out or caps a function's share.",
+    "Synchronous invocations return errors and throttles to the caller; asynchronous ones go through Lambda's internal queue with two retries for errors, up to six hours for throttles, and on-failure destinations; queue and stream sources are polled by event source mappings with batching and their own retry rules.",
+    "Every event source can deliver duplicates, so handlers must be idempotent; protect downstream systems by putting a queue between bursts and databases and capping concurrency.",
+    "Cost is requests plus GB-seconds (plus API Gateway if used); it beats always-on containers at low or spiky volume and loses at steady high volume, with a crossover around tens of millions of requests a month for a typical API.",
+    "Serverless is the wrong answer for steady high throughput, long or stateful processing, latency-critical paths that can't absorb cold starts, chatty fine-grained pipelines with expensive orchestration, and workloads needing GPUs or special hosts.",
+    "Prime Video's monitoring service hit a scaling wall at about 5% of expected load and high costs from Step Functions transitions and S3 calls; moving the same components into one process on ECS cut infrastructure cost by over 90%."
+  ],
+  "glossary": [
+    [
+      "Alias",
+      "A named pointer to a Lambda function version, such as live, which can split traffic between two versions for canary deployments."
+    ],
+    [
+      "API Gateway",
+      "AWS's managed front door for HTTP and REST APIs; it can invoke Lambda functions synchronously and is billed per request."
+    ],
+    [
+      "Asynchronous invocation",
+      "Calling a function without waiting for the result: Lambda queues the event, returns 202, and runs the function later with its own retry rules."
+    ],
+    [
+      "Cold start",
+      "A request that has to wait for a new execution environment to be created and initialised before the handler runs."
+    ],
+    [
+      "Concurrency",
+      "The number of requests a function is handling at the same moment; on standard Lambda, one per execution environment."
+    ],
+    [
+      "Dead-letter queue (DLQ)",
+      "A queue or topic that receives events that failed all processing attempts so they can be inspected or replayed."
+    ],
+    [
+      "Destination",
+      "A target (queue, topic, function or event bus) that receives a record of an asynchronous invocation's success or failure."
+    ],
+    [
+      "Durable functions",
+      "A Lambda capability that checkpoints a function's progress so it can wait and resume over long periods (up to a year) without paying for idle compute."
+    ],
+    [
+      "Event source mapping (ESM)",
+      "A Lambda-managed poller that reads from a queue or stream (SQS, Kinesis, DynamoDB Streams, Kafka) and invokes the function with batches."
+    ],
+    [
+      "Execution environment",
+      "The isolated microVM sandbox in which a function's runtime, extensions and code run; reused across invocations while warm."
+    ],
+    [
+      "Extension",
+      "A process that runs alongside a function in its execution environment, typically for telemetry or secrets, with its own lifecycle hooks."
+    ],
+    [
+      "FIFO queue",
+      "An SQS queue type that preserves order within a message group and deduplicates messages, at lower throughput than standard queues."
+    ],
+    [
+      "Firecracker",
+      "The open-source virtual machine monitor AWS built to run lightweight microVMs for Lambda and Fargate."
+    ],
+    [
+      "GB-second",
+      "Lambda's unit of compute billing: configured memory in GB multiplied by billed duration in seconds."
+    ],
+    [
+      "Handler",
+      "The function in your code that Lambda calls for each event."
+    ],
+    [
+      "Idempotent",
+      "Safe to run more than once with the same input: the second run has no additional effect."
+    ],
+    [
+      "Init phase",
+      "The part of an execution environment's life that starts extensions and the runtime and runs code outside the handler."
+    ],
+    [
+      "JVM (Java Virtual Machine)",
+      "The runtime that executes Java and other JVM languages; known for comparatively slow start-up, which is why SnapStart first targeted Java."
+    ],
+    [
+      "Lambda Managed Instances",
+      "A Lambda option that runs functions on EC2 instances in your account, with several concurrent requests per environment and longer timeouts for some invocation types."
+    ],
+    [
+      "Little's law",
+      "In a stable system, the average number of items in it equals arrival rate times average time in the system; for functions, concurrency = requests per second × duration."
+    ],
+    [
+      "Partial batch response",
+      "A way for a function processing a batch from a queue or stream to report which items failed, so only those are retried."
+    ],
+    [
+      "Provisioned concurrency",
+      "Execution environments Lambda keeps initialised in advance for a function version, billed whether used or not, to avoid cold starts."
+    ],
+    [
+      "RDS Proxy",
+      "A managed connection pool in front of RDS and Aurora databases that lets many short-lived clients, such as Lambda environments, share a small number of database connections."
+    ],
+    [
+      "Reserved concurrency",
+      "A setting that both guarantees a function a slice of the account's concurrency and caps it at that number."
+    ],
+    [
+      "SnapStart",
+      "A Lambda feature that snapshots an initialised execution environment when a version is published and restores from it instead of running Init."
+    ],
+    [
+      "Synchronous invocation",
+      "Calling a function and waiting for its response, as API Gateway and function URLs do; errors and throttles go back to the caller."
+    ],
+    [
+      "Throttling",
+      "Rejecting requests when concurrency limits are reached; synchronous callers get HTTP 429."
+    ],
+    [
+      "Visibility timeout",
+      "In SQS, how long a received message stays hidden from other consumers before it reappears if not deleted."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What is a cold start and what can you do about it?",
+      "A cold start is a request that waits while Lambda creates a new execution environment: downloading code, starting the runtime and extensions, and running initialisation code outside the handler. It ranges from under 100 ms to over a second depending on runtime, package size and init work. You reduce it by shipping smaller packages and importing only what you use, doing expensive work lazily, choosing faster-starting runtimes, using SnapStart (restore from a snapshot) or provisioned concurrency (pre-initialised environments), and keeping cold-start-sensitive paths off functions entirely.",
+      "Follow-up: why do cold starts matter more during a traffic burst? — Because a burst needs many new environments at once; the requests that arrive first all hit cold starts together, which is when tail latency is worst."
+    ],
+    [
+      "E",
+      "How is a Lambda function billed?",
+      "Per request ($0.20 per million in us-east-1, October 2026) plus per GB-second: configured memory in GB times billed duration. On x86 that's $0.0000166667 per GB-second for the first tier, on Arm $0.0000133334. Since 1 August 2025 the Init phase is billed too. A 512 MB Arm function that runs 120 ms costs 0.5 × 0.12 × $0.0000133334 ≈ $0.0000008 per call plus $0.0000002 for the request — about $1 per million calls, before API Gateway or other services.",
+      "Follow-up: why can adding memory make a function cheaper? — CPU is proportional to memory, so a CPU-bound function may run more than twice as fast at twice the memory, lowering GB-seconds; measure with a power-tuning sweep."
+    ],
+    [
+      "E",
+      "What's the difference between synchronous and asynchronous invocation?",
+      "Synchronous: the caller waits for the result; errors and throttles (HTTP 429) go straight back to the caller, who decides whether to retry — API Gateway, function URLs, ALB and direct Invoke calls work this way. Asynchronous: Lambda puts the event in an internal queue, returns 202 immediately and invokes the function later; on function errors it retries twice, on throttles and system errors it keeps retrying for up to six hours, and failed events can go to an on-failure destination or a dead-letter queue — S3, SNS and EventBridge invoke this way.",
+      "Follow-up: what does that mean for a webhook endpoint? — Accept the webhook synchronously, validate it, put it on a queue and return 200 fast; process asynchronously so a slow downstream doesn't make the sender time out and retry."
+    ],
+    [
+      "M",
+      "Your API needs 2,000 requests per second at peak, each taking 250 ms in a function. What concurrency do you need and what limits will you hit?",
+      "By Little's law, concurrency is 2,000 × 0.25 = 500 concurrent executions at peak, more with headroom for slower requests. The default account quota of 1,000 per region is shared by every function in the account, so another busy function could starve this one: reserve concurrency for it or raise the quota. Scaling from zero to 500 is within the per-function rate of 1,000 environments per 10 seconds, but those first 500 requests are cold starts. Downstream, 500 concurrent environments may each open a database connection — 500 connections can overwhelm a database, so use a proxy (RDS Proxy) or a connection-light data store.",
+      "Follow-up: what does reserved concurrency do exactly? — It guarantees the function that many environments from the account pool and caps it at that number; requests beyond it are throttled."
+    ],
+    [
+      "M",
+      "How does Lambda consume an SQS queue, and what goes wrong?",
+      "An event source mapping long-polls the queue and invokes the function with batches. In standard mode it starts with five concurrent batches and adds up to 300 concurrent invocations per minute while messages remain, up to 1,250 by default; a maximum-concurrency setting caps it. A message being processed is hidden for the queue's visibility timeout; if the function fails, the whole batch returns to the queue unless you use partial batch responses. Common failures: a visibility timeout shorter than the function timeout, so messages reappear and are processed twice (AWS recommends at least six times the function timeout); poison messages retried forever without a redrive policy to a dead-letter queue; and scaling consumers so fast that the downstream database falls over.",
+      "Follow-up: how do you protect the database? — Set the mapping's maximum concurrency to what the database can take, and keep the queue as the buffer; the backlog grows during bursts and drains afterwards."
+    ],
+    [
+      "M",
+      "What do provisioned concurrency and SnapStart each solve, and what do they cost?",
+      "Provisioned concurrency keeps N environments initialised for a function version, so requests up to N never cold-start; you pay for the provisioned GB-seconds all the time ($0.0000033334 per GB-second on Arm in us-east-1, October 2026) plus a lower duration rate when they're used. SnapStart runs Init once when you publish a version, snapshots the environment, and restores new environments from the snapshot; it cuts cold starts for runtimes with slow init (Java, Python, .NET) at a smaller cost, but code must be snapshot-safe — no uniqueness or credentials captured during init that would be cloned into every restored environment.",
+      "Follow-up: what is 'snapshot-safe'? — Regenerate random seeds, unique IDs, temporary credentials and network connections after restore (using runtime hooks) because every environment restored from the snapshot starts with identical memory."
+    ],
+    [
+      "M",
+      "When would you put a queue between API Gateway and a function?",
+      "When the work doesn't need to finish before replying, or when bursts could overwhelm the function or what it calls. The API accepts the request, writes it to SQS and returns 202 with an ID; a consumer function processes at a controlled concurrency. You gain burst absorption, retries with a dead-letter queue, and protection for downstream systems. You lose immediate results (clients poll or get a callback) and add a component to monitor.",
+      "Follow-up: how do you make the consumer safe under duplicates? — Use an idempotency key from the request, record processed keys in a table with a conditional write, and skip work already done."
+    ],
+    [
+      "M",
+      "Compare the cost of Lambda and a container for an API at 1 million and 100 million requests a month.",
+      "Assume 512 MB on Arm, 120 ms average, behind an API Gateway HTTP API ($1 per million), against two Fargate Arm tasks of 1 vCPU and 2 GB with an Application Load Balancer, us-east-1 prices from 7 October 2026, ignoring free tiers. At 1 million: Lambda $0.80 compute + $0.20 requests + $1.00 gateway = $2.00; the containers cost about $80 a month whatever the traffic. At 100 million (about 38 requests per second on average): Lambda $80 + $20 + $100 = $200; the same two tasks still cope, about $83 with the load balancer. Without API Gateway (a function URL) Lambda is $100. The crossover is roughly 40 million requests a month with the gateway and 80 million without it.",
+      "Follow-up: what makes the crossover move? — Duration and memory (they scale Lambda's GB-seconds), the gateway choice, how bursty traffic is (containers must be sized for peaks), and how much idle time the containers would carry."
+    ],
+    [
+      "H",
+      "When is serverless the wrong answer? Give concrete signals.",
+      "Steady high throughput where per-request pricing exceeds a right-sized container fleet; long-running or stateful processing that would be split into many steps whose orchestration and data passing cost more than the compute; latency-critical paths with strict P99 targets that cold starts would break and provisioned concurrency would make expensive; workloads needing GPUs, large local disk, specific instance types or long-lived connections (WebSockets held for hours, streaming consumers); and very chatty designs where functions pass large intermediate data through S3 or queues. Signals in production: GB-seconds rising with flat traffic, throttles and concurrency limits on the critical path, orchestration and storage-request lines bigger than compute on the bill.",
+      "Follow-up: what would you do instead of a rewrite? — Move the hot path to a container while keeping functions for glue and spiky edges; Prime Video kept the same components and only changed where they ran."
+    ],
+    [
+      "H",
+      "Design an image-processing pipeline: users upload up to 50 MB images, you generate thumbnails and run a classifier, and results appear within a minute.",
+      "Clients upload directly to S3 with a presigned URL (avoiding the 6 MB synchronous payload limit). An S3 event to EventBridge or SQS triggers a thumbnail function (2–3 GB memory for image libraries, timeout a few minutes, /tmp sized for the image), writing thumbnails back to S3. The classifier is a model that needs a GPU or large memory, so it runs on a container service consuming a queue, not in a function. Each step is idempotent, keyed by object key and version, so duplicate events are harmless. Failures go to dead-letter queues with alarms; a status record in DynamoDB tracks progress for the UI. Concurrency caps on the functions protect the classifier queue and any database.",
+      "Follow-up: why not chain functions with Step Functions for every step? — You can, and for a few steps it's clear; at high volume, per-transition costs and passing data through S3 between steps can dominate, so keep the chain short and the data in S3 referenced by key."
+    ],
+    [
+      "H",
+      "Walk through Prime Video's 2023 monitoring rewrite. What exactly made the serverless version expensive?",
+      "Prime Video's video-quality analysis service had a media converter that split streams into frames, defect detectors that analysed them, and orchestration, built with Step Functions and Lambda, with frames stored temporarily in S3. Step Functions performed several state transitions for every second of every stream, which hit account limits at around 5% of the expected load and is billed per transition; the detectors downloading frames from S3 generated large numbers of Tier-1 S3 requests, which were expensive. The team moved the same components into a single process on ECS and EC2, passing frames in memory, and reported infrastructure cost falling by over 90%, with room to scale to thousands of streams; they scaled out by running copies with different subsets of detectors.",
+      "Follow-up: is this an argument against serverless? — No; the authors say microservices and serverless work at scale but must be chosen case by case. It's an argument against fine-grained orchestration and passing bulk data between components through storage at high frequency."
+    ],
+    [
+      "H",
+      "How do you make a Lambda-based system safe to retry end to end?",
+      "Assume every source can deliver duplicates: async invocation, SQS, EventBridge and stream retries all do. Give each unit of work an idempotency key (a request ID, an S3 object key and version, a message deduplication ID). Before doing side effects, record the key with a conditional write (for example DynamoDB put with attribute_not_exists) and store the result; on a duplicate, return the stored result. Make downstream calls idempotent too (payment APIs with idempotency keys). Bound retries: set maximum retry attempts and event age for async invocations, redrive policies for queues, and partial batch responses so one bad record doesn't retry a batch of 10. Send exhausted events to dead-letter queues with alarms and a replay tool.",
+      "Follow-up: what's the trap with idempotency records? — Their lifetime: keep them at least as long as the longest retry window (six hours for async, the queue's retention for SQS), and handle the case where the first attempt is still running when the duplicate arrives."
+    ]
+  ],
+  "refs": [
+    [
+      "post",
+      "Scaling up the Prime Video audio/video monitoring service and reducing costs by 90% (archived)",
+      "The case: Step Functions transitions and S3 Tier-1 requests made a serverless design hit limits at 5% of load; the same components in one ECS process cost over 90% less (Marcin Kolny, 22 March 2023).",
+      "https://web.archive.org/web/20231230202019/https://www.primevideotech.com/video-streaming/scaling-up-the-prime-video-audio-video-monitoring-service-and-reducing-costs-by-90"
+    ],
+    [
+      "docs",
+      "Understanding the Lambda execution environment lifecycle",
+      "Init, Restore, Invoke and Shutdown phases, the 10-second init limit, freezing and reuse, and cold-start guidance.",
+      "https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html"
+    ],
+    [
+      "docs",
+      "Lambda quotas",
+      "Memory, timeout, payload sizes, /tmp, concurrency defaults and the per-function scaling rate.",
+      "https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html"
+    ],
+    [
+      "docs",
+      "How Lambda handles errors and retries with asynchronous invocation",
+      "Two retries for errors, up to six hours for throttles, duplicates even without errors, DLQs and destinations.",
+      "https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-error-handling.html"
+    ],
+    [
+      "docs",
+      "Configuring scaling behavior for SQS event source mappings",
+      "Five initial batches, +300 concurrent invocations per minute, 1,250 by default, maximum concurrency and provisioned mode.",
+      "https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-scaling.html"
+    ],
+    [
+      "post",
+      "AWS Lambda standardizes billing for INIT phase (AWS Compute Blog)",
+      "Why and from when (1 August 2025) the Init phase is billed for all function configurations.",
+      "https://aws.amazon.com/blogs/compute/aws-lambda-standardizes-billing-for-init-phase/"
+    ],
+    [
+      "paper",
+      "Firecracker: Lightweight Virtualization for Serverless Applications (NSDI 2020)",
+      "How AWS isolates functions in microVMs that boot in about 125 ms with a few megabytes of overhead.",
+      "https://www.usenix.org/conference/nsdi20/presentation/agache"
+    ],
+    [
+      "docs",
+      "AWS Lambda pricing",
+      "Request and GB-second prices by architecture, provisioned concurrency and other charges.",
+      "https://aws.amazon.com/lambda/pricing/"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team building a photo-sharing feature writes its upload handler as a function. It's wonderful: no servers, deploys in seconds, costs a few dollars a month. So they write everything else as functions too — a resize function, a moderation function, a notification function, an indexing function, stitched together with a workflow service, with images passed between steps through object storage.</p>
+<p>Then a marketing campaign brings ten times the usual traffic in an hour. Requests start failing with "Rate exceeded" because all the functions share one account-wide concurrency quota and the indexing backlog has eaten it. The database behind the notification function falls over because 900 function instances opened 900 connections at once. Some users get two notifications, because a timed-out step was retried after it had already sent one. And at the end of the month the bill's biggest lines aren't compute at all: they're workflow state transitions and storage requests from passing images between steps.</p>
+<p>Nothing here is a bug in the platform. Each is a property of the serverless execution model that the team never had to think about at low volume: how execution environments are created and reused, how concurrency is counted and capped, how each kind of event source retries, what a cold start is, and how the pricing units behave at scale. The same properties are what make serverless excellent for the right workloads — bursty event handling, glue between managed services, jobs that run a few minutes a day.</p>
+<p>This lesson takes the functions-as-a-service model apart using AWS Lambda as the concrete system. It covers the execution environment and its lifecycle, cold starts and the tools against them, concurrency maths and limits, the three invocation models and their retry semantics, timeouts and payload limits, a worked cost comparison against a container at 1 million and 100 million requests a month, and the signals that serverless is the wrong answer. The case is Prime Video's 2023 write-up of moving a monitoring service from Step Functions and Lambda to a monolith on containers and cutting its cost by more than 90%.</p>
+</section>
+
+<section data-field="primer">
+<p>Think of a function platform as a hotel with an unusual check-in policy. You don't rent a room by the month. Each time a guest (a request) arrives, the hotel gives them a room for exactly as long as they need it and bills you by the minute, scaled by the size of the room. When the guest leaves, the room isn't torn down; it's kept made up for a while in case another guest of the same kind arrives, who can then walk straight in. If many guests arrive at once and no prepared rooms are free, the hotel has to prepare new ones, and those guests wait in the lobby while it does. The hotel has a rule that your company can't occupy more than a certain number of rooms at once, across all your guests of all kinds.</p>
+<p>Map it across. The room is an <strong>execution environment</strong>: a small, isolated virtual machine (a <em>microVM</em>) with the memory you configured, your code and its runtime. A request occupies one environment for its duration (on standard Lambda, one request per environment at a time). Preparing a new room is the <strong>Init</strong> phase — start the runtime, load your code, run your initialisation — and a guest who waits for it experiences a <strong>cold start</strong>. A room kept made up is a <em>warm</em> environment, <em>frozen</em> between requests and reused. The occupancy rule is the <strong>concurrency quota</strong>. And the per-minute, per-room-size billing is the <strong>GB-second</strong>.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Timeline of one execution environment: init, invoke, frozen idle period, warm invoke, another invoke, then shutdown hours later">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="20" y1="150" x2="620" y2="150" style="stroke:var(--line-2);fill:none"/>
+    <text x="620" y="170" text-anchor="end" style="fill:var(--muted)">time →</text>
+    <rect x="30" y="110" width="90" height="34" rx="4" style="fill:var(--s4);opacity:0.6"/>
+    <text x="75" y="131" text-anchor="middle" style="fill:var(--ink)">Init</text>
+    <rect x="122" y="110" width="60" height="34" rx="4" style="fill:var(--s1);opacity:0.7"/>
+    <text x="152" y="131" text-anchor="middle" style="fill:var(--ink)">Invoke</text>
+    <rect x="184" y="110" width="140" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="254" y="131" text-anchor="middle" style="fill:var(--ink-2)">frozen (not billed)</text>
+    <rect x="326" y="110" width="60" height="34" rx="4" style="fill:var(--s1);opacity:0.7"/>
+    <text x="356" y="131" text-anchor="middle" style="fill:var(--ink)">Invoke</text>
+    <rect x="388" y="110" width="70" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <rect x="460" y="110" width="60" height="34" rx="4" style="fill:var(--s1);opacity:0.7"/>
+    <text x="490" y="131" text-anchor="middle" style="fill:var(--ink)">Invoke</text>
+    <text x="540" y="131" style="fill:var(--muted)">…</text>
+    <rect x="560" y="110" width="55" height="34" rx="4" style="fill:var(--s5);opacity:0.6"/>
+    <text x="587" y="131" text-anchor="middle" style="fill:var(--ink)">Shut</text>
+    <text x="106" y="96" text-anchor="middle" style="fill:var(--crit)">request 1: cold start</text>
+    <line x1="106" y1="100" x2="106" y2="108" style="stroke:var(--crit);fill:none"/>
+    <text x="356" y="96" text-anchor="middle" style="fill:var(--good)">request 2: warm</text>
+    <text x="490" y="96" text-anchor="middle" style="fill:var(--good)">request 3: warm</text>
+    <text x="75" y="190" text-anchor="middle" style="fill:var(--ink-2)">extensions, runtime,</text>
+    <text x="75" y="206" text-anchor="middle" style="fill:var(--ink-2)">code outside handler</text>
+    <text x="75" y="222" text-anchor="middle" style="fill:var(--muted)">≤ 10 s on demand</text>
+    <text x="254" y="190" text-anchor="middle" style="fill:var(--ink-2)">globals, connections and</text>
+    <text x="254" y="206" text-anchor="middle" style="fill:var(--ink-2)">/tmp survive while frozen</text>
+    <text x="587" y="190" text-anchor="middle" style="fill:var(--ink-2)">recycled after</text>
+    <text x="587" y="206" text-anchor="middle" style="fill:var(--ink-2)">a few hours</text>
+    <text x="320" y="30" text-anchor="middle" style="fill:var(--ink);font-weight:600">One execution environment, one request at a time</text>
+    <text x="320" y="50" text-anchor="middle" style="fill:var(--muted)">billed: Init + each Invoke, in GB-seconds; idle frozen time is free</text>
+  </g>
+</svg>
+<figcaption>Only the first request in an environment pays for Init. Everything created during Init — imported libraries, SDK clients, database connections — is reused by the requests that follow, which is why code outside the handler matters so much.</figcaption>
+</figure>
+
+<p>The model gives you three things that are hard to get otherwise: no capacity planning (environments appear as requests arrive), no idle cost (frozen environments are free and unused functions cost nothing), and strong isolation (each environment is its own microVM). It takes away three things: control over the machine, long-running work (a request may run at most 15 minutes), and cheapness at high steady volume, because you pay a premium for every unit of work in exchange for paying nothing for idle.</p>
+<p>A useful way to hold the whole model in your head is as three dials you never see on a server. The <em>memory dial</em> sets the size of each room and, with it, how much CPU the guest gets and how much each minute costs. The <em>concurrency dial</em> is the occupancy rule — for the account, and optionally per function. The <em>timeout dial</em> is the maximum stay. Almost every serverless incident is one of these dials set without thinking about the others: memory too low so requests run long, which raises concurrency, which hits the occupancy limit; or a timeout longer than the caller's patience, so work continues after nobody is waiting for it.</p>
+<p>Where the analogy breaks: a hotel's lobby is a polite queue. Lambda's is not, for synchronous calls — if no room is available and you're at your occupancy limit, the guest is turned away immediately with an error (a <em>throttle</em>), and it's the caller's job to try again. Only asynchronous and queue-fed invocations wait in a real queue. Knowing which kind of caller you have decides how your system behaves at the limit.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The execution environment</h4>
+<p>Lambda runs each environment in a <strong>Firecracker</strong> microVM — a minimal virtual machine monitor AWS built for this purpose and described in an NSDI 2020 paper, designed to boot in about 125 ms with a few megabytes of overhead per VM. That's what lets Lambda give every environment a hardware-virtualisation boundary (stronger than containers sharing a kernel, k8s1) while creating them on demand.</p>
+<p>You configure an environment mainly through <strong>memory</strong>: 128 MB to 10,240 MB in 1 MB steps. CPU is allocated in proportion to memory; per the Lambda quotas page, at 1,769 MB a function has the equivalent of one vCPU, and at 10,240 MB up to six. Network bandwidth per environment is 625 Mbps by default. Each environment has a <code>/tmp</code> directory of 512 MB to 10,240 MB, a limit of 1,024 file descriptors and 1,024 processes or threads. Code is a zip (50 MB zipped upload, 250 MB unzipped including layers) or a container image up to 10 GB. You choose x86_64 or arm64; Arm is about 20% cheaper per GB-second.</p>
+<p>On standard Lambda, <strong>an environment handles one request at a time</strong>. Ten simultaneous requests need ten environments. That one fact explains most of what follows: concurrency maths, connection storms against databases, and why globals are safe within an environment.</p>
+
+<h4>2. The lifecycle, phase by phase</h4>
+<p>AWS's documentation describes the lifecycle as phases, each started by an event to the runtime and to any <strong>extensions</strong> (helper processes for telemetry, secrets and the like):</p>
+<ul>
+<li><strong>Init.</strong> Start extensions, bootstrap the runtime (the Python interpreter, the JVM, the Node.js process) and run your code outside the handler — imports, SDK clients, configuration, connection pools. On-demand functions get 10 seconds for Init; if it doesn't finish, Lambda retries Init at the first invocation under the function timeout. (With provisioned concurrency, SnapStart or Managed Instances, init can run much longer.) Since 1 August 2025, Init is billed for every configuration; previously, managed runtimes packaged as zip files didn't pay for it.</li>
+<li><strong>Invoke.</strong> Lambda calls your <strong>handler</strong> with the event. The function timeout, at most 900 seconds (15 minutes), bounds this phase, including time extensions spend after the handler returns.</li>
+<li><strong>Freeze.</strong> When the handler and extensions report done, Lambda freezes the environment. Nothing runs and nothing is billed. Globals, open connections and files in <code>/tmp</code> remain. Background threads you started also freeze and resume on the next request, which surprises people.</li>
+<li><strong>Thaw and reuse.</strong> The next request for the same function version may land on a frozen environment, which thaws and goes straight to Invoke: a <strong>warm start</strong>.</li>
+<li><strong>Shutdown.</strong> Eventually Lambda retires the environment, giving extensions up to 2,000 ms to clean up. AWS states it recycles environments every few hours even for functions invoked continuously, so nothing can live forever.</li>
+</ul>
+<p>Failures reset the environment: if a handler crashes or times out, Lambda tears down the runtime and the next request on that environment pays a new ("suppressed") Init, which shows up as extra duration in the next REPORT log line.</p>
+<p>Every invocation ends with a REPORT line in the function's logs, which is the best place to see all of this in numbers:</p>
+<pre>REPORT RequestId: 527cb862-… Duration: 118.42 ms Billed Duration: 119 ms
+Memory Size: 512 MB Max Memory Used: 141 MB Init Duration: 412.07 ms</pre>
+<p><code>Init Duration</code> appears only on cold starts. Billed duration is rounded up to the millisecond.</p>
+
+<h4>3. Cold starts: anatomy and remedies</h4>
+<p>A <strong>cold start</strong> is the latency a request experiences when it waits for a new environment: placing and booting the microVM, downloading the code, and Init. AWS's documentation says cold starts typically occur in under 1% of invocations and range from under 100 ms to over a second. The variation comes from a few sources: the runtime (compiled languages and lightweight interpreters start faster than a JVM loading a framework), the package size (more to download and load), and above all what your init code does (importing a large ML library, fetching secrets, opening connections).</p>
+<p>Three facts make cold starts matter more than "under 1%" suggests. They concentrate at scale-out moments — a burst that needs 400 new environments produces 400 cold starts in the same few seconds, exactly at the busiest time. They concentrate on low-traffic functions, where every request may find no warm environment. And they compound in call chains: a request that passes through three functions can hit three cold starts.</p>
+<p>The remedies, roughly in order of cost:</p>
+<ol>
+<li><strong>Do less at init.</strong> Import only the modules you need (AWS's own example: load the DynamoDB client, not the whole SDK), make rarely used dependencies lazy, keep packages small, avoid network calls in init that could be deferred.</li>
+<li><strong>Choose the runtime and memory deliberately.</strong> More memory brings more CPU, which shortens CPU-bound init; Arm and x86 differ by workload — measure.</li>
+<li><strong>SnapStart.</strong> For supported runtimes (Java, Python, .NET), Lambda runs Init once when you publish a version, snapshots the initialised memory and disk, and restores new environments from it. Code must be "snapshot-safe": anything unique created during init (random seeds, IDs, temporary credentials, connections) is cloned into every restored environment, so it must be regenerated in an after-restore hook.</li>
+<li><strong>Provisioned concurrency.</strong> Lambda keeps N environments initialised for a version at all times; requests up to N never cold-start. You pay for the provisioned capacity whether used or not — $0.0000033334 per GB-second on Arm in us-east-1 (October 2026), about 25% of the on-demand duration price — plus a reduced duration rate when invoked. Ten 1 GB environments provisioned all month cost about 10 × 1 × 730 × 3,600 × $0.0000033334 ≈ $87.60.</li>
+</ol>
+
+<h4>4. Concurrency: the number that governs everything</h4>
+<p><strong>Concurrency</strong> is how many requests a function is handling at the same moment — on standard Lambda, the number of busy environments. It follows from <strong>Little's law</strong>: average concurrency = arrival rate × average duration. An API receiving 400 requests per second, each taking 150 ms, runs at 400 × 0.15 = 60 concurrent executions. Double the duration (a slow database) and concurrency doubles with no change in traffic — which is why downstream slowness turns into concurrency exhaustion.</p>
+<p>Two limits bound it (October 2026 defaults):</p>
+<ul>
+<li><strong>Account concurrency per region:</strong> 1,000 concurrent executions by default, shared by every function in the account in that region, raisable to tens of thousands. New accounts may start lower. When it's exhausted, synchronous calls fail with <code>429 TooManyRequestsException</code>.</li>
+<li><strong>Per-function scaling rate:</strong> each function can add up to 1,000 execution environments every 10 seconds. A function idling at 50 environments that suddenly needs 2,500 reaches it no sooner than about 25 seconds later, given enough account quota.</li>
+</ul>
+<p>Two settings shape it per function. <strong>Reserved concurrency</strong> sets aside N from the account pool for a function and also caps it at N — the cap is often the more useful half, because it stops one function from starving the rest or from flooding a database. <strong>Provisioned concurrency</strong>, above, pre-initialises environments and doesn't by itself cap anything.</p>
+<p>Work an example. A flash sale sends 5,000 requests per second to a checkout function averaging 200 ms: concurrency 1,000. That's the entire default account quota. Every other function in the account — order processing, the webhook handler — now throttles too. The fix is not only "raise the quota": reserve concurrency for checkout (and cap the less important functions), raise the account quota ahead of the event, and check the database can take 1,000 concurrent clients (it usually can't; use RDS Proxy or a queue).</p>
+
+<h4>5. Invocation models and their retry semantics</h4>
+<p>How a function is invoked decides what happens on errors, throttles and overload. There are three models:</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Three invocation models: synchronous where errors return to the caller; asynchronous where Lambda's internal queue retries and sends failures to a destination; polling where an event source mapping reads batches from SQS or a stream">
+  <defs><marker id="cl5-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="24" style="fill:var(--ink);font-weight:600">Synchronous</text>
+    <rect x="20" y="34" width="120" height="36" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="80" y="57" text-anchor="middle" style="fill:var(--ink)">API GW / URL</text>
+    <line x1="140" y1="46" x2="290" y2="46" marker-end="url(#cl5-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="290" y1="62" x2="140" y2="62" marker-end="url(#cl5-arrow)" style="stroke:var(--crit);fill:none"/>
+    <text x="215" y="80" text-anchor="middle" style="fill:var(--ink-2)">error or 429 → caller retries</text>
+    <rect x="292" y="34" width="110" height="36" rx="5" style="fill:var(--surface);stroke:var(--s1)"/><text x="347" y="57" text-anchor="middle" style="fill:var(--ink)">function</text>
+    <text x="20" y="118" style="fill:var(--ink);font-weight:600">Asynchronous</text>
+    <rect x="20" y="128" width="120" height="36" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="80" y="151" text-anchor="middle" style="fill:var(--ink)">S3 / SNS / EB</text>
+    <line x1="140" y1="146" x2="168" y2="146" marker-end="url(#cl5-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <rect x="170" y="128" width="110" height="36" rx="5" style="fill:var(--surface);stroke:var(--s4)"/><text x="225" y="151" text-anchor="middle" style="fill:var(--ink)">internal queue</text>
+    <line x1="280" y1="146" x2="290" y2="146" marker-end="url(#cl5-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <rect x="292" y="128" width="110" height="36" rx="5" style="fill:var(--surface);stroke:var(--s1)"/><text x="347" y="151" text-anchor="middle" style="fill:var(--ink)">function</text>
+    <line x1="402" y1="146" x2="458" y2="146" marker-end="url(#cl5-arrow)" style="stroke:var(--crit);fill:none"/>
+    <rect x="460" y="128" width="160" height="36" rx="5" style="fill:var(--surface-2);stroke:var(--crit)"/><text x="540" y="151" text-anchor="middle" style="fill:var(--ink)">on-failure dest. / DLQ</text>
+    <text x="347" y="184" text-anchor="middle" style="fill:var(--ink-2)">202 at once · 2 retries on error · throttles retried ≤ 6 h · duplicates possible</text>
+    <text x="20" y="224" style="fill:var(--ink);font-weight:600">Polling (event source mapping)</text>
+    <rect x="20" y="234" width="120" height="36" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="80" y="257" text-anchor="middle" style="fill:var(--ink)">SQS / Kinesis</text>
+    <rect x="170" y="234" width="110" height="36" rx="5" style="fill:var(--surface);stroke:var(--s2)"/><text x="225" y="257" text-anchor="middle" style="fill:var(--ink)">poller (ESM)</text>
+    <line x1="168" y1="252" x2="142" y2="252" marker-end="url(#cl5-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <line x1="280" y1="252" x2="290" y2="252" marker-end="url(#cl5-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <rect x="292" y="234" width="110" height="36" rx="5" style="fill:var(--surface);stroke:var(--s1)"/><text x="347" y="257" text-anchor="middle" style="fill:var(--ink)">function</text>
+    <text x="420" y="248" style="fill:var(--ink-2)">batches; failures return to the</text>
+    <text x="420" y="266" style="fill:var(--ink-2)">queue (or block the shard)</text>
+    <text x="225" y="290" text-anchor="middle" style="fill:var(--muted)">pulls ↑</text>
+  </g>
+</svg>
+<figcaption>Who owns the retry decides everything: the caller (synchronous), Lambda's own queue (asynchronous), or the source queue or stream (polling). Only the first returns throttles to a client; only the last can apply back-pressure by letting a backlog grow.</figcaption>
+</figure>
+
+<p><strong>Synchronous.</strong> The caller waits for the response: API Gateway, function URLs, Application Load Balancers, and direct <code>Invoke</code> calls with <code>RequestResponse</code>. Request and response payloads are limited to 6 MB each (streamed responses up to 200 MB). Errors and throttles return to the caller, which decides whether to retry. A client retrying aggressively during a throttle makes the overload worse (sc12): use backoff with jitter.</p>
+<p><strong>Asynchronous.</strong> S3 notifications, SNS, EventBridge and <code>Invoke</code> with <code>InvocationType=Event</code> hand the event to Lambda, which puts it in an internal queue and returns HTTP 202 immediately; payloads are limited to 1 MB. Per the documentation: on function errors (including timeouts) Lambda retries twice, waiting about one minute and then two; on throttles and system errors it returns the event to the queue and retries for up to six hours by default, with backoff growing to five minutes. Events older than the maximum event age, or that fail every attempt, are discarded unless you configure an <strong>on-failure destination</strong> or a <strong>dead-letter queue</strong>. The documentation also warns that the same event may be delivered more than once even without errors, and that under extreme backlog events can expire before being processed.</p>
+<p><strong>Polling (event source mappings).</strong> For SQS, Kinesis, DynamoDB Streams, Kafka and others, Lambda runs pollers that read records and invoke the function synchronously with batches. For a standard SQS queue, the documentation describes the default scaling: five concurrent batches when messages appear, adding up to 300 concurrent invocations per minute while messages remain, to a maximum of 1,250 by default; a <em>maximum concurrency</em> setting (2 to 1,000) caps it, and a provisioned mode scales faster at extra cost. If the function fails, the batch's messages become visible again after the queue's visibility timeout and are retried until the queue's redrive policy moves them to a dead-letter queue — unless the function reports a <strong>partial batch response</strong> listing only the failed IDs. For streams, records are processed in order per shard, so a failing record blocks its shard until it succeeds, expires or a bisect/skip setting moves past it.</p>
+<p>Two design rules follow. First, <strong>every handler must be idempotent</strong>, because every model can deliver duplicates. Second, <strong>put a queue between bursts and fragile downstreams</strong>: an API function that writes to a database at whatever rate requests arrive will eventually take the database down; one that writes to SQS, with a consumer capped by maximum concurrency, lets the backlog absorb the burst.</p>
+
+<h4>6. Timeouts, limits and what to do about each</h4>
+<table>
+<thead><tr><th>Limit (Oct 2026)</th><th>Value</th><th>What hits it</th><th>Usual fix</th></tr></thead>
+<tbody>
+<tr><td>Timeout</td><td>900 s max</td><td>long batch steps, slow downstreams</td><td>split work, use a queue or a container; set timeouts below the caller's</td></tr>
+<tr><td>Sync payload</td><td>6 MB request, 6 MB response</td><td>file uploads through API</td><td>presigned S3 URLs; pass references not data</td></tr>
+<tr><td>Async payload</td><td>1 MB</td><td>large events</td><td>store in S3, send the key</td></tr>
+<tr><td>Memory / CPU</td><td>10,240 MB, ~6 vCPUs</td><td>ML inference, big transforms</td><td>containers or instances, especially with GPUs</td></tr>
+<tr><td>Package</td><td>250 MB unzipped / 10 GB image</td><td>ML libraries</td><td>container image packaging, slimmer dependencies</td></tr>
+<tr><td>/tmp</td><td>up to 10,240 MB</td><td>temporary files</td><td>size it; stream to S3</td></tr>
+<tr><td>Env variables</td><td>4 KB total</td><td>config sprawl</td><td>parameter store or secrets manager</td></tr>
+<tr><td>Account concurrency</td><td>1,000 default</td><td>bursts, shared accounts</td><td>reserved concurrency, quota increase, separate accounts</td></tr>
+</tbody>
+</table>
+<p>Set the function timeout deliberately. It should be longer than the work normally takes (with margin) and shorter than whatever waits for it: API Gateway's integration timeout for synchronous APIs, and less than the SQS visibility timeout for queue consumers (AWS recommends a visibility timeout of at least six times the function timeout). A function that times out after its caller has already given up wastes money and may still perform side effects.</p>
+<p>One more resource: <strong>connections</strong>. Because each environment is separate, 500 concurrent executions open 500 database connections. Relational databases often can't take that. Solutions: RDS Proxy (a managed connection pool in front of the database), data stores designed for many short connections (DynamoDB over HTTPS), and caps on concurrency.</p>
+
+<h4>7. Cost: Lambda against a container, worked</h4>
+<p>Take a typical JSON API: 512 MB on Arm, 120 ms average billed duration, behind an API Gateway HTTP API. Compare with an ECS service on Fargate Arm: two tasks of 1 vCPU and 2 GB (two for availability across zones), each measured to serve 60 requests per second at the latency target, behind an Application Load Balancer, autoscaling above two tasks at high load. Prices are us-east-1 from the AWS price list on 7 October 2026; free tiers are ignored.</p>
+<p>Lambda per million requests: GB-seconds = 1,000,000 × 0.5 × 0.12 = 60,000; × $0.0000133334 = $0.80; requests $0.20; HTTP API $1.00 per million. Total $2.00 per million with API Gateway, $1.00 with a function URL instead.</p>
+<p>Fargate: each task costs 1 × $0.03238 + 2 × $0.00356 = $0.0395 an hour; two tasks for 730 hours = $57.67. The load balancer is $0.0225 an hour ($16.43) plus capacity units (about $6–9 at these volumes). About $80–83 a month as a floor.</p>
+<table>
+<thead><tr><th>Requests / month</th><th>Average rps</th><th>Lambda + HTTP API</th><th>Lambda + function URL</th><th>Fargate + ALB</th></tr></thead>
+<tbody>
+<tr><td>1 million</td><td>0.4</td><td>$2</td><td>$1</td><td>~$80</td></tr>
+<tr><td>10 million</td><td>3.8</td><td>$20</td><td>$10</td><td>~$80</td></tr>
+<tr><td>100 million</td><td>38</td><td>$200</td><td>$100</td><td>~$83</td></tr>
+<tr><td>1 billion</td><td>381</td><td>$2,000</td><td>$1,000</td><td>~$394 (10 tasks)</td></tr>
+</tbody>
+</table>
+
+<figure>
+<svg viewBox="0 0 640 290" width="100%" role="img" aria-label="Log-log line chart of monthly cost against requests per month. Lambda with API Gateway rises from 2 dollars at 1 million to 2,000 dollars at 1 billion; Lambda with a function URL from 1 to 1,000 dollars; Fargate stays near 80 dollars until 100 million and reaches about 394 dollars at 1 billion. Crossovers near 40 million and 80 million requests.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="18" style="fill:var(--ink);font-weight:600">Monthly cost (log scale) vs requests per month (log scale)</text>
+    <g style="stroke:var(--line);stroke-width:1;fill:none">
+      <line x1="80" y1="230" x2="600" y2="230"/><line x1="80" y1="172.9" x2="600" y2="172.9"/><line x1="80" y1="115.7" x2="600" y2="115.7"/><line x1="80" y1="58.6" x2="600" y2="58.6"/>
+    </g>
+    <g style="fill:var(--muted)">
+      <text x="72" y="234" text-anchor="end">$1</text><text x="72" y="177" text-anchor="end">$10</text><text x="72" y="120" text-anchor="end">$100</text><text x="72" y="63" text-anchor="end">$1,000</text>
+      <text x="80" y="250" text-anchor="middle">1M</text><text x="253" y="250" text-anchor="middle">10M</text><text x="427" y="250" text-anchor="middle">100M</text><text x="600" y="250" text-anchor="middle">1B</text>
+    </g>
+    <polyline points="80,212.8 253.3,155.7 426.7,98.5 600,41.4" style="stroke:var(--s1);stroke-width:2;fill:none"/>
+    <polyline points="80,230 253.3,172.9 426.7,115.7 600,58.6" style="stroke:var(--s2);stroke-width:2;fill:none"/>
+    <polyline points="80,121.3 253.3,121.3 426.7,120.3 600,81.7" style="stroke:var(--s3);stroke-width:2;fill:none"/>
+    <circle cx="357.6" cy="121.3" r="4" style="fill:var(--surface);stroke:var(--ink-2);stroke-width:1.5"/>
+    <circle cx="409.8" cy="121.3" r="4" style="fill:var(--surface);stroke:var(--ink-2);stroke-width:1.5"/>
+    <text x="350" y="140" text-anchor="end" style="fill:var(--ink-2)">~40M</text>
+    <text x="418" y="140" style="fill:var(--ink-2)">~80M</text>
+    <text x="590" y="36" text-anchor="end" style="fill:var(--ink)">Lambda + HTTP API</text>
+    <text x="590" y="74" text-anchor="end" style="fill:var(--ink)">Lambda + URL</text>
+    <text x="590" y="100" text-anchor="end" style="fill:var(--ink)">Fargate + ALB</text>
+    <g>
+      <line x1="90" y1="272" x2="110" y2="272" style="stroke:var(--s1);stroke-width:2;fill:none"/><text x="116" y="276" style="fill:var(--ink-2)">Lambda + HTTP API</text>
+      <line x1="260" y1="272" x2="280" y2="272" style="stroke:var(--s2);stroke-width:2;fill:none"/><text x="286" y="276" style="fill:var(--ink-2)">Lambda + function URL</text>
+      <line x1="440" y1="272" x2="460" y2="272" style="stroke:var(--s3);stroke-width:2;fill:none"/><text x="466" y="276" style="fill:var(--ink-2)">Fargate (2+ tasks) + ALB</text>
+    </g>
+  </g>
+</svg>
+<figcaption>Functions cost in proportion to traffic; a container fleet costs a floor and then steps up. Below a few tens of millions of requests a month the function is far cheaper; above roughly 40–80 million (for this duration and memory) the container wins. The table above gives the same numbers.</figcaption>
+</figure>
+
+<p>The crossover moves with every assumption. Double the duration to 240 ms and Lambda's compute doubles, moving the crossover down; drop it to 30 ms and Lambda stays competitive much longer. Bursty traffic hurts containers, which must be sized for the peak, while Lambda only pays for what runs. And the floor matters: a container service rarely runs on less than two tasks, while a function at zero traffic costs zero. That's why many systems use both: functions for low-volume and spiky edges, containers for the steady core.</p>
+
+<h4>8. Beyond the classic model</h4>
+<p>AWS has added options that change some of these trade-offs; know they exist and what they trade. <strong>Lambda durable functions</strong> checkpoint progress so a function can wait — for a callback, a timer, a human approval — for up to a year without paying for idle compute, with quotas on operations and stored state per execution. <strong>Lambda Managed Instances</strong> run functions on EC2 instances in your account, with several concurrent requests per environment and longer timeouts (up to 90 minutes) for asynchronous and most queue-driven invocations; you get EC2 pricing levers in exchange for capacity on your side of the line. Other providers' function services differ in details that matter: Google Cloud Run functions run on Cloud Run and can handle many concurrent requests per instance; Azure Functions has several hosting plans with different scaling and timeouts. Check concurrency-per-instance semantics before translating a design.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why one request per environment is a deliberate choice</h4>
+<p>Standard Lambda's one-request-per-environment rule makes the programming model simple — no thread safety, no request interleaving, memory per request is predictable — and makes isolation strong. It costs efficiency for I/O-bound work: an environment waiting 100 ms on a database is billed for that wait and can't serve anyone else, whereas a container serving 80 concurrent requests overlaps their waits. That's the root of the pricing crossover and of the connection-storm problem. Platforms that allow concurrency per instance (Cloud Run, Lambda Managed Instances) recover the efficiency and bring back the thread-safety and noisy-request concerns.</p>
+
+<h4>Throttling is back-pressure, and it needs somewhere to go</h4>
+<p>When a function hits its concurrency limit, the platform is telling the system to slow down. Where that signal goes depends on the invocation model. Synchronous callers receive 429s and must back off; if they retry immediately they multiply load (the retry storm of sc12). Asynchronous invocations queue the pressure inside Lambda for up to six hours — invisible unless you watch the async event age and dropped-event metrics. Event source mappings convert it into queue depth, which is the healthiest form: visible, durable and drained at the rate you allow. Designing a serverless system is largely deciding where each burst waits.</p>
+
+<h4>Orchestration and data passing can dominate the bill</h4>
+<p>Fine-grained serverless designs pay for the glue: workflow state transitions, queue and topic requests, object-storage requests for intermediate data, logs per invocation. At low volume these are pennies; at high frequency they scale with the number of steps times the number of items, not with the amount of real work. Prime Video's monitoring service performed several state transitions per second of every stream and moved frames between components via S3; those two lines, not Lambda compute, were the problem. A useful review question is "what does one unit of business work cost, broken down by service?" — if orchestration and storage requests exceed compute, the granularity is wrong.</p>
+
+<h4>Memory tuning is a cost optimisation with a non-obvious shape</h4>
+<p>Because CPU scales with memory, a CPU-bound function's duration often falls almost in proportion as memory rises, until it reaches the code's own parallelism limit (a single-threaded handler gains little beyond about one vCPU's worth, 1,769 MB). In that range GB-seconds stay roughly flat while latency improves, so more memory is free speed. Beyond it, cost rises linearly with no latency benefit. I/O-bound functions barely speed up at all, so they should run at the smallest memory that fits. The practical method is a sweep: invoke the function with a realistic payload at several memory sizes, record duration and cost per invocation, and pick the knee of the curve — open-source tools such as AWS Lambda Power Tuning automate exactly this.</p>
+<h4>Deployments, versions and aliases are how you ship safely</h4>
+<p>Each publish creates an immutable numbered version; an alias such as <code>live</code> points at a version and can split traffic between two (for example 90/10) for a canary. Event sources and API integrations should point at aliases, not <code>$LATEST</code>, so a deploy is an alias update you can roll back in seconds. New versions start with no warm environments, so a deploy produces a wave of cold starts; shifting traffic gradually (CodeDeploy's linear or canary configurations) spreads them out and lets alarms stop a bad version before it takes all traffic.</p>
+<h4>Observability needs to follow events, not hosts</h4>
+<p>There's no host to log into. Every invocation produces logs and metrics (invocations, errors, throttles, duration, concurrency, iterator age for streams, async event age), and traces need context propagated through events — a trace ID carried in message attributes from the API function through the queue to the consumer. Without it, a request that fans out through five functions and two queues can't be followed. Structured logs with request IDs, and alarms on throttles, error rates, dead-letter queue depth and iterator age, are the minimum (cl11).</p>
+
+<h4>The security model is strong, and so is the blast radius of a bad role</h4>
+<p>Each environment is a microVM, so co-tenant isolation is excellent. But a function's execution role (cl2) is the whole of its authority, and functions are often given broad roles because they're "small". An injection bug in a function with <code>s3:*</code> or <code>dynamodb:*</code> on <code>*</code> is as dangerous as one in a server with the same permissions. Give each function its own least-privilege role, keep secrets out of environment variables when they're sensitive (use a secrets manager with caching), and remember that event payloads from S3 keys, queue messages or webhooks are untrusted input.</p>
+</section>
+
+<section data-field="prod">
+<h4>Failure modes and their symptoms</h4>
+<p><strong>Account concurrency exhaustion.</strong> Unrelated functions start throttling at the same time as one function's burst. Metrics: <code>ConcurrentExecutions</code> near the account limit, <code>Throttles</code> across functions. Fix: reserved concurrency for critical functions and caps on others, quota increases, separate accounts for noisy workloads.</p>
+<p><strong>Downstream overload.</strong> A database or third-party API fails as soon as traffic grows, because concurrency scales with requests. Fix: a queue in between and maximum concurrency on the consumer; connection pooling via RDS Proxy.</p>
+<p><strong>Duplicate side effects.</strong> Double emails, double charges. Cause: retries across any invocation model. Fix: idempotency keys with conditional writes.</p>
+<p><strong>Poison messages.</strong> One bad message fails forever, retried each visibility timeout, or blocks a stream shard. Fix: redrive policies to dead-letter queues, partial batch responses, bisect-on-error and maximum record age for streams.</p>
+<p><strong>Visibility timeout too short.</strong> Messages processed twice because they reappear while still being handled. Fix: visibility timeout at least six times the function timeout.</p>
+<p><strong>Silent async backlog.</strong> Events from S3 or EventBridge wait in Lambda's internal queue during throttling and some expire. Metrics: <code>AsyncEventAge</code>, <code>AsyncEventsDropped</code>. Fix: on-failure destinations, more concurrency, or an SQS queue you control.</p>
+<p><strong>Cold-start latency spikes.</strong> P99 jumps during deploys (new versions start cold) and bursts. Fix: SnapStart or provisioned concurrency on latency-critical functions, smaller init, warm-up before shifting traffic.</p>
+<p><strong>Timeout cascades.</strong> A function times out after its API Gateway caller has already given up, while still writing. Fix: timeouts nested from the outside in.</p>
+
+<h4>What to watch</h4>
+<p>Per function: invocations, errors, throttles, P50/P99 duration, init duration and cold-start rate, concurrent executions, cost per invocation. Per source: queue depth and age of oldest message, stream iterator age, async event age and drops, dead-letter queue depth.</p>
+
+<h4>The case: Prime Video's monitoring service (March 2023)</h4>
+<p>Prime Video's Video Quality Analysis team wrote about a service that monitors every live stream customers watch for perceptual defects such as block corruption, frozen video or audio/video sync problems. It had three components: a media converter that turns streams into frames and audio buffers, defect detectors that analyse them, and orchestration. The first version was a distributed system of serverless components — AWS Step Functions for orchestration, Lambda for detectors — which the authors note was a good choice for building quickly. But as they onboarded streams it hit a hard scaling limit at around 5% of the expected load, and its cost was too high to run at scale.</p>
+<p>Two mechanisms caused it. Step Functions orchestration performed multiple state transitions for every second of every stream, reaching account limits, and Step Functions charges per state transition. And the media converter uploaded frames to an S3 bucket from which each detector downloaded them, so the number of Tier-1 S3 requests (which include PUTs, at $0.005 per 1,000 in us-east-1 in October 2026) was very large. The team moved all components into a single process running in an ECS task on EC2, passing frames in memory and orchestrating inside the instance. The components stayed the same, so much of the code was reused; detectors now scale vertically, and when they outgrew one instance the team ran clones of the service, each with a subset of detectors, behind a lightweight request distributor. They reported that infrastructure cost fell by over 90%, that the service could handle thousands of streams with room to grow, and that EC2 compute savings plans could lower costs further.</p>
+<p>The authors' own conclusion is the right one to repeat in an interview: microservices and serverless components work at high scale, but whether to use them has to be decided case by case. What went wrong was granularity: per-second orchestration and bulk data passed through storage between components, both billed per operation.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> simulate a function platform's concurrency, cold starts and throttling, and build the cost crossover — Python 3.12 standard library only. About 20 minutes; no cloud account.</p>
+<ol>
+<li><strong>Environments.</strong> Write a discrete-event simulation (a <code>heapq</code> of arrival and completion events) of one function: a pool of warm environments, a cold-start delay of 400 ms when no warm one is free, a duration drawn from <code>random.expovariate</code> with mean 150 ms, an account concurrency limit, and environments that expire after 10 idle minutes.</li>
+<li><strong>Steady load.</strong> Feed 100 requests per second for 10 minutes. Check that average concurrency ≈ 100 × 0.15 = 15 (Little's law) and that the cold-start fraction falls below 1% after the first seconds.</li>
+<li><strong>Burst.</strong> Jump to 2,000 requests per second for 30 seconds with a limit of 1,000. Count throttles, cold starts and P99 latency during the burst. Add a per-function scale-up rate of 1,000 new environments per 10 seconds and rerun.</li>
+<li><strong>Queue instead.</strong> Put arrivals into a FIFO list consumed with a maximum concurrency of 200. Report peak backlog and how long it takes to drain.</li>
+<li><strong>Costs.</strong> Write <code>lambda_cost(req, mem_gb, dur_s, arm=True, gateway=True)</code> and <code>fargate_cost(req)</code> from section 7 and print the table for 1M, 10M, 100M and 1B requests; then find the crossover by bisection.</li>
+</ol>
+<p><strong>What to look for:</strong> step 2 reproduces Little's law; step 3 shows the burst's first seconds full of cold starts and, at the limit, throttles that the caller must handle; step 4 shows zero throttles but a backlog that drains over time — the trade a queue makes. Step 5 should give $2, $20, $200 and $2,000 for Lambda with the gateway against about $80, $80, $83 and $394, with a crossover near 40 million requests a month.</p>
+<p><strong>Needs an AWS account (optional):</strong> deploy a hello-world function, invoke it twice with <code>aws lambda invoke --function-name hello --log-type Tail out.json</code>, and decode the base64 <code>LogResult</code>: the first REPORT line includes <code>Init Duration</code>, the second doesn't.</p>
+</section>
+
+<section data-field="drill">
+<b>Diagnose: the campaign that broke the serverless backend</b>
+<p>A retail app's backend is all Lambda in one account: an API function behind API Gateway (P50 80 ms, P99 1.2 s), an order-processing function triggered asynchronously by EventBridge, an email function consuming an SQS queue (visibility timeout 30 s, function timeout 60 s), and a nightly report function. During a campaign: API errors spike with 429s; customers receive duplicate confirmation emails; the PostgreSQL database hits its connection limit; some orders are processed hours late; the report function fails too. What happened, and what do you change?</p>
+<details><summary>Answer</summary>
+<p><strong>Shared concurrency.</strong> All functions share the account's regional quota (1,000 by default). The API's burst plus order processing consumed it, so the API got 429s and the report function throttled. Fix: reserved concurrency for the API, caps on order processing and email, a quota increase before campaigns, and possibly a separate account for batch work.</p>
+<p><strong>Database connections.</strong> Each concurrent environment opened its own PostgreSQL connection; hundreds of environments exceeded the database's limit. Fix: RDS Proxy, connections created once per environment (outside the handler), and caps on concurrency for functions that write to the database.</p>
+<p><strong>Duplicate emails.</strong> The SQS visibility timeout (30 s) is shorter than the function timeout (60 s): slow sends made messages reappear and be processed again. Also, delivery is at-least-once anyway. Fix: visibility timeout ≥ 6 × function timeout (360 s), an idempotency key per order in a table with a conditional write before sending, and partial batch responses.</p>
+<p><strong>Late orders.</strong> EventBridge invokes the order function asynchronously; under throttling, Lambda kept the events in its internal queue and retried for up to six hours. Fix: alarm on async event age, configure an on-failure destination, or route events to an SQS queue you control with visible depth and a capped consumer.</p>
+<p><strong>Tail latency.</strong> P99 of 1.2 s suggests cold starts during the burst on top of database waits. Fix: trim init, consider SnapStart or modest provisioned concurrency for the API during campaigns.</p>
+<p><strong>Then reconsider shape.</strong> If the API runs at high steady volume after the campaign, compare its monthly Lambda plus API Gateway cost with a container service; keep functions for the event-driven edges.</p>
+</details>
+</section>

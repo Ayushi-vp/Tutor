@@ -1,0 +1,476 @@
+<!-- topic source for mlc/mc25; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "mc25",
+  "t": "A mixture-of-experts layer with a top-k router",
+  "tag": "Transformers",
+  "sum": "Replace one feed-forward block with many and send each token to only k of them: softmax gating, top-k selection and renormalisation, expert capacity and dropped tokens worked by hand, dispatch into an (experts × capacity) buffer and combine by scatter-add, the Switch Transformer load-balancing loss and its gradient, all checked against a per-token loop and a dense masked computation.",
+  "prereq": [
+    ["lm17", "Mixture of experts: many feed-forward experts per layer, a router picks a few per token, so parameters grow without growing compute per token."],
+    ["mc11", "A two-layer network: x·W1, a non-linearity, then ·W2; its backward pass follows the chain rule through each product."],
+    ["mc10", "Softmax turns logits into probabilities; subtracting the max keeps it stable; its Jacobian is diag(p) − p·pᵀ."],
+    ["mc16", "In a transformer block, attention mixes information across tokens and the feed-forward block transforms each token independently."],
+    ["dl9", "Expert parallelism places different experts on different devices, so routing tokens to experts means sending them across devices."]
+  ],
+  "myths": [
+    ["A mixture of experts runs every expert and averages them.", "That is a dense ensemble. A sparse MoE runs only the k experts the router picks for each token (k = 1 in Switch Transformer, 2 in Mixtral), so compute per token stays near that of one or two feed-forward blocks while total parameters grow with the number of experts. Mixtral 8x7B has about 47B parameters but uses about 13B per token."],
+    ["Each expert specialises in a topic, like a 'maths expert'.", "Routing happens per token at every MoE layer, and studies of trained MoE models mostly find experts specialising in surface patterns — token types, positions, syntax — rather than human-recognisable subjects. 'Expert' is a name for a parameter block chosen by a learned router, not a promise of semantic specialisation."],
+    ["Every token is always processed by k experts.", "Experts have a fixed capacity per batch so that work can be laid out in fixed-size buffers. When too many tokens choose one expert, the overflow is dropped: the token skips that expert and passes through the layer's residual connection. Capacity factor trades dropped tokens against wasted padding."],
+    ["The load-balancing loss makes the router worse at choosing experts.", "Without it, the router tends to collapse onto a few experts — they get more gradient, improve, and attract more tokens — leaving most parameters unused and the busy experts overflowing. A small auxiliary loss (Switch Transformer used α = 10⁻²) keeps load spread while barely affecting the main objective."],
+    ["Top-k gates should be renormalised after dropping tokens.", "Implementations differ, and it is a choice to state. In the common capacity-based designs, a dropped assignment simply contributes nothing; the remaining gate weights are not rescaled, so the token's output shrinks and the residual connection carries the rest. Rescaling would change the function depending on which other tokens were in the batch."]
+  ],
+  "recap": [
+    "An MoE layer replaces one feed-forward block with E experts and a router; each token is processed by only k experts.",
+    "The router computes softmax probabilities over experts from the token's hidden state, keeps the top k, and renormalises their weights to sum to 1.",
+    "Expert capacity C = ceil(k·T/E × capacity factor) fixes how many assignments each expert accepts in a batch of T tokens.",
+    "Assignments are processed in priority order — all first choices, then second choices — and those beyond an expert's capacity are dropped.",
+    "Dispatch scatters kept tokens into an (E, C, d) buffer, all experts run in one batched einsum, and combine scatter-adds gate-weighted outputs back to tokens.",
+    "A token whose assignments are all dropped gets zero from the layer and passes through on the residual connection.",
+    "The Switch Transformer auxiliary loss α·E·Σ f_i·P_i, with f the fraction of tokens routed (top-1) to each expert and P the mean router probability, is minimised by uniform routing at value α.",
+    "f is a count and has no gradient; the gradient flows through P and pushes down the logits of experts that receive more than their share.",
+    "The vectorised layer must equal a per-token loop with the same capacity rule, and a dense computation masked to the chosen experts when capacity is unlimited."
+  ],
+  "glossary": [
+    ["Auxiliary (load-balancing) loss", "An extra loss term added to the training objective to keep tokens spread evenly across experts."],
+    ["Capacity factor", "A multiplier on the even share of assignments per expert; above 1 it leaves buffer room, below 1 it forces drops."],
+    ["Combine", "Gathering each expert's outputs back to their tokens, weighted by the gate values, and summing."],
+    ["Dispatch", "Placing each kept token's hidden state into its expert's slot in a fixed-size buffer."],
+    ["Dropped token", "A token assignment that exceeded its expert's capacity and was not processed by that expert."],
+    ["Expert", "One of several feed-forward networks in an MoE layer, each with its own weights."],
+    ["Expert capacity", "The maximum number of token assignments an expert processes per batch."],
+    ["Gate", "The weight given to an expert's output for a token, from the router's renormalised probabilities."],
+    ["Router", "The small network (often one linear layer and a softmax) that scores experts for each token."],
+    ["Scatter-add", "Adding values into an array at given indices, accumulating when indices repeat (np.add.at)."],
+    ["Sparse MoE", "A mixture of experts where each token activates only a few experts, so compute stays small as parameters grow."],
+    ["Top-k routing", "Sending each token to the k experts with the highest router probabilities."]
+  ],
+  "qa": [
+    ["E", "What problem does a mixture-of-experts layer solve?", "It decouples parameter count from compute per token. A dense layer's cost grows with its size; an MoE layer has E experts but each token uses only k, so the model can hold E/k times more feed-forward parameters for roughly the same compute per token. Mixtral 8x7B, with 8 experts and top-2 routing, has about 47B parameters and uses about 13B per token."],
+    ["E", "How does the router choose experts?", "A linear layer maps the token's hidden state to E logits; softmax turns them into probabilities; the top k are selected and their probabilities renormalised to sum to one, giving the gates. The layer output is the gate-weighted sum of the chosen experts' outputs."],
+    ["E", "What is expert capacity and why is it needed?", "The maximum number of token assignments an expert takes per batch, C = ceil(k·T/E × capacity factor). Accelerators and expert parallelism need fixed-size buffers, so each expert gets C slots. Assignments beyond C are dropped; those tokens skip the expert and continue on the residual connection."],
+    ["M", "Walk through capacity and drops for 4 tokens, 3 experts, top-2, capacity factor 1.0.", "C = ceil(2·4/3) = 3. Process first choices first: if three tokens choose expert 0 first and one chooses expert 1, expert 0 is full. Then second choices: a token whose second choice is expert 0 is dropped from it. In the lesson's example token 2 keeps only expert 1 with gate 7/9, so its output is 7/9 of expert 1's output and the residual carries the rest; other tokens keep both experts.", "Follow-up: Why process first choices before second choices? — So a token's best expert is not taken by another token's second choice; it protects the most important assignments when capacity is tight."],
+    ["M", "Write the Switch Transformer load-balancing loss and explain it.", "loss = α · E · Σ_i f_i · P_i, where f_i is the fraction of tokens whose top-1 choice is expert i and P_i is the average router probability for expert i over the batch. Under uniform routing both are 1/E and the loss equals α; concentrating tokens on one expert raises it towards α·E. f is a count and is not differentiable, but P is, so the gradient pushes probability away from experts that receive too many tokens. The paper used α = 10⁻²."],
+    ["M", "How is the MoE layer vectorised?", "Flatten the T·k assignments in priority order, compute each assignment's position within its expert with a cumulative count over a one-hot matrix, mask positions ≥ C, scatter kept tokens into an (E, C, d) buffer, run all experts at once with batched einsums over stacked weights (E, d, h) and (E, h, d), and scatter-add gate-weighted outputs back to tokens with np.add.at. No Python loop over tokens or experts."],
+    ["M", "What goes wrong without a load-balancing loss?", "Routing collapse: early on, slightly better experts get more tokens, therefore more gradient, therefore get better and attract more tokens. A few experts end up doing all the work and overflowing their capacity (many dropped tokens), while the rest of the parameters sit idle. The model behaves like a much smaller dense model with extra waste."],
+    ["M", "How do you test an MoE implementation?", "Against references that are obviously correct: a per-token loop over chosen experts applying the same capacity rule, which must match exactly including which assignments are dropped; a dense computation of every expert on every token, masked to the chosen experts with their gates, which must match when capacity is unlimited; the aux loss at its known values (α at uniform, α·E fully collapsed); and a finite-difference check of the aux loss gradient."],
+    ["H", "Derive the gradient of the aux loss with respect to router logits.", "loss = α·E·Σ_i f_i·P_i with P_i = (1/T)·Σ_t p_ti and f constant. dloss/dp_ti = α·E·f_i/T. Through the softmax Jacobian, dloss/dz_tj = Σ_i (α·E·f_i/T)·p_ti(δ_ij − p_tj) = (α·E/T)·p_tj·(f_j − Σ_i f_i p_ti). So a token's logit for expert j is pushed down when f_j exceeds the f-weighted average under that token's routing probabilities: overloaded experts lose probability mass.", "Follow-up: Why does the loss multiply by E? — So its value at uniform routing, α·E·Σ(1/E·1/E)·... = α, is independent of the number of experts, keeping α comparable across configurations."],
+    ["H", "Capacity factor 1.0 or 1.25: how do you choose?", "A larger factor drops fewer tokens but pads buffers with empty slots, wasting compute and memory and increasing communication in expert parallelism. Switch Transformers reported better results at lower capacity factors (1.0-1.25) when combined with the load-balancing loss, with dropped tokens typically under 1%. Measure the drop rate per layer during training; raise the factor or the aux-loss weight if drops are high, lower the factor if buffers are mostly padding."],
+    ["H", "What changes when experts live on different devices?", "Dispatch becomes an all-to-all communication: each device sends each expert's slice of its tokens to the device holding that expert, the experts compute, and a second all-to-all returns outputs. Fixed capacity makes these messages fixed-size. Communication often dominates, so designs limit how many devices a token's experts span, overlap communication with computation, and keep routing decisions stable. Imbalanced routing becomes a straggler problem: the busiest device sets the step time."],
+    ["H", "Why does Switch Transformer compute the router in float32?", "Training with bfloat16 everywhere made sparse models unstable: the router's softmax over expert logits is sensitive to rounding, and small changes flip hard routing decisions. Switch Transformers cast only the router's input to float32 inside the router function and cast the dispatch and combine tensors back to bfloat16, getting float32 stability at nearly bfloat16 speed. Other stabilisers include a router z-loss penalising large logits and smaller initialisation scales."]
+  ],
+  "refs": [
+    ["paper", "Switch Transformers: scaling to trillion parameter models with simple and efficient sparsity (Fedus, Zoph, Shazeer; JMLR 2022)", "Top-1 routing, expert capacity = tokens per batch / number of experts × capacity factor, dropped tokens on the residual path, the load-balancing loss α·N·Σ f_i·P_i with α = 10⁻², and selective float32 precision for the router.", "https://arxiv.org/abs/2101.03961"],
+    ["paper", "Outrageously large neural networks: the sparsely-gated mixture-of-experts layer (Shazeer et al., 2017)", "The noisy top-k gating network, sparse MoE layers between LSTM layers, and importance and load losses for balance.", "https://arxiv.org/abs/1701.06538"],
+    ["paper", "Mixtral of experts (Jiang et al., 2024)", "8 experts per layer with top-2 routing: about 47B parameters, about 13B active per token.", "https://arxiv.org/abs/2401.04088"],
+    ["docs", "NumPy: numpy.ufunc.at", "Unbuffered in-place operations at indices, so repeated indices accumulate — the combine step.", "https://numpy.org/doc/stable/reference/generated/numpy.ufunc.at.html"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>The feed-forward blocks of a transformer hold most of its parameters, and every token passes through all of them. Doubling the model's capacity doubles the compute for every token generated. A mixture-of-experts layer breaks that link: replace the one feed-forward block with E of them — the experts — and add a small router that, for each token, picks k of the E. With 8 experts and k = 2, the layer holds four times the parameters of a top-2 dense equivalent while each token pays for only two experts. That is how Mixtral 8x7B has about 47 billion parameters but uses about 13 billion per token, and how Switch Transformers scaled to a trillion parameters.</p>
+<p>The idea is simple; the engineering is not. Routing is data-dependent, so the number of tokens per expert varies from batch to batch, while accelerators want fixed-size work. The answer is expert capacity — a fixed number of slots per expert — which means some tokens get dropped when an expert is popular. Popular experts become more popular, because they receive more gradient, so routers collapse onto a few experts unless an auxiliary loss pushes the load back toward uniform. And a fast implementation must move tokens into per-expert buffers and back without a Python loop over tokens.</p>
+<p>This lesson builds the layer from scratch in NumPy, in the problem's usual order: the maths in plain words; the equations; a worked example of 4 tokens and 3 experts with top-2 routing, capacity 3, one dropped assignment and the load-balancing loss computed by hand; a per-token loop that defines the correct behaviour, capacity rule included; a vectorised dispatch-and-combine version using a cumulative count, an (E, C, d) buffer and batched einsums; the Switch Transformer auxiliary loss with its hand-derived gradient; and tests showing the vectorised layer matches the loop exactly — including which assignments are dropped — matches a dense masked computation, and that gradient descent on the auxiliary loss rebalances a router biased towards one expert from 62% of tokens to an even 25% each.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: a hospital triage desk</h4>
+<p>A hospital has several specialist clinics instead of one general ward. At the entrance a triage nurse looks at each patient and decides which two clinics they should see, giving each a weight — "mostly cardiology, a bit of respiratory" — and the patient's final treatment plan blends the two clinics' advice in those proportions. Each clinic can see only so many patients per hour. When cardiology is full, a patient whose second choice was cardiology simply does not get that consultation today and leaves with only their first clinic's plan; patients' first choices are booked before anyone's second choices, so nobody loses their main consultation to someone else's backup. And the hospital board watches the numbers: if the triage nurse sends nearly everyone to cardiology, the board nudges the nurse to spread patients out, or the other clinics sit idle while cardiology turns people away.</p>
+<p>Patients are <strong>tokens</strong>; clinics are <strong>experts</strong>; the triage nurse is the <strong>router</strong>; "which two, with what weights" is <strong>top-k routing with renormalised gates</strong>; clinic slots per hour are <strong>expert capacity</strong>; the missed consultation is a <strong>dropped token</strong>, and leaving with only the first plan is the residual connection carrying the rest; booking first choices first is the <strong>priority order</strong>; the board's nudge is the <strong>load-balancing loss</strong>.</p>
+<p>The analogy breaks in one instructive way: real clinics specialise by medical field, chosen by people. MoE experts are blocks of parameters whose "specialities" emerge from training, and they rarely line up with human categories.</p>
+
+<h4>Sparse compute, dense memory</h4>
+<p>The headline trade is worth stating precisely. Per token, the layer does about k experts' worth of arithmetic, so a top-2 layer with 8 experts costs about the same per token as a dense layer twice the size of one expert. But all 8 experts' weights exist and must be stored, trained and, at inference, kept in memory. So MoE models are cheap in FLOPs per token and expensive in memory and communication. That asymmetry explains most design choices that follow: capacity limits (to keep work regular), load balancing (to keep every expert's parameters useful and every device equally busy), and the attention paid to how tokens move between devices.</p>
+
+<h4>What the interviewer is checking</h4>
+<p>Whether the router and gates are right (softmax, top-k, renormalisation, stable tie-breaking); whether capacity and dropping are handled with a defined priority rather than ignored; whether the implementation avoids a Python loop over tokens — the cumulative-count trick and the batched einsum are the usual signals; whether the combine step accumulates correctly when a token goes to several experts; and whether the candidate knows why the load-balancing loss exists and what its value means. Testing against a loop and a dense masked computation shows the candidate can verify an optimised implementation, which matters more here than in most problems because routing bugs produce plausible-looking numbers.</p>
+
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="MoE layer data flow. Tokens x of shape T by d enter the router, which outputs softmax probabilities over E experts; top-k indices and renormalised gates are chosen. Assignments are ordered with first choices before second choices, positions within each expert come from a cumulative count, and positions at or beyond capacity C are dropped. Kept tokens are dispatched into a buffer of shape E by C by d; all experts run as one batched einsum; outputs are combined back to tokens with gate weights by scatter-add.">
+  <defs><marker id="mc25-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="110" width="80" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="50" y="135" text-anchor="middle" style="fill:var(--ink)">tokens X</text>
+    <text x="50" y="152" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">(T, d)</text>
+    <rect x="115" y="20" width="140" height="70" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="185" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">router</text>
+    <text x="185" y="58" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">softmax(X·Wr)</text>
+    <text x="185" y="75" text-anchor="middle" style="fill:var(--muted)">top-k · renormalise</text>
+    <line x1="90" y1="125" x2="160" y2="92" marker-end="url(#mc25-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="280" y="20" width="160" height="70" rx="4" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="360" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">capacity</text>
+    <text x="360" y="58" text-anchor="middle" style="fill:var(--muted)">firsts before seconds</text>
+    <text x="360" y="75" text-anchor="middle" style="fill:var(--muted)">pos ≥ C → dropped</text>
+    <line x1="255" y1="55" x2="278" y2="55" marker-end="url(#mc25-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="280" y="120" width="160" height="90" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="360" y="140" text-anchor="middle" style="fill:var(--ink);font-weight:600">dispatch buffer</text>
+    <text x="360" y="158" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">(E, C, d)</text>
+    <rect x="296" y="168" width="36" height="30" style="fill:var(--s1)"/>
+    <rect x="342" y="168" width="36" height="30" style="fill:var(--s2)"/>
+    <rect x="388" y="168" width="36" height="30" style="fill:var(--s3)"/>
+    <line x1="90" y1="150" x2="278" y2="160" marker-end="url(#mc25-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="360" y1="90" x2="360" y2="118" marker-end="url(#mc25-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="470" y="120" width="160" height="90" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="550" y="140" text-anchor="middle" style="fill:var(--ink);font-weight:600">all experts at once</text>
+    <text x="550" y="160" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">einsum ecd,edh</text>
+    <text x="550" y="178" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">relu · einsum ech,ehd</text>
+    <text x="550" y="198" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">(E, C, d)</text>
+    <line x1="440" y1="165" x2="468" y2="165" marker-end="url(#mc25-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="280" y="232" width="350" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="455" y="256" text-anchor="middle" style="fill:var(--ink)">combine: Y[token] += gate · out[expert, slot]   (np.add.at)</text>
+    <line x1="550" y1="210" x2="550" y2="230" marker-end="url(#mc25-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="40" y="232" style="fill:var(--muted)">dropped assignments</text>
+    <text x="40" y="250" style="fill:var(--muted)">add nothing; the residual</text>
+    <text x="40" y="268" style="fill:var(--muted)">connection carries x</text>
+  </g>
+</svg>
+<figcaption>Every step after routing is a fixed-shape array operation: the buffer has exactly C slots per expert whatever the routing, which is what makes the layer fast on accelerators and splittable across devices. Capacity is where the data-dependence is absorbed, at the price of occasionally dropped assignments.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<h4>1. The problem as it is usually asked</h4>
+<p>"Implement a mixture-of-experts feed-forward layer in NumPy with a top-k router. Handle expert capacity, and implement the load-balancing loss. Verify the output." Clarify: what an expert is (here a two-layer ReLU network d → h → d); k (1 or 2); whether gates are renormalised over the top k (yes here, as in Mixtral's top-2; Switch's top-1 uses the raw probability); the capacity formula and drop policy (ceil(k·T/E × factor), first choices before second choices, drops add nothing); and which auxiliary loss (Switch's). Outline: hand example, a per-token loop as the reference, a vectorised dispatch/combine version, the loss and its gradient, tests.</p>
+
+<h4>2. The maths in plain words</h4>
+<p>For each token, the router multiplies the token's vector by a small matrix to get one score per expert, and softmax turns scores into probabilities. Keep the k highest; divide each by their sum, so the k weights add to one — these are the gates. The token's output is each chosen expert's output scaled by its gate, summed.</p>
+<p>Capacity makes it practical. If every expert received exactly its share, each would get k·T/E assignments in a batch of T tokens. Allow a little more — multiply by the capacity factor — and round up: that is C slots per expert. Fill the slots in priority order: every token's first choice, then every token's second choice, each in token order. An assignment that finds its expert full is dropped and contributes nothing.</p>
+<p>The load-balancing loss measures how unevenly tokens are spread. For each expert, multiply the fraction of tokens that picked it first (f) by its average router probability (P), add these products over experts, and scale by α·E. If the router is uniform, every f and P is 1/E, the sum is 1/E, and the loss is exactly α. If everything goes to one expert, f and P are 1 for it and 0 elsewhere, and the loss is α·E. Only P can carry gradient — f is a count — and that gradient lowers the probability of experts that are receiving too much.</p>
+
+<h4>3. The equations</h4>
+<pre>router:      z = x·Wr            p = softmax(z)            (T, E)
+top-k:       S_t = indices of the k largest p_t          gates g_te = p_te / Σ_{e∈S_t} p_te
+capacity:    C = ceil(k·T/E × capacity_factor)
+priority:    assignments ordered (rank 1 for all t), (rank 2 for all t), …
+             pos(t, e) = number of earlier assignments to expert e;   kept ⟺ pos &lt; C
+expert e:    E_e(x) = relu(x·W1[e])·W2[e]               W1: (E, d, h)  W2: (E, h, d)
+output:      y_t = Σ_{e∈S_t, kept} g_te · E_e(x_t)          (residual adds x_t outside the layer)
+
+aux loss:    f_i = (1/T) Σ_t 1[argmax_e p_te = i]      P_i = (1/T) Σ_t p_ti
+             L_aux = α · E · Σ_i f_i · P_i               (= α at uniform routing; = α·E if collapsed)
+gradient:    ∂L_aux/∂z_tj = (α·E/T) · p_tj · (f_j − Σ_i f_i p_ti)        (f treated as constant)
+compute:     per token ≈ k experts' FLOPs (+ router), parameters ≈ E experts</pre>
+
+<h4>4. A worked example by hand</h4>
+<p>Four tokens, three experts, top-2, capacity factor 1.0. To keep the arithmetic readable, the router probabilities are given directly and each "expert" is a multiplication by a constant: expert 0 by 1, expert 1 by 10, expert 2 by 100, with every token's value x = 1.</p>
+<table>
+<thead><tr><th>Token</th><th>Router probabilities</th><th>Top-2 (best first)</th><th>Renormalised gates</th></tr></thead>
+<tr><td>t0</td><td>[0.6, 0.3, 0.1]</td><td>0, 1</td><td>0.6/0.9 = 2/3, 0.3/0.9 = 1/3</td></tr>
+<tr><td>t1</td><td>[0.5, 0.1, 0.4]</td><td>0, 2</td><td>5/9, 4/9</td></tr>
+<tr><td>t2</td><td>[0.2, 0.7, 0.1]</td><td>1, 0</td><td>7/9, 2/9</td></tr>
+<tr><td>t3</td><td>[0.7, 0.2, 0.1]</td><td>0, 1</td><td>7/9, 2/9</td></tr>
+</table>
+<ul>
+<li><strong>Capacity.</strong> C = ceil(2 × 4 / 3 × 1.0) = ceil(2.67) = <strong>3</strong> slots per expert.</li>
+<li><strong>First choices.</strong> t0 → 0, t1 → 0, t2 → 1, t3 → 0. Expert 0 now holds t0, t1, t3: <em>full</em>. Expert 1 holds t2.</li>
+<li><strong>Second choices.</strong> t0 → 1 (slot 2 of 3), t1 → 2 (slot 1), t2 → 0 — <em>expert 0 is full: dropped</em> — t3 → 1 (slot 3). One of eight assignments is dropped.</li>
+<li><strong>Outputs.</strong> t0: 2/3 × 1 + 1/3 × 10 = <strong>4</strong>. t1: 5/9 × 1 + 4/9 × 100 = 405/9 = <strong>45</strong>. t2: 7/9 × 10 = <strong>7.78</strong> — its second expert's 2/9 share is simply missing (it would have added 2/9). t3: 7/9 × 1 + 2/9 × 10 = <strong>3</strong>.</li>
+<li><strong>Load-balancing loss</strong> with α = 0.01. Top-1 choices: expert 0 three times, expert 1 once: f = [0.75, 0.25, 0]. Mean probabilities: P = [(0.6 + 0.5 + 0.2 + 0.7)/4, (0.3 + 0.1 + 0.7 + 0.2)/4, (0.1 + 0.4 + 0.1 + 0.1)/4] = [0.5, 0.325, 0.175]. Σ f·P = 0.375 + 0.08125 + 0 = 0.45625; × α × E = 0.01 × 3 × 0.45625 = <strong>0.0137</strong>, against 0.01 for perfectly uniform routing — the router is visibly favouring expert 0.</li>
+</ul>
+<p>The drop happened because expert 0 was everyone's favourite: it filled with first choices before t2's second choice arrived. Had second choices been processed in token order alongside first choices, t2's backup could have taken a slot that t3's first choice needed. The block asserts every number.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Capacity slots for the worked example. Three experts with three slots each. Expert 0 holds t0, t1 and t3 (first choices); t2's second choice arrives when it is full and is dropped. Expert 1 holds t2 (first choice), then t0 and t3 (second choices). Expert 2 holds t1 (second choice) and has two empty padding slots.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="40" style="fill:var(--ink)">expert 0 (×1)</text>
+    <rect x="130" y="24" width="70" height="26" rx="3" style="fill:var(--s1)"/><text x="165" y="41" text-anchor="middle" style="fill:var(--surface)">t0 · 1st</text>
+    <rect x="205" y="24" width="70" height="26" rx="3" style="fill:var(--s1)"/><text x="240" y="41" text-anchor="middle" style="fill:var(--surface)">t1 · 1st</text>
+    <rect x="280" y="24" width="70" height="26" rx="3" style="fill:var(--s1)"/><text x="315" y="41" text-anchor="middle" style="fill:var(--surface)">t3 · 1st</text>
+    <rect x="370" y="24" width="90" height="26" rx="3" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/><text x="415" y="41" text-anchor="middle" style="fill:var(--crit)">t2 · 2nd ✕</text>
+    <text x="470" y="41" style="fill:var(--crit)">full: dropped</text>
+    <text x="20" y="100" style="fill:var(--ink)">expert 1 (×10)</text>
+    <rect x="130" y="84" width="70" height="26" rx="3" style="fill:var(--s1)"/><text x="165" y="101" text-anchor="middle" style="fill:var(--surface)">t2 · 1st</text>
+    <rect x="205" y="84" width="70" height="26" rx="3" style="fill:var(--s2)"/><text x="240" y="101" text-anchor="middle" style="fill:var(--surface)">t0 · 2nd</text>
+    <rect x="280" y="84" width="70" height="26" rx="3" style="fill:var(--s2)"/><text x="315" y="101" text-anchor="middle" style="fill:var(--surface)">t3 · 2nd</text>
+    <text x="20" y="160" style="fill:var(--ink)">expert 2 (×100)</text>
+    <rect x="130" y="144" width="70" height="26" rx="3" style="fill:var(--s2)"/><text x="165" y="161" text-anchor="middle" style="fill:var(--surface)">t1 · 2nd</text>
+    <rect x="205" y="144" width="70" height="26" rx="3" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 2"/><text x="240" y="161" text-anchor="middle" style="fill:var(--muted)">pad</text>
+    <rect x="280" y="144" width="70" height="26" rx="3" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 2"/><text x="315" y="161" text-anchor="middle" style="fill:var(--muted)">pad</text>
+    <text x="130" y="200" style="fill:var(--ink)">C = 3 slots each · 7 of 8 assignments kept · 2 padding slots computed for nothing</text>
+    <text x="130" y="218" style="fill:var(--muted)">outputs: t0 = 2/3·1 + 1/3·10 = 4 · t1 = 5/9·1 + 4/9·100 = 45 · t2 = 7/9·10 · t3 = 7/9·1 + 2/9·10 = 3</text>
+  </g>
+</svg>
+<figcaption>Slots fill left to right in priority order — all first choices (blue) before any second choice (orange). Expert 0 is everyone's favourite and fills on first choices alone, so token 2's backup is the one dropped; expert 2 is underused and carries padding. This is the imbalance the auxiliary loss pushes against.</figcaption>
+</figure>
+
+<pre class="run">import math
+import numpy as np
+
+# The hand-worked example: 4 tokens, 3 experts, top-2 routing, capacity factor 1.0.
+probs_h = np.array([[0.6, 0.3, 0.1],
+                    [0.5, 0.1, 0.4],
+                    [0.2, 0.7, 0.1],
+                    [0.7, 0.2, 0.1]])
+top2 = np.argsort(-probs_h, axis=1)[:, :2]                      # [[0,1],[0,2],[1,0],[0,1]]
+g = np.take_along_axis(probs_h, top2, axis=1)
+g = g / g.sum(axis=1, keepdims=True)                            # renormalise over the chosen two
+assert top2.tolist() == [[0, 1], [0, 2], [1, 0], [0, 1]]
+assert np.allclose(g, [[2/3, 1/3], [5/9, 4/9], [7/9, 2/9], [7/9, 2/9]])
+C = math.ceil(2 * 4 / 3 * 1.0)                                  # capacity = ceil(k * T / E * factor) = 3
+assert C == 3
+# First choices fill experts first: expert 0 gets t0, t1, t3 (full); expert 1 gets t2.
+# Second choices: t0 -&gt; 1, t1 -&gt; 2, t2 -&gt; 0 (FULL: dropped), t3 -&gt; 1.
+scale = np.array([1.0, 10.0, 100.0])                            # toy experts: expert i multiplies by scale[i]
+y = [g[0, 0] * 1 + g[0, 1] * 10, g[1, 0] * 1 + g[1, 1] * 100, g[2, 0] * 10, g[3, 0] * 1 + g[3, 1] * 10]
+assert np.allclose(y, [4.0, 45.0, 70 / 9, 3.0])                  # t2 loses its second expert's share
+f = np.bincount(probs_h.argmax(axis=1), minlength=3) / 4         # fraction routed (top-1) to each expert
+P = probs_h.mean(axis=0)                                         # mean router probability per expert
+aux = 0.01 * 3 * (f * P).sum()
+assert np.allclose(f, [0.75, 0.25, 0.0]) and np.allclose(P, [0.5, 0.325, 0.175])
+assert np.isclose(aux, 0.0136875)                                # uniform routing would give exactly 0.01</pre>
+
+<h4>5. The naive implementation: a loop per token</h4>
+<p>The reference implementation is deliberately plain. <code>route</code> computes softmax probabilities (stable: subtract the row maximum), takes the top k with a stable argsort so ties resolve deterministically, and renormalises. <code>moe_loop</code> applies capacity by walking ranks outer and tokens inner — all first choices, then all second choices — counting each expert's load and marking each assignment kept or dropped; then for each token and each kept assignment it runs that expert on that token alone and accumulates the gate-weighted output. It is slow (one tiny matrix product per token per expert), but every line maps to the definition, which is what a reference needs.</p>
+<pre class="run">def softmax(z, axis=-1):
+    z = z - z.max(axis=axis, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def init_moe(d, h, E, seed=0):
+    r = np.random.default_rng(seed)
+    return {"Wr": r.normal(scale=0.5, size=(d, E)),                       # router
+            "W1": r.normal(scale=d ** -0.5, size=(E, d, h)),              # expert e: d -&gt; h -&gt; d
+            "W2": r.normal(scale=h ** -0.5, size=(E, h, d))}
+
+def expert(params, e, x):                                                 # x: (n, d)
+    return np.maximum(x @ params["W1"][e], 0.0) @ params["W2"][e]
+
+def route(params, X, k):
+    """Router: softmax over experts, top-k, gates renormalised over the chosen k."""
+    probs = softmax(X @ params["Wr"])                                      # (T, E)
+    idx = np.argsort(-probs, axis=1, kind="stable")[:, :k]                 # (T, k), best first
+    gates = np.take_along_axis(probs, idx, axis=1)
+    return probs, idx, gates / gates.sum(axis=1, keepdims=True)
+
+def moe_loop(params, X, k, capacity=None):
+    """Reference: per token, per chosen expert, with the same capacity rule (first choices first)."""
+    probs, idx, gates = route(params, X, k)
+    T, E = probs.shape
+    load = np.zeros(E, dtype=int)
+    keep = np.zeros((T, k), dtype=bool)
+    for rank in range(k):                                                  # all first choices, then seconds
+        for t in range(T):
+            e = idx[t, rank]
+            if capacity is None or load[e] &lt; capacity:
+                load[e] += 1; keep[t, rank] = True
+    Y = np.zeros_like(X)
+    for t in range(T):
+        for rank in range(k):
+            if keep[t, rank]:
+                Y[t] += gates[t, rank] * expert(params, idx[t, rank], X[t:t + 1])[0]
+    return Y, keep</pre>
+
+<h4>6. The vectorised layer: dispatch, batched experts, combine</h4>
+<p><strong>Flatten in priority order.</strong> The T·k assignments are laid out rank-major: <code>tok = tile(arange(T), k)</code>, <code>exp_ = idx.T.reshape(-1)</code>, <code>gate = gates.T.reshape(-1)</code>, so all first choices come before all second choices, each in token order — exactly the loop's order.</p>
+<p><strong>Positions by cumulative count.</strong> A one-hot matrix of shape (k·T, E) marks each assignment's expert; its cumulative sum down the rows, minus one, read at each row's own expert, is how many earlier assignments chose the same expert — the assignment's slot. Slots ≥ C are dropped. This is the trick that replaces the loop's load counters with one <code>cumsum</code>.</p>
+<p><strong>Dispatch.</strong> A zero buffer of shape (E, C, d) receives each kept token's vector at (expert, slot) with one fancy-indexed assignment. Empty slots stay zero — the padding the capacity factor pays for.</p>
+<p><strong>All experts at once.</strong> With expert weights stacked as W1 (E, d, h) and W2 (E, h, d) — W1 and W2 being each expert's first and second weight matrices, stacked along a leading expert axis —, two einsums compute every expert on its own slots: <code>einsum("ecd,edh-&gt;ech")</code>, ReLU, <code>einsum("ech,ehd-&gt;ecd")</code>. On an accelerator this is a batched matrix multiply; across devices it is where expert parallelism splits the E dimension.</p>
+<p><strong>Combine.</strong> Each kept assignment reads its expert's output at its slot, multiplies by its gate, and adds into its token's row of Y. A token appears up to k times, so the addition must accumulate on repeated indices: <code>np.add.at</code>, which ordinary fancy-indexed <code>+=</code> does not do. The function also returns the capacity, drop count, per-expert load, and the f and P vectors for the loss. <code>aux_loss</code> and its gradient implement section 3's formulas.</p>
+<pre class="run">def moe_forward(params, X, k, capacity_factor=1.25):
+    """Vectorised top-k MoE: assignments sorted by (choice rank, token), positions within each expert
+    from a running count, capacity mask, dispatch into an (E, C, d) buffer, all experts in one batched
+    einsum, then combine with gate weights by scatter-add."""
+    probs, idx, gates = route(params, X, k)
+    T, E = probs.shape
+    C = math.ceil(k * T / E * capacity_factor)
+    # Flatten assignments in priority order: every token's first choice before any second choice.
+    tok = np.tile(np.arange(T), k)                                         # (k*T,)
+    exp_ = idx.T.reshape(-1)                                               # rank-major order
+    gate = gates.T.reshape(-1)
+    one_hot = np.eye(E, dtype=int)[exp_]                                   # (k*T, E)
+    pos = (np.cumsum(one_hot, axis=0) - 1)[np.arange(k * T), exp_]         # slot within the expert
+    kept = pos &lt; C
+    buf = np.zeros((E, C, X.shape[1]))
+    buf[exp_[kept], pos[kept]] = X[tok[kept]]                              # dispatch
+    H = np.maximum(np.einsum("ecd,edh-&gt;ech", buf, params["W1"]), 0.0)      # every expert at once
+    out = np.einsum("ech,ehd-&gt;ecd", H, params["W2"])                       # (E, C, d)
+    Y = np.zeros_like(X)
+    np.add.at(Y, tok[kept], gate[kept, None] * out[exp_[kept], pos[kept]])  # combine
+    f = np.bincount(idx[:, 0], minlength=E) / T                            # top-1 dispatch fraction
+    P = probs.mean(axis=0)
+    stats = {"capacity": C, "dropped": int((~kept).sum()), "load": np.bincount(exp_[kept], minlength=E),
+             "f": f, "P": P}
+    return Y, kept.reshape(k, T).T, stats
+
+def aux_loss(probs, top1, alpha=0.01):
+    """Switch Transformer load-balancing loss: alpha * E * sum_i f_i * P_i (minimised at uniform, = alpha)."""
+    T, E = probs.shape
+    f = np.bincount(top1, minlength=E) / T
+    return alpha * E * float(f @ probs.mean(axis=0))
+
+def aux_loss_grad_logits(probs, top1, alpha=0.01):
+    """d aux / d router logits. f is a count (no gradient); P_i = mean_t softmax_i, so
+    d aux / d z_tj = alpha * E / T * p_tj * (f_j - sum_i f_i p_ti)."""
+    T, E = probs.shape
+    f = np.bincount(top1, minlength=E) / T
+    return alpha * E / T * probs * (f[None, :] - (probs @ f)[:, None])</pre>
+
+<h4>7. Testing it</h4>
+<p>Eight checks. <strong>(1)</strong> The hand example pushed through the same cumulative-count dispatch reproduces outputs [4, 45, 7.78, 3] with exactly one dropped assignment. <strong>(2)</strong> With capacity large enough that nothing drops, the vectorised layer equals the per-token loop for k = 1 and k = 2. <strong>(3)</strong> With tight capacity factors 0.5, 1.0 and 1.25 on 64 tokens and 4 experts (capacity 16, 32 and 40 slots), both implementations drop exactly the same assignments — the boolean "kept" matrices are identical — and produce the same outputs, and no expert's load exceeds its capacity; at factor 0.5, 64 of the 128 assignments are dropped, at 1.0 four are, at 1.25 none. <strong>(4)</strong> A dense computation — every expert on every token, a (T, E, d) array costing E times the work — masked to the chosen experts and gates equals the MoE output. <strong>(5)</strong> The auxiliary loss is exactly α for uniform routing and α·E when everything goes to one expert. <strong>(6)</strong> Its analytic gradient with respect to router logits matches central finite differences to 10<sup>−9</sup>, and the summed gradient for the most-loaded expert is positive, so gradient descent lowers its logits. <strong>(7)</strong> A router biased towards expert 0 (62.5% of tokens' first choice), trained for 200 steps on the auxiliary loss alone, ends at an exactly even 25% per expert. <strong>(8)</strong> If PyTorch is installed, <code>torch.topk</code> on <code>torch.softmax</code> gives the same indices and renormalised gates, and one expert's forward pass matches.</p>
+<pre class="run">rng = np.random.default_rng(0)
+d, h, E, T = 16, 32, 4, 64
+params = init_moe(d, h, E)
+X = rng.normal(size=(T, d))
+
+# 1. The toy hand example through the vectorised dispatch: same outputs, one dropped assignment.
+def toy_forward():
+    probs, idx = probs_h, top2
+    gates = g
+    tok = np.tile(np.arange(4), 2); exp_ = idx.T.reshape(-1); gate = gates.T.reshape(-1)
+    pos = (np.cumsum(np.eye(3, dtype=int)[exp_], axis=0) - 1)[np.arange(8), exp_]
+    kept = pos &lt; 3
+    Y = np.zeros(4)
+    np.add.at(Y, tok[kept], gate[kept] * scale[exp_[kept]] * 1.0)
+    return Y, kept
+Yt, kept_t = toy_forward()
+assert np.allclose(Yt, [4.0, 45.0, 70 / 9, 3.0]) and (~kept_t).sum() == 1
+
+# 2. With no capacity limit, the vectorised layer equals the per-token loop (k = 1 and k = 2).
+for k in (1, 2):
+    Yv, _, st = moe_forward(params, X, k, capacity_factor=E)              # capacity = k*T: nothing dropped
+    Yl, _ = moe_loop(params, X, k)
+    assert st["dropped"] == 0 and np.allclose(Yv, Yl)
+
+# 3. With a tight capacity, both drop exactly the same assignments and still agree.
+for cf in (0.5, 1.0, 1.25):
+    Yv, kept_v, st = moe_forward(params, X, 2, capacity_factor=cf)
+    Yl, kept_l = moe_loop(params, X, 2, capacity=st["capacity"])
+    assert np.array_equal(kept_v, kept_l) and np.allclose(Yv, Yl)
+    assert st["load"].max() &lt;= st["capacity"]
+    if cf == 0.5:
+        assert st["dropped"] &gt;= T                                          # half the slots: many drops
+
+# 4. Top-k equals a dense computation masked to the chosen experts (every expert on every token).
+probs, idx, gates = route(params, X, 2)
+dense = np.stack([expert(params, e, X) for e in range(E)], axis=1)         # (T, E, d): E times the work
+mask = np.zeros((T, E)); np.put_along_axis(mask, idx, gates, axis=1)
+assert np.allclose((mask[:, :, None] * dense).sum(axis=1), moe_forward(params, X, 2, capacity_factor=E)[0])
+
+# 5. Load-balancing loss: alpha at uniform routing, alpha * E when everything goes to one expert.
+uni = np.full((T, E), 1 / E); top1_uni = np.arange(T) % E
+assert np.isclose(aux_loss(uni, top1_uni), 0.01)
+skew = np.tile(np.eye(E)[0], (T, 1)); assert np.isclose(aux_loss(skew, np.zeros(T, dtype=int)), 0.01 * E)
+
+# 6. Its gradient w.r.t. router logits, checked by finite differences (f held fixed, as in training).
+Z = X @ params["Wr"]; top1 = softmax(Z).argmax(axis=1)
+G = aux_loss_grad_logits(softmax(Z), top1)
+for (t, j) in [(0, 0), (5, 2), (63, 3)]:
+    Zp, Zm = Z.copy(), Z.copy(); Zp[t, j] += 1e-6; Zm[t, j] -= 1e-6
+    num = (aux_loss(softmax(Zp), top1) - aux_loss(softmax(Zm), top1)) / 2e-6
+    assert abs(num - G[t, j]) &lt; 1e-9
+over = np.argmax(np.bincount(top1, minlength=E))
+assert G[:, over].sum() &gt; 0                                                # descent lowers the busiest expert's logits
+
+# 7. Gradient descent on the aux loss alone spreads routing out of an overloaded expert.
+Wr, b = params["Wr"].copy(), np.array([2.0, 0.0, 0.0, 0.0])            # a router biased toward expert 0
+def balance(W, bias):
+    p = softmax(X @ W + bias); return np.bincount(p.argmax(axis=1), minlength=E) / T, p
+f0, _ = balance(Wr, b)
+for _ in range(200):
+    _, p_ = balance(Wr, b)
+    Gz = aux_loss_grad_logits(p_, p_.argmax(axis=1))
+    Wr -= 20.0 * X.T @ Gz; b -= 20.0 * Gz.sum(axis=0)                     # dL/dWr = X^T dL/dZ, dL/db = sum_t
+f1, _ = balance(Wr, b)
+assert f0[0] &gt; 0.6 and f1.max() &lt; 0.45                                     # expert 0's share falls sharply
+
+# 8. Cross-check routing and one expert against PyTorch, if available.
+try:
+    import torch
+    pt = torch.softmax(torch.tensor(X @ params["Wr"]), dim=-1)
+    vals, ids = torch.topk(pt, 2, dim=-1)
+    assert np.array_equal(ids.numpy(), idx) and np.allclose((vals / vals.sum(-1, keepdim=True)).numpy(), gates)
+    xt = torch.tensor(X[:3])
+    ref = torch.relu(xt @ torch.tensor(params["W1"][1])) @ torch.tensor(params["W2"][1])
+    assert np.allclose(ref.numpy(), expert(params, 1, X[:3]))
+except ImportError:
+    pass
+if __name__ == "__main__":
+    print("dropped at cf 0.5/1.0/1.25:", [moe_forward(params, X, 2, c)[2]["dropped"] for c in (0.5, 1.0, 1.25)])
+    print("top-1 share before/after balancing:", f0.round(3), f1.round(3))</pre>
+
+<h4>8. Numerical and practical traps</h4>
+<p><strong>Ties in the router.</strong> Equal probabilities make top-k ambiguous; use a stable sort (or add a tiny index-based tie-break) so two implementations — and two devices — agree. <strong>Fancy-index += does not accumulate.</strong> <code>Y[tok] += v</code> with repeated <code>tok</code> keeps only one addition; use <code>np.add.at</code> (or sort and segment-sum). <strong>Renormalising after drops.</strong> Rescaling the surviving gates makes a token's output depend on which other tokens shared the batch; most designs do not. <strong>Low-precision routing.</strong> In bfloat16 the router's softmax can flip near-tied decisions between steps; Switch Transformers cast the router's input to float32 within the router. <strong>Large logits.</strong> Routers can drift to large logits that make softmax near one-hot and gradients vanish; a router z-loss (penalising the log-sum-exp of logits) counters it. <strong>Capacity rounding.</strong> Use ceil, not floor, or a capacity factor of 1.0 with uneven division gives fewer slots than assignments even under perfect balance.</p>
+
+<h4>9. Edge cases worth naming</h4>
+<p><strong>k = E</strong> makes the layer a dense, gate-weighted ensemble. <strong>k = 1</strong> (Switch routing): gates can be the raw top probability rather than renormalised (renormalising one value gives 1 and kills the router's gradient through the gate). <strong>Capacity factor ≥ E/k</strong>: nothing can ever be dropped. <strong>A token with all assignments dropped</strong>: output zero; the residual carries it unchanged. <strong>Inference with one token</strong>: capacity per expert is tiny or the rule is often disabled at inference (no drops), which is one reason training and inference outputs can differ slightly.</p>
+
+<h4>10. Complexity</h4>
+<p>Router: O(T·d·E). Dispatch and combine: O(T·k·d) data movement plus O(T·k·E) for the one-hot cumulative count (O(T·k) with a scatter-based counter). Experts: O(E·C·d·h) = O(capacity_factor · k · T · d · h), i.e. about k feed-forward blocks per token times the capacity factor, versus O(E · T · d · h) for the dense masked computation. Memory: expert weights O(E·d·h); the dispatch buffer O(E·C·d). Parameters scale with E, per-token compute with k.</p>
+
+<h4>11. Talking through the design</h4>
+<p>Lead with the purpose (parameters without per-token compute), the router and top-k gates, then capacity and drops with the first-choices-first rule, the vectorised dispatch via cumulative counts and batched einsums, and the load-balancing loss with its values at uniform and collapsed routing. Mention the training stabilisers (float32 router, z-loss), and close with systems: all-to-all communication, stragglers from imbalance, and the inference memory cost of holding every expert.</p>
+</section>
+
+<section data-field="deep">
+<h4>Noisy top-k gating (Shazeer et al., 2017)</h4>
+<p>The sparsely-gated MoE paper that revived the idea added tunable Gaussian noise to the router's logits before taking the top k — the noise scale itself learned through a softplus — and set non-top-k logits to minus infinity before the softmax. The noise helps exploration and load balance early in training, since near-ties between experts are broken randomly rather than always the same way. It used two balancing terms: an importance loss (the coefficient of variation of each expert's total gate weight) and a load loss (a smooth estimate of how many tokens each expert receives). Switch Transformers later folded these into the single f·P loss used here.</p>
+
+<h4>Why f·P and not just f</h4>
+<p>The quantity we want balanced is f, the fraction of tokens each expert actually receives, but f comes from an argmax and has no gradient. P, the mean router probability, is differentiable and correlated with f. Multiplying them weights each expert's probability-gradient by how overloaded it actually is: the gradient (α·E/T)·p_tj·(f_j − Σ_i f_i·p_ti) is positive for experts with above-average f, so descent reduces their logits, and negative for underused ones. It is a cheap, stable surrogate; its minimum at uniform routing is what makes it a balance loss rather than just a penalty.</p>
+
+<h4>Expert choice: letting experts pick tokens</h4>
+<p>Capacity overflow comes from tokens choosing experts. Expert-choice routing inverts it: each expert picks its top C tokens by router score, so every expert is exactly full and load is balanced by construction, with no auxiliary loss. A token may then be chosen by several experts or by none. It works well for training encoder-style models, but it is awkward for autoregressive decoding, where an expert's choice would depend on future tokens in the batch.</p>
+
+<h4>Experts in parallel: all-to-all</h4>
+<p>At scale, experts live on different devices. Each device routes its tokens, packs them into per-expert buffers of fixed capacity, and an all-to-all exchange sends each buffer to the device holding that expert; after the experts compute, a second all-to-all sends results back for combining. Fixed capacity is what makes those messages fixed-size, which collective-communication libraries and accelerators prefer. Communication can dominate step time, and imbalance turns into stragglers: the most loaded device sets the pace. That is why load balancing is not only about parameter utilisation but about wall-clock time.</p>
+
+<h4>The router z-loss</h4>
+<p>Load balancing controls where tokens go; it does not control how confident the router is. Routers can drift to very large logits, making the softmax nearly one-hot: gates become 0 or 1, gradients through them vanish, and in low precision the exponentials overflow or round badly. The router z-loss, introduced in later sparse-model work (ST-MoE), adds a small penalty on the squared log-sum-exp of each token's router logits, pulling logits towards modest magnitudes without changing which expert is preferred. It is cheap — one log-sum-exp per token, already computed for the softmax — and commonly used alongside the balancing loss.</p>
+
+<h4>Finer-grained and shared experts</h4>
+<p>Recent designs split experts more finely — many small experts with a larger k — so that combinations of experts can represent more specialised functions for the same compute, and add one or more always-on "shared" experts that every token passes through, so common knowledge does not have to be duplicated in every routed expert. Both keep the same mechanics as this lesson — router, top-k, capacity, dispatch, combine, balance — with different values of E and k and a dense branch added to the output.</p>
+
+<h4>MoE at inference</h4>
+<p>Compute per token is low, but every expert must be in memory: Mixtral's roughly 47B parameters all need to be loaded even though about 13B are active per token. At batch size one, decoding reads only the active experts' weights per token, so it behaves like a 13B model in bandwidth terms; at larger batches, different tokens activate different experts and most of the weights are read every step. Serving systems therefore shard experts across GPUs, offload rarely used experts, or quantise them (mc27), and capacity limits are usually relaxed at inference so no token is dropped.</p>
+</section>
+
+<section data-field="prod">
+<h4>Where MoE layers run</h4>
+<p>MoE feed-forward layers appear in many large open and closed language models; the published examples include Switch Transformers (top-1, up to a trillion parameters), GLaM, and Mixtral 8x7B (8 experts per layer, top-2, about 47B parameters with about 13B active per token). They typically replace the feed-forward block in every layer or every other layer, keeping attention dense.</p>
+
+<h4>Failure modes and symptoms</h4>
+<p><strong>Routing collapse.</strong> Symptom: a few experts receive most tokens; per-expert load histograms are skewed; dropped-token rates climb. Cause: auxiliary loss too weak or absent. Fix: raise its weight, add noise, check the router's initialisation scale.</p>
+<p><strong>Training instability.</strong> Symptom: loss spikes or divergence, especially in bfloat16. Cause: router logits growing and decisions flipping. Fix: float32 router computation, router z-loss, smaller router initialisation.</p>
+<p><strong>High drop rates.</strong> Symptom: many tokens skip experts, quality lags a dense baseline. Cause: capacity factor too low for the achieved balance. Fix: raise the factor or improve balance.</p>
+<p><strong>Slow steps.</strong> Symptom: GPU utilisation low on some devices. Cause: imbalance creating stragglers, or all-to-all communication dominating. Fix: better balance, capacity tuning, overlapping communication with computation.</p>
+<p><strong>Train-inference mismatch.</strong> Symptom: evaluation differs between batched and single-sequence inference. Cause: capacity drops depend on batch composition. Fix: disable drops at inference or use a generous capacity.</p>
+
+<p><strong>Dead experts.</strong> Symptom: some experts receive almost no tokens for thousands of steps and their weights stop changing. Cause: early collapse that the balancing loss never fully reversed. Fix: re-initialise or merge them, or increase router noise for a period.</p>
+
+<h4>What to monitor and tune</h4>
+<p>Per-layer, per-expert token counts (f) and mean probabilities (P); the auxiliary loss value relative to α; dropped-assignment rate per layer; router logit magnitudes (for z-loss); and device step-time spread. Tune the capacity factor (1.0-1.25 is typical in the Switch results), the auxiliary loss weight (10⁻² in Switch), k, and the number of experts.</p>
+
+<h4>A cost estimate</h4>
+<p>A feed-forward block with d = 4,096 and h = 14,336 (Mixtral-like) has 2 × 4,096 × 14,336 ≈ 117M parameters (ignoring gating projections). Eight experts hold about 940M parameters per layer; top-2 routing computes about 235M parameter-multiplies per token, a quarter of the parameters, so the layer is 4× larger than its compute suggests. With capacity factor 1.25, buffers hold 25% more slots than the balanced share, so the expert compute actually performed is up to 1.25× the useful amount when many slots are padding.</p>
+
+<h4>The reference for this problem</h4>
+<p>Fedus, Zoph and Shazeer's Switch Transformers paper defines the pieces used here: expert capacity = (tokens per batch / number of experts) × capacity factor; tokens beyond an expert's capacity skip it and pass through the residual connection, with drop rates typically under 1% in their experiments; the auxiliary loss α·N·Σ f_i·P_i with f_i the fraction of tokens dispatched to expert i and P_i the fraction of router probability for expert i, minimised under uniform routing and used with α = 10⁻²; and selective casting of the router to float32 for stability under bfloat16. Shazeer et al. (2017) introduced the sparsely-gated layer with noisy top-k gating; the Mixtral paper documents a widely used top-2 configuration.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then vary it, break it and measure it. Python 3.12 with NumPy (the gpt_env venv); PyTorch only for the optional cross-check.</p>
+<ol>
+<li>Run the four blocks as one script. All assertions pass and it prints drop counts at three capacity factors and the expert shares before and after balancing.</li>
+<li><strong>Vary by hand.</strong> Redo section 4 with token 3's probabilities [0.1, 0.2, 0.7]. Which assignments are dropped now, and what is the auxiliary loss?</li>
+<li><strong>Break the priority.</strong> Flatten assignments token-major (<code>idx.reshape(-1)</code>) instead of rank-major. Rerun test 3: which tokens lose their first choice?</li>
+<li><strong>Break the combine.</strong> Replace <code>np.add.at</code> with <code>Y[tok[kept]] += …</code>. Which test fails and why?</li>
+<li><strong>Measure.</strong> Time the loop, the dense masked computation and the vectorised layer for T = 1,024, E = 8, k = 2, d = 64, h = 256.</li>
+<li><strong>Explore balance.</strong> Train the biased router on the auxiliary loss with α scaled up and down by 10× and plot the top-1 shares over steps.</li>
+</ol>
+<p>Every experiment runs in a second or two, so plot as you go: per-expert loads, drop counts and the auxiliary loss over steps are the three curves that tell you whether a routing change helped. What to look for: priority order decides which tokens keep their best expert; add.at is what makes multi-expert combine correct; the dense computation costs E/k times more; and the auxiliary loss's weight sets how quickly load evens out.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>(a) A layer has E = 64 experts, top-1 routing, and batches of 8,192 tokens. What is the capacity at factors 1.0 and 1.25, and how many slots are padding per batch at factor 1.25 if routing is perfectly balanced? (b) After training, f for one layer is 0.2 for two experts and spread evenly over the other 62. What is the auxiliary loss with α = 0.01, assuming P ≈ f?</p>
+<details><summary>Answer</summary>
+<pre class="run">E_d, T_d = 64, 8192
+cap_10 = math.ceil(1 * T_d / E_d * 1.0)
+cap_125 = math.ceil(1 * T_d / E_d * 1.25)
+padding = E_d * cap_125 - T_d
+f_d = np.array([0.2, 0.2] + [0.6 / 62] * 62)
+loss_d = 0.01 * E_d * float(f_d @ f_d)
+assert (cap_10, cap_125, padding) == (128, 160, 2048)
+assert round(loss_d, 4) == 0.0549</pre>
+<p>(a) Capacity is 8,192/64 = 128 slots per expert at factor 1.0 and 160 at 1.25. With perfect balance each expert gets 128 tokens, so 64 × 32 = <strong>2,048 padding slots</strong> per batch — 25% extra expert compute that does nothing, the price of headroom. (b) Σ f·P ≈ 2 × 0.2² + 62 × (0.6/62)² = 0.08 + 0.0058 = 0.0858; × 0.01 × 64 = <strong>0.0549</strong>, about 5.5 times the uniform value of 0.01. Two experts receiving 20% each — about 13 times their fair share of 1/64 — would also overflow badly: each needs 1,638 slots against 160, so most of their tokens are dropped. The loss is signalling a real imbalance.</p>
+</details>
+</section>

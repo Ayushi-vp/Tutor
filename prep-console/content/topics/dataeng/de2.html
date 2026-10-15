@@ -1,0 +1,589 @@
+<!-- topic source for dataeng/de2; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "de2",
+  "t": "File formats: CSV and JSON vs Avro vs Parquet and ORC — row groups, pages, encodings, statistics and the small-files problem",
+  "tag": "Storage",
+  "sum": "What is inside the files a lake is made of: why CSV and JSON are slow and fragile, how Avro serves pipelines and Parquet/ORC serve analytics, Parquet's row groups, column chunks, pages and footer, dictionary, run-length, bit-packing and delta encodings, compression codecs, min/max statistics and predicate pushdown, and the small-files problem — with measured byte counts for one million real-shaped events.",
+  "prereq": [
+    [
+      "db12",
+      "Columnar storage reads only the columns a query needs, and similar values stored together compress well; zone maps let an engine skip blocks whose min/max cannot match."
+    ],
+    [
+      "db5",
+      "Databases store data in fixed-size pages and pay for every page they read; layout decides which operations are cheap."
+    ],
+    [
+      "cl6",
+      "Object storage serves whole objects or byte ranges over HTTP; each request has tens of milliseconds of first-byte latency and a small per-request price."
+    ],
+    [
+      "de1",
+      "The lake keeps data as files in object storage, read by many engines; bronze holds raw data, silver and gold hold cleaned and modelled tables."
+    ]
+  ],
+  "myths": [
+    [
+      "Parquet is compressed, so the codec is what makes it small.",
+      "Most of the saving comes from encoding before any codec runs. In the measured example, dictionary and bit-packing alone shrink the event_type column from 9.4 MB of plain strings to 0.38 MB, and Snappy then adds nothing. Codecs help most on columns that encodings cannot simplify, such as high-cardinality IDs and free text."
+    ],
+    [
+      "Bigger row groups are always better.",
+      "Larger row groups mean fewer footer entries, longer sequential reads and better compression, but they also mean coarser statistics (one min/max covers more rows, so less can be skipped), more memory for writers that buffer a whole row group, and fewer units of parallelism when a file is split across tasks. 128 MB to 1 GB is a common range; the right value depends on how the data is filtered and read."
+    ],
+    [
+      "Predicate pushdown means Parquet has an index.",
+      "Plain Parquet has min/max statistics per column chunk (and optionally per page) and optional Bloom filters, not a B-tree. Statistics only help when values are clustered, so that each row group covers a narrow range. On randomly ordered data every row group's min and max span nearly the whole domain and nothing is skipped — which is why sort order (de3) matters as much as the format."
+    ],
+    [
+      "CSV is fine for a lake because every tool reads it.",
+      "Every tool reads it differently. CSV has no types, no standard for nulls, quoting or encodings, and no schema; a single unescaped comma or newline in a text field shifts every following column. It must be fully parsed to read even one column, and it cannot be split safely when fields may contain newlines. Keep CSV at the edges (partner drops, exports) and convert to Parquet in bronze or silver."
+    ],
+    [
+      "Avro and Parquet compete; pick one.",
+      "They are built for different jobs. Avro is row-oriented with the schema in the file header and is ideal for writing one record at a time, for messages in Kafka and for pipelines that read whole records. Parquet is columnar and ideal for analytical scans of a few columns. Many platforms use Avro (or Protobuf) in motion and Parquet at rest."
+    ]
+  ],
+  "recap": [
+    "CSV and JSON are text, untyped and row-oriented, so readers must parse every byte of every row; they are fragile at scale and several times larger than binary columnar files.",
+    "Avro is a compact binary row format with its schema in the file header and sync markers between blocks; it suits streaming, messages and whole-record reads, and supports schema evolution through reader and writer schemas.",
+    "A Parquet file holds row groups; each row group holds one column chunk per column; each column chunk holds pages; the footer at the end lists every row group and column chunk with offsets, sizes, encodings and statistics.",
+    "Encodings do most of the work: dictionary encoding replaces repeated values with small integer codes, the RLE/bit-packing hybrid stores those codes in the minimum number of bits and collapses runs, and delta encoding stores differences between neighbouring integers.",
+    "In the measured example, one million events took 56.3 MB as CSV, about 140 MB as JSON lines, 25.9 MB as uncompressed Parquet, 15.1 MB with Snappy and 7.9 MB with Zstandard.",
+    "Statistics (min, max, null count) per column chunk and optionally per page let readers skip row groups and pages that cannot match a filter, but only if the data is clustered on the filtered column.",
+    "Readers read the footer first, then fetch only the byte ranges of the columns and row groups they need, which on object storage turns a scan into a few large ranged GET requests.",
+    "The small-files problem is per-file overhead — listing, opening, reading footers and scheduling a task per file — multiplied by thousands of files, plus poor compression and statistics in each tiny file; the cure is fewer, larger files (roughly 128 MB to 1 GB) via better writes and compaction."
+  ],
+  "glossary": [
+    [
+      "Avro",
+      "An Apache binary, row-oriented serialisation format whose files carry their schema in a header; widely used for Kafka messages and pipeline records."
+    ],
+    [
+      "Bit-packing",
+      "Storing small integers using only as many bits as the largest one needs, e.g. 3 bits each for codes 0–7 instead of 32 or 64."
+    ],
+    [
+      "Bloom filter",
+      "A compact probabilistic structure that answers \"definitely not present\" or \"possibly present\" for a value; Parquet can store one per column chunk to skip chunks on equality filters."
+    ],
+    [
+      "BYTE_STREAM_SPLIT",
+      "A Parquet encoding for floating-point (and some fixed-width) values that writes the first byte of every value, then every second byte, and so on, so a following compression codec finds more repetition."
+    ],
+    [
+      "Codec",
+      "A general-purpose compression algorithm applied to encoded pages, such as Snappy, Zstandard (zstd), gzip or LZ4."
+    ],
+    [
+      "Column chunk",
+      "The data of one column inside one row group of a Parquet file, stored contiguously and made of pages."
+    ],
+    [
+      "Column projection",
+      "Reading only the columns a query references; in columnar formats it means not fetching the other columns' bytes at all."
+    ],
+    [
+      "Compaction",
+      "Rewriting many small files into fewer large ones, usually as a scheduled maintenance job."
+    ],
+    [
+      "CSV",
+      "Comma-separated values: a plain-text format with one record per line and fields separated by commas, with no types or standard null handling."
+    ],
+    [
+      "Definition level",
+      "Per-value metadata in Parquet saying how much of an optional (or nested) field's path is present; for a flat optional column it simply marks null versus not null."
+    ],
+    [
+      "Delta encoding",
+      "Storing each value as the difference from the previous one (DELTA_BINARY_PACKED in Parquet), so sorted or slowly changing integers and timestamps become tiny numbers."
+    ],
+    [
+      "Dictionary encoding",
+      "Storing each distinct value once in a dictionary and replacing every occurrence with its integer position in the dictionary."
+    ],
+    [
+      "Dictionary fallback",
+      "When a column's dictionary grows past its size limit (1 MB by default in parquet-java and pyarrow), the writer stops dictionary-encoding the rest of that column chunk and writes plain values."
+    ],
+    [
+      "Footer",
+      "The metadata block at the end of a Parquet file (FileMetaData, serialised with Thrift) followed by its 4-byte length and the magic bytes PAR1."
+    ],
+    [
+      "INT96",
+      "A legacy 12-byte Parquet timestamp encoding written by old Impala and Hive versions; modern writers use 64-bit integers with an explicit unit instead."
+    ],
+    [
+      "JSON lines",
+      "A text format with one JSON object per line; common for logs and event exports."
+    ],
+    [
+      "ORC",
+      "Optimized Row Columnar: an Apache columnar format from the Hive ecosystem, organised in stripes with lightweight indexes; similar in purpose to Parquet."
+    ],
+    [
+      "Page",
+      "The smallest unit of encoding and compression in Parquet, typically around 1 MB or 20,000 rows by default in common writers; data pages hold values, a dictionary page holds a column chunk's dictionary."
+    ],
+    [
+      "Page index",
+      "Optional Parquet structures (ColumnIndex and OffsetIndex) that store min/max per page and page locations, letting readers skip pages, not just row groups."
+    ],
+    [
+      "Parquet",
+      "An Apache open columnar file format for analytics: row groups, column chunks and pages, with encodings, compression and statistics."
+    ],
+    [
+      "Predicate pushdown",
+      "Passing a query's filter down to the file reader so it can skip row groups or pages whose statistics prove no row can match."
+    ],
+    [
+      "RLE (run-length encoding)",
+      "Storing a run of identical values as (value, count); Parquet's RLE/bit-packing hybrid switches between runs and bit-packed groups."
+    ],
+    [
+      "Row group",
+      "A horizontal slice of a Parquet file's rows; within it each column is stored as a separate column chunk."
+    ],
+    [
+      "Schema evolution",
+      "Changing a dataset's schema over time (adding, removing, renaming or retyping fields) while old and new data stay readable."
+    ],
+    [
+      "SIMD",
+      "Single instruction, multiple data: CPU instructions that apply one operation to a short vector of values at once, which columnar batches make easy to use."
+    ],
+    [
+      "Small-files problem",
+      "The slowdown and cost caused by datasets made of very many small files, where per-file overhead dominates the actual data reading."
+    ],
+    [
+      "Snappy",
+      "A fast compression codec from Google with a modest compression ratio; the default Parquet codec in pyarrow and Spark."
+    ],
+    [
+      "Splittable",
+      "A file that can be divided into pieces processed independently by different tasks, which needs boundaries a reader can find (row groups, stripes, sync markers)."
+    ],
+    [
+      "Statistics",
+      "Per-column-chunk (and optionally per-page) metadata such as minimum, maximum and null count, used for skipping data."
+    ],
+    [
+      "Stripe",
+      "ORC's equivalent of a row group: a horizontal slice of rows, 64 MB by default, with its own index and footer."
+    ],
+    [
+      "Sync marker",
+      "A random 16-byte value repeated between blocks of an Avro file so a reader starting mid-file can find the next block boundary."
+    ],
+    [
+      "Thrift",
+      "A serialisation framework (originally from Facebook) that Parquet uses to encode its metadata structures."
+    ],
+    [
+      "Zstandard (zstd)",
+      "A modern compression codec with tunable levels that typically compresses much better than Snappy at moderate CPU cost, and decompresses quickly."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why is Parquet so much smaller and faster to query than CSV for the same data?",
+      "Three reasons stack. Parquet is binary and typed, so a 64-bit integer takes at most 8 bytes rather than up to 20 characters plus a delimiter. It is columnar, so similar values sit together and encodings such as dictionary, run-length and delta collapse them before a codec even runs. And it carries metadata — schema, offsets, statistics — so a reader fetches only the columns and row groups it needs instead of parsing every byte. In the measured one-million-event example, CSV was 56 MB and Parquet with zstd was 7.9 MB, and a query on two columns reads a fraction of that."
+    ],
+    [
+      "E",
+      "Describe the physical layout of a Parquet file.",
+      "A file starts with the 4 magic bytes PAR1, then one or more row groups, each a horizontal slice of rows. Inside a row group each column is a contiguous column chunk, and each column chunk is a sequence of pages — an optional dictionary page followed by data pages that are encoded and compressed independently. At the end is the footer: Thrift-encoded metadata with the schema and, for every row group and column chunk, its offset, size, encodings and statistics, followed by a 4-byte footer length and PAR1 again. Readers read the end first, then jump to exactly the byte ranges they need."
+    ],
+    [
+      "E",
+      "When would you choose Avro over Parquet?",
+      "When records are written one at a time and read whole: Kafka messages, CDC events, RPC payloads, or a landing format for a streaming pipeline. Avro is a compact binary row format, writes are cheap appends, the schema travels in the file header (or in a schema registry for messages), and its reader/writer schema resolution makes evolution safe. For analytical scans of a few columns over many rows, convert to Parquet."
+    ],
+    [
+      "M",
+      "Explain dictionary encoding and the RLE/bit-packing hybrid with numbers.",
+      "Dictionary encoding stores each distinct value once and replaces every value with its index. A column of one million event types with 8 distinct values becomes an 8-entry dictionary plus one million codes from 0 to 7. Those codes need only 3 bits each, so bit-packing stores them in about 375 KB instead of millions of bytes of strings, and when the same code repeats in a run (as it does if data is sorted) RLE stores the run as one value and a count. Measured with pyarrow, the column went from 9.4 MB plain to 380 KB, and to under 3 KB once the data was sorted by event type.",
+      "Follow-up: When does dictionary encoding stop helping? — When cardinality is high: the dictionary grows past its page limit (1 MB by default in parquet-java and pyarrow) and the writer falls back to plain encoding for the rest of the chunk, as it did for unique event IDs."
+    ],
+    [
+      "M",
+      "What is predicate pushdown and when does it fail to help?",
+      "The engine passes the filter down to the file reader, which compares it with the min and max statistics of each row group (and, with a page index, each page) and skips any whose range cannot contain a match. It helps only when data is clustered on the filtered column, so each row group covers a narrow range — for example a file sorted by timestamp queried for one hour. On randomly ordered data every row group spans nearly the whole range of values, statistics prove nothing, and the reader reads everything. It also fails for filters on expressions the reader cannot evaluate against statistics, such as a function applied to the column.",
+      "Follow-up: How do you get pushdown to work for an ID lookup? — Sort or cluster by the ID so ranges are narrow, or write Bloom filters for that column so equality lookups can skip chunks that definitely lack the value."
+    ],
+    [
+      "M",
+      "Snappy or zstd for Parquet in a data lake? Justify with numbers.",
+      "Usually zstd at a low-to-moderate level for data at rest. In the measured example Snappy produced 15.1 MB and zstd 7.9 MB from the same 25.9 MB of encoded data; Uber reported about 39% less storage moving its largest tables from Snappy to zstd, with lower vCore-seconds on most queries because less data was read and shuffled. Snappy remains a fine choice for short-lived intermediate data where write CPU dominates. Decompression speed is similar enough that read-heavy tables benefit from the smaller size.",
+      "Follow-up: Should you just use the highest zstd level? — No: write time rises steeply with level while size gains flatten; Uber found no benefit past level 19 even for one-off offline conversion, and for routine writes levels around 1 to 3 are the usual default."
+    ],
+    [
+      "M",
+      "What is the small-files problem and how big does it get?",
+      "Every file costs a listing entry, at least one request to read its footer and another for its data, task-scheduling overhead in engines that create a task per file, and metadata in the catalog or table format; small files also compress worse and have less useful statistics. A day of 100 GB stored as 100,000 one-megabyte files means about 200,000 GET requests and 100,000 tasks, where 800 files of 128 MB would need about 1,600 requests and a few hundred tasks. The fix is to write fewer, larger files (buffer longer, repartition before writing) and compact regularly.",
+      "Follow-up: Why does a streaming job create so many small files? — It commits output every trigger interval per output partition and per task, so a 10-second trigger, 50 tasks and 24 hourly partitions can produce hundreds of thousands of files a day unless output is coalesced or compacted."
+    ],
+    [
+      "M",
+      "How does a reader read only two columns of a 1 GB Parquet file on S3?",
+      "It issues a ranged GET for the tail of the file to read the footer length and footer (often by speculatively reading the last 64 KB or so, which usually contains the whole footer). From the footer it knows the byte offset and length of each column chunk in each row group, applies any statistics-based skipping, and then issues ranged GETs only for the two needed column chunks per surviving row group, often coalescing nearby ranges. The other columns' bytes are never transferred."
+    ],
+    [
+      "M",
+      "How does schema evolution work in Avro versus Parquet?",
+      "Avro resolves a writer's schema against the reader's schema field by field by name: added fields need a default so old data can be read, removed fields are ignored, and type promotions such as int to long are allowed. Parquet files each carry their own schema; engines either take one file's schema or merge schemas across files, and columns are matched by name (or by field ID when written by Iceberg). Adding nullable columns is easy in both; renames and type changes are where things break, which is why table formats track column IDs (de4)."
+    ],
+    [
+      "H",
+      "A dashboard query filtering one user_id over a 2 TB Parquet table reads all 2 TB. Why, and what would you change?",
+      "user_id values are spread randomly across files and row groups, so every row group's min/max covers nearly the full ID range and statistics skip nothing. Options: cluster or sort the data by user_id (or Z-order on user_id plus date, de3) so ranges become narrow; write Bloom filters on user_id so equality lookups skip chunks that cannot contain the ID; enable page indexes for finer skipping; or, if point lookups dominate, serve them from a key-value store and keep Parquet for scans. I would measure files and row groups read before and after each change.",
+      "Follow-up: What does sorting by user_id cost? — Other columns that were naturally ordered, such as timestamps, compress worse once their order is destroyed; in the measured example sorting by type and country grew the timestamp column from 4.6 MB to 5.6 MB, and a time-range filter loses its pushdown."
+    ],
+    [
+      "H",
+      "Design the file layout for a 5 TB/day event stream that is landed every five minutes but queried mostly by day and event type.",
+      "Land micro-batches as Parquet with zstd into an hourly bronze area and accept small files there. Run a compaction job (hourly or daily) that rewrites each hour or day into files of roughly 256 MB to 1 GB, sorted by event_type and then timestamp, so dictionary/RLE collapse the type column and statistics prune on type and time. With 5 TB/day of encoded output and 512 MB files, that is about 10,000 files a day instead of hundreds of thousands. Use a table format so compaction swaps files atomically, and keep row groups around 128 MB so a large file still splits into parallel tasks.",
+      "Follow-up: How do readers avoid seeing both the small files and the compacted copy during the rewrite? — The table format commits the compaction as one snapshot that removes the small files and adds the large ones, so readers see one version or the other (de4)."
+    ],
+    [
+      "H",
+      "Your Spark job reading Parquet got 5× slower after an upstream team changed their writer. File count and total size are unchanged. What might they have changed?",
+      "Look at the footers. Possibilities: they disabled statistics or switched to a writer that writes no page index, so pushdown stopped skipping; they changed the sort order, so row-group ranges widened; they grew row groups to the whole file, so the file can no longer be split into several tasks and parallelism dropped; they switched codec (gzip is slower to decompress than Snappy or zstd); or they changed types — timestamps as strings or decimals as strings disable both efficient encodings and comparisons. parquet-tools or pyarrow's metadata API will show row-group counts, encodings, codecs and statistics side by side.",
+      "Follow-up: What would you put in the data contract to prevent this? — Required codec, target file and row-group sizes, sort columns, statistics enabled and column types, all checked automatically on new files (de11)."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "Apache Parquet: file format documentation",
+      "The official description of row groups, column chunks, pages, metadata and the recommended configurations.",
+      "https://parquet.apache.org/docs/file-format/"
+    ],
+    [
+      "code",
+      "parquet-format: Encodings.md",
+      "The specification of PLAIN, RLE/bit-packing hybrid, dictionary, delta and BYTE_STREAM_SPLIT encodings.",
+      "https://raw.githubusercontent.com/apache/parquet-format/master/Encodings.md"
+    ],
+    [
+      "post",
+      "Cost Efficiency @ Scale in Big Data File Format",
+      "Uber Engineering, January 2022 — moving the lake to zstd (about 39% smaller than Snappy), column pruning and sort-order savings, with vCore benchmarks.",
+      "https://www.uber.com/blog/cost-efficiency-big-data/"
+    ],
+    [
+      "docs",
+      "parquet-java (parquet-hadoop) configuration",
+      "Writer defaults for block (row group) size, page size, dictionary size, Bloom filters and statistics truncation.",
+      "https://raw.githubusercontent.com/apache/parquet-java/master/parquet-hadoop/README.md"
+    ],
+    [
+      "docs",
+      "PyArrow: Reading and Writing the Apache Parquet Format",
+      "How to write, inspect and filter Parquet from Python, including row-group and statistics metadata.",
+      "https://arrow.apache.org/docs/python/parquet.html"
+    ],
+    [
+      "docs",
+      "Apache Avro specification",
+      "Binary encoding, object container files with sync markers, and schema resolution rules.",
+      "https://avro.apache.org/docs/1.12.0/specification/"
+    ],
+    [
+      "docs",
+      "Apache ORC: configuration",
+      "Stripe size, row index stride and compression defaults for ORC.",
+      "https://orc.apache.org/docs/hive-config.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A data platform team at a retailer lands its clickstream in the lake as gzip-compressed JSON lines, one file per minute per web server. It works on day one. A year later the folder holds 40 TB in 9 million files. A data scientist asks a simple question — how many purchases per country per day last quarter — and the query reads all 40 TB, because to find the two fields it needs (event type and country), the engine must decompress and parse every byte of every JSON object. It spends the first eleven minutes just listing and opening files, before it reads a single event. The query costs real money, takes over an hour, and fails twice when a single malformed line with an unescaped quote makes the parser give up.</p>
+<p>The same data rewritten as Parquet, compacted into files of a few hundred megabytes and sorted by event type, answers the question by reading two columns out of twelve, skipping every row group whose statistics show no purchases, and touching perhaps 1% of the bytes. Nothing about the hardware changed. The difference is entirely in how the bytes are arranged inside the files, and how many files there are.</p>
+<p>This is why file formats are the first technical topic of the track. Every engine you will meet later — Spark, a warehouse, DuckDB, a PyTorch data loader — spends most of its time reading files, and the format decides how many bytes it must read, how much CPU it spends decoding them, how many requests it makes to object storage, and whether a filter can skip data at all. ML pipelines feel this acutely: a training set is often the widest table in the company, read many times, and a feature pipeline that scans a year of events every night pays for a bad layout every night.</p>
+<p>This lesson starts with the text formats (CSV and JSON) and why they hurt, then the binary row format Avro, then takes a Parquet file apart: row groups, column chunks and pages, the footer, each encoding, compression codecs, statistics and predicate pushdown, with byte counts measured from a real one-million-row file written with pyarrow. It finishes with the small-files problem and Uber's account of saving petabytes by changing codecs and column layout.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a filing cabinet versus a pile of letters</h4>
+<p>Imagine you keep a record of every customer interaction. In the first office, each interaction is a handwritten letter, and the letters are piled in order of arrival. Every letter says, in full sentences, "On the eighth of October, customer five-five-three, in Germany, viewed product sushi-12." To count purchases by country, you must pick up every letter and read every sentence. That is CSV and JSON: human-readable, self-describing in a loose way, and expensive to read in bulk.</p>
+<p>In the second office, the clerk keeps a filing cabinet. Each drawer covers a block of time (that is a <strong>row group</strong>). Inside each drawer, there is a separate folder for each kind of information — one for dates, one for customers, one for countries, one for event types (those are <strong>column chunks</strong>). The country folder does not repeat "Germany" ten thousand times; it has a small code sheet at the front (1 = Germany, 2 = France…) and then a list of codes (that is <strong>dictionary encoding</strong>), and where the same code appears many times in a row it just writes "1, repeated 400 times" (that is <strong>run-length encoding</strong>). On the front of each drawer is a label: "dates from 08:00 to 10:24; event types from add_to_cart to view" (those are <strong>statistics</strong>). And there is an index card at the back of the cabinet listing every drawer and folder and where it sits (that is the <strong>footer</strong>).</p>
+<p>To count purchases by country, the clerk reads the index card, opens only the "event type" and "country" folders, and skips any drawer whose label proves it contains no purchases. Most of the cabinet is never opened. That is Parquet.</p>
+<p>The analogy breaks in two places worth knowing. A real cabinet can be updated by slipping a letter into a folder; a Parquet file cannot be changed after it is written, so updates mean writing new files (and table formats, in de4, track which files are current). And the clerk's labels only help if the drawers are organised: if every drawer holds a random mix of dates and event types, every label says "everything", and the clerk must open every drawer. That second point — layout matters as much as format — is the bridge to de3.</p>
+
+<h4>The formats in one picture</h4>
+<p>There are two axes. <strong>Text versus binary</strong>: text formats (CSV, JSON) store values as characters that must be parsed; binary formats store typed values directly. <strong>Row versus columnar</strong>: row formats store each record's fields together (good for writing and reading whole records); columnar formats store each field's values together (good for reading a few fields of many records). CSV and JSON are text and row-oriented. Avro (and Protobuf, used by many services) is binary and row-oriented. Parquet and ORC are binary and columnar.</p>
+
+<figure>
+<svg viewBox="0 0 640 330" width="100%" role="img" aria-label="Layout of a Parquet file: magic bytes, two row groups each with column chunks made of pages, and a footer with metadata, length and magic bytes">
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="20" width="60" height="290" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="50" y="40" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">PAR1</text>
+    <text x="50" y="58" text-anchor="middle" style="fill:var(--muted)">4 bytes</text>
+    <rect x="100" y="20" width="180" height="125" rx="6" style="fill:none;stroke:var(--s1);stroke-width:1.5"/>
+    <text x="190" y="38" text-anchor="middle" style="fill:var(--ink);font-weight:600">Row group 0 (rows 0–99,999)</text>
+    <rect x="110" y="48" width="160" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="190" y="65" text-anchor="middle" style="fill:var(--ink)">chunk: ts</text>
+    <rect x="110" y="80" width="160" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="190" y="97" text-anchor="middle" style="fill:var(--ink)">chunk: event_type</text>
+    <rect x="110" y="112" width="160" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--s4)"/>
+    <text x="190" y="129" text-anchor="middle" style="fill:var(--ink)">chunk: country …</text>
+    <rect x="100" y="160" width="180" height="70" rx="6" style="fill:none;stroke:var(--s1);stroke-width:1.5"/>
+    <text x="190" y="180" text-anchor="middle" style="fill:var(--ink);font-weight:600">Row group 1 … 9</text>
+    <text x="190" y="200" text-anchor="middle" style="fill:var(--ink-2)">same columns, next</text>
+    <text x="190" y="216" text-anchor="middle" style="fill:var(--ink-2)">100,000 rows each</text>
+    <rect x="100" y="245" width="180" height="65" rx="6" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="190" y="265" text-anchor="middle" style="fill:var(--ink);font-weight:600">Footer (Thrift)</text>
+    <text x="190" y="282" text-anchor="middle" style="fill:var(--ink-2)">schema, offsets, sizes,</text>
+    <text x="190" y="298" text-anchor="middle" style="fill:var(--ink-2)">encodings, min/max</text>
+    <rect x="360" y="40" width="260" height="170" rx="6" style="fill:none;stroke:var(--s3);stroke-width:1.5"/>
+    <text x="490" y="60" text-anchor="middle" style="fill:var(--ink);font-weight:600">Inside one column chunk</text>
+    <rect x="375" y="72" width="230" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="490" y="92" text-anchor="middle" style="fill:var(--ink)">Dictionary page: 8 distinct strings</text>
+    <rect x="375" y="110" width="230" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="490" y="130" text-anchor="middle" style="fill:var(--ink)">Data page 1: header + 3-bit codes</text>
+    <rect x="375" y="148" width="230" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="490" y="168" text-anchor="middle" style="fill:var(--ink)">Data page 2 … (≈1 MB each)</text>
+    <text x="490" y="198" text-anchor="middle" style="fill:var(--ink-2)">each page encoded + compressed alone</text>
+    <line x1="270" y1="93" x2="360" y2="90" style="fill:none;stroke:var(--s3);stroke-dasharray:4 3"/>
+    <rect x="360" y="245" width="260" height="65" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="490" y="265" text-anchor="middle" style="fill:var(--ink)">then: footer length (4 bytes)</text>
+    <text x="490" y="283" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">PAR1</text>
+    <text x="490" y="300" text-anchor="middle" style="fill:var(--ink-2)">readers start from the end</text>
+    <line x1="280" y1="278" x2="358" y2="278" style="fill:none;stroke:var(--accent)"/>
+  </g>
+</svg>
+<figcaption>A Parquet file is a cabinet of drawers (row groups), each holding one folder per column (column chunks), each made of pages. The footer at the end is the index: a reader fetches it first and then jumps straight to the byte ranges it needs, which is why the footer sits at the end and not the start — the writer only knows the offsets after writing the data.</figcaption>
+</figure>
+
+<p>A reader who stops here should remember that a columnar file lets a query read only the columns it uses, that encodings make repeated and ordered values nearly free, that statistics let readers skip whole slices of rows, and that all of this assumes reasonably large, well-organised files.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The text formats: CSV and JSON</h4>
+<p><strong>CSV</strong> (comma-separated values) stores one record per line and separates fields with commas. It has no types: <code>00123</code> may be a string with leading zeros or the number 123, and only the reader decides. It has no standard for nulls (empty field, <code>NULL</code>, <code>\N</code>, <code>NA</code> are all in use), for quoting (a field containing a comma must be quoted; a field containing a quote must double it; a field containing a newline breaks naive line-based readers) or for character encodings. It has no schema beyond an optional header line. To read one column, a reader must still scan and tokenise every byte of every line, because column boundaries are only discovered by parsing.</p>
+<p><strong>JSON</strong> (JavaScript Object Notation), usually stored as <strong>JSON lines</strong> (one object per line), fixes some of this: it has strings, numbers, booleans, null, arrays and nested objects, and every record names its fields. The price is size — every record repeats every field name — and a type system too weak for data work: no distinction between integers and floats beyond the digits, no dates or timestamps (they become strings), and numbers that some parsers silently turn into 64-bit floats, losing precision above 2<sup>53</sup>. JSON is also schema-on-read: one producer writing <code>"price": "12.50"</code> instead of <code>12.5</code> is invisible until a reader chokes.</p>
+<p>Both formats are row-oriented text, so they share three costs: bytes (text representations are several times larger than binary ones), CPU (parsing text is slow — often slower than reading the bytes from storage), and fragility. They are fine at the edges of a platform — a partner's daily drop, a human-readable export, raw logs landed into bronze exactly as received — and wrong as the storage format for anything queried repeatedly.</p>
+
+<h4>2. Avro: compact binary rows with a schema</h4>
+<p><strong>Apache Avro</strong> is a binary, row-oriented format designed for data in motion. Records are encoded field after field with no field names and no delimiters: integers as variable-length zig-zag encoded numbers (small values take 1 byte), strings as a length followed by bytes. The reader knows how to decode the bytes because it has the <strong>schema</strong>, a JSON document listing each field's name and type. An Avro <em>object container file</em> puts that schema in the file header, then a 16-byte random <strong>sync marker</strong>, then blocks of records (each block compressed as a unit), each followed by the sync marker again. A reader dropped into the middle of a file can scan for the marker to find the next block boundary, which makes Avro files <strong>splittable</strong> across parallel tasks.</p>
+<p>Avro's distinguishing feature is <strong>schema resolution</strong>. A reader can use a different schema from the writer's: fields are matched by name, a field the reader expects but the writer did not write is filled from the reader schema's default value, fields the writer wrote but the reader does not want are skipped, and some type promotions (int to long, float to double) are allowed. This is what lets producers and consumers of a Kafka topic evolve independently, and why Avro, together with a schema registry that stores each schema version, is a common choice for CDC events and service messages (de8 covers registries and compatibility modes). For analytical scans, though, Avro has the row-format problem: reading one field means decoding every field before it in every record.</p>
+
+<h4>3. Parquet: the anatomy of a columnar file</h4>
+<p><strong>Apache Parquet</strong> was created in 2013 by engineers at Twitter and Cloudera, inspired by Google's Dremel paper (db12 introduced Dremel's nested columnar encoding). It is now the default storage format of most lakes and lakehouses. Its structure has four levels.</p>
+<p>A <strong>file</strong> begins with the 4 magic bytes <code>PAR1</code>. It contains one or more <strong>row groups</strong>, each a horizontal slice of rows — for example rows 0 to 99,999. Within a row group, the values of each column are stored contiguously as a <strong>column chunk</strong>, so a reader that needs only two columns reads only those two chunks. Each column chunk is divided into <strong>pages</strong>, the unit at which values are encoded and compressed: optionally a dictionary page first, then data pages. At the very end is the <strong>footer</strong>: a <code>FileMetaData</code> structure serialised with Apache Thrift, followed by a 4-byte footer length and <code>PAR1</code> again.</p>
+<p>The footer holds the schema; the number of rows; and for every row group, for every column chunk, the byte offset and size, the codec, the list of encodings used, the number of values and the <strong>statistics</strong> (minimum, maximum, null count). It is at the end because the writer only knows those offsets after it has written the data; it writes everything in one sequential pass and then writes the index. A reader therefore starts at the end. On object storage, a typical reader issues one ranged GET for the last few tens of kilobytes of the file (which usually contains the whole footer), parses it, decides which row groups and columns it needs, and then issues ranged GETs for just those byte ranges, often merging nearby ranges into one request.</p>
+<p>How big are these units? The Parquet project's documentation recommends large row groups (it says 512 MB to 1 GB) so that a row group matches a large sequential read. Real writers use their own defaults: parquet-java (used by Spark and Hive) targets 128 MB row groups (<code>parquet.block.size</code>) and 1 MB pages, and limits pages to 20,000 rows; pyarrow 25 caps a row group at 1,048,576 rows by default and uses 1 MB data pages and a 1 MB dictionary page limit. These defaults are checked against the current parquet-java README and pyarrow 25.0.1 documentation as of October 2026, and they change over time, so check the version you run.</p>
+
+<h4>4. A real table, measured</h4>
+<p>To make the rest concrete, here is one table written with pyarrow 25.0.1 on 2026-10-08: one day of one million app events with six columns, shaped like real clickstream data.</p>
+<ul>
+<li><code>event_id</code> — 64-bit integer, unique and increasing (10,000,000 to 10,999,999).</li>
+<li><code>ts</code> — millisecond timestamp in UTC, sorted, one day's range.</li>
+<li><code>user_id</code> — 64-bit integer, 200,000 distinct users in random order.</li>
+<li><code>event_type</code> — string, 8 distinct values (view 40%, click 20%, search 15% and so on).</li>
+<li><code>country</code> — string, 50 distinct codes such as <code>C07</code>, uniformly random.</li>
+<li><code>price</code> — double, present on only 10% of rows, null on the rest.</li>
+</ul>
+<table>
+<thead><tr><th>Format</th><th>Bytes</th><th>vs CSV</th></tr></thead>
+<tr><td>JSON lines (estimated from 10,000 rows)</td><td>≈ 139.8 MB</td><td>2.5×</td></tr>
+<tr><td>CSV</td><td>56.3 MB</td><td>1.0×</td></tr>
+<tr><td>Parquet, plain encoding, no compression</td><td>41.3 MB</td><td>0.73×</td></tr>
+<tr><td>Parquet, default encodings, no compression</td><td>25.9 MB</td><td>0.46×</td></tr>
+<tr><td>Parquet, default encodings + Snappy (pyarrow's default)</td><td>15.1 MB</td><td>0.27×</td></tr>
+<tr><td>Parquet, default encodings + zstd</td><td>7.9 MB</td><td>0.14×</td></tr>
+</table>
+<p>Three separate effects are visible. Going from text to binary values (CSV to plain Parquet) saves 27%: an 8-digit ID is 8 bytes either way, but timestamps shrink from 32 characters to 8 bytes, and doubles for missing prices vanish. Going from plain to the default encodings saves another 37% of the original. And compression on top of the encodings roughly halves (Snappy) or thirds (zstd) what is left. The per-column numbers, read from the file's own footer, show where each saving comes from:</p>
+<table>
+<thead><tr><th>Column</th><th>Plain, uncompressed</th><th>Default encodings, uncompressed</th><th>+ Snappy</th><th>+ zstd</th></tr></thead>
+<tr><td>event_id</td><td>8.00 MB</td><td>8.27 MB</td><td>4.28 MB</td><td>1.28 MB</td></tr>
+<tr><td>ts</td><td>8.00 MB</td><td>8.27 MB</td><td>4.58 MB</td><td>1.83 MB</td></tr>
+<tr><td>user_id</td><td>8.00 MB</td><td>7.79 MB</td><td>4.77 MB</td><td>3.34 MB</td></tr>
+<tr><td>event_type</td><td>9.36 MB</td><td>0.38 MB</td><td>0.38 MB</td><td>0.35 MB</td></tr>
+<tr><td>country</td><td>7.00 MB</td><td>0.75 MB</td><td>0.75 MB</td><td>0.76 MB</td></tr>
+<tr><td>price</td><td>0.96 MB</td><td>0.40 MB</td><td>0.36 MB</td><td>0.32 MB</td></tr>
+</table>
+<p>The next sections explain each row of that table.</p>
+
+<h4>5. Dictionary encoding and the RLE/bit-packing hybrid</h4>
+<p><strong>Plain encoding</strong> writes values back to back: 8 bytes per 64-bit integer, and for strings a 4-byte length followed by the bytes. That is why <code>event_type</code> takes 9.36 MB plain: one million strings averaging about 5 characters, plus 4 bytes of length each.</p>
+<p><strong>Dictionary encoding</strong> collects the distinct values of the column chunk into a dictionary page and replaces each value with its index. <code>event_type</code> has 8 distinct values, so the dictionary is 8 short strings and the data pages hold one million indices between 0 and 7. Those indices are then stored with Parquet's <strong>RLE/bit-packing hybrid</strong> encoding (the specification calls the combination <code>RLE_DICTIONARY</code>). <strong>Bit-packing</strong> stores each index in the fewest bits that can hold the largest: 8 values need 3 bits (2<sup>3</sup> = 8), so one million indices take 3,000,000 bits = 375,000 bytes. The measured column is 379,818 bytes — 375,000 for the codes plus the dictionary and page headers. <code>country</code>, with 50 values, needs 6 bits (2<sup>6</sup> = 64 ≥ 50): 750,000 bytes predicted, 754,766 measured. The arithmetic is exact because the encoding is that simple.</p>
+<p>The <strong>RLE</strong> (run-length encoding) half of the hybrid kicks in when the same index repeats: instead of bit-packing 400 copies of "2", it writes "2, repeated 400 times" in a couple of bytes. In our file the event types are in random order, so runs are short and bit-packing does all the work. When the same table is sorted by <code>event_type</code> and then <code>country</code>, the <code>event_type</code> column becomes 8 long runs and shrinks from 380 KB to <strong>2.9 KB</strong>; <code>country</code> becomes 400 runs (50 per event type) and shrinks to <strong>3.9 KB</strong>.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Dictionary encoding turns strings into small codes, which bit-packing stores in 3 bits each, and RLE collapses into runs when the data is sorted">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">Plain strings (9.36 MB)</text>
+    <g style="font-family:var(--mono)">
+      <rect x="20" y="32" width="64" height="24" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="52" y="49" text-anchor="middle" style="fill:var(--ink)">view</text>
+      <rect x="84" y="32" width="64" height="24" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="116" y="49" text-anchor="middle" style="fill:var(--ink)">click</text>
+      <rect x="148" y="32" width="64" height="24" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="180" y="49" text-anchor="middle" style="fill:var(--ink)">view</text>
+      <rect x="212" y="32" width="64" height="24" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="244" y="49" text-anchor="middle" style="fill:var(--ink)">search</text>
+      <rect x="276" y="32" width="64" height="24" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="308" y="49" text-anchor="middle" style="fill:var(--ink)">view</text>
+    </g>
+    <text x="360" y="49" style="fill:var(--ink-2)">… 1,000,000 values</text>
+    <text x="20" y="90" style="fill:var(--ink);font-weight:600">Dictionary page</text>
+    <text x="20" y="108" style="fill:var(--ink-2);font-family:var(--mono)">0=view 1=click 2=search 3=scroll …7=purchase</text>
+    <text x="20" y="140" style="fill:var(--ink);font-weight:600">Bit-packed codes, 3 bits each (0.38 MB)</text>
+    <g style="font-family:var(--mono)">
+      <rect x="20" y="150" width="40" height="24" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="40" y="167" text-anchor="middle" style="fill:var(--ink)">000</text>
+      <rect x="60" y="150" width="40" height="24" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="80" y="167" text-anchor="middle" style="fill:var(--ink)">001</text>
+      <rect x="100" y="150" width="40" height="24" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="120" y="167" text-anchor="middle" style="fill:var(--ink)">000</text>
+      <rect x="140" y="150" width="40" height="24" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="160" y="167" text-anchor="middle" style="fill:var(--ink)">010</text>
+      <rect x="180" y="150" width="40" height="24" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="200" y="167" text-anchor="middle" style="fill:var(--ink)">000</text>
+    </g>
+    <text x="240" y="167" style="fill:var(--ink-2)">1,000,000 × 3 bits = 375,000 bytes</text>
+    <text x="20" y="206" style="fill:var(--ink);font-weight:600">Same column after sorting: RLE runs (2.9 KB)</text>
+    <g style="font-family:var(--mono)">
+      <rect x="20" y="216" width="150" height="24" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="95" y="233" text-anchor="middle" style="fill:var(--ink)">0 × 400,112</text>
+      <rect x="170" y="216" width="150" height="24" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="245" y="233" text-anchor="middle" style="fill:var(--ink)">1 × 199,870</text>
+      <rect x="320" y="216" width="150" height="24" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="395" y="233" text-anchor="middle" style="fill:var(--ink)">2 × 150,034</text>
+    </g>
+    <text x="490" y="233" style="fill:var(--ink-2)">… 8 runs</text>
+  </g>
+</svg>
+<figcaption>Three stages of the same column. Dictionary encoding replaces strings with codes; bit-packing stores each code in 3 bits because there are only 8 values; and once the rows are sorted, run-length encoding stores each value once with a count. Notice that the last step depends entirely on row order, not on the format. (Run lengths shown are illustrative; real pages break runs at page boundaries.)</figcaption>
+</figure>
+
+<p>Dictionary encoding has a limit. The dictionary itself must fit in its page limit (1 MB by default in both pyarrow and parquet-java). <code>event_id</code> is unique: its dictionary would need a million entries, so after the first ~131,000 values (1 MB ÷ 8 bytes) the writer gives up — <strong>dictionary fallback</strong> — and writes the rest of the chunk in plain encoding. The footer records both encodings (<code>PLAIN</code>, <code>RLE</code>, <code>RLE_DICTIONARY</code>), and the column ends up slightly <em>larger</em> than plain (8.27 MB versus 8.00 MB) because of the wasted dictionary. <code>user_id</code>, with 200,000 distinct values, also overflows its dictionary partway through. High-cardinality columns are where general-purpose compression has to do the work instead.</p>
+
+<h4>6. Delta encoding for ordered numbers</h4>
+<p>Some columns are neither repetitive nor random: they are ordered. <code>event_id</code> increases by exactly 1 per row; <code>ts</code> increases by an average of 86 milliseconds. Storing each value in 8 bytes wastes almost all of the bits. <strong>Delta encoding</strong> (<code>DELTA_BINARY_PACKED</code> in Parquet) stores the first value, then the differences between consecutive values, in blocks; within each block it subtracts the smallest difference and bit-packs the remainders. For <code>event_id</code> every difference is 1, so every remainder is 0 and needs 0 bits: writing this column with delta encoding produced <strong>24,000 bytes</strong> instead of 8,000,000 — essentially just block headers. For <code>ts</code>, gaps range from 0 to a few hundred milliseconds, needing around 9 bits each: <strong>1.17 MB</strong> instead of 8 MB, uncompressed. pyarrow does not choose delta encoding by default; you request it per column with <code>column_encoding={"ts": "DELTA_BINARY_PACKED"}</code> and <code>use_dictionary</code> turned off for that column. Spark's parquet-java writer uses delta encodings automatically only for the newer "v2" data pages.</p>
+<p>Parquet has other encodings for specific shapes: <code>DELTA_LENGTH_BYTE_ARRAY</code> and <code>DELTA_BYTE_ARRAY</code> for strings (the latter stores shared prefixes once, which suits sorted URLs or keys), and <code>BYTE_STREAM_SPLIT</code> for floating-point numbers, which writes all the first bytes of the values, then all the second bytes and so on. Floats rarely repeat exactly, but their high-order bytes (sign and exponent) are very similar, so splitting them out gives the compression codec long runs of similar bytes. Uber reported in 2022 that byte-stream split alone does not shrink data but improves what a codec achieves afterwards.</p>
+
+<h4>7. Nulls and definition levels</h4>
+<p>How does Parquet store <code>price</code>, which is null on 90% of rows? It does not store the nulls as values. Alongside each optional column it stores <strong>definition levels</strong>: for a flat optional column, one small number per row, 1 if the value is present and 0 if it is null, encoded with the same RLE/bit-packing hybrid (1 bit per row, with long runs of zeros collapsing). The value stream then holds only the 100,000 real prices. Plain, that is 100,000 × 8 bytes = 800 KB plus about 125 KB of 1-bit levels, which matches the measured 0.96 MB; with dictionary encoding (many prices repeat at two decimal places) it drops to 0.40 MB. Nested data (lists and structs) adds <strong>repetition levels</strong> that record where each list begins — the Dremel idea db12 described — but you rarely need to think about them unless you are debugging a writer.</p>
+
+<h4>8. Compression codecs</h4>
+<p>After encoding, each page can be compressed with a general-purpose <strong>codec</strong>. The common ones are <strong>Snappy</strong> (very fast, modest ratio; the default in pyarrow and in Spark's Parquet writer), <strong>zstd</strong> (Zstandard: much better ratio at modest CPU cost, with levels 1 to 22), <strong>gzip</strong> (good ratio, slow to decompress), and <strong>LZ4</strong> (very fast). Codecs work on bytes, finding repeated byte sequences, so they help most on what encodings left behind. The measured table shows it: Snappy halves the integer and timestamp columns, which still contain long runs of identical high-order bytes, but does nothing for <code>event_type</code> and <code>country</code>, which bit-packing already squeezed to near their information content (Snappy even added a few hundred bytes of framing). zstd goes much further on integers — <code>event_id</code> 1.28 MB versus Snappy's 4.28 MB — because it finds longer-range patterns.</p>
+<p>Because compression is per page, a reader decompresses only the pages it reads, and pages from different columns can be decoded in parallel. Decompression speed matters more than compression speed for tables that are written once and read many times; zstd decompresses fast at any level, which is why many lakes moved to it. The trade-off is write-time CPU: high zstd levels are slow to compress.</p>
+
+<h4>9. Statistics and predicate pushdown</h4>
+<p>Every column chunk's metadata in the footer can carry <strong>statistics</strong>: minimum value, maximum value and null count. Writers can also add a <strong>page index</strong> — a <code>ColumnIndex</code> with min and max per page and an <code>OffsetIndex</code> with each page's location — so a reader can skip individual pages, not just whole row groups. (pyarrow writes chunk statistics by default but the page index only when you pass <code>write_page_index=True</code>.) Optionally a writer adds a <strong>Bloom filter</strong> per column chunk: a compact bit array that can say "this value is definitely not in this chunk", useful for equality lookups on high-cardinality columns like IDs. parquet-java leaves Bloom filters off by default.</p>
+<p><strong>Predicate pushdown</strong> is the engine passing a query's filter down to the reader. Suppose the same one million events are written with 10 row groups of 100,000 rows, sorted by time, and a query asks for <code>WHERE ts &gt;= '12:00' AND ts &lt; '13:00'</code>. The footer (7.6 KB for this file, versus 1.4 KB for the one-row-group file) lists each row group's <code>ts</code> range. Measured:</p>
+<table>
+<thead><tr><th>Row group</th><th>min ts</th><th>max ts</th><th>Read?</th></tr></thead>
+<tr><td>0 – 3</td><td>00:00:00</td><td>09:36:47</td><td>skip</td></tr>
+<tr><td>4</td><td>09:36:47</td><td>12:00:49</td><td>read (contains 12:00–12:00:49)</td></tr>
+<tr><td>5</td><td>12:00:49</td><td>14:24:40</td><td>read</td></tr>
+<tr><td>6 – 9</td><td>14:24:40</td><td>23:59:59</td><td>skip</td></tr>
+</table>
+<p>Two of ten row groups survive, and of those only the columns in the <code>SELECT</code> are fetched (<strong>column projection</strong>). If the query selects <code>event_type</code> and <code>country</code>, the reader fetches about 2/10 of their 1.1 MB plus the <code>ts</code> chunks needed to apply the filter exactly — perhaps 1.2 MB of a 15 MB file. The engine still applies the filter row by row inside the surviving row groups; statistics only tell it what it can safely ignore.</p>
+
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Ten row groups with timestamp ranges; a filter for 12:00 to 13:00 reads only row groups 4 and 5 when data is sorted, but all ten when data is random">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">Sorted by ts — filter 12:00–13:00</text>
+    <rect x="20" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="48" y="54" text-anchor="middle" style="fill:var(--muted)">0</text>
+    <rect x="80" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="108" y="54" text-anchor="middle" style="fill:var(--muted)">1</text>
+    <rect x="140" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="168" y="54" text-anchor="middle" style="fill:var(--muted)">2</text>
+    <rect x="200" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="228" y="54" text-anchor="middle" style="fill:var(--muted)">3</text>
+    <rect x="260" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--good);stroke-width:2"/><text x="288" y="54" text-anchor="middle" style="fill:var(--ink)">4</text>
+    <rect x="320" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--good);stroke-width:2"/><text x="348" y="54" text-anchor="middle" style="fill:var(--ink)">5</text>
+    <rect x="380" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="408" y="54" text-anchor="middle" style="fill:var(--muted)">6</text>
+    <rect x="440" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="468" y="54" text-anchor="middle" style="fill:var(--muted)">7</text>
+    <rect x="500" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="528" y="54" text-anchor="middle" style="fill:var(--muted)">8</text>
+    <rect x="560" y="32" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="588" y="54" text-anchor="middle" style="fill:var(--muted)">9</text>
+    <text x="20" y="86" style="fill:var(--ink-2)">each covers ~2.4 h: min/max prove 8 groups cannot match → read 2 of 10</text>
+    <text x="20" y="128" style="fill:var(--ink);font-weight:600">Random order — same filter</text>
+    <rect x="20" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="48" y="160" text-anchor="middle" style="fill:var(--ink)">0</text>
+    <rect x="80" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="108" y="160" text-anchor="middle" style="fill:var(--ink)">1</text>
+    <rect x="140" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="168" y="160" text-anchor="middle" style="fill:var(--ink)">2</text>
+    <rect x="200" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="228" y="160" text-anchor="middle" style="fill:var(--ink)">3</text>
+    <rect x="260" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="288" y="160" text-anchor="middle" style="fill:var(--ink)">4</text>
+    <rect x="320" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="348" y="160" text-anchor="middle" style="fill:var(--ink)">5</text>
+    <rect x="380" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="408" y="160" text-anchor="middle" style="fill:var(--ink)">6</text>
+    <rect x="440" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="468" y="160" text-anchor="middle" style="fill:var(--ink)">7</text>
+    <rect x="500" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="528" y="160" text-anchor="middle" style="fill:var(--ink)">8</text>
+    <rect x="560" y="138" width="56" height="34" rx="3" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:2"/><text x="588" y="160" text-anchor="middle" style="fill:var(--ink)">9</text>
+    <text x="20" y="192" style="fill:var(--ink-2)">every group has min ≈ 00:00 and max ≈ 23:59 → statistics prove nothing → read 10 of 10</text>
+    <text x="20" y="212" style="fill:var(--accent)">same file format, same footer — the difference is row order</text>
+  </g>
+</svg>
+<figcaption>Predicate pushdown is only as good as the clustering. With rows sorted by time, each row group covers a narrow slice of the day and eight of ten are skipped from the footer alone. Shuffle the same rows and every group's range spans the whole day, so the reader must open them all.</figcaption>
+</figure>
+
+<p>This is the most important practical fact about statistics: they describe the data, they do not organise it. Sort order is a choice the writer makes, and choosing it trades one column's pushdown and compression against another's. When the measured table was sorted by <code>event_type</code> and <code>country</code>, those two columns shrank to almost nothing, but <code>ts</code> grew from 4.58 MB to 5.61 MB and <code>event_id</code> from 4.28 MB to 4.89 MB (Snappy), the file as a whole grew from 15.1 MB to 15.6 MB, and the time filter above would no longer skip anything. de3 covers how to choose, and techniques such as Z-ordering that cluster on several columns at once.</p>
+
+<h4>10. ORC in one section</h4>
+<p><strong>ORC</strong> (Optimized Row Columnar) came from the Hive project at about the same time as Parquet and has the same core ideas with different names. A file is divided into <strong>stripes</strong> (64 MB by default) instead of row groups; within each stripe, columns are stored as streams; every 10,000 rows (the <em>row index stride</em>) ORC records min/max and positions, giving page-like skipping built in; and the file and stripe footers hold metadata. ORC has rich encodings and optional Bloom filters, and the current ORC documentation lists zstd as the default codec. ORC remains strong in Hive- and Trino-heavy shops; Parquet won broader ecosystem support (Spark's default, pandas, Arrow, DuckDB, every warehouse's external tables, every table format), so new platforms usually standardise on Parquet.</p>
+
+<h4>11. The small-files problem</h4>
+<p>Everything above assumed reasonably large files. Real lakes often have the opposite. A streaming job that commits every minute, a Spark job with 2,000 tasks each writing its own file into each of 50 partitions, a pipeline that appends one file per incoming API call — each produces thousands or millions of small files. Each file carries fixed costs that do not shrink with its size:</p>
+<ul>
+<li><strong>Listing</strong>: object stores return at most 1,000 keys per list request (S3's <code>ListObjectsV2</code> limit), so 1,000,000 files need 1,000 sequential-ish list calls before planning can even begin — unless a table format's metadata already lists them (de4).</li>
+<li><strong>Opening</strong>: at least one request to read the footer and one or more for data, each with tens of milliseconds of first-byte latency on object storage.</li>
+<li><strong>Scheduling</strong>: engines such as Spark create read tasks from files and byte ranges; with tiny files, task launch overhead (tens of milliseconds each) dominates. Spark mitigates this by packing small files together into one task, treating each file as costing an extra 4 MB (<code>spark.sql.files.openCostInBytes</code>) when packing up to 128 MB per task (<code>spark.sql.files.maxPartitionBytes</code>).</li>
+<li><strong>Worse files</strong>: a 1 MB Parquet file has one tiny row group, little for dictionaries and codecs to find, a footer proportionally large, and statistics that are fine-grained but must be read separately for each file.</li>
+<li><strong>Metadata</strong>: catalogs, table-format manifests and (on HDFS) the NameNode's memory all grow with file count.</li>
+</ul>
+<p>Size it. One day of events, 100 GB after encoding. As 100,000 files of 1 MB, a full scan needs about 100 list calls, at least 200,000 GET requests (footer plus data per file), and — even at 200 concurrent requests and 30 ms each — about 30 seconds of pure request latency before counting any data transfer; Spark plans tens of thousands of tasks. As 800 files of 128 MB, it needs one list call, about 1,600 GETs plus ranged reads within files, and a few hundred tasks. The bytes read are the same; the overhead differs by two orders of magnitude. At the request price (S3 Standard GETs are fractions of a cent per thousand), the money is small; the time and the planning overhead are not.</p>
+<p>The cures are on both sides. On write: buffer longer before committing, repartition or coalesce before writing so each task writes one file per output partition, and size output files deliberately (many writers have a target file size option). After write: <strong>compaction</strong>, a maintenance job that rewrites small files into large ones — safe only when a table format commits the swap atomically, which de3 and de4 build on. A common target is files of 128 MB to 1 GB, with row groups of 64–256 MB inside them so a large file still splits into parallel read tasks.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why columnar plus vectorised reading is a CPU story, not just an I/O story</h4>
+<p>Bytes saved on disk are obvious; less obvious is that columnar files also make the CPU faster. When a reader decodes a page, it produces a batch of thousands of values of one type laid out contiguously in memory — the Apache Arrow in-memory format is the common target. The engine then runs tight loops over those arrays: compare every timestamp in the batch to the filter bound, producing a bitmap; sum every price where the bitmap is set. Such loops use SIMD instructions (one instruction operating on 4–16 values) and stay in the CPU cache. A row format forces the engine to walk record by record, branching on each field. This is why Spark's vectorized Parquet reader (on by default) and engines like DuckDB are so much faster than row-at-a-time readers even on cached data. It is also why dictionary-encoded columns can sometimes be filtered without decoding: compare the filter to the 8 dictionary entries once, then scan the 3-bit codes.</p>
+
+<h4>Statistics have sharp edges</h4>
+<p>Min/max statistics are only useful if the reader trusts them, and there have been real bugs. Early Parquet writers computed string min/max with signed byte comparison, which is wrong for non-ASCII UTF-8, so readers learned to ignore string statistics from old writer versions; Parquet later added a <code>ColumnOrder</code> field to the footer and new <code>min_value</code>/<code>max_value</code> fields with defined ordering. Long strings make statistics large, so writers truncate them (parquet-java's column-index truncate length is 64 bytes); a truncated max must be rounded up so it is still an upper bound. Floating-point NaN breaks ordering and is handled specially. The practical lesson: when a pushdown that should work does not, inspect the footer — statistics may be missing, truncated, or deliberately ignored for that writer version.</p>
+
+<h4>Choosing row-group and file sizes is a three-way trade</h4>
+<p>Row groups trade pushdown granularity, memory and parallelism. A row group is buffered in memory by the writer until it is flushed (so a 1 GB row group across 200 columns needs a lot of writer memory), is the finest unit a reader can skip with chunk statistics, and is typically the unit of parallel splitting when an engine divides one big file across tasks. Very large row groups give long sequential reads and good compression but coarse skipping and few splits; very small ones give fine skipping but many seeks and a large footer. The page index loosens the trade by allowing page-level skipping inside large row groups. For object storage, where each request costs tens of milliseconds, the practical sweet spot is files of hundreds of megabytes with row groups of roughly 64–256 MB; for a training data loader doing random access, smaller row groups (or a dedicated shard format, de12) are better.</p>
+
+<h4>Schema evolution at the file level, and why IDs beat names</h4>
+<p>Each Parquet file carries its own schema, so a table made of many files may contain several schema versions. Engines reconcile them by matching column names: a new nullable column reads as null in old files; a dropped column is ignored. Renames are the trap: if <code>price</code> is renamed to <code>unit_price</code>, old files have <code>price</code> and new ones <code>unit_price</code>, and a by-name reader sees two half-empty columns. Iceberg solves this by writing a numeric <strong>field ID</strong> into each Parquet column's schema and resolving by ID, so a rename is a metadata-only change and old files still map correctly. Type changes are harder: widening int to long can be read safely; anything else usually means rewriting data. Avro sidesteps much of this with explicit reader/writer schema resolution and aliases. This is one of the main reasons de4's table formats exist.</p>
+
+<h4>Formats for ML data are under pressure</h4>
+<p>Parquet was designed for analytical scans, and ML workloads stress it in new ways. Training tables can have thousands of feature columns, making footers megabytes long and metadata parsing a real cost. Embedding columns are fixed-length float vectors that compress poorly and are better stored as fixed-size lists with byte-stream split. Data loaders want random access to individual rows for shuffling, which row-group-oriented files serve badly. Newer formats such as Lance (built around fast random access and vector search) and research formats like Nimble (from Meta, aimed at very wide tables) target these needs; the common practical response is still Parquet with tuned row groups for preprocessing, then conversion into training shards (de12). It is worth knowing the pressures exist, and being able to explain them, rather than knowing every new format's name.</p>
+
+<h4>Encryption and integrity</h4>
+<p>Parquet supports modular encryption: the footer and individual columns can be encrypted with different keys, so a table can expose non-sensitive columns to everyone while only principals with the right key decrypt, say, an email column. Pages can also carry CRC checksums (pyarrow's <code>write_page_checksum</code>, off by default) to detect corruption. Both are worth knowing because ML feature tables frequently mix sensitive and non-sensitive columns, and silent corruption in a training set is otherwise invisible.</p>
+</section>
+
+<section data-field="prod">
+<h4>How file formats hurt in production</h4>
+<p><strong>The JSON-forever bronze layer.</strong> Raw JSON is landed "temporarily" and never converted; analysts query it directly. Symptom: queries whose cost and runtime scale with total history, frequent parse failures, and type confusion (the same field as string in some files and number in others). Fix: convert to typed Parquet in silver with schema enforcement, and quarantine records that do not parse.</p>
+<p><strong>Small files from streaming and over-partitioned writes.</strong> Symptom: Spark jobs whose driver spends minutes planning, tens of thousands of tiny tasks each running for milliseconds, slow listings, a table-format metadata tree that keeps growing. Check file count and median file size per partition; a median under 32 MB is a red flag. Fix: coalesce or repartition before writing, longer trigger intervals, scheduled compaction.</p>
+<p><strong>Pushdown that silently stopped working.</strong> Symptom: a query that used to read a few gigabytes reads terabytes, after a writer change. Causes: a new writer that omits statistics, timestamps written as strings, a lost sort order, or a filter wrapped in a function (<code>WHERE date(ts) = …</code>) that the reader cannot push down. Check the query's "files read / bytes read" metrics and the footers of new files.</p>
+<p><strong>Precision and type drift.</strong> Timestamps written as INT96 (a legacy Impala/Hive encoding) by one writer and as INT64 microseconds by another; decimals written as doubles; integers that overflowed because a source widened its column. These show up as subtly wrong values in features, not as errors. Fix: pin types in the data contract and test new files against it.</p>
+<p><strong>Dictionary blow-up and memory.</strong> Writers buffering a whole row group of a very wide table can run out of memory; readers decoding large dictionaries for many columns at once can too. Symptom: writer OOM on wide feature tables. Fix: smaller row groups for wide tables, fewer columns per file, or splitting the table.</p>
+
+<h4>Tools and metrics</h4>
+<p><code>pyarrow.parquet.ParquetFile(path).metadata</code> (used in the lab) and the <code>parquet-cli</code> tool from parquet-java print row groups, column chunk sizes, encodings, codecs and statistics. Query engines report files and bytes scanned per query — the single most useful number for spotting a format or layout problem. Track per table: file count, median and p10 file size, bytes per row, and compression ratio over time.</p>
+
+<h4>The case: Uber's file-format cost work (2022)</h4>
+<p>In "Cost Efficiency @ Scale in Big Data File Format" (Uber Engineering blog, 25 January 2022, by Xinli Shang, Zheng Shao and Mohammad Islam), Uber describes reducing storage in its Parquet-dominated lake by changing how files are written, not what they contain. Before the project, the lake mainly used gzip and Snappy. On their ten largest Hive tables with zstd at the default level 3, they measured about 7% less storage than gzip, about 39% less than Snappy, and about 79% less than uncompressed. Read cost did not suffer: in their query benchmarks zstd's vCore-seconds were close to Snappy's on a full scan and much lower on queries with shuffles, filters and aggregations, because less data was read and moved. Testing levels 1 to 22 on 65 one-gigabyte files, they found size gains flattened while write time kept rising, and chose level 19 only for one-off offline conversion of existing gzip data.</p>
+<p>They also contributed tooling upstream: zstd support in parquet-java that no longer depended on Hadoop's native library (PARQUET-1866, in Parquet 1.12.0), a "trans-compression" command to recompress existing files without decoding the data (PARQUET-1949), and a column-pruning tool that copies files while skipping unused columns about 20 times faster than rewriting them with Spark (PARQUET-1800), after identifying unused columns from lineage and query audit logs. And they measured sort order: on one table with a UUID, a timestamp and latitude/longitude, sorting rows by UUID then time cut data size by 32%. Every idea in this lesson — codec choice, column removal, sort order — was worth petabytes at their scale.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> write a real Parquet file and read its anatomy and statistics yourself. Uses pandas and pyarrow from <code>C:\ra_projects\how-to-train-your-gpt\gpt_env</code> (pyarrow 25); about 15 minutes.</p>
+<ol>
+<li>Build a table of 1,000,000 rows with NumPy: <code>event_id</code> as <code>np.arange</code>, <code>ts</code> as sorted random milliseconds within one day, <code>user_id</code> as random integers up to 200,000, <code>event_type</code> chosen from 8 strings with uneven probabilities, <code>country</code> from 50 codes. Convert with <code>pa.table({...})</code>.</li>
+<li>Write it three ways with <code>pq.write_table</code>: <code>compression="none"</code>, <code>"snappy"</code> and <code>"zstd"</code>; also write it as CSV with <code>pyarrow.csv.write_csv</code>. Print <code>os.path.getsize</code> for each.</li>
+<li>Open the Snappy file with <code>md = pq.ParquetFile(path).metadata</code>. For each column, print <code>md.row_group(0).column(i).encodings</code>, <code>total_uncompressed_size</code>, <code>total_compressed_size</code> and the <code>statistics</code> min/max.</li>
+<li>Rewrite with <code>row_group_size=100_000</code>, print each row group's <code>ts</code> min and max, then read with <code>pq.read_table(path, columns=["event_type"], filters=[("ts", "&gt;=", t12), ("ts", "&lt;", t13)])</code>.</li>
+<li>Try next: shuffle the rows before writing (<code>table.take(np.random.permutation(n))</code>) and print the row-group ranges again.</li>
+</ol>
+<p><strong>What to look for.</strong> CSV should be roughly 3–4 times the Snappy file. <code>event_type</code>'s encoded size should be close to 1,000,000 × 3 bits = 375 KB, and <code>country</code>'s close to 750 KB — the bit-packing arithmetic made visible. <code>event_id</code>'s encodings should list both <code>RLE_DICTIONARY</code> and <code>PLAIN</code>: the dictionary fallback. With 10 sorted row groups, each <code>ts</code> range covers about 2.4 hours, so the filter can skip eight of them; after shuffling, every range spans the whole day and nothing can be skipped.</p>
+</section>
+
+<section data-field="drill">
+<p><b>Diagnose: the 40-minute feature query</b></p>
+<p>A nightly feature job computes, for each user, purchase counts over the last 7 days from a table <code>silver.events</code>. The table is 90 days of Parquet in S3, 300 GB in total, partitioned by date (one folder per day). The query filters <code>event_type = 'purchase'</code> and the last 7 days. It used to take 4 minutes; it now takes 40. The Spark UI shows it reads all 7 partitions fully: 23 GB, 240,000 files, 240,000 tasks. A month ago an upstream team switched landing from hourly batches to a streaming job with a 10-second trigger. What happened, and what do you change?</p>
+<details><summary>Answer</summary>
+<p><strong>Diagnosis.</strong> The date filter works (7 of 90 partitions), but inside each day there are now about 34,000 files (240,000 ÷ 7), averaging about 100 KB each (23 GB ÷ 240,000). That is the streaming job: one file per task per trigger. With 8,640 ten-second triggers a day and a handful of tasks per trigger, tens of thousands of files a day is exactly what to expect. The job is dominated by per-file overhead: listing, a footer read and a data read per file, and task scheduling — 240,000 tasks at even 10 ms of overhead each is 40 minutes of task time before any real work. The tiny files also kill pushdown: each holds a few seconds of mixed event types, so per-file statistics for <code>event_type</code> span many values, and every file must be opened just to learn that.</p>
+<p><strong>Fix in the short term.</strong> Compact each day into files of roughly 256 MB–1 GB: 23 GB ÷ 7 ≈ 3.3 GB per day becomes about 4–13 files per day. Sort within each compacted file by <code>event_type</code> then <code>ts</code>, so the purchase rows (about 2% of events) sit in a few row groups and the others are skipped from statistics. Run compaction daily (or hourly for the current day) as a maintenance job, and use a table format so the swap is atomic and readers never see duplicates.</p>
+<p><strong>Fix in the long term.</strong> Make the streaming writer coalesce its output (fewer tasks writing, a longer trigger such as one minute if freshness allows) and give the landing table a file-count and median-file-size check with an alert. Expected result: the 7-day read becomes about 30–90 files and, with sorting, reads well under 1 GB — back to a few minutes or less.</p>
+</details>
+</section>

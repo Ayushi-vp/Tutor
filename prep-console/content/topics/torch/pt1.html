@@ -1,0 +1,441 @@
+<!-- topic source for torch/pt1; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "pt1",
+  "t": "Tensors for real: storage, strides, views and dtypes",
+  "tag": "Tensors",
+  "sum": "A tensor is a view onto a flat block of memory: dtype, device, shape, strides and an offset. Why transpose is free, why view() fails, what in-place ops do to autograd, and how the NumPy bridge shares memory.",
+  "prereq": [
+    ["py1", "Python names are labels bound to objects; two names can point at the same mutable object, so a change through one is visible through the other."],
+    ["gpu4", "FP32 uses 4 bytes per number, FP16 and BF16 use 2; BF16 keeps FP32's exponent range but has only 8 bits of precision, FP16 has more precision but overflows above 65,504."],
+    ["mc11", "In the NumPy implementations a network is arrays plus hand-written forward and backward functions; every intermediate the backward pass needs is kept from the forward pass."]
+  ],
+  "myths": [
+    ["<code>x.t()</code> and <code>x.permute(...)</code> rearrange the numbers in memory.", "They only swap entries in the shape and stride lists. No byte moves, which is why they take the same time for a 10-element tensor and a 10-GB one. The cost is deferred: the result is usually non-contiguous, and the next operation that needs contiguous memory (a <code>view</code>, many custom kernels, some matmul paths) pays for the copy instead."],
+    ["<code>reshape</code> and <code>view</code> are the same thing.", "<code>view</code> never copies: it either reinterprets the existing memory or raises an error. <code>reshape</code> returns a view when one is possible and silently makes a copy when it is not. Code that relies on writes through the result reaching the original works with <code>view</code> and can silently stop working with <code>reshape</code>."],
+    ["Slicing a tensor gives you a smaller tensor that uses less memory.", "A basic slice is a view that keeps the whole storage alive. Keep <code>logits[:, -1]</code> from a 1 GB logits tensor in a list and you keep the full 1 GB per element. Call <code>.clone()</code> on the slice when you want to keep only what you sliced."],
+    ["<code>torch.from_numpy(a)</code> and <code>torch.tensor(a)</code> both just convert the array.", "<code>from_numpy</code> wraps the NumPy buffer with no copy, so later writes to <code>a</code> show up in the tensor and vice versa; <code>torch.tensor</code> always copies. Both keep NumPy's dtype, so a default NumPy float array becomes a float64 tensor, which then fails against float32 weights with \"mat1 and mat2 must have the same dtype\"."],
+    ["In-place operations are a free memory optimisation you should use everywhere.", "They save one allocation, but autograd keeps some inputs and outputs for the backward pass. If an in-place op overwrites one of those, the backward pass raises \"modified by an inplace operation\". On a leaf that requires grad they are refused outright. The saving is real only for large activations that nothing else needs."],
+    ["A tensor on the GPU is just a tensor with a flag set.", "Its storage lives in GPU memory that the CPU cannot read directly. Mixing it with a CPU tensor raises a device error, printing it or calling <code>.item()</code> copies data back and makes the CPU wait for the GPU, and <code>.numpy()</code> is refused until you call <code>.cpu()</code>."]
+  ],
+  "recap": [
+    "A tensor is metadata (dtype, device, shape, strides, storage offset) pointing into a storage, which is a flat, typed block of bytes on one device.",
+    "The address of element (i, j, …) is offset + i·stride[0] + j·stride[1] + …, counted in elements; a contiguous row-major tensor has strides that are running products of the trailing sizes.",
+    "Transpose, permute, slicing, expand, unsqueeze and view create new metadata over the same storage, so they are free and writes through them reach the original.",
+    "view() requires memory that can be described by new strides and raises otherwise; reshape() falls back to a copy; contiguous() copies only when the layout is not already row-major.",
+    "dtype decides bytes per element and numerical behaviour: parameters × bytes gives memory (7B × 2 bytes = 14 GB in BF16), and type promotion rules decide the result dtype when you mix them.",
+    "Every tensor has a version counter; in-place ops bump it, and autograd refuses to backpropagate through a saved tensor whose version changed.",
+    "torch.from_numpy and .numpy() share memory with no copy; torch.tensor copies; GPU tensors and tensors that require grad must be moved and detached first.",
+    "A small view keeps its whole storage alive, which is a classic slow memory leak; clone() the part you want to keep."
+  ],
+  "glossary": [
+    ["Advanced indexing", "Indexing with an integer tensor, a list or a boolean mask, such as <code>x[[0, 2]]</code>. It always copies, unlike basic slicing."],
+    ["Basic indexing", "Indexing with integers, slices (<code>a:b:c</code>), <code>None</code> and <code>...</code>. It always returns a view."],
+    ["BF16 (bfloat16)", "A 16-bit floating-point format with FP32's 8 exponent bits and 7 stored mantissa bits: the same range as FP32 with much less precision."],
+    ["Caching allocator", "PyTorch's GPU memory manager, which keeps freed blocks for reuse instead of returning them to the driver, so freed memory still shows as used in nvidia-smi."],
+    ["Contiguous", "Laid out in row-major order with no gaps, so the last dimension has stride 1 and each earlier stride is the product of the sizes after it."],
+    ["CUDA", "NVIDIA's platform for running general computation on its GPUs; in PyTorch, <code>cuda</code> is the device type for NVIDIA (and AMD ROCm) GPUs."],
+    ["Device", "Where a tensor's storage lives: <code>cpu</code>, <code>cuda:0</code>, <code>mps</code> or <code>meta</code> (shape only, no data)."],
+    ["dtype", "The element type of a tensor, such as float32, bfloat16 or int64; it fixes the bytes per element and the arithmetic rules."],
+    ["Element size", "Bytes per element for a dtype: 4 for float32, 2 for bfloat16 and float16, 8 for int64, 1 for bool and uint8."],
+    ["DTensor", "A tensor subclass that represents one logical tensor split or copied across many devices; FSDP2 (pt11) stores parameters this way."],
+    ["Expand", "Making a tensor appear larger along a size-1 dimension by giving that dimension stride 0, so every index reads the same memory."],
+    ["In-place operation", "An operation that writes its result into an existing tensor instead of allocating a new one; in PyTorch its name ends in an underscore, like <code>add_</code>."],
+    ["Leaf tensor", "A tensor that autograd did not compute from other tensors, typically a parameter or an input you created; gradients are accumulated into its <code>.grad</code> (taught fully in pt3)."],
+    ["Memory format", "The order in which a 4-D image tensor's dimensions are laid out in memory; <code>contiguous_format</code> is NCHW, <code>channels_last</code> is NHWC."],
+    ["Host–device synchronisation", "A point where the CPU (host) must wait for all queued GPU (device) work to finish, caused by reading a GPU value on the CPU, for example with .item() or print."],
+    ["Meta device", "A device that stores shape, dtype and strides but no data, used to compute output shapes or build huge models without allocating memory."],
+    ["NCHW / NHWC", "Orders for image tensors: batch, channels, height, width (PyTorch's logical order) versus batch, height, width, channels (the channels_last physical order)."],
+    ["Pinned memory", "CPU memory locked in place so the GPU can copy from it directly and asynchronously; needed for non_blocking transfers (pt5)."],
+    ["Reference counting","Tracking how many references point at an object and freeing it the moment the count reaches zero; CPython and PyTorch storages both work this way."],
+    ["Storage", "The flat, one-dimensional block of typed bytes on one device that one or more tensors look into."],
+    ["Storage offset", "The index in the storage where a tensor's element [0, 0, …] lives."],
+    ["Stride", "For each dimension, how many elements to skip in storage to move one step along that dimension."],
+    ["Type promotion", "The rule that picks the result dtype when an operation mixes dtypes, for example int64 + float32 → float32."],
+    ["Version counter", "A counter on each tensor (shared by its views) that every in-place write increments; autograd uses it to detect that a saved tensor was overwritten."],
+    ["View", "A tensor that shares storage with another tensor but has its own shape, strides and offset."]
+  ],
+  "qa": [
+    ["E", "What is a tensor in PyTorch, physically?", "It is a small metadata object — dtype, device, shape, strides and a storage offset — that points into a storage, a flat block of bytes on one device. Many tensors can share one storage with different metadata; those are views. Element (i, j) lives at offset + i·stride[0] + j·stride[1] in the storage, counted in elements."],
+    ["E", "What does contiguous() do, and when do you need it?", "It returns the tensor itself if the memory is already in row-major order, and otherwise copies it into a new row-major storage. You need it before view() on a transposed or permuted tensor, before passing data to code that assumes a flat layout (custom CUDA or C++ kernels, some export paths), and sometimes to speed up an operation that reads the last dimension many times.", "Follow-up: Why not call it everywhere to be safe? — When the tensor is already contiguous it is free, but when it is not, every call is a full memory copy; sprinkling it through a model can add gigabytes of traffic per step."],
+    ["E", "What is the difference between torch.tensor(a) and torch.from_numpy(a)?", "torch.tensor always copies the data into a new storage. torch.from_numpy wraps NumPy's buffer without copying, so the tensor and the array share memory and writes through either are visible in both. Both keep the array's dtype, which for a default NumPy float array is float64."],
+    ["M", "x is a 3×4 float32 tensor. Give the strides of x and of x.t(), and say whether x.t().view(12) works.", "x has strides (4, 1): four elements to the next row, one to the next column. x.t() has shape 4×3 and strides (1, 4) over the same storage. view(12) needs the 12 elements in order with a single stride, but reading x.t() in row-major order visits storage positions 0, 4, 8, 1, 5, … , so no single stride exists and view raises; reshape(12) or contiguous().view(12) works by copying.", "Follow-up: Which ops are guaranteed to return a view? — Basic indexing, view, transpose/t, permute, expand, unsqueeze/squeeze, narrow, select, unflatten, split and chunk, diagonal; the docs' Tensor Views page lists them. Advanced indexing never does, and reshape/contiguous only sometimes."],
+    ["M", "How much GPU memory do the weights of a 7-billion-parameter model need in FP32, BF16 and INT8?", "Bytes = parameters × element size. 7×10^9 × 4 = 28 GB in FP32, × 2 = 14 GB in BF16, × 1 = 7 GB in INT8 (about 26, 13 and 6.5 GiB). This is the weights only; training also needs gradients, optimiser state and activations, which is why a 7B model does not train on one 24 GB card without tricks.", "Follow-up: How much does AdamW add on top in plain FP32 training? — Two FP32 moment tensors per parameter: 2 × 28 GB = 56 GB, plus 28 GB of FP32 gradients, so about 112 GB before activations."],
+    ["M", "Why does PyTorch raise 'one of the variables needed for gradient computation has been modified by an inplace operation'?", "Some backward formulas need tensors from the forward pass, for example sigmoid's backward needs its output. Autograd records the version counter of every tensor it saves. An in-place op such as mul_ increments the counter; when backward runs and finds version 1 where it recorded version 0, it knows the saved data is no longer what the forward pass produced and raises instead of returning a wrong gradient. Fix by using the out-of-place op, or by cloning before modifying.", "Follow-up: Then why does y.add_(1) after z = y * 3 work fine? — Multiplication by a constant does not need y in its backward (the gradient is just 3), so y was never saved and changing it is harmless."],
+    ["M", "A training job's memory grows by a few hundred megabytes every evaluation, and never comes back. You see code appending logits[:, -1] to a list. What is happening?", "logits[:, -1] is a basic slice, so it is a view that keeps the entire logits storage alive. If logits is batch × sequence × vocabulary, the list holds the full tensor for every step, not the last position. Append logits[:, -1].clone() (or .detach().cpu() if you only need the values on the host), and if the tensor came from a graph, detach it so the graph is also freed."],
+    ["M", "What does expand() do in memory, and why is writing into an expanded tensor an error?", "expand makes a size-1 dimension appear larger by setting its stride to 0, so all indices along it read the same elements; nothing is copied. An in-place write would need several logical elements to receive different values while sharing one memory location, so PyTorch raises 'more than one element of the written-to tensor refers to a single memory location'. Use repeat() or clone() when you need real, writable copies."],
+    ["M", "What are the type promotion rules you need to know day to day?", "Mixing categories promotes to the higher category: integer with float gives float, using the default float dtype (float32) when the float side is a Python scalar. A dimensioned tensor's dtype wins over a zero-dimensional tensor or Python scalar of the same category, so a float16 tensor times 2.0 stays float16. True division of integers gives float; floor division keeps integer. Sums of integer tensors accumulate in int64.", "Follow-up: What happens when you sum 70,000 ones stored in float16? — The result overflows to inf because float16's maximum is 65,504; reductions on half types should accumulate in float32, which is what autocast arranges for many ops."],
+    ["H", "Explain what happens, step by step, when you call x.permute(0, 2, 3, 1).contiguous() on an 8×3×32×32 tensor, and what channels_last memory format is.", "permute only reorders shape and strides: (8, 3, 32, 32) with strides (3072, 1024, 32, 1) becomes (8, 32, 32, 3) with strides (3072, 32, 1, 1024) — no copy. contiguous() then allocates a new 24,576-element storage and copies so the result has strides (3072, 96, 3, 1). channels_last is the same physical layout (NHWC) while keeping the logical NCHW shape: an NCHW tensor in channels_last has strides (3072, 1, 96, 3), which convolution kernels on tensor cores often prefer.", "Follow-up: Why keep the NCHW shape instead of just permuting? — So the model code and every layer's indexing stay unchanged; only the memory order changes, and operators that support channels_last pick faster kernels."],
+    ["H", "When is an in-place operation safe for autograd, and why does PyTorch not use copy-on-write to make all of them safe?", "It is safe when the overwritten tensor is not saved by any operation whose backward still has to run, and when it is not a leaf that requires grad. The PyTorch paper explains the choice: a versioning system detects unsafe mutations, and copy-on-write was rejected because it would add cost and hidden copies to every program while unsafe mutation is rare and easy to fix once reported.", "Follow-up: How would you find which in-place op broke it in a large model? — Turn on torch.autograd.set_detect_anomaly(True); the error then carries the forward stack trace of the op whose saved tensor was modified."],
+    ["H", "You load a NumPy dataset into a model and training is twice as slow and uses twice the memory you expected. What do you check?", "The dtype. NumPy defaults to float64, from_numpy keeps it, and if the model was built in float64 to match (or the inputs are cast late) every activation is 8 bytes and runs on float64 kernels, which are far slower than float32 on GPUs, especially consumer cards. Cast once at the data boundary with .float() or torch.from_numpy(a.astype(np.float32)), and assert the dtype in the first batch.", "Follow-up: Where else does float64 sneak in? — torch.tensor of Python floats is float32, but torch.from_numpy, pandas .values and some loss weights created with NumPy are float64; torch.set_default_dtype changes the default for everything and is rarely what you want."],
+    ["H", "How would you build a sliding-window view of a 1-D signal (window 128, step 64) without copying, and what is the risk?", "Use x.unfold(0, 128, 64), which returns a view of shape (num_windows, 128) whose strides are (64, 1): each row starts 64 elements after the previous one and rows overlap. The risk is that overlapping views share memory, so an in-place write to one window changes its neighbours, and PyTorch refuses in-place ops that write overlapping memory. Treat the result as read-only or clone it before modifying."]
+  ],
+  "refs": [
+    ["docs", "PyTorch 2.14 — Tensor Views", "Which operations return views, how views share storage, and how to tell a view from a copy.", "https://docs.pytorch.org/docs/2.14/tensor_view.html"],
+    ["docs", "PyTorch 2.14 — Tensor Attributes (dtype, device, layout, type promotion)", "The dtype table and the exact type promotion rules for tensors, zero-dim tensors and Python scalars.", "https://docs.pytorch.org/docs/2.14/tensor_attributes.html"],
+    ["paper", "Paszke et al. — PyTorch: An Imperative Style, High-Performance Deep Learning Library (NeurIPS 2019)", "The design paper: the tensor versioning system for safe mutation (and why copy-on-write was rejected), reference counting that frees memory immediately, and the caching allocator.", "https://arxiv.org/abs/1912.01703"],
+    ["docs", "PyTorch 2.14 — Autograd mechanics: in-place operations", "Why in-place operations are discouraged with autograd and how the version-counter correctness check works.", "https://docs.pytorch.org/docs/2.14/notes/autograd.html"],
+    ["docs", "PyTorch 2.14 — torch.from_numpy", "Memory sharing with NumPy arrays and the dtypes that are supported.", "https://docs.pytorch.org/docs/2.14/generated/torch.from_numpy.html"],
+    ["docs", "PyTorch tutorials — Channels Last Memory Format", "How channels_last strides work and when convolution kernels benefit.", "https://docs.pytorch.org/tutorials/intermediate/memory_format_tutorial.html"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>Imagine a NumPy-fluent engineer on day one of a PyTorch codebase. They write <code>attn = q @ k.transpose(-2, -1)</code>, then try to flatten something with <code>.view(batch, -1)</code> and get an error about a view size "not compatible with input tensor's size and stride". They switch to <code>.reshape</code> because a forum post said so. It works. A week later a teammate's code writes into the result of a <code>reshape</code>, expecting the change to reach the original tensor, and it silently does not — because this time <code>reshape</code> made a copy. Elsewhere, an evaluation loop appends <code>logits[:, -1]</code> to a list and the process's memory climbs by hundreds of megabytes per batch until it dies, even though each saved item "only" has one position. And when they feed a NumPy array to the model, they get "mat1 and mat2 must have the same dtype, but got Double and Float".</p>
+<p>None of these are exotic. They all come from one fact that a NumPy-shaped intuition hides: a PyTorch tensor is not a box of numbers. It is a small description — what type of number, on which device, what shape, and how to walk through memory — that points into a separate block of bytes. Several tensors can point into the same block. Some operations make a new description and move nothing; some move every byte. Some modify memory that other tensors, and the autograd engine, are still relying on.</p>
+<p>In an ML-debugging interview, these are the first bugs planted, because they produce wrong results or crashes far from their cause. The interviewer wants to hear you reason from the memory model: "this is a view, so this write changes the original", "this slice keeps the whole storage alive", "this in-place op overwrote a tensor autograd saved".</p>
+<p>This lesson builds that model from the ground up: storage and metadata, the stride formula with worked examples, which operations make views and which copy, what <code>contiguous()</code> really does, dtypes and the memory arithmetic they imply, devices, in-place operations and the version counter that protects autograd, and the zero-copy bridge to NumPy. Everything is checked against PyTorch 2.14, the current release on 8 October 2026.</p>
+</section>
+
+<section data-field="primer">
+<p>Start with a bookshelf. A <strong>storage</strong> is one long shelf of numbered slots, each holding one number of the same type: slot 0, slot 1, slot 2 and so on. The shelf lives in one room — the CPU's main memory or a particular GPU's memory. A <strong>tensor</strong> is a reading guide for that shelf: "start at slot 0; my data is 3 rows by 4 columns; to go to the next row, skip 4 slots; to go to the next column, skip 1 slot". Two different reading guides can describe the same shelf in different ways. One says "3 rows of 4"; another says "4 rows of 3, where moving down a row skips 1 slot and moving along a row skips 4". The second guide is the transpose of the first, and producing it required writing a new guide, not rearranging the shelf.</p>
+<p>That reading guide is the tensor's metadata. It has five parts:</p>
+<ul>
+<li><strong>dtype</strong> — the type of number in every slot (float32, bfloat16, int64, bool…), which fixes how many bytes each slot takes.</li>
+<li><strong>device</strong> — which room the shelf is in: <code>cpu</code>, <code>cuda:0</code>, <code>mps</code> (Apple GPUs) or <code>meta</code> (no shelf at all, just the guide).</li>
+<li><strong>shape</strong> (also called size) — how many entries along each dimension, such as <code>(3, 4)</code>.</li>
+<li><strong>strides</strong> — for each dimension, how many slots to skip to take one step along it, such as <code>(4, 1)</code>.</li>
+<li><strong>storage offset</strong> — which slot holds the first element.</li>
+</ul>
+<p>With those five numbers, the position of any element is simple arithmetic: <em>slot = offset + i × stride[0] + j × stride[1] + …</em>. For a fresh 3×4 tensor with strides (4, 1) and offset 0, element [2, 1] is at slot 0 + 2·4 + 1·1 = 9.</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="One storage of 12 slots read by two tensors: x with shape 3 by 4 and strides 4,1, and its transpose with shape 4 by 3 and strides 1,4">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">Storage (12 float32 slots, 48 bytes, one block of memory)</text>
+    <g style="font-family:var(--mono)">
+      <rect x="20" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="45" y="54" text-anchor="middle" style="fill:var(--ink)">0</text>
+      <rect x="70" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="95" y="54" text-anchor="middle" style="fill:var(--ink)">1</text>
+      <rect x="120" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="145" y="54" text-anchor="middle" style="fill:var(--ink)">2</text>
+      <rect x="170" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="195" y="54" text-anchor="middle" style="fill:var(--ink)">3</text>
+      <rect x="220" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="245" y="54" text-anchor="middle" style="fill:var(--ink)">4</text>
+      <rect x="270" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="295" y="54" text-anchor="middle" style="fill:var(--ink)">5</text>
+      <rect x="320" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="345" y="54" text-anchor="middle" style="fill:var(--ink)">6</text>
+      <rect x="370" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="395" y="54" text-anchor="middle" style="fill:var(--ink)">7</text>
+      <rect x="420" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="445" y="54" text-anchor="middle" style="fill:var(--ink)">8</text>
+      <rect x="470" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="495" y="54" text-anchor="middle" style="fill:var(--ink)">9</text>
+      <rect x="520" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="545" y="54" text-anchor="middle" style="fill:var(--ink)">10</text>
+      <rect x="570" y="34" width="50" height="30" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="595" y="54" text-anchor="middle" style="fill:var(--ink)">11</text>
+    </g>
+    <text x="20" y="100" style="fill:var(--ink);font-weight:600">x: shape (3, 4), strides (4, 1)</text>
+    <text x="20" y="116" style="fill:var(--muted)">next row = skip 4 slots, next column = skip 1</text>
+    <g style="font-family:var(--mono)">
+      <text x="30" y="146" style="fill:var(--ink)">[ 0  1  2  3]</text>
+      <text x="30" y="166" style="fill:var(--ink)">[ 4  5  6  7]</text>
+      <text x="30" y="186" style="fill:var(--ink)">[ 8  9 10 11]</text>
+    </g>
+    <text x="340" y="100" style="fill:var(--ink);font-weight:600">x.t(): shape (4, 3), strides (1, 4)</text>
+    <text x="340" y="116" style="fill:var(--muted)">same 48 bytes, new reading guide</text>
+    <g style="font-family:var(--mono)">
+      <text x="350" y="146" style="fill:var(--ink)">[ 0  4  8]</text>
+      <text x="350" y="166" style="fill:var(--ink)">[ 1  5  9]</text>
+      <text x="350" y="186" style="fill:var(--ink)">[ 2  6 10]</text>
+      <text x="350" y="206" style="fill:var(--ink)">[ 3  7 11]</text>
+    </g>
+    <rect x="20" y="230" width="600" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="34" y="252" style="fill:var(--ink)">element [2, 1] of x  → slot 0 + 2·4 + 1·1 = 9</text>
+    <text x="34" y="274" style="fill:var(--ink)">element [1, 2] of x.t() → slot 0 + 1·1 + 2·4 = 9   (the same number)</text>
+  </g>
+</svg>
+<figcaption>Transposing wrote a new shape and stride list; the 48 bytes did not move. Reading x.t() row by row jumps around storage (0, 4, 8, 1, …), which is exactly what "not contiguous" means.</figcaption>
+</figure>
+
+<p>Three consequences follow, and the rest of the lesson unpacks each one. First, many operations — transpose, permute, slicing, adding a dimension — only write a new reading guide. They are free, and they create <strong>views</strong>: tensors that share a storage, so writing through one changes what the others see. Second, some reading guides describe memory that is jumbled relative to plain row-major order (non-<strong>contiguous</strong>), and some operations need it unjumbled, which forces a real copy. Third, because several tensors can see the same bytes, writing into a tensor in place is risky: something else, including the autograd engine that computes gradients, may still need the old value.</p>
+<p>Where the analogy breaks: a real shelf is either in one room or another, but a PyTorch storage on a GPU is not readable from the CPU at all without an explicit copy, and that copy costs time. Also, the slots are all exactly the same width — you cannot mix float32 and int64 on one shelf; changing dtype means a new shelf (or, rarely, reinterpreting the same bytes, which <code>view(dtype)</code> does on purpose).</p>
+<p>If you remember one sentence: <em>a tensor is a view onto storage, described by dtype, device, shape, strides and offset; ask of every operation whether it changes the description or the bytes</em>.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Making tensors, and the dtype you get by default</h4>
+<p>You create tensors from Python data, from NumPy, or with a factory function. The dtype you get depends on how:</p>
+<pre>import torch, numpy as np
+torch.tensor([1, 2]).dtype            # torch.int64   (Python ints → int64)
+torch.tensor([1.0, 2]).dtype          # torch.float32 (Python floats → the default float dtype)
+torch.zeros(3, 4).dtype               # torch.float32
+torch.from_numpy(np.arange(3.0)).dtype  # torch.float64 (NumPy's default float)
+torch.get_default_dtype()             # torch.float32</pre>
+<p>The <strong>default float dtype</strong> is float32. Factory functions such as <code>zeros</code>, <code>ones</code>, <code>randn</code> and <code>empty</code> use it unless you pass <code>dtype=</code>. Python integers become int64, the 8-byte integer, because indices into large tensors can exceed 2<sup>31</sup>. NumPy arrays keep their own dtype, and NumPy's default float is float64 — that single fact causes a large share of "expected Float but found Double"-style errors.</p>
+<p><code>torch.empty</code> deserves a word: it allocates storage without initialising it, so it contains whatever bytes were there. It is the fastest constructor and the right one when you will overwrite every element; it is a bug when you forget to.</p>
+
+<h4>2. dtype: bytes per element, range and precision</h4>
+<p>The dtype fixes three things: how many bytes each element takes (its <strong>element size</strong>), the range of values it can hold, and how finely it can distinguish nearby values. The ones you will meet constantly:</p>
+<table>
+<thead><tr><th>dtype</th><th>Bytes</th><th>What it is for</th><th>Watch out for</th></tr></thead>
+<tr><td>float32</td><td>4</td><td>Default parameters, optimiser state, safe reductions</td><td>Twice the memory and much slower matmuls than 16-bit on modern GPUs</td></tr>
+<tr><td>bfloat16</td><td>2</td><td>Training and inference activations and weights</td><td>Only about 3 significant decimal digits: 257 rounds to 256</td></tr>
+<tr><td>float16</td><td>2</td><td>Inference, older GPUs, training with loss scaling</td><td>Overflows above 65,504</td></tr>
+<tr><td>float64</td><td>8</td><td>Scientific code, gradient checks</td><td>Very slow on most GPUs; usually arrives by accident from NumPy</td></tr>
+<tr><td>int64 (long)</td><td>8</td><td>Indices, token ids, class labels</td><td>Loss functions expect int64 targets</td></tr>
+<tr><td>int32, int8, uint8</td><td>4, 1, 1</td><td>Compact ids, quantised weights, image bytes</td><td>uint8 arithmetic wraps around: 250 + 10 = 4</td></tr>
+<tr><td>bool</td><td>1</td><td>Masks</td><td>One byte per element, not one bit</td></tr>
+</table>
+<p>Memory arithmetic follows directly: bytes = number of elements × element size. A 7-billion-parameter model's weights need 7×10<sup>9</sup> × 4 = 28 GB in float32, 14 GB in bfloat16, 7 GB in int8. A batch of 32 sequences × 2,048 tokens × vocabulary 50,257 of float32 logits is 32 × 2,048 × 50,257 × 4 bytes ≈ 13.2 GB — which is why logits are a classic out-of-memory culprit and why careful code never materialises them in float32 at full size (pt7 returns to this).</p>
+<p>Precision matters too. bfloat16 keeps float32's 8-bit exponent, so it covers the same range (up to about 3.4×10<sup>38</sup>), but has only 8 bits of significand precision, so between 256 and 512 it can only represent even numbers. Running it here: <code>torch.tensor(257., dtype=torch.bfloat16)</code> prints 256. float16 is the opposite trade: 11 bits of precision but a maximum of 65,504, so summing 70,000 ones in float16 gives <code>inf</code>. The general rule, which gpu4 covers in depth: store and multiply in 16 bits, accumulate sums in 32.</p>
+
+<h4>3. Type promotion: what dtype comes out when you mix them</h4>
+<p>When an operation receives different dtypes, PyTorch picks a result dtype by <strong>type promotion</strong>. The rules are ordered by category — bool, then integer, then floating point, then complex — and by whether the operand is a "real" tensor with dimensions, a zero-dimensional tensor, or a plain Python number.</p>
+<ol>
+<li>If the categories differ, the result takes the higher category. <code>int64 tensor + 0.5</code> is float; since the float side is a Python scalar, PyTorch uses the default float dtype, float32.</li>
+<li>Within one category, a dimensioned tensor's dtype beats zero-dimensional tensors and Python scalars. A float16 activation times <code>2.0</code> stays float16, which is what you want — a Python constant should not double your memory.</li>
+<li>Among dimensioned tensors of the same category, the wider type wins: float16 + float32 → float32.</li>
+<li>If a zero-dimensional tensor is of a higher category than every dimensioned operand, the result is wide enough for it: an int32 tensor times a float64 zero-dimensional tensor gives float64 (checked on 2.14).</li>
+</ol>
+<p>Two everyday consequences. Division with <code>/</code> is always true division, so <code>torch.tensor([3]) / torch.tensor([2])</code> is a float tensor holding 1.5; use <code>//</code> for floor division, which stays integer. And in-place operations cannot change a tensor's dtype: <code>int_tensor.add_(0.5)</code> raises, because the result would have to be float but the storage is int.</p>
+
+<h4>4. Converting dtypes: .to(), .float(), .long() and view(dtype)</h4>
+<p>Changing dtype is always a new tensor with new storage, because the bytes per element change: <code>x.float()</code>, <code>x.half()</code>, <code>x.bfloat16()</code>, <code>x.long()</code> and <code>x.to(torch.bfloat16)</code> all allocate and convert every element. If the tensor already has that dtype they return it unchanged, with no copy — which means code like <code>y = x.float(); y.add_(1)</code> modifies <code>x</code> when <code>x</code> was already float32 and leaves it alone when it was float16. That is the same "sometimes a view, sometimes a copy" trap as <code>reshape</code>, and the fix is the same: never rely on which one happened, and <code>clone()</code> when you need ownership.</p>
+<p>Conversions round. Float to integer truncates toward zero (<code>torch.tensor([2.7, -2.7]).long()</code> is [2, -2]); float32 to bfloat16 rounds to the nearest representable value, which is how 257 became 256. Converting back does not restore lost digits. <code>.to()</code> can change dtype and device in one call, <code>x.to("cuda", torch.bfloat16)</code>, and <code>x.to(other)</code> matches another tensor's dtype and device — handy in a module that must create a tensor "like" its input.</p>
+<p>One conversion does not copy on purpose: <code>x.view(torch.int32)</code> on a float32 tensor reinterprets the same bytes as integers (1.0 becomes 1065353216, its IEEE-754 bit pattern). That is used for bit tricks and packed quantised formats; used by accident, it produces garbage with no error, so when you see <code>view</code> with a dtype argument, slow down.</p>
+
+<h4>5. Device: where the storage lives</h4>
+<p>A tensor's <strong>device</strong> names the memory holding its storage. <code>cpu</code> is main memory. <code>cuda:0</code>, <code>cuda:1</code> are NVIDIA GPUs (AMD GPUs under ROCm also appear as <code>cuda</code>). <code>mps</code> is Apple's GPU. <code>meta</code> is special: it records dtype, shape and strides but allocates nothing, so you can build a 70-billion-parameter model on the meta device in milliseconds to inspect its shapes, and materialise the real weights later — pt8 and pt11 use this.</p>
+<p>Operations require all tensor inputs on the same device (zero-dimensional CPU tensors are an allowed exception). Mixing raises "Expected all tensors to be on the same device". <code>x.to("cuda")</code> or <code>x.cuda()</code> copies to the GPU and returns a new tensor; if <code>x</code> is already there, it returns <code>x</code> itself.</p>
+<p>The cost model is the important part. A GPU runs operations <em>asynchronously</em>: the CPU queues work and moves on. Anything that needs a GPU value on the CPU — <code>.item()</code>, <code>print(x)</code>, <code>.cpu()</code>, <code>.tolist()</code>, an <code>if</code> on a tensor — forces the CPU to wait until the GPU has finished everything queued before. That wait is called a <strong>host–device synchronisation</strong>, and pt12 shows how one stray <code>.item()</code> per step can cost 10-30% of throughput. Copies from CPU to GPU can overlap with compute only if the CPU memory is <em>pinned</em> (locked so the GPU can read it directly) and you pass <code>non_blocking=True</code>; pt5 covers that.</p>
+
+<h4>6. Shape, strides and the address formula</h4>
+<p>Now the heart of it. A <strong>stride</strong> is, for each dimension, how many elements to skip in storage to move one step along that dimension. For a freshly allocated tensor in row-major (C) order, the last dimension has stride 1 and each earlier stride is the product of all the sizes after it. A tensor of shape (2, 3, 4) has strides (12, 4, 1): one step along dimension 0 skips a whole 3×4 block of 12, one step along dimension 1 skips a row of 4.</p>
+<p>The position in storage of element (i<sub>0</sub>, i<sub>1</sub>, …) is</p>
+<pre>slot = storage_offset + i0*stride[0] + i1*stride[1] + ...
+byte address = storage_base + slot * element_size</pre>
+<p>Strides are counted in elements, not bytes (NumPy counts bytes, a frequent confusion when moving between the two). A worked trace on the tensor <code>x = torch.arange(12.).reshape(3, 4)</code>, checked on 2.14:</p>
+<table>
+<thead><tr><th>Expression</th><th>Shape</th><th>Strides</th><th>Offset</th><th>Contiguous?</th></tr></thead>
+<tr><td><code>x</code></td><td>(3, 4)</td><td>(4, 1)</td><td>0</td><td>yes</td></tr>
+<tr><td><code>x.t()</code></td><td>(4, 3)</td><td>(1, 4)</td><td>0</td><td>no</td></tr>
+<tr><td><code>x[1]</code> (one row)</td><td>(4,)</td><td>(1,)</td><td>4</td><td>yes</td></tr>
+<tr><td><code>x[:, 1]</code> (one column)</td><td>(3,)</td><td>(4,)</td><td>1</td><td>no</td></tr>
+<tr><td><code>x[:, ::2]</code></td><td>(3, 2)</td><td>(4, 2)</td><td>0</td><td>no</td></tr>
+<tr><td><code>x.unsqueeze(0)</code></td><td>(1, 3, 4)</td><td>(12, 4, 1)</td><td>0</td><td>yes</td></tr>
+</table>
+<p>Read the column slice: to get <code>x[:, 1]</code> = [1, 5, 9], start at slot 1 and step 4 each time. No data moved; the tensor just describes "every fourth slot starting at 1". All of these share the same 48-byte storage, which you can confirm with <code>x[:, 1].data_ptr()</code> pointing 4 bytes past <code>x.data_ptr()</code> or with <code>x.untyped_storage().data_ptr()</code> being equal for all of them.</p>
+
+<h4>7. Views: which operations share storage</h4>
+<p>A <strong>view</strong> is a tensor that shares storage with another (its base) and differs only in metadata. The PyTorch docs list the view operations; the ones you use daily are:</p>
+<ul>
+<li><strong>Basic indexing</strong> — integers, slices <code>a:b:c</code>, <code>None</code> and <code>...</code>.</li>
+<li><code>view</code>, <code>unflatten</code>, <code>flatten</code> (when possible), <code>unsqueeze</code>, <code>squeeze</code>.</li>
+<li><code>t</code>, <code>transpose</code>, <code>permute</code>, <code>mT</code>, <code>movedim</code>.</li>
+<li><code>expand</code>, <code>narrow</code>, <code>select</code>, <code>split</code>, <code>chunk</code>, <code>unbind</code>, <code>diagonal</code>, <code>unfold</code>, <code>as_strided</code>.</li>
+<li><code>detach</code> — a view that shares data but is cut off from autograd (pt3).</li>
+</ul>
+<p>Operations that always <em>copy</em>: <strong>advanced indexing</strong> (an integer tensor or list, <code>x[[0, 2]]</code>, or a boolean mask <code>x[x &gt; 0]</code>), <code>clone</code>, <code>repeat</code>, arithmetic that produces new values, and <code>.to()</code> with a different dtype or device. Operations that <em>sometimes</em> copy: <code>reshape</code>, <code>contiguous</code>, <code>flatten</code>. Treat "sometimes" as a warning label — code should never rely on whether they did.</p>
+<p>Writes go through views both ways:</p>
+<pre>x = torch.zeros(3, 4)
+row = x[1]          # view
+row.fill_(7.0)      # x[1] is now all 7s
+col = x[:, 0]
+col += 1            # in-place on a view: x[:, 0] is now 1, 8, 1</pre>
+<p>Advanced indexing on the left of an assignment is different: <code>x[[0, 2]] = 5</code> is translated into an in-place <code>index_put_</code> on <code>x</code> and does modify it, but <code>y = x[[0, 2]]; y += 5</code> modifies a copy and leaves <code>x</code> unchanged. This asymmetry is a favourite planted bug.</p>
+
+<h4>8. Contiguity, view() versus reshape(), and the cost of contiguous()</h4>
+<p>A tensor is <strong>contiguous</strong> when its elements, read in row-major order, sit one after another in storage with no gaps or jumps — equivalently, its strides equal the row-major strides for its shape. <code>x</code> is contiguous; <code>x.t()</code> is not, because reading it row by row visits slots 0, 4, 8, 1, 5, 9, …</p>
+<p><code>view(new_shape)</code> must express the new shape with strides over the <em>same</em> memory. For <code>x.t().view(12)</code> it would need one stride that walks 0, 4, 8, 1, … — impossible — so PyTorch raises "view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead." (the exact 2.14 message). <code>reshape</code> tries a view first and, failing that, copies into new contiguous storage. <code>contiguous()</code> returns the tensor itself when it is already contiguous and a row-major copy otherwise.</p>
+<p>What does the copy cost? It is a read and a write of every byte. For the 13.2 GB logits tensor above, a <code>contiguous()</code> moves 26 GB of memory traffic; on a GPU with about 3 TB/s of memory bandwidth that is roughly 9 ms, every time. That is why you want to know whether your reshapes copy, and why attention code arranges its permutes so that the expensive matmuls receive layouts they like.</p>
+<p>The pattern you will see in every transformer (and in pt10):</p>
+<pre># x: (B, T, C) → split heads → (B, nh, T, hs)
+q = q.view(B, T, nh, hs).transpose(1, 2)        # view, then free transpose
+y = attention(q, k, v)                           # (B, nh, T, hs)
+y = y.transpose(1, 2).contiguous().view(B, T, C) # undo: needs the copy</pre>
+<p>The last line is where the copy happens: after transposing back, heads and time are interleaved in memory, so the merge into C channels needs <code>contiguous()</code> before <code>view</code>.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Decision flow: view either reinterprets memory or raises; reshape tries a view then copies; contiguous returns self or copies">
+  <defs><marker id="pt1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="230" y="12" width="180" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="320" y="30" text-anchor="middle" style="fill:var(--ink)">Can the new shape be</text>
+    <text x="320" y="45" text-anchor="middle" style="fill:var(--ink)">expressed with new strides?</text>
+    <line x1="270" y1="52" x2="150" y2="100" marker-end="url(#pt1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="180" y="72" style="fill:var(--good)">yes</text>
+    <line x1="370" y1="52" x2="490" y2="100" marker-end="url(#pt1-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="440" y="72" style="fill:var(--crit)">no</text>
+    <rect x="40" y="102" width="220" height="70" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="150" y="122" text-anchor="middle" style="fill:var(--ink);font-weight:600">Shares storage</text>
+    <text x="150" y="140" text-anchor="middle" style="fill:var(--ink-2)">view(): returns a view</text>
+    <text x="150" y="156" text-anchor="middle" style="fill:var(--ink-2)">reshape(): returns a view</text>
+    <rect x="380" y="102" width="220" height="70" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="490" y="122" text-anchor="middle" style="fill:var(--ink);font-weight:600">Needs a copy</text>
+    <text x="490" y="140" text-anchor="middle" style="fill:var(--ink-2)">view(): raises RuntimeError</text>
+    <text x="490" y="156" text-anchor="middle" style="fill:var(--ink-2)">reshape(): silently copies</text>
+    <rect x="40" y="196" width="560" height="52" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="320" y="216" text-anchor="middle" style="fill:var(--ink)">contiguous(): already row-major → returns the same tensor (free)</text>
+    <text x="320" y="236" text-anchor="middle" style="fill:var(--ink)">otherwise → allocates new storage and copies every element</text>
+  </g>
+</svg>
+<figcaption>view() gives you a guarantee (no copy, writes reach the base) or an error; reshape() gives you a result whose sharing you cannot rely on.</figcaption>
+</figure>
+
+<h4>9. Stride 0 and expand(); memory formats</h4>
+<p>A stride can be zero. <code>torch.tensor([1., 2., 3.]).expand(4, 3)</code> has shape (4, 3) and strides (0, 1): moving down a row skips nothing, so all four rows read the same three numbers. This is how broadcasting (pt2) works without copying. Reading is fine; writing is not, because four logical elements share one memory slot: <code>expanded.add_(1)</code> raises "more than one element of the written-to tensor refers to a single memory location. Please clone() the tensor before performing the operation." <code>repeat(4, 1)</code> makes a real 12-element copy you can write.</p>
+<p>Strides also let one logical shape have different physical orders. Image tensors are logically NCHW (batch, channels, height, width). The <strong>channels_last</strong> memory format keeps that logical shape but stores the data NHWC: an 8×3×32×32 tensor converted with <code>.to(memory_format=torch.channels_last)</code> has strides (3072, 1, 96, 3) — channel varies fastest. Convolution kernels on NVIDIA tensor cores are often faster in that layout, and pt12 measures it. Because the logical shape did not change, the rest of the model's code does not change either.</p>
+
+<h4>10. In-place operations and the version counter</h4>
+<p>An <strong>in-place operation</strong> writes its result into an existing tensor's storage instead of allocating new memory. By convention its name ends in an underscore: <code>add_</code>, <code>mul_</code>, <code>relu_</code>, <code>zero_</code>, <code>copy_</code>. Augmented assignment on tensors (<code>x += 1</code>) and slice assignment (<code>x[0] = 5</code>) are in place too. They save an allocation, which matters for very large activations.</p>
+<p>The danger comes from the autograd engine — the part of PyTorch that records operations during the forward pass and runs them backwards to compute gradients (pt3 teaches it properly; for now, think of it as "the forward pass leaves a trail of saved tensors that the backward pass reads"). Many backward formulas need values from the forward pass. Sigmoid's derivative is σ(x)(1 − σ(x)), so sigmoid saves its <em>output</em>. If you then modify that output in place, the backward pass would read the wrong numbers and produce a silently wrong gradient.</p>
+<p>PyTorch prevents this with a <strong>version counter</strong>. Every tensor carries one (views share their base's counter), and every in-place write increments it. When an operation saves a tensor for backward, it records the current version. At backward time it compares. A trace, run on 2.14:</p>
+<pre>a = torch.randn(4, requires_grad=True)
+b = a.sigmoid()          # sigmoid saves b, at version 0
+b._version               # 0
+b.mul_(2)                # in place: version 1
+b.sum().backward()
+# RuntimeError: one of the variables needed for gradient computation has been
+# modified by an inplace operation: [torch.FloatTensor [4]], which is output 0
+# of Sigmoid, is at version 1; expected version 0 instead.</pre>
+<p>The error names the operation (Sigmoid), the tensor's shape and both versions — read it, and you know exactly which tensor to stop modifying. Not every in-place op breaks: after <code>y = a * 2; z = y * 3</code>, doing <code>y.add_(1)</code> is fine, because multiplication by a constant has gradient 3 regardless of <code>y</code>, so <code>y</code> was never saved. Whether a tensor is saved depends on the backward formula of each operation that consumed it, which is why "in-place is fine here" is a judgement call you verify by running backward once.</p>
+<p>A second rule: a <strong>leaf tensor</strong> that requires gradients — a parameter or an input you created with <code>requires_grad=True</code> — cannot be modified in place at all, because autograd would lose track of what its gradient refers to. <code>w.add_(1)</code> raises "a leaf Variable that requires grad is being used in an in-place operation". Optimisers update parameters in place, so they do it inside <code>torch.no_grad()</code>, which tells autograd not to record the update (pt3 and pt6).</p>
+<p>The PyTorch paper (Paszke et al., NeurIPS 2019) describes this as a deliberate design: a versioning system that detects unsafe mutation, rather than copy-on-write, which would have made every program pay for hidden copies to protect the rare program that mutates saved data.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Timeline: sigmoid saves b at version 0, mul_ bumps it to version 1, backward finds a mismatch and raises">
+  <defs><marker id="pt1-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="30" y1="60" x2="610" y2="60" marker-end="url(#pt1-arrow2)" style="fill:none;stroke:var(--line-2);stroke-width:2"/>
+    <text x="610" y="48" text-anchor="end" style="fill:var(--muted)">time →</text>
+    <circle cx="90" cy="60" r="6" style="fill:var(--s1)"/>
+    <text x="90" y="88" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">b = a.sigmoid()</text>
+    <text x="90" y="106" text-anchor="middle" style="fill:var(--ink-2)">saved: b @ version 0</text>
+    <circle cx="300" cy="60" r="6" style="fill:var(--s3)"/>
+    <text x="300" y="88" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">b.mul_(2)</text>
+    <text x="300" y="106" text-anchor="middle" style="fill:var(--ink-2)">b._version → 1</text>
+    <circle cx="520" cy="60" r="6" style="fill:var(--crit)"/>
+    <text x="520" y="88" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">backward()</text>
+    <text x="520" y="106" text-anchor="middle" style="fill:var(--ink-2)">needs b @ version 0</text>
+    <rect x="40" y="134" width="560" height="80" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="320" y="156" text-anchor="middle" style="fill:var(--ink)">Sigmoid's backward computes grad · b · (1 − b) from the SAVED b.</text>
+    <text x="320" y="176" text-anchor="middle" style="fill:var(--ink)">Version 1 ≠ 0, so the saved values are stale: raise, rather than return</text>
+    <text x="320" y="196" text-anchor="middle" style="fill:var(--ink)">a gradient computed from 2·σ(a) instead of σ(a).</text>
+  </g>
+</svg>
+<figcaption>The version counter turns a silent wrong gradient into a loud error at the exact op that would have been wrong.</figcaption>
+</figure>
+
+<h4>11. The NumPy bridge</h4>
+<p>PyTorch and NumPy can share memory on the CPU:</p>
+<pre>a = np.arange(3.0)          # float64
+t = torch.from_numpy(a)     # no copy: t and a share the buffer
+a[0] = 100                  # t[0] is now 100
+n = t.numpy()               # no copy back either
+n[2] = -1                   # t[2] and a[2] are now -1
+c = torch.tensor(a)         # copy: later writes to a do not reach c</pre>
+<p>Rules to remember: <code>from_numpy</code> and <code>.numpy()</code> share memory; <code>torch.tensor</code>, <code>torch.as_tensor</code> with a different dtype or device, and <code>np.array(t)</code> copy. <code>.numpy()</code> only works on CPU tensors that do not require grad — otherwise you get "Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead." For a GPU tensor the idiom is <code>t.detach().cpu().numpy()</code>, which is a device-to-host copy and a synchronisation.</p>
+<p>Shared memory is a feature (zero-copy loading of a large dataset) and a hazard: a data pipeline that returns <code>torch.from_numpy(buffer)</code> and then reuses <code>buffer</code> for the next batch hands the model a tensor whose contents change underneath it. And because the dtype is kept, the boundary is where you cast: <code>torch.from_numpy(a.astype(np.float32))</code> for features, <code>.long()</code> for class labels.</p>
+
+<h4>12. Memory lifetime: a small view keeps a big storage alive</h4>
+<p>PyTorch frees a storage the moment no tensor refers to it — the PyTorch paper calls out this reference counting, which piggybacks on CPython's own, as a deliberate choice over garbage collection so memory is released exactly when it stops being needed. The flip side is that a view <em>is</em> a reference. A run on 2.14:</p>
+<pre>big = torch.empty(1024, 1024, 256)   # 268 M float32 = 1.0 GiB
+v = big[:1]                          # a 1 MiB slice, as a view
+del big
+v.untyped_storage().nbytes() / 2**30 # 1.0  — the whole GiB is still held
+v = v.clone()                        # now only 1 MiB is held</pre>
+<p>In a training loop this shows up as memory that climbs and never falls: a list of per-step slices, a cache of "last hidden state" views, or a tensor kept for logging that still has an autograd graph attached (which keeps every saved activation of that step alive — pt3). The fix is <code>.clone()</code> for the data, <code>.detach()</code> to drop the graph, and <code>.item()</code> or <code>.cpu()</code> for logging scalars — remembering that those last two synchronise.</p>
+</section>
+
+<section data-field="deep">
+<h4>as_strided, unfold and the power and danger of hand-made strides</h4>
+<p>Because a tensor is just metadata over storage, you can write the metadata yourself with <code>torch.as_strided(x, size, stride, offset)</code>. <code>x.unfold(0, 128, 64)</code> is the safe special case: it returns overlapping windows of a 1-D signal, shape (n_windows, 128) with strides (64, 1), each window starting 64 elements after the previous, with zero copying. im2col for convolutions (mc14) can be written the same way. The danger is that nothing checks your strides are sensible: <code>as_strided</code> can produce views that read past the logical end of the tensor into other data in the same storage, and overlapping views make in-place writes ambiguous. PyTorch detects the most common case — "unsupported operation: some elements of the input tensor and the written-to tensor refer to a single memory location", which is what <code>x += x.t()</code> raises on 2.14 — but only when it can prove the overlap. Use as_strided for read-only tricks and clone before writing.</p>
+
+<h4>Dense, non-overlapping and the kernels that care</h4>
+<p>Most element-wise kernels do not require contiguity; PyTorch's internal iterator (TensorIterator) computes addresses from strides and can even reorder dimensions so the innermost loop runs over the smallest stride. What kernels do care about is whether a tensor is <em>non-overlapping and dense</em> — every slot used exactly once, in some order. Then an element-wise op can process storage as one flat array and preserve the input's memory format in the output, which is why <code>torch.relu(x_channels_last)</code> returns channels_last. Matmul is pickier: cuBLAS (NVIDIA's dense linear-algebra library) accepts a matrix whose last dimension or second-to-last dimension has stride 1 — that is, row-major or column-major — so <code>a @ b.t()</code> needs no copy, but a matrix sliced with a step on both dimensions gets copied first. Custom C++ or Triton kernels often assume contiguity outright; a missing <code>.contiguous()</code> before one gives wrong numbers rather than an error, the worst possible failure.</p>
+
+<h4>The version counter is shared by views, and .data bypasses it</h4>
+<p>Views share their base's version counter, so an in-place write through any view invalidates saved tensors that alias the same storage: <code>h = x.sigmoid(); h[:, 0].zero_()</code> breaks backward exactly like modifying <code>h</code>. The legacy <code>.data</code> attribute returns a tensor that shares storage but has a <em>separate</em> version counter and no autograd history, so writing through <code>.data</code> silently corrupts saved tensors with no error. <code>.detach()</code> also drops history but shares the counter, so misuse is caught. This is the practical reason modern code uses <code>detach()</code> and <code>with torch.no_grad():</code> and treats <code>.data</code> as a code smell.</p>
+
+<h4>Reductions and accumulation dtype</h4>
+<p>Summing many 16-bit numbers in 16 bits loses information long before it overflows: once the running sum is large, adding a small value rounds to no change (in bfloat16, 256 + 1 is 256). PyTorch's reduction kernels on CUDA accumulate half and bfloat16 sums in float32 internally and round the final result; the output dtype is still the input's. That protects a single <code>sum()</code>, but not a running total you build yourself across steps (<code>total = total + loss</code> with a bfloat16 <code>total</code>), not a cumulative sum whose intermediate values are stored, and not the case where the final result itself exceeds the format — the 70,000-ones float16 sum is <code>inf</code> on 2.14 CPU. Keep accumulators, loss tallies and metrics in float32; autocast (pt7) does this for loss computations by running softmax and reductions in float32.</p>
+
+<h4>Integer dtypes and indices</h4>
+<p>Indexing, <code>gather</code>, <code>embedding</code> and loss targets expect int64 by default (some accept int32). Token ids stored as int32 or uint16 to halve dataset size must be converted with <code>.long()</code> before use; uint16 data cast to int16 instead wraps ids above 32,767 to negative numbers, which then index from the end of the embedding table without any error. A vocabulary of 50,257 does not fit int16 but does fit uint16 — the conversion order matters. Integer overflow is silent in PyTorch, as in C: int32 element counts overflow at 2.1 billion, which a 70,000 × 32,768 attention score matrix exceeds.</p>
+
+<h4>Freed is not returned: the caching allocator</h4>
+<p>On the GPU, asking the driver for memory (<code>cudaMalloc</code>) and giving it back (<code>cudaFree</code>) are slow and make the CPU wait, so PyTorch keeps freed blocks in its own cache and hands them to the next allocation of a suitable size; the PyTorch paper shows the first iteration of ResNet-50 stalling on these calls and later iterations running smoothly once the cache is warm. The consequence for reasoning about tensors: when the last view of a storage dies, PyTorch's <em>allocated</em> counter (<code>torch.cuda.memory_allocated()</code>) drops at once, but the <em>reserved</em> counter (<code>torch.cuda.memory_reserved()</code>) and what <code>nvidia-smi</code> shows do not, because the block stays in the cache. A "leak" that shows only in nvidia-smi is usually the cache, not a leak; a leak shows in the allocated counter. The cache can also fragment: many free blocks of the wrong sizes, so a large allocation fails even though plenty is free in total. pt7 covers the allocator statistics and the <code>expandable_segments</code> setting that reduces fragmentation.</p>
+
+<h4>Tensor subclasses: why the metadata model generalises</h4>
+<p>Because a tensor is an interface (shape, dtype, device, strides) rather than a concrete buffer, PyTorch lets other objects behave as tensors. <code>__torch_function__</code> and <code>__torch_dispatch__</code> let a subclass intercept every operation. That is how <code>DTensor</code> represents a tensor sharded across many GPUs (FSDP2 in pt11 stores parameters as DTensors), how fake tensors run a model with shapes but no data to trace it for <code>torch.compile</code> (pt12), and how quantised weight formats in torchao (pt13) present packed integers as if they were floating-point weights. When you see a stride or dtype you did not expect in a modern codebase, check whether you are looking at a subclass.</p>
+</section>
+
+<section data-field="prod">
+<h4>Failure mode: memory that climbs and never comes back</h4>
+<p>Symptom: process or GPU memory grows by a fixed amount per step or per evaluation batch until an out-of-memory error, often hours in. Causes, in order of frequency: views of large tensors stored in a list (<code>logits[:, -1]</code>, <code>hidden[-1]</code>); tensors stored for logging that still carry an autograd graph (<code>losses.append(loss)</code> instead of <code>loss.item()</code> or <code>loss.detach()</code>), which keeps every activation of that step alive; and caches keyed by tensors. To find it, compare <code>torch.cuda.memory_allocated()</code> before and after a step (pt7 shows the memory snapshot tool that names the allocation site), and check suspicious objects with <code>t.untyped_storage().nbytes()</code> versus <code>t.numel() * t.element_size()</code>: a large gap means a view pinning a bigger storage.</p>
+
+<h4>Failure mode: float64 creep</h4>
+<p>Symptom: training is several times slower than a reference, memory is about double, or a "same dtype" error appears at the first layer. A NumPy array, a pandas column, or a class-weight vector computed with NumPy enters as float64. If someone "fixed" the error by calling <code>model.double()</code>, everything runs in float64 — on consumer and many data-centre GPUs float64 throughput is a small fraction of float32. Guard the data boundary with an assertion in the first batch (<code>assert x.dtype == torch.float32</code>) and cast labels to int64 explicitly.</p>
+
+<h4>Failure mode: silent aliasing</h4>
+<p>Symptom: values change "by themselves", or a test passes on CPU and fails with workers or on GPU. Typical sources: a DataLoader collate function returns <code>torch.from_numpy</code> of a buffer it later reuses; a module stores a view of its input and the caller later modifies the input in place; or code relies on <code>reshape</code> having returned a view. Diagnose by comparing <code>a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()</code>. Fix by cloning at ownership boundaries: when data passes from one component to another that will keep it, clone it.</p>
+
+<h4>Failure mode: in-place errors after a refactor</h4>
+<p>Symptom: "modified by an inplace operation" appears after someone replaced <code>x = x + y</code> with <code>x += y</code> or switched an activation to <code>inplace=True</code> to save memory. Read the error: it names the operation whose saved tensor changed (for example "output 0 of SigmoidBackward" or "ReluBackward") and the expected and actual versions. If the forward is long, <code>torch.autograd.set_detect_anomaly(True)</code> attaches the forward stack trace to the error (pt9 shows the full workflow). The fix is almost always to revert to the out-of-place form; the memory saved by an in-place activation is one activation tensor, which activation checkpointing (pt7) handles more systematically.</p>
+
+<h4>Knobs and tools</h4>
+<ul>
+<li><code>t.stride()</code>, <code>t.is_contiguous()</code>, <code>t.storage_offset()</code>, <code>t.untyped_storage().nbytes()</code> and <code>t._base</code> (the base tensor of a view, or <code>None</code>) — the five calls that answer "is this a view, and of what?".</li>
+<li><code>t._version</code> — the version counter, useful when bisecting an in-place error.</li>
+<li><code>torch.set_default_dtype</code> — changes the default float for all factory functions; almost never what you want globally, and libraries may assume float32.</li>
+<li><code>torch.device("meta")</code> and <code>torch.empty(..., device="meta")</code> — shape checks for huge models with no allocation.</li>
+</ul>
+
+<h4>The design decision behind all of this</h4>
+<p>The PyTorch paper (Paszke et al., NeurIPS 2019) is worth reading for the reasoning: PyTorch chose eager, imperative execution with mutable tensors because that is how Python programmers write code, and then made mutation safe with version counters, and memory predictable with reference counting and a caching allocator that reuses freed GPU blocks without calling the slow <code>cudaFree</code>. Every failure in this section is the cost side of those choices — views make reshaping free but let small tensors pin big storages; mutation is allowed but can be refused at backward time. Knowing the design tells you what kind of bug to look for.</p>
+</section>
+
+<section data-field="lab">
+<p>Runs on CPU with PyTorch 2.14 in the existing venv (<code>C:\ra_projects\how-to-train-your-gpt\gpt_env\Scripts\python.exe</code>); about 10 minutes. Save as <code>pt1_lab.py</code>.</p>
+<pre>import torch, numpy as np
+x = torch.arange(12.).reshape(3, 4)
+for name, t in [("x", x), ("x.t()", x.t()), ("x[:,1]", x[:, 1]), ("x[1]", x[1])]:
+    print(f"{name:7} shape={tuple(t.shape)} stride={t.stride()} "
+          f"offset={t.storage_offset()} contig={t.is_contiguous()} "
+          f"shares={t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()}")
+try:
+    x.t().view(12)
+except RuntimeError as e:
+    print("view failed:", str(e)[:60])
+print("reshape shares?", x.t().reshape(12).data_ptr() == x.data_ptr())
+
+big = torch.empty(1024, 1024, 64)                    # 256 MiB
+v = big[:1]; del big
+print("view holds MiB:", v.untyped_storage().nbytes() / 2**20)
+print("clone holds MiB:", v.clone().untyped_storage().nbytes() / 2**20)
+
+a = torch.randn(4, requires_grad=True)
+b = a.sigmoid(); b.mul_(2)
+try:
+    b.sum().backward()
+except RuntimeError as e:
+    print("in-place:", str(e)[:90])
+
+arr = np.zeros(3); t = torch.from_numpy(arr); arr[0] = 5
+print("from_numpy sees write:", t[0].item(), t.dtype)</pre>
+<ol>
+<li>Run it. Check that <code>x.t()</code> and <code>x[:, 1]</code> report <code>shares=True</code> and <code>contig=False</code>, and that the strides match the table in the body.</li>
+<li>Look at "view holds MiB": it should be 256, not 1. That is the leak pattern from the body. The clone holds 0.25 MiB.</li>
+<li>The in-place error should name Sigmoid and versions 1 and 0. Replace <code>b.mul_(2)</code> with <code>b = b * 2</code> and confirm backward runs.</li>
+<li>Note the dtype printed for the NumPy tensor: float64. Pass it to <code>torch.nn.Linear(3, 2)</code> and read the error, then fix it with <code>.float()</code>.</li>
+<li>Stretch: convert <code>torch.zeros(8, 3, 32, 32)</code> to channels_last and print its strides; predict them before running.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Find the bug: the cache that never fills and the memory that never frees</b>
+<p>This evaluation helper collects the final hidden state of each batch and normalises it in place. Users report two problems: memory grows by about 1.5 GB per batch until the process dies, and the "normalised" vectors in <code>feats</code> differ from what <code>model.hidden</code> holds afterwards, even though the code looks like it normalises both. Find the bugs.</p>
+<pre>feats = []
+model.eval()
+for x in loader:                       # x: (64, 512) token ids
+    out = model(x)                     # out: (64, 512, 768) float32 hidden states
+    last = out[:, -1]                  # (64, 768)
+    sel = last[[0, 1, 2, 3]]           # first four rows, for a preview
+    sel /= sel.norm(dim=-1, keepdim=True)
+    feats.append(last)
+    model.hidden = last</pre>
+<details><summary>Answer</summary>
+<p><strong>Bug 1 — the view pins the whole activation, with its graph.</strong> <code>out[:, -1]</code> is a basic slice, so <code>last</code> is a view of the full 64 × 512 × 768 float32 tensor: 64 × 512 × 768 × 4 bytes ≈ 100 MB. Worse, the loop runs with autograd on (<code>eval()</code> only changes dropout and normalisation behaviour; it does not stop graph recording — pt3 and pt4), so <code>out</code> carries a graph that keeps every saved activation of the forward pass alive: that is where the ~1.5 GB per batch comes from. Symptom: steady growth per batch. Fix: run under <code>with torch.inference_mode():</code> and append <code>last.clone()</code> (or <code>last.cpu()</code>), so only 64 × 768 × 4 bytes ≈ 197 KB per batch is kept.</p>
+<p><strong>Bug 2 — advanced indexing copies, so the in-place normalisation hits a copy.</strong> <code>last[[0, 1, 2, 3]]</code> uses a list index, which is advanced indexing and always copies. <code>sel /= …</code> then normalises the copy; <code>last</code>, <code>feats</code> and <code>model.hidden</code> are untouched. Symptom: "normalised" features are not normalised. Fix: if the intent is to normalise the stored features, normalise <code>last</code> itself out of place (<code>last = torch.nn.functional.normalize(last, dim=-1)</code>) before appending; if the intent was only a preview, the line is dead code and should be removed.</p>
+<p><strong>Bug 3 (latent) — shared aliasing between the list and the model attribute.</strong> <code>feats[-1]</code> and <code>model.hidden</code> are the same tensor. Any later in-place change to <code>model.hidden</code> (for example a <code>model.hidden.zero_()</code> reset) rewrites the last saved feature. Fix: store a clone in one place. In an interview, say how you would confirm each: compare <code>untyped_storage().nbytes()</code> of <code>feats[0]</code> with its <code>numel() * element_size()</code>, and compare <code>data_ptr()</code> of <code>sel</code> and <code>last</code>.</p>
+</details>
+<b>Estimate: will the logits fit?</b>
+<p>A model has a 128,256-token vocabulary. You run a batch of 8 sequences of 8,192 tokens and compute logits in float32 for the whole sequence. How much memory do the logits take, and what is the cheapest change that cuts it?</p>
+<details><summary>Answer</summary>
+<p>8 × 8,192 × 128,256 × 4 bytes ≈ 33.6 GB (31.3 GiB) — more than the whole activation budget of most single-GPU runs, and the softmax inside the loss can need another copy of the same size. The cheapest changes: compute the loss in chunks of the sequence so only one chunk's logits exist at once (cuts memory by the number of chunks); keep logits in bfloat16 and let the loss upcast internally (halves it); and at inference compute logits only for the last position (<code>hidden[:, -1]</code> before the output layer), which turns 8,192 positions into 1.</p>
+</details>
+</section>

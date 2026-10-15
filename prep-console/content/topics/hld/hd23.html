@@ -1,0 +1,626 @@
+<!-- topic source for hld/hd23; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "hd23",
+  "t": "Design a real-time voice assistant at scale",
+  "tag": "Voice",
+  "sum": "A phone and in-app voice assistant for 10,000 simultaneous calls: cascaded ASR → LLM → TTS versus speech-to-speech models, the voice-to-voice latency budget worked per stage, the barge-in state machine, telephony and WebRTC transport, tool calls mid-conversation, GPU sizing, cost per minute, and how to evaluate a conversation.",
+  "prereq": [
+    [
+      "mm7",
+      "A voice agent's key metric is voice-to-voice latency; a cascade of voice activity detection, streaming ASR, an LLM and streaming TTS must overlap its stages to land near 800 ms, and turn-taking is the hard part."
+    ],
+    [
+      "hd15",
+      "A support agent answers by chat and phone with retrieval and permission-checked tools, hands off to humans with a summary, and fits a voice turn into about 800 ms with filler speech while tools run."
+    ],
+    [
+      "hd1",
+      "A self-hosted inference platform serves models with continuous batching and prefix caching, and is sized by tokens per second at a latency target."
+    ],
+    [
+      "ae10",
+      "Perceived latency depends on time to first token and streaming; overlapping stages and showing progress early matter more than total time."
+    ],
+    [
+      "hd12",
+      "LLM features are evaluated offline on golden sets and online with sampled human and model judgements, traced end to end."
+    ],
+    [
+      "hd13",
+      "A gateway in front of model providers routes, falls back and meters tokens; it is how a voice stack reaches external LLMs safely."
+    ]
+  ],
+  "myths": [
+    [
+      "Voice latency is the sum of the model latencies.",
+      "The biggest single item is usually the endpointing wait, the silence the system waits for before deciding the user has finished: frameworks commonly default to around half a second (LiveKit's session waits 0.5 to 3.0 seconds by default; OpenAI's server VAD example uses 500 ms of silence). Network and telephony add another 100–200 ms. A fast LLM cannot fix a slow turn detector."
+    ],
+    [
+      "Barge-in just means stopping the audio when the user speaks.",
+      "Stopping on any sound makes the agent stop for coughs, background TV and the user's own \"mm-hm\". A real barge-in handler ducks the audio, waits a couple of hundred milliseconds or for real words, then stops playback, flushes buffered audio at the telephony provider, cancels generation, and truncates the conversation history to what the user actually heard, so the model does not believe it said things the caller never heard."
+    ],
+    [
+      "Speech-to-speech models make the cascade obsolete.",
+      "They cut latency and keep tone of voice, but they give up some control: text guardrails and redaction between stages, swapping one component, exact transcripts for audit, and per-stage debugging. Many production systems keep a cascade for regulated or tool-heavy flows and use speech-to-speech where naturalness matters most; the choice is per use case."
+    ],
+    [
+      "GPUs are the main cost of a voice assistant.",
+      "At scale, self-hosted ASR, LLM and TTS can cost a fraction of a cent per minute; telephony carriage and any per-minute API fees usually dominate. The engineering question is utilisation: calls are long, peaks are sharp, and GPUs provisioned for the peak sit idle at night."
+    ],
+    [
+      "A phone call is just audio over a WebSocket.",
+      "The public phone network delivers 8 kHz, 8-bit μ-law audio (Twilio's media streams always use audio/x-mulaw at 8000 Hz, mono), adds carrier and jitter-buffer delay, and gives you no echo cancellation guarantees on the far end. In-app voice over WebRTC gets 48 kHz Opus, browser echo cancellation and lower latency. The two channels need different tuning."
+    ]
+  ],
+  "recap": [
+    "A voice assistant at scale is a set of long-lived, stateful call sessions, each running turn detection, speech recognition, an LLM with tools and speech synthesis in a streaming pipeline, on shared GPU services.",
+    "The cascaded design (ASR → LLM → TTS) gives control, transcripts and swappable parts; speech-to-speech models give lower latency and keep tone of voice; many systems use both, chosen per flow.",
+    "On the phone, a typical cascade lands near one second at the median: about 80 ms inbound carriage, 300 ms endpointing, 60 ms ASR finalisation, 250 ms LLM time to first token, 100 ms for a first phrase, 120 ms TTS first audio and 80 ms outbound.",
+    "Speculative generation on the partial transcript during the endpointing wait, co-locating stages and short first phrases bring the phone median toward 800 ms; WebRTC saves about 80 ms more on network.",
+    "Barge-in is a state machine: duck on detected speech, confirm with duration or words, then stop playback, clear the provider's audio buffer, cancel generation and truncate history to the audio actually played.",
+    "At 1 million calls a day of 4 minutes, average concurrency is about 2,800 and the peak about 8,300, so the system is sized for 10,000 simultaneous calls.",
+    "In the worked sizing, 10,000 calls need roughly 60 GPUs for the LLM, 70 for ASR and 100 for TTS at peak, about $0.001 per call-minute at the peak hour, so telephony and API fees dominate the cost per minute.",
+    "Tool calls mid-conversation run asynchronously with a spoken filler if they will take more than about 700 ms, and irreversible actions are confirmed aloud.",
+    "Quality is measured per turn and per call: voice-to-voice latency percentiles at the media edge, false and missed barge-ins, word error rate, task success and escalation, with simulated callers as a regression suite."
+  ],
+  "glossary": [
+    [
+      "ASR",
+      "Automatic speech recognition: turning audio into text; streaming ASR emits partial transcripts while the user is still speaking and a final one at the end."
+    ],
+    [
+      "Backchannel",
+      "Short listener sounds such as \"mm-hm\" or \"yeah\" that mean \"go on\", not \"stop talking\"."
+    ],
+    [
+      "Barge-in",
+      "The user starting to speak while the agent is talking, intending to interrupt it."
+    ],
+    [
+      "Cascade",
+      "A voice pipeline built from separate models for recognition, language and synthesis, connected by text."
+    ],
+    [
+      "DTMF",
+      "Dual-tone multi-frequency: the tones a phone keypad sends, delivered to software as digit events so callers can type numbers instead of saying them."
+    ],
+    [
+      "Echo cancellation (AEC)",
+      "Removing the agent's own voice from the microphone signal so the system does not hear itself and interrupt itself."
+    ],
+    [
+      "Endpointing",
+      "Deciding that the user has finished their turn, usually from silence length plus, in better systems, the meaning of what was said."
+    ],
+    [
+      "Jitter buffer",
+      "A small buffer at the receiver that holds audio packets briefly so they can be played smoothly despite uneven arrival times; it adds delay."
+    ],
+    [
+      "Media server (SFU)",
+      "A server that receives and forwards real-time audio and video streams between participants, such as a caller and an agent process."
+    ],
+    [
+      "Opus",
+      "The audio codec WebRTC uses: wideband, low-delay and robust to packet loss."
+    ],
+    [
+      "PSTN",
+      "The public switched telephone network: ordinary phone calls, carried between carriers and reaching software through SIP trunks or providers such as Twilio."
+    ],
+    [
+      "SIP trunk",
+      "A connection that carries phone calls between the phone network and a company's systems using the Session Initiation Protocol."
+    ],
+    [
+      "Speculative generation",
+      "Starting the LLM on the partial transcript before the turn is confirmed over, and discarding the work if the user keeps talking."
+    ],
+    [
+      "Speech-to-speech model",
+      "A single model that takes audio in and produces audio out, without an intermediate text step the application controls."
+    ],
+    [
+      "TTFT",
+      "Time to first token: how long an LLM takes from receiving a request to emitting its first output token."
+    ],
+    [
+      "TTS",
+      "Text-to-speech: synthesising audio from text; streaming TTS starts producing audio from the first phrase."
+    ],
+    [
+      "Turn detector",
+      "A model that predicts from the words (and sometimes the audio) whether the user's turn is complete, so the system can wait less after definite statements and more after trailing ones."
+    ],
+    [
+      "UDP",
+      "A network transport that sends packets without retransmission or ordering, which real-time media prefers because late audio is useless anyway."
+    ],
+    [
+      "VAD",
+      "Voice activity detection: a small model that labels short audio frames as speech or not speech."
+    ],
+    [
+      "Voice-to-voice latency",
+      "The time from the end of the user's speech to the first audio of the agent's reply, as the user hears it."
+    ],
+    [
+      "WebRTC",
+      "The browser and mobile standard for real-time audio and video over UDP, with codecs, jitter buffers, echo cancellation and encryption built in."
+    ],
+    [
+      "WER",
+      "Word error rate: substitutions, deletions and insertions divided by the number of words in a reference transcript."
+    ],
+    [
+      "μ-law (G.711)",
+      "The 8 kHz, 8-bit audio encoding of classic telephony: 64 kbit/s, narrowband, the format phone audio arrives in."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What is voice-to-voice latency and why is it the main metric?",
+      "It is the time from the end of the user's speech to the first audio of the reply, as heard by the user. Human conversation leaves gaps of a few hundred milliseconds, so replies that take well over a second feel broken and make users talk over the agent. It must be measured at the media edge per turn, at the median and p95, because component latencies do not add up to it cleanly."
+    ],
+    [
+      "E",
+      "Compare a cascaded voice pipeline with a speech-to-speech model.",
+      "A cascade runs separate ASR, LLM and TTS models connected by text: you get transcripts, text guardrails, any LLM with full tool support, and per-stage debugging, but each hand-off adds latency and tone of voice is lost. A speech-to-speech model goes from audio to audio in one model: lower latency and more natural prosody, but less control over each step and dependence on one vendor's model. Choose per flow: regulated and tool-heavy flows often stay cascaded."
+    ],
+    [
+      "E",
+      "Why does phone audio need different handling from in-app audio?",
+      "Phone audio arrives as 8 kHz μ-law, narrowband and often noisy, through carriers that add delay and a jitter buffer, with unknown echo cancellation on the caller's side. In-app WebRTC audio is 48 kHz Opus with browser echo cancellation and lower network delay. Recognition models, VAD thresholds and endpointing need tuning per channel, and the latency budget differs by about 80–150 ms."
+    ],
+    [
+      "M",
+      "Walk through the latency budget of one phone turn and where you would cut.",
+      "About 80 ms inbound carriage, 300 ms endpointing, 60 ms ASR finalisation, 250 ms LLM time to first token, 100 ms to accumulate a first phrase, 120 ms TTS first audio and 80 ms outbound: about 990 ms. Cuts: a semantic turn detector to shorten the silence wait after definite statements, speculative LLM generation on the partial transcript during that wait, prefix caching so prefill covers only new tokens, a short first sentence, and co-locating ASR, LLM and TTS in one region next to the media gateway.",
+      "Follow-up: Why not just set the silence threshold to 100 ms? — The agent would cut users off at every mid-sentence pause; false endpoints are worse than slower replies because the agent answers half a question."
+    ],
+    [
+      "M",
+      "Design the barge-in handling.",
+      "Run VAD on the caller's audio while the agent speaks. On detected speech, duck the agent's volume and keep generating; confirm a real interruption if speech lasts about 250 ms or ASR yields words that are not backchannel. On confirmation, stop playback, tell the telephony provider to drop buffered audio (Twilio's clear message), cancel the LLM and TTS streams, and truncate the conversation history to the audio actually played, tracked with playback marks. If the speech was a backchannel or noise, restore volume and continue.",
+      "Follow-up: How do you know what was played? — Send a mark after each audio chunk; the provider echoes it when that chunk finishes playing. The last echoed mark gives the played position, which maps to text offsets for truncation."
+    ],
+    [
+      "M",
+      "Estimate concurrency for 1 million calls a day averaging 4 minutes.",
+      "Four million call-minutes a day spread over 1,440 minutes is about 2,800 calls in progress on average (Little's law). With a daytime peak about three times the average, roughly 8,300 at peak, so size for 10,000 with headroom. Every one of them is a live stream through VAD, ASR and, part of the time, TTS, plus an LLM request every several seconds."
+    ],
+    [
+      "M",
+      "How do you handle a tool call that takes two seconds mid-conversation?",
+      "Predict tool latency from history; if it will exceed about 700 ms, speak a short filler (\"Let me check that order\") while the tool runs asynchronously, and keep listening so the user can add information or interrupt. Use timeouts and a fallback phrase if the tool fails, idempotency keys for anything that changes state, and spoken confirmation before irreversible actions. Never leave more than about a second of dead air on the phone, or callers assume the line dropped."
+    ],
+    [
+      "M",
+      "Where does the cost per minute come from?",
+      "Telephony carriage per minute, any per-minute or per-token API fees for hosted models, GPU time for self-hosted models, and media and orchestration servers. In the worked sizing, self-hosted GPUs cost about $0.001 per minute at the peak hour and perhaps twice that averaged over the day, so carriage (assumed $0.010 a minute) and API fees dominate; an LLM API at the assumed large-model prices adds about $0.018 a minute."
+    ],
+    [
+      "H",
+      "Size the GPU fleet for 10,000 simultaneous calls.",
+      "LLM: with one turn every 8 seconds per call, 1,250 requests a second; with prefix caching each needs about 300 new prefill tokens and 40 output tokens, so 375,000 prefill and 50,000 decode tokens a second. At an assumed 2,100 decode tokens a second and 25,000 prefill tokens a second per GPU for an 8B model at the latency target, that is about 24 plus 15 GPUs, about 60 with headroom for time to first token. ASR at an assumed 150 streams per GPU is about 70 GPUs. TTS for the roughly 40% of time the agent speaks, 4,000 streams at an assumed 40 per GPU, is 100 GPUs. Measure the per-GPU figures for your models; the method matters more than the constants.",
+      "Follow-up: How does the fleet change between peak and night? — Calls last minutes, so scaling in means draining sessions; scale GPU pools on a schedule plus queue depth, keep a warm minimum per region, and use spare night capacity for batch work."
+    ],
+    [
+      "H",
+      "An agent worker crashes mid-call. What happens?",
+      "The media server or telephony stream notices the worker's disconnect; the call should not drop. Session state (transcript so far, tool results, the current task) is checkpointed after every turn to a fast store, so a replacement worker can join the media session within a second or two, say a recovery phrase (\"Sorry, I missed that, could you say it again?\") and continue. Tool calls in flight are retried with their idempotency keys so a refund is not issued twice."
+    ],
+    [
+      "H",
+      "How would you evaluate a new turn detector before shipping it?",
+      "Offline, replay a labelled set of real calls (with human-marked true turn ends and interruptions) through both detectors and measure median and p95 endpointing delay, the rate of premature endpoints (cutting the user off) and false barge-ins. Then run simulated callers with varied speaking styles, accents and noise. Online, A/B by call with voice-to-voice latency, talk-over duration, user repeats (\"as I was saying\"), task success and escalation as metrics; premature endpoints are the guardrail, because they damage calls more than slower replies.",
+      "Follow-up: What does a premature endpoint look like in the data? — The user's speech resumes within a second of the agent starting to reply, often followed by a barge-in; count those per thousand turns."
+    ],
+    [
+      "H",
+      "When would you choose a speech-to-speech model over the cascade for this product?",
+      "For open-ended conversational flows where naturalness, emotion and the fastest replies matter, and tool use is light; for languages where the vendor's model is strong. Keep the cascade where you need exact transcripts for compliance, text guardrails and redaction before content reaches a model, a specific LLM or fine-tuned model, complex multi-tool flows, or vendor independence. Design the session layer so both can sit behind the same transport, turn handling and tool interface, then route by flow and measure."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "OpenAI Realtime API: Voice activity detection",
+      "server_vad (threshold, prefix_padding_ms, silence_duration_ms; the example uses 0.5, 300 and 500) and semantic_vad with eagerness low, medium, high or auto; create_response and interrupt_response for speech-to-speech conversations.",
+      "https://platform.openai.com/docs/guides/realtime-vad"
+    ],
+    [
+      "docs",
+      "OpenAI Realtime API: Realtime conversations",
+      "Interruption handling: over WebRTC and SIP the server truncates unplayed audio automatically; over WebSocket the client stops playback and sends conversation.item.truncate with audio_end_ms.",
+      "https://platform.openai.com/docs/guides/realtime-conversations"
+    ],
+    [
+      "docs",
+      "LiveKit Agents: Turns overview",
+      "Turn detection modes (turn-detector model, realtime model, VAD only, STT endpointing, manual), interruption handling, false interruptions, and a telephony configuration with server VAD threshold 0.7 and 400 ms silence.",
+      "https://docs.livekit.io/agents/build/turns/"
+    ],
+    [
+      "docs",
+      "LiveKit Agents: Turn detector",
+      "Audio-based end-of-turn model; by default the session waits between 0.5 and 3.0 seconds after speech to confirm a turn end; requires VAD with min_silence_duration of at least 250 ms; 14 languages.",
+      "https://docs.livekit.io/agents/build/turns/turn-detector/"
+    ],
+    [
+      "docs",
+      "LiveKit Agents: Silero VAD plugin",
+      "VAD defaults: min_speech_duration 0.05 s, min_silence_duration 0.55 s, prefix padding 0.5 s, activation_threshold 0.5, 8 or 16 kHz.",
+      "https://docs.livekit.io/agents/build/turns/vad/"
+    ],
+    [
+      "docs",
+      "Twilio Media Streams: WebSocket messages",
+      "Phone audio arrives as audio/x-mulaw at 8,000 Hz, mono, base64 in media messages; mark messages report playback completion; a clear message empties Twilio's audio buffer for barge-in.",
+      "https://www.twilio.com/docs/voice/media-streams/websocket-messages"
+    ],
+    [
+      "paper",
+      "Moshi: a speech-text foundation model for real-time dialogue",
+      "Défossez et al., 2024: a full-duplex speech-to-speech model with a theoretical latency of 160 ms, the reference point for speech-to-speech designs.",
+      "https://arxiv.org/abs/2410.00037"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A bank's phone line takes a million calls a day. Most are routine: a balance, a lost card, a payment date, a branch's opening hours. Callers wait an average of six minutes for an agent, the contact centre costs a fortune, and the old menu system ("press 4 for card services") is hated. The bank wants a voice assistant that answers the phone, understands what callers say in their own words, looks up their account, does the routine things, and hands the rest to a human with a summary. The same assistant should also run inside the bank's mobile app.</p>
+<p>The prototype works in a quiet office. It records the caller until they stop, sends the audio to a transcription service, sends the text to a language model, sends the reply to a speech synthesiser, and plays it. Each step takes about a second, so every reply arrives three or four seconds after the caller stops talking. Callers say "hello?" into the silence, then both talk at once. When the assistant is mid-sentence and the caller says "no, the other card", it keeps reading out the wrong card's details for ten seconds, because it cannot be interrupted. When a caller pauses to find their card, it decides they have finished and answers half a question. On a speakerphone it hears its own voice and interrupts itself. And at 9 a.m. on Monday, when 8,000 people call at once, the transcription vendor's rate limit returns errors and calls go silent.</p>
+<p>Every one of these is a design problem, not a model problem. The senior question is to build a voice assistant that holds 10,000 simultaneous conversations, replies in about a second or less, can be interrupted naturally, takes turns without cutting people off, calls bank systems mid-conversation without dead air, works over both phone lines and the app, costs a few cents a minute at most, and can be shown to work well, with numbers. The two big architectural choices are a <strong>cascade</strong> of speech recognition, language model and speech synthesis, and a single <strong>speech-to-speech</strong> model, and the interview expects you to compare them honestly.</p>
+<p>The lesson follows the interview: requirements with latency, quality, cost and safety targets; estimates by hand for concurrency, tokens, GPUs and cost per minute; the session API; the choice between cascade and speech-to-speech; the high-level design; deep dives on the per-stage latency budget, the barge-in state machine, transport over telephony and WebRTC, and tool calls mid-conversation; GPU sizing; evaluation; failure modes; and what changes at ten times the scale. The real cases are the published documentation of OpenAI's Realtime API, LiveKit's agent framework and Twilio's media streams, which show the exact mechanisms (voice activity detection settings, truncation on interruption, audio formats and buffer control) a production system has to get right. The theory of the latency budget itself is in mm7; this case is about running it as a system.</p>
+</section>
+
+<section data-field="primer">
+<h4>What the system does</h4>
+<p>A <strong>real-time voice assistant</strong> holds spoken conversations. For each call it runs a <strong>session</strong>: a long-lived process that receives the caller's audio as a continuous stream, decides when the caller has finished a turn, works out a reply (possibly calling tools such as "look up account" or "freeze card"), speaks the reply as a stream of audio, and keeps listening the whole time in case the caller interrupts. Unlike a chat request, which lasts a few seconds, a call lasts minutes, and audio flows in both directions continuously, so the design is about many concurrent stateful streams rather than individual requests.</p>
+<h4>The mental model: a simultaneous interpreter's booth</h4>
+<p>Picture a conference interpreter. They listen continuously, start working out the translation before the speaker finishes, begin speaking as soon as they have the first phrase, stop instantly if the speaker interrupts with a correction, and never leave long silences. Behind them, a team handles the logistics: microphones, headsets, booth scheduling for a hundred sessions in parallel.</p>
+<p>The voice assistant is that interpreter plus that logistics team. <strong>Voice activity detection</strong> (VAD), a tiny model that labels each 20–30 ms audio frame as speech or not, is the interpreter's ear noticing someone is talking. <strong>Endpointing</strong>, deciding the caller has finished, is knowing when a sentence is over. <strong>Streaming speech recognition</strong> (ASR) is understanding words as they come. The <strong>language model</strong> is deciding what to say, and <strong>streaming speech synthesis</strong> (TTS) is speaking the first phrase while still composing the rest. <strong>Barge-in</strong> handling is stopping mid-sentence when interrupted. The logistics team is the media servers, telephony connections and GPU pools that make 10,000 booths work at once.</p>
+<p>The analogy breaks in one important place: a human interpreter hears themselves without confusion, but the assistant's microphone can pick up its own voice (on speakerphones especially), and without <strong>echo cancellation</strong> it will interrupt itself. And unlike an interpreter, the assistant has no natural sense of when a pause means "I'm thinking" rather than "I'm done": that has to be built and tuned.</p>
+<figure>
+<svg viewBox="0 0 640 320" width="100%" role="img" aria-label="Two architectures. Top: cascade. Caller audio from phone or app enters a media edge, then VAD and turn detector, streaming ASR producing text, LLM with tools, streaming TTS producing audio, back to the media edge. Bottom: speech-to-speech. Audio goes from the media edge into one speech-to-speech model with tools, which returns audio. Both share session state, tools and the media edge.">
+<defs><marker id="hd23-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="22" style="fill:var(--ink);font-weight:600">Cascade</text>
+<rect x="20" y="40" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="65" y="60" text-anchor="middle" style="fill:var(--ink)">Media edge</text>
+<text x="65" y="76" text-anchor="middle" style="fill:var(--muted)">phone · app</text>
+<rect x="130" y="40" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+<text x="175" y="60" text-anchor="middle" style="fill:var(--ink)">VAD + turn</text>
+<text x="175" y="76" text-anchor="middle" style="fill:var(--muted)">detector</text>
+<rect x="240" y="40" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/>
+<text x="285" y="60" text-anchor="middle" style="fill:var(--ink)">Streaming</text>
+<text x="285" y="76" text-anchor="middle" style="fill:var(--muted)">ASR → text</text>
+<rect x="350" y="40" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="395" y="60" text-anchor="middle" style="fill:var(--ink)">LLM</text>
+<text x="395" y="76" text-anchor="middle" style="fill:var(--muted)">+ tools</text>
+<rect x="460" y="40" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/>
+<text x="505" y="60" text-anchor="middle" style="fill:var(--ink)">Streaming</text>
+<text x="505" y="76" text-anchor="middle" style="fill:var(--muted)">TTS → audio</text>
+<line x1="110" y1="62" x2="128" y2="62" marker-end="url(#hd23-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="220" y1="62" x2="238" y2="62" marker-end="url(#hd23-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="330" y1="62" x2="348" y2="62" marker-end="url(#hd23-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="440" y1="62" x2="458" y2="62" marker-end="url(#hd23-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<path d="M550,62 L600,62 L600,110 L65,110 L65,86" marker-end="url(#hd23-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<text x="330" y="126" text-anchor="middle" style="fill:var(--muted)">text between stages: transcripts, guardrails, any LLM, per-stage metrics</text>
+<text x="20" y="170" style="fill:var(--ink);font-weight:600">Speech-to-speech</text>
+<rect x="20" y="186" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="65" y="206" text-anchor="middle" style="fill:var(--ink)">Media edge</text>
+<text x="65" y="222" text-anchor="middle" style="fill:var(--muted)">phone · app</text>
+<rect x="160" y="186" width="280" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="300" y="206" text-anchor="middle" style="fill:var(--ink)">One speech-to-speech model</text>
+<text x="300" y="222" text-anchor="middle" style="fill:var(--muted)">audio in → audio out · server VAD · tools</text>
+<line x1="110" y1="200" x2="158" y2="200" marker-end="url(#hd23-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="158" y1="218" x2="112" y2="218" marker-end="url(#hd23-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<text x="330" y="252" text-anchor="middle" style="fill:var(--muted)">fewer hops, keeps tone of voice; less control between steps</text>
+<rect x="470" y="186" width="150" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s4)"/>
+<text x="545" y="206" text-anchor="middle" style="fill:var(--ink)">Shared: session</text>
+<text x="545" y="222" text-anchor="middle" style="fill:var(--muted)">state · tools · audit</text>
+<text x="320" y="300" text-anchor="middle" style="fill:var(--muted)">Both sit behind the same transport, turn handling and tool layer, so flows can be routed to either.</text>
+</g>
+</svg>
+<figcaption>The cascade's text hand-offs are both its cost (each adds latency and loses tone of voice) and its value (each is a place to log, check, redact and swap a component). Notice that the session layer, tools and transport are shared, which is what lets one product use both architectures.</figcaption>
+</figure>
+<h4>Three things that make voice different from chat</h4>
+<p>First, <strong>silence is the user interface</strong>. In chat, a user presses send; in speech, the system must infer the end of a turn from silence and meaning, and every millisecond it waits is added to every reply. Second, <strong>audio is consumed in real time</strong>: a reply can be generated faster than it is spoken, so the system always has buffered audio queued ahead of what the caller has heard, and an interruption must discard that buffer and correct the conversation history to what was actually heard. Third, <strong>calls are long-lived and stateful</strong>: a four-minute call pins resources for four minutes, peaks are sharp (Monday mornings), and a crashed process must not drop a live call. A reader who stops here has the shape: per-call streaming sessions, a turn-taking state machine at the centre, model stages that overlap rather than run in sequence, and capacity planned in concurrent calls rather than requests.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–17</span><span class="ck-t">API &amp; choice</span></div><div class="ck"><span class="ck-m">17–23</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">23–47</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">47–55</span><span class="ck-t">Eval &amp; failures</span></div><div class="ck"><span class="ck-m">55–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> Answer inbound phone calls and in-app voice sessions; understand free speech in the bank's main languages; authenticate callers (knowledge questions or a one-time code sent to the app); answer questions from the help centre; call account tools (balance, recent transactions, freeze card, set up a payment plan) with the caller's permissions; hand off to a human agent with a summary when needed (hd15 covers handoff policy); allow interruption at any time; record transcripts for audit where the law allows.</p>
+<p><strong>Latency targets.</strong> <strong>Voice-to-voice latency</strong>, from the end of the caller's speech to the first audio of the reply as the caller hears it: p50 at most 1.0 s on the phone and 0.8 s in the app; p95 at most 1.6 s. Barge-in: agent audio stops within 200 ms of a confirmed interruption. No dead air longer than 1.5 s during tool calls.</p>
+<p><strong>Quality targets.</strong> Task success (the caller's goal achieved without a human) at least 65% for in-scope intents; premature endpoints (cutting the caller off) below 2% of turns; false barge-ins (stopping for a cough or "mm-hm") below 3% of agent turns; word error rate on numbers and names below agreed thresholds per language.</p>
+<p><strong>Scale and cost targets.</strong> 1 million calls a day, 10,000 simultaneous at peak; total cost including telephony at most $0.05 per minute; availability 99.95% for call handling (a failed assistant must fall back to the human queue, never to silence).</p>
+<p><strong>Safety targets.</strong> Authentication before any account data is spoken; spoken confirmation before money moves; no card numbers captured in transcripts (sensitive digits via keypad); recordings and transcripts retained and redacted per policy.</p>
+<p><strong>Clarifying questions.</strong> "Phone only, or app too?" "Which languages?" "Do we own the telephony or use a provider?" "Must the LLM be self-hosted for data reasons?" "What does a human handoff look like, and what is the human queue's capacity?"</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p><strong>Concurrency.</strong> One million calls a day at an average of 4 minutes is 4 million call-minutes. Spread over the 1,440 minutes of a day, that is about <strong>2,800 calls in progress on average</strong> (Little's law: concurrency = arrival rate × duration). Calls bunch into business hours, with a Monday-morning peak about three times the average, so roughly <strong>8,300 at peak</strong>; the design is sized for 10,000 with headroom.</p>
+<p><strong>Audio bandwidth.</strong> Phone audio is G.711 μ-law: 8,000 samples a second at 8 bits, 64 kbit/s each way, plus packet overhead. 10,000 calls is about 1.3 Gbit/s of audio in both directions combined: unremarkable for a data centre, but it must stay inside one region close to the telephony provider, because every extra network hop adds latency.</p>
+<p><strong>LLM load.</strong> In a typical service call the agent speaks a turn about every 8 seconds, so 10,000 calls produce about <strong>1,250 LLM requests a second</strong>. Each request carries the system prompt, tool definitions and the conversation so far, about 3,500 tokens, but with prefix caching (hd1) only the new part, roughly 300 tokens (the caller's latest words plus the agent's last turn and any tool result), needs fresh prefill. Spoken replies are short: about 40 output tokens. So the LLM fleet must handle about 375,000 prefill tokens and 50,000 decode tokens a second, with time to first token held near 250 ms.</p>
+<p><strong>ASR and TTS load.</strong> Every active call streams caller audio through VAD and ASR all the time (the caller might speak at any moment), so 10,000 ASR streams. The agent is speaking roughly 40% of the time, so about 4,000 TTS streams at peak, each of which must synthesise faster than real time.</p>
+<p><strong>Cost per minute, assuming self-hosted models.</strong> The GPU sizing in section 10 arrives at about 230 GPUs at peak. At an assumed $2.50 per GPU-hour, that is $575 an hour, during an hour in which 10,000 calls run for 60 minutes each: 600,000 call-minutes. GPU cost is therefore about <strong>$0.001 per call-minute</strong> at peak, perhaps $0.002 averaged over the day once idle off-peak capacity is counted. Telephony carriage (assume $0.010 a minute for this estimate; real rates depend on carrier, country and contract) is ten times larger. If the LLM is a hosted API instead, with the illustrative $3 and $15 per million input and output tokens and cached input at a tenth of the price, one turn costs about (300 + 3,200 × 0.1) × $3/10⁶ + 40 × $15/10⁶ ≈ $0.0019 + $0.0006 = $0.0025, and at 7.5 turns a minute about <strong>$0.018 a minute</strong>, more than everything else combined. Either way, the cost target of $0.05 a minute is met, but by a margin that depends far more on carriage and API pricing than on GPUs.</p>
+<p><strong>The insight to say out loud.</strong> This is a concurrency system, not a throughput system: 10,000 long-lived bidirectional streams, each with tight per-turn deadlines. The hard parts are turn-taking, the latency budget and graceful failure, not raw compute.</p>
+
+<h4>3 · The session API</h4>
+<pre># Phone: the telephony provider opens a WebSocket per call
+WS /v1/calls/stream?call_sid=CA...          # inbound: base64 audio/x-mulaw @ 8 kHz, mono
+  &lt;- {"event":"media","media":{"payload":"..."}}        every 20 ms
+  -&gt; {"event":"media","media":{"payload":"..."}}        agent audio chunks
+  -&gt; {"event":"mark","mark":{"name":"turn12_chunk3"}}   provider echoes when played
+  -&gt; {"event":"clear"}                                  barge-in: drop buffered audio
+
+# App: the client joins a WebRTC room; an agent worker joins the same room
+POST /v1/sessions  { "channel": "app", "user_token": "...", "locale": "en-GB" }
+  -&gt; { "room": "rm_93", "token": "...", "media_url": "wss://media.region..." }
+
+# Internal events every session emits (to tracing and evaluation)
+turn.user_end_detected  { t_audio_end_ms, endpoint_delay_ms, transcript, confidence }
+turn.agent_first_audio  { t_first_audio_ms, voice_to_voice_ms, stage_breakdown }
+turn.barge_in           { confirmed: true, played_ms: 1840, truncated_chars: 112 }
+tool.call / tool.result { name, latency_ms, idempotency_key, filler_spoken }</pre>
+<p>Two choices matter. The phone path speaks the telephony provider's protocol directly, including <strong>marks</strong> (the provider echoes a named marker when the audio before it has finished playing) and <strong>clear</strong> (empty the provider's playback buffer), because barge-in depends on both: Twilio's media-stream documentation describes exactly these two messages. And every turn emits timing events with a stage breakdown, because the latency budget is managed per turn from real measurements, not from component benchmarks.</p>
+
+<h4>4 · Cascade or speech-to-speech</h4>
+<p>A <strong>cascade</strong> connects separate models with text. Its strengths are control and visibility: transcripts exist for audit and evaluation; text guardrails and redaction run between recognition and the LLM and between the LLM and synthesis; any LLM can be used, including fine-tuned or self-hosted ones with full tool support; each stage can be swapped, scaled and measured independently. Its weakness is that each hand-off adds latency, and converting speech to text discards tone of voice: the LLM does not hear that the caller sounds upset, and the synthesiser must guess how to say things.</p>
+<p>A <strong>speech-to-speech model</strong> takes audio in and produces audio out. Hosted examples include OpenAI's Realtime models; research models such as Moshi model the user's and the system's audio as parallel streams and report a theoretical latency of 160 ms. Strengths: fewer hops and therefore lower latency, prosody (tone, emphasis, hesitation) understood and produced, and turn detection built in (OpenAI's API offers server-side VAD and a semantic VAD mode). Weaknesses: less control between steps, transcripts produced alongside rather than as the source of truth, dependence on one vendor's model for both understanding and speaking, and usually a per-minute or per-audio-token price.</p>
+<p>The design choice is per flow, behind one session layer. The bank routes authentication, payments and complaints (where exact transcripts, redaction and deterministic tool use matter) through the cascade, and open-ended help-centre conversations through speech-to-speech where it measures better on latency and satisfaction. The session layer, transport, tools and evaluation are shared, so moving a flow is a configuration change measured by an A/B test.</p>
+
+<h4>5 · High-level design</h4>
+<p><strong>Edge.</strong> Phone calls arrive from carriers over <strong>SIP trunks</strong> (connections carrying calls between the phone network and software) to a telephony provider, which forwards audio over a WebSocket to the nearest region. App sessions use <strong>WebRTC</strong> to a <strong>media server</strong> (a selective forwarding unit, or SFU, such as LiveKit's) in the nearest region. <strong>Session workers</strong> are CPU processes, each running a few dozen call sessions: VAD, the turn state machine, orchestration of ASR, LLM, TTS and tools, and audio encoding. <strong>Model services</strong> are shared GPU pools reached over streaming gRPC: ASR, an LLM fleet (or a gateway to a hosted LLM, hd13), TTS, and for some flows a speech-to-speech endpoint. <strong>Tool services</strong> are the bank's APIs behind an authorisation layer that checks the authenticated caller's identity. <strong>State</strong>: per-call session state (transcript, task, tool results) checkpointed to a fast store after each turn; recordings and transcripts to object storage with retention rules; timing and quality events to the tracing and evaluation platform (hd12). <strong>Control plane</strong>: routing of calls to regions and workers, autoscaling, configuration of prompts, voices and turn-detection settings per flow.</p>
+<p>Everything on a call's critical path lives in one region, ideally one availability zone: the media edge, the session worker and the GPU services. A cross-region hop adds tens of milliseconds to every turn, which the budget cannot afford.</p>
+
+<h4>6 · Deep dive: the latency budget, stage by stage</h4>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Phone turn latency budget at the median. Inbound carriage 80 ms, endpointing 300 ms, ASR finalisation 60 ms, LLM time to first token 250 ms, first phrase 100 ms, TTS first audio 120 ms, outbound carriage 80 ms: total 990 ms. Below, the optimised version: speculative LLM generation overlaps most of the LLM time with the endpointing wait, giving about 800 ms. WebRTC saves about 80 ms more.">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="20" y="20" style="fill:var(--ink);font-weight:600">Phone turn, sequential (scale: 100 ms = 55 px)</text>
+<rect x="20" y="32" width="44" height="30" style="fill:var(--s6)"/>
+<rect x="64" y="32" width="165" height="30" style="fill:var(--s1)"/>
+<rect x="229" y="32" width="33" height="30" style="fill:var(--s2)"/>
+<rect x="262" y="32" width="137.5" height="30" style="fill:var(--accent)"/>
+<rect x="399.5" y="32" width="55" height="30" style="fill:var(--s5)"/>
+<rect x="454.5" y="32" width="66" height="30" style="fill:var(--s3)"/>
+<rect x="520.5" y="32" width="44" height="30" style="fill:var(--s6)"/>
+<text x="42" y="80" text-anchor="middle" style="fill:var(--ink-2)">in 80</text>
+<text x="146" y="80" text-anchor="middle" style="fill:var(--ink-2)">endpointing 300</text>
+<text x="245" y="96" text-anchor="middle" style="fill:var(--ink-2)">ASR 60</text>
+<text x="330" y="80" text-anchor="middle" style="fill:var(--ink-2)">LLM TTFT 250</text>
+<text x="427" y="96" text-anchor="middle" style="fill:var(--ink-2)">phrase 100</text>
+<text x="487" y="80" text-anchor="middle" style="fill:var(--ink-2)">TTS 120</text>
+<text x="542" y="96" text-anchor="middle" style="fill:var(--ink-2)">out 80</text>
+<text x="575" y="52" style="fill:var(--ink);font-weight:600">≈ 990 ms</text>
+<text x="20" y="136" style="fill:var(--ink);font-weight:600">With speculative generation during the endpointing wait</text>
+<rect x="20" y="148" width="44" height="30" style="fill:var(--s6)"/>
+<rect x="64" y="148" width="165" height="30" style="fill:var(--s1)"/>
+<rect x="146" y="184" width="137.5" height="14" style="fill:var(--accent);opacity:0.55"/>
+<text x="215" y="212" text-anchor="middle" style="fill:var(--accent)">LLM starts on the partial transcript at 150 ms of silence</text>
+<rect x="229" y="148" width="66" height="30" style="fill:var(--accent)"/>
+<rect x="295" y="148" width="55" height="30" style="fill:var(--s5)"/>
+<rect x="350" y="148" width="66" height="30" style="fill:var(--s3)"/>
+<rect x="416" y="148" width="44" height="30" style="fill:var(--s6)"/>
+<text x="480" y="168" style="fill:var(--ink);font-weight:600">≈ 800 ms</text>
+<text x="320" y="240" text-anchor="middle" style="fill:var(--muted)">If the caller keeps talking, the speculative work is discarded; the cost is wasted prefill, not latency.</text>
+</g>
+</svg>
+<figcaption>The endpointing wait is the largest single block, and it is dead time unless something useful happens during it. Speculative generation uses that time; notice that the LLM bar moves under the endpointing bar rather than shrinking, which is why the saving holds even with an unchanged model.</figcaption>
+</figure>
+<p><strong>The baseline, stage by stage.</strong> Inbound carriage: the caller's audio crosses carriers and the telephony provider's jitter buffer (a small buffer that smooths uneven packet arrival), about 80 ms. <strong>Endpointing</strong>: the system waits for enough silence (and, with a turn detector, enough meaning) to decide the turn is over; 300 ms is an aggressive but common target. Defaults in frameworks are more conservative: LiveKit's documentation says the session waits between 0.5 and 3.0 seconds after speech by default, and its Silero VAD plugin defaults to 0.55 s of silence; OpenAI's server VAD example uses 500 ms. Getting to 300 ms is a tuning project, not a default. ASR finalisation: once the turn ends, the recogniser emits its final transcript, about 60 ms after the last audio. LLM time to first token: queueing plus prefill of the new tokens, about 250 ms. First phrase: TTS needs a few words before it can start speaking naturally, so the system waits for the first clause, about 100 ms of generation. TTS first audio: about 120 ms. Outbound carriage: about 80 ms. Total: about <strong>990 ms</strong> at the median, just inside the phone target with no margin.</p>
+<p><strong>Where the time comes back.</strong> <em>Semantic turn detection</em>: a <strong>turn detector</strong>, a small model reading the partial transcript (and in some systems the audio), predicts whether the turn is complete. After a definite statement ("I'd like to freeze my card.") it can endpoint after 200 ms; after a trailing one ("My account number is, um...") it waits longer. OpenAI's semantic VAD mode works the same way, with an <code>eagerness</code> setting that tunes the maximum wait. <em>Speculative generation</em>: start the LLM on the partial transcript after, say, 150 ms of silence; if the turn is confirmed and the final transcript matches, the reply is already 150 ms along; if the caller keeps talking, discard it. This moves most of the LLM's time under the endpointing wait and brings the median to about <strong>800 ms</strong>. <em>Prefix caching</em> keeps prefill to the new tokens. <em>Short first sentences</em>: instruct the model to open with a short clause ("Sure, let me check.") so TTS can start sooner. <em>Co-location</em>: VAD, ASR, LLM and TTS in the same zone as the media edge, with persistent streaming connections, so internal hops cost single-digit milliseconds. <em>WebRTC</em>: in the app, network carriage is about 40 ms each way instead of 80, saving another 80 ms.</p>
+<p><strong>Percentiles do not add.</strong> The p95 of each stage summed gives a pessimistic number, because stages rarely all hit their tail at once; mm7's lab shows stage p95s summing to about 1,510 ms against an end-to-end p95 of about 1,330 ms. The opposite error also happens: LLM queueing delay rises sharply as the fleet's utilisation rises, so the p95 at 9 a.m. on Monday can be twice that at 3 p.m. on Wednesday. Measure voice-to-voice latency end to end, per turn, at the media edge, and break it down by stage from timestamps, by hour and by load.</p>
+
+<h4>7 · Deep dive: the barge-in state machine</h4>
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Turn state machine. States: Listening, User speaking, Endpoint pending (speculating), Agent thinking, Agent speaking, Barge-in candidate, Tool wait. Transitions: speech start moves Listening to User speaking; silence moves to Endpoint pending; speech resumes returns to User speaking and discards speculation; turn confirmed moves to Agent thinking; first audio moves to Agent speaking; speech detected while speaking moves to Barge-in candidate with volume ducked; speech under 250 ms or a backchannel returns to Agent speaking; speech of 250 ms or real words confirms: clear buffer, cancel, truncate, back to User speaking; tool call moves to Tool wait with filler; reply finished returns to Listening.">
+<defs><marker id="hd23-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="20" y="30" width="110" height="36" rx="18" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+<text x="75" y="53" text-anchor="middle" style="fill:var(--ink)">Listening</text>
+<rect x="190" y="30" width="120" height="36" rx="18" style="fill:var(--surface-2);stroke:var(--s1)"/>
+<text x="250" y="53" text-anchor="middle" style="fill:var(--ink)">User speaking</text>
+<rect x="380" y="30" width="140" height="36" rx="18" style="fill:var(--surface-2);stroke:var(--s2)"/>
+<text x="450" y="47" text-anchor="middle" style="fill:var(--ink)">Endpoint pending</text>
+<text x="450" y="61" text-anchor="middle" style="fill:var(--muted)">speculating</text>
+<rect x="420" y="130" width="120" height="36" rx="18" style="fill:var(--surface-2);stroke:var(--accent)"/>
+<text x="480" y="153" text-anchor="middle" style="fill:var(--ink)">Agent thinking</text>
+<rect x="230" y="130" width="130" height="36" rx="18" style="fill:var(--surface-2);stroke:var(--s3)"/>
+<text x="295" y="153" text-anchor="middle" style="fill:var(--ink)">Agent speaking</text>
+<rect x="210" y="230" width="170" height="36" rx="18" style="fill:var(--surface-2);stroke:var(--crit)"/>
+<text x="295" y="247" text-anchor="middle" style="fill:var(--ink)">Barge-in candidate</text>
+<text x="295" y="261" text-anchor="middle" style="fill:var(--muted)">volume ducked</text>
+<rect x="470" y="230" width="130" height="36" rx="18" style="fill:var(--surface-2);stroke:var(--s4)"/>
+<text x="535" y="247" text-anchor="middle" style="fill:var(--ink)">Tool wait</text>
+<text x="535" y="261" text-anchor="middle" style="fill:var(--muted)">filler spoken</text>
+<line x1="130" y1="48" x2="188" y2="48" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="159" y="40" text-anchor="middle" style="fill:var(--muted)">speech</text>
+<line x1="310" y1="42" x2="378" y2="42" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="344" y="34" text-anchor="middle" style="fill:var(--muted)">silence</text>
+<line x1="378" y1="58" x2="312" y2="58" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="344" y="78" text-anchor="middle" style="fill:var(--muted)">resumes: discard</text>
+<line x1="470" y1="68" x2="478" y2="128" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="520" y="102" style="fill:var(--muted)">confirmed</text>
+<line x1="418" y1="148" x2="362" y2="148" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="390" y="140" text-anchor="middle" style="fill:var(--muted)">audio</text>
+<line x1="270" y1="168" x2="270" y2="228" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="200" y="200" style="fill:var(--muted)">speech heard</text>
+<line x1="320" y1="228" x2="320" y2="170" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="328" y="200" style="fill:var(--muted)">&lt;250 ms / "mm-hm"</text>
+<path d="M210,248 L150,248 L150,90 L235,68" marker-end="url(#hd23-arrow2)" style="stroke:var(--crit);fill:none"/>
+<text x="90" y="160" style="fill:var(--crit)">confirmed:</text>
+<text x="90" y="176" style="fill:var(--crit)">clear · cancel</text>
+<text x="90" y="192" style="fill:var(--crit)">truncate</text>
+<line x1="500" y1="168" x2="525" y2="228" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="535" y="200" style="fill:var(--muted)">tool call</text>
+<path d="M230,138 L75,138 L75,68" marker-end="url(#hd23-arrow2)" style="stroke:var(--ink-2);fill:none"/>
+<text x="120" y="130" style="fill:var(--muted)">reply done</text>
+</g>
+</svg>
+<figcaption>The candidate state is the heart of good barge-in: it buys a quarter of a second to tell an interruption from a cough or a backchannel without letting the agent talk over the caller at full volume. Notice that a confirmed interruption does three things at once (clear the playback buffer, cancel generation, truncate history), and missing any one produces a distinct, recognisable bug.</figcaption>
+</figure>
+<p><strong>Detecting a candidate.</strong> VAD runs on the caller's audio continuously, including while the agent speaks. When it detects speech during the agent's turn, the session does not stop immediately: coughs, a door, a television and the caller's own <strong>backchannels</strong> ("mm-hm", "yeah", "OK", which mean "go on") would all stop the agent mid-sentence. Instead it enters the candidate state and <em>ducks</em> the agent's audio (lowers its volume, say to 30%) so the caller is not shouted over.</p>
+<p><strong>Confirming.</strong> The interruption is confirmed if speech continues for about 250 ms, or if ASR produces words that are not on the backchannel list. A word-based rule catches short real interruptions ("Stop.", "No.") that a duration rule would miss, while the duration rule catches interruptions in which ASR has not yet produced words. LiveKit's documentation describes a related feature, adaptive interruption handling, that distinguishes true interruptions from conversational backchannels, and a notion of false interruptions for this exact case. If the candidate speech ends quickly or is a backchannel, volume is restored and the agent continues.</p>
+<p><strong>Acting on a confirmed interruption.</strong> Three things, all needed. <em>Stop the audio</em>: the session stops sending audio, but the telephony provider has already buffered a second or more ahead, so the session sends Twilio's <code>clear</code> message, which empties the provider's audio buffer (Twilio then returns the outstanding marks). Over WebRTC, the agent's track is muted or its send buffer flushed. <em>Cancel generation</em>: cancel the LLM stream and the TTS stream so no more audio is produced and no more tokens are paid for. <em>Truncate history</em>: the LLM produced, say, three sentences, but the caller heard only the first one and a half. If the history keeps all three, the model believes it told the caller things they never heard ("as I mentioned, the fee is waived"). The session knows what was played from the marks: after each audio chunk it sends a mark named for that chunk, and the provider echoes it when that chunk finishes playing, so the last echoed mark gives the played position. OpenAI's Realtime documentation describes the same step for its API: over WebRTC and SIP the server truncates unplayed audio automatically, and over a WebSocket the client sends <code>conversation.item.truncate</code> with <code>audio_end_ms</code>, the number of milliseconds actually played.</p>
+<p><strong>Echo.</strong> If the caller is on a speakerphone or the app's loudspeaker, the agent's own voice comes back through the microphone. Browsers' WebRTC stacks include <strong>echo cancellation</strong> (AEC), which subtracts the known outgoing signal from the incoming one. On the phone you cannot rely on the far end, so the session raises the VAD threshold while the agent speaks (LiveKit's telephony example raises the server VAD threshold to 0.7 for noisy phone audio) and can compare incoming audio with its own recent output. Self-interruption shows up in metrics as barge-ins whose transcript matches the agent's own words.</p>
+<p><strong>Worked trace.</strong> At t = 0 the agent starts: "Your last three payments were forty pounds to..." At 1.6 s the caller says "No, the credit card." VAD fires at 1.65 s; the session ducks and enters the candidate state. ASR emits "no the" at 1.85 s: not a backchannel, so the interruption is confirmed at 1.85 s. The session sends <code>clear</code>; the last echoed mark corresponds to 1.70 s of played audio ("Your last three payments were forty pounds"), so the history is truncated there and the agent's turn is recorded as interrupted. The LLM and TTS streams are cancelled. The caller's full utterance ends at 2.6 s, endpointing confirms at 2.9 s, and the reply about the credit card starts at about 3.6 s. Audio stopped about 200 ms after the caller began speaking, within target.</p>
+
+<h4>8 · Deep dive: transport over telephony and WebRTC</h4>
+<p><strong>Phone path.</strong> Calls reach the bank's numbers through carriers and a telephony provider. The provider bridges the call to software in one of two ways: a <strong>SIP trunk</strong> to the bank's own media servers (more control, more operations), or a <em>media stream</em> over a WebSocket, as Twilio offers. Twilio's documentation specifies the format: audio arrives in media messages as base64-encoded <code>audio/x-mulaw</code> at 8,000 Hz, one channel. That is <strong>G.711 μ-law</strong>, the 8-bit, 8 kHz, 64 kbit/s encoding of classic telephony. Two consequences. Recognition models must be trained or tuned for 8 kHz narrowband audio, because models trained on 16 kHz wideband lose accuracy on phone audio, especially on numbers and names; and TTS output must be resampled to 8 kHz and μ-law encoded, which flattens voice quality, so voices are chosen for intelligibility on the phone. Typical audio frames are 20 ms (160 bytes of μ-law each).</p>
+<p><strong>App path.</strong> The app uses WebRTC, the browser and mobile standard for real-time media over UDP: the <strong>Opus</strong> codec at up to 48 kHz, jitter buffers that adapt to network conditions, built-in echo cancellation, noise suppression and encryption. The app connects to a media server in the nearest region; the session worker joins the same room as another participant. WebRTC's UDP transport tolerates packet loss gracefully (Opus conceals a lost packet), whereas audio over a TCP WebSocket stalls on loss while TCP retransmits, so WebSockets carrying audio belong only between servers in the same data centre, never over mobile networks to users.</p>
+<p><strong>Region placement and failure.</strong> Phone numbers and app sessions are routed to the nearest healthy region; each region has its own media edge, session workers and GPU pools sized for its share of peak plus the share it would inherit if a neighbouring region failed. If no assistant capacity is available, the call routes to the human queue with a message, never to silence.</p>
+
+<h4>9 · Deep dive: tool calls mid-conversation</h4>
+<p><strong>The dead-air problem.</strong> On the phone, more than about a second of silence makes callers think the line dropped. A tool such as "fetch last ten transactions" might take 300 ms or 3 seconds. The session predicts each tool's latency from recent history (a p90 per tool). If the prediction exceeds about 700 ms, the LLM is prompted (or a template is used) to speak a short <strong>filler</strong> first ("Let me pull up your recent transactions"), and the tool runs while the filler plays. If the tool is still running when the filler ends, a second filler or a soft processing sound follows at about 2 seconds, and a fallback at a hard timeout (say 6 seconds): "I'm having trouble reaching that system; I can transfer you or try again."</p>
+<p><strong>Keep listening.</strong> During a tool wait the caller may speak ("actually, just the credit card"). The state machine stays responsive: the new utterance is appended, and the tool result is used if still relevant or discarded if the caller changed the request.</p>
+<p><strong>State-changing tools.</strong> Freezing a card, setting up a payment plan or moving money follows the propose-confirm-execute pattern from hd15: the agent states exactly what it will do, the caller confirms ("yes"), and the tool executes with an <strong>idempotency key</strong> so that a retry after a timeout or a worker crash cannot execute twice. Numbers are read back digit by digit, because speech recognition errors on numbers are the most damaging kind.</p>
+<p><strong>Sensitive input.</strong> Card numbers or passwords spoken aloud end up in audio, transcripts and logs, which drags all of them into payment-card and security compliance scope. Systems commonly switch to keypad entry for these: the caller types digits on the keypad (the provider sends them as DTMF events, which Twilio's media streams expose as <code>dtmf</code> messages), and the session passes them to the tool without writing them to the transcript.</p>
+
+<h4>10 · GPU sizing for 10,000 simultaneous calls</h4>
+<p>The method matters more than the constants, which must be measured for your models and hardware. The figures below are assumptions for an 8-billion-parameter LLM and typical streaming ASR and TTS models on current data-centre GPUs.</p>
+<table>
+<thead><tr><th>Service</th><th>Load at peak</th><th>Assumed capacity per GPU</th><th>GPUs</th></tr></thead>
+<tbody>
+<tr><td>LLM decode</td><td>1,250 req/s × 40 tokens = 50,000 tok/s</td><td>2,100 tok/s at the latency target</td><td>24</td></tr>
+<tr><td>LLM prefill</td><td>1,250 req/s × 300 new tokens = 375,000 tok/s</td><td>25,000 tok/s</td><td>15</td></tr>
+<tr><td>LLM headroom</td><td>keep TTFT near 250 ms at p95</td><td>run at about 65% utilisation</td><td>≈ 60 total</td></tr>
+<tr><td>ASR</td><td>10,000 streams</td><td>150 concurrent streams</td><td>≈ 70</td></tr>
+<tr><td>TTS</td><td>4,000 streams (agent talks ~40% of the time)</td><td>40 real-time streams</td><td>100</td></tr>
+<tr><td>Total</td><td></td><td></td><td>≈ 230</td></tr>
+</tbody>
+</table>
+<p>Two points deserve saying aloud. The LLM's capacity is set by the time-to-first-token target, not raw throughput: a fleet that is 95% busy queues requests, and queueing delay lands directly in the voice-to-voice latency. So LLM GPUs run well below full utilisation at peak. And because calls last minutes, scaling down means <strong>draining</strong>: a session worker stops accepting new calls and exits when its last call ends. GPU pools scale on a schedule (known daily and weekly peaks) plus queue depth and time to first token, with a warm minimum per region. Off-peak, spare GPUs can run batch work such as transcribing recordings for quality review.</p>
+
+<h4>11 · Evaluation plan</h4>
+<p><strong>Per-turn metrics</strong>, from session events: voice-to-voice latency at p50 and p95 by channel, flow and hour, with the stage breakdown; <strong>premature endpoints</strong> (the caller resumes speaking within a second of the agent starting, a sign the agent cut them off); <strong>false barge-ins</strong> (agent stopped for noise, backchannel or its own echo); <strong>missed barge-ins</strong> (caller spoke over the agent for more than a second without the agent stopping); talk-over duration; dead-air gaps over 1.5 s.</p>
+<p><strong>Per-call metrics</strong>: task success (the intent was resolved without a human, verified by the tool log and absence of a repeat call within seven days); escalation rate and reason; authentication success; average handle time; post-call survey satisfaction where available.</p>
+<p><strong>Recognition quality</strong>: <strong>word error rate</strong> (WER, substitutions plus deletions plus insertions divided by reference words) on a weekly human-transcribed sample, broken out by channel, language and accent, with separate accuracy for numbers, dates and names, which matter most.</p>
+<p><strong>Offline regression with simulated callers.</strong> A suite of scripted scenarios (lost card, disputed payment, angry caller, caller who changes their mind, caller with a strong accent, noisy background, speakerphone echo) is played by an LLM acting as the caller through a TTS voice, with noise added, against each release. It measures task success, latency and interruption behaviour automatically. Simulated callers are more regular than real ones, so they gate releases but do not replace online measurement.</p>
+<p><strong>Online experiments.</strong> New turn detectors, voices, prompts or a switch between cascade and speech-to-speech for a flow are A/B tested by call, with task success as the primary metric and latency, premature endpoints, escalations and complaints as guardrails.</p>
+
+<h4>12 · Failure modes and trade-offs</h4>
+<table>
+<thead><tr><th>Failure</th><th>Symptom</th><th>Defence</th></tr></thead>
+<tbody>
+<tr><td>Endpointing too eager</td><td>Agent answers half-questions</td><td>Semantic turn detector, per-flow thresholds, premature-endpoint metric</td></tr>
+<tr><td>Endpointing too slow</td><td>Callers say "hello?"</td><td>Tune silence; speculative generation; latency alerts</td></tr>
+<tr><td>Echo self-interruption</td><td>Agent stops itself</td><td>AEC in app; higher VAD threshold while speaking on phone</td></tr>
+<tr><td>History not truncated</td><td>Agent refers to unheard text</td><td>Marks-based played position; truncate on every barge-in</td></tr>
+<tr><td>LLM queueing at peak</td><td>p95 latency doubles at 9 a.m.</td><td>Headroom, schedule-based scaling, priority for interactive</td></tr>
+<tr><td>Worker crash</td><td>Call drops</td><td>Per-turn checkpoint; reattach; idempotent tools</td></tr>
+<tr><td>Vendor outage</td><td>Silence</td><td>Fallback provider or self-hosted model; route to human queue</td></tr>
+</tbody>
+</table>
+<p>The trade-offs to name: shorter endpointing against more cut-offs; speculative generation against wasted prefill; cascade control against speech-to-speech naturalness; self-hosting cost and control against API simplicity; aggressive scale-in against warm capacity for sudden spikes.</p>
+
+<h4>13 · What changes at 10× scale</h4>
+<p>At 10 million calls a day and 100,000 simultaneous calls, three things change. <strong>Multi-region by default</strong>: tens of thousands of GPUs cannot sit in one region, so each region carries its local traffic plus failover share, and telephony routing becomes region-aware. <strong>Model specialisation</strong>: the LLM bill or fleet is large enough to fine-tune a small model for the top intents (shorter prompts, faster first tokens) and to distil the turn detector per language. <strong>Capacity contracts and spot use</strong>: provisioned throughput from vendors or reserved GPUs cover the daily base, with burst capacity for peaks, and off-peak GPUs run transcription and evaluation jobs so the fleet's average utilisation rises. The session layer itself scales horizontally without change, which is the payoff of keeping it stateless apart from the per-turn checkpoint.</p>
+</section>
+
+<section data-field="deep">
+<h4>Turn-taking is a prediction problem with asymmetric costs</h4>
+<p>Endpointing decides, every few tens of milliseconds, whether the caller is done. Waiting too long costs latency on every turn; ending too early costs a broken turn, which is much worse: the agent answers half a question, the caller talks over it, barge-in fires, and the conversation loses several seconds and some trust. So the threshold should not sit where errors balance; it should sit where the expected cost is lowest, which tolerates a slightly slower median to keep premature endpoints rare. A turn detector improves the whole trade-off curve rather than moving along it: it knows that "I'd like to check my balance." is complete and "I'd like to check my, um" is not, so it can be fast on the first and patient on the second. LiveKit's documentation gives the same rationale for its turn-detector model, citing a user who says they need to think for a moment and then pauses.</p>
+<h4>Speculative generation is a cache of probable futures</h4>
+<p>Starting the LLM before the turn is confirmed is a bet that the partial transcript is the final one. When it wins, the reply is ready sooner; when it loses, the work is discarded. The cost is wasted prefill and decode on abandoned speculations, which at a 20–30% loss rate adds that much to LLM compute. Two refinements make it cheaper: speculate only after the turn detector's probability crosses a moderate threshold, and keep the speculation's prefix cache, because the final transcript usually extends the partial one, so even a "lost" speculation leaves useful cached prefill behind.</p>
+<h4>Interruptions corrupt state unless every layer agrees on what was heard</h4>
+<p>Four layers have their own idea of the conversation: the LLM's context, the TTS stream, the telephony provider's playback buffer and the caller's ears. A barge-in must bring the first three in line with the fourth. The playback buffer is the subtle one: audio sent is not audio played, because providers buffer ahead to smooth jitter. Marks solve this by turning "played" into an event; without them, sessions guess from send times and truncate in the wrong place, producing agents that skip or repeat half-sentences after interruptions. The same discipline applies to tools: a tool result that arrives after the caller changed the request must be checked against the current state before it is spoken.</p>
+<h4>Speech-to-speech changes where guardrails can live</h4>
+<p>In a cascade, text exists between every stage, so a redaction step can strip card numbers before the LLM sees them, a policy classifier can block an unsafe reply before it is spoken, and the transcript is the authoritative record. In a speech-to-speech model, the model hears audio and speaks audio; transcripts are produced alongside, not in between. Guardrails move to the edges: input policy enforced by what tools and data the model can reach, output checks run on the parallel transcript (which may lag the audio), and compliance records kept as audio plus transcript. For regulated flows this is often the deciding argument for keeping the cascade, independent of latency.</p>
+<h4>GPU utilisation fights latency, and calls make it worse</h4>
+<p>An LLM fleet serving chat can run hot because users tolerate an extra half-second; a voice fleet cannot, because queueing delay lands directly in voice-to-voice latency. Calls are also long, so the load cannot be shed quickly: a surge of new calls adds load that persists for minutes. The practical answers are priority scheduling (voice turns ahead of any batch work sharing the fleet), admission control at the call level (when capacity is exhausted, new calls go to the human queue or a callback offer, rather than degrading every existing call), and forecasting-driven scaling, because reactive autoscaling that takes several minutes to add GPUs is too slow for a Monday-morning ramp.</p>
+<h4>Narrowband audio changes model choices</h4>
+<p>Phone audio cuts frequencies above about 3.4 kHz, removing much of the information that distinguishes consonants such as f and s. Recognisers trained on wideband audio lose accuracy on it, most visibly on spelled names, postcodes and account numbers. Teams either fine-tune ASR on 8 kHz call audio, or use models trained on mixed bandwidths, and they add domain vocabulary (product names, branch names) as recognition hints. On the output side, synthetic voices that sound rich at 24 kHz can sound muffled at 8 kHz μ-law, so voices are evaluated on the phone channel, not in a studio.</p>
+</section>
+
+<section data-field="prod">
+<h4>How it fails in practice</h4>
+<p><strong>The Monday-morning p95.</strong> The assistant met its latency targets in testing and at launch on a Wednesday. The next Monday at 9 a.m., p95 voice-to-voice latency rose from 1.4 s to 2.9 s and talk-over doubled. Traces showed the LLM fleet at 97% utilisation and time to first token queueing. Autoscaling was reactive and took eight minutes to add GPUs, by which time the ramp was over and callers had suffered. The fix was schedule-based pre-scaling from the weekly forecast, a lower utilisation target for the voice pool, and call-level admission control that offers callbacks when capacity is short.</p>
+<p><strong>The agent that talked to itself.</strong> In-app sessions on one Android model showed a false barge-in rate of 20%, against 2% elsewhere. Transcripts of the "interruptions" matched the agent's own words. That device's echo cancellation was disabled in the app's audio configuration for a speakerphone mode. Re-enabling the platform's echo cancellation and adding a check that flags barge-ins whose transcript matches recent agent output fixed it and gave a permanent detector for the next regression.</p>
+<p><strong>The phantom promise.</strong> Callers complained that the assistant claimed to have "already explained" a fee waiver they had never heard. Each case followed a barge-in. A refactor had moved truncation onto the send path rather than the played path, so after interruptions the history kept text that had been sent to the provider but never played. Restoring marks-based truncation and adding a simulated-caller scenario that interrupts at random points closed it.</p>
+<h4>What to monitor</h4>
+<p>Per turn: voice-to-voice latency by stage, endpointing delay, premature endpoints, false and missed barge-ins, dead-air gaps. Per call: task success, escalation, authentication failures, duration, survey score. Per service: concurrent sessions per worker, GPU utilisation and queue depth per pool, LLM time to first token, ASR and TTS real-time factor, tool latency and error rates. Business: cost per minute split into carriage, APIs and compute; calls routed to humans because of capacity.</p>
+<h4>Knobs people tune</h4>
+<p>VAD activation threshold and minimum silence per channel; turn-detector eagerness; barge-in confirmation duration and backchannel list; speculation threshold; filler trigger latency and phrases; TTS voice and speed for the phone channel; LLM utilisation target; regional capacity shares; admission-control thresholds.</p>
+<h4>The real cases: OpenAI Realtime, LiveKit and Twilio documentation</h4>
+<p>The mechanisms in this design are visible in vendors' public documentation, checked on 10 October 2026. OpenAI's Realtime API configures turn detection per session with either <code>server_vad</code>, which takes a threshold, <code>prefix_padding_ms</code> and <code>silence_duration_ms</code> (its example uses 0.5, 300 and 500), or <code>semantic_vad</code>, which scores the probability that the user has finished speaking from their words and has an <code>eagerness</code> setting (low, medium, high or auto, where auto equals medium). Its conversation guide describes interruption: over WebRTC and SIP the server knows how much audio has played and truncates automatically; over a WebSocket the client must stop playback and send <code>conversation.item.truncate</code> with <code>audio_end_ms</code>. LiveKit's Agents framework documents turn detection modes (a turn-detector model, a realtime model's own detection, VAD only, speech-to-text endpointing, or manual), default endpointing waits of 0.5 to 3.0 seconds, a requirement that VAD's minimum silence be at least 250 ms when using its audio turn detector, Silero VAD defaults (0.55 s minimum silence, activation threshold 0.5) and a telephony configuration with a higher VAD threshold and a 400 ms silence window. Twilio's media streams specify phone audio as <code>audio/x-mulaw</code> at 8,000 Hz mono, provide mark messages that report when audio has finished playing, and a clear message that empties the playback buffer. Defaults and product names change quickly in this area; the stable lesson is the set of mechanisms every production voice system needs: tunable endpointing, interruption with truncation to played audio, and explicit buffer control.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> build a voice latency budget calculator that samples each stage from a skewed distribution, shows end-to-end percentiles for phone and app, shows that summed stage p95s overstate the end-to-end p95, measures the effect of speculation, and sizes GPUs for N concurrent calls. Python 3.12, standard library only.</p>
+<ol>
+<li>Save as <code>voice_budget.py</code> and run <code>python voice_budget.py</code>.</li>
+<li>Read the stage table: each stage's p50 and p95, then the sum of p95s against the simulated end-to-end p95.</li>
+<li>Compare the three scenarios (phone, phone with speculation, app with speculation). Speculation should move the median by roughly the overlap, not the whole LLM time.</li>
+<li>Change <code>ENDPOINT_MS</code> to 550 (a common default) and see how far the phone p50 moves: the turn detector, not the model, is the biggest lever.</li>
+<li>Change <code>CALLS</code> and the per-GPU capacities in the sizing block and read the GPU count and cost per minute.</li>
+</ol>
+<pre>"""Voice latency budget and GPU sizing. Python 3.12, stdlib only."""
+import math, random, statistics as st
+rng = random.Random(42)
+ENDPOINT_MS = 300
+def lognorm(median, p95):                 # sampler with given median and p95
+    sigma = math.log(p95 / median) / 1.645
+    return lambda: median * math.exp(rng.gauss(0, sigma))
+def stages(channel):
+    net = (80, 130) if channel == "phone" else (40, 80)
+    return {"net_in": lognorm(*net), "endpoint": lognorm(ENDPOINT_MS, ENDPOINT_MS * 1.6),
+            "asr_final": lognorm(60, 120), "llm_ttft": lognorm(250, 520),
+            "first_phrase": lognorm(100, 180), "tts_first": lognorm(120, 220),
+            "net_out": lognorm(*net)}
+def pct(xs, p): xs = sorted(xs); return xs[int(p / 100 * (len(xs) - 1))]
+def simulate(channel, speculate, n=20_000):
+    S = stages(channel); totals = []; per = {k: [] for k in S}
+    for _ in range(n):
+        v = {k: f() for k, f in S.items()}
+        for k in v: per[k].append(v[k])
+        llm = v["llm_ttft"]
+        if speculate:                     # LLM starts at 150 ms of silence on the partial
+            head_start = max(0.0, v["endpoint"] + v["asr_final"] - 150)
+            llm = max(0.0, llm - head_start)
+        totals.append(v["net_in"] + v["endpoint"] + v["asr_final"] + llm
+                      + v["first_phrase"] + v["tts_first"] + v["net_out"])
+    return per, totals
+per, tot = simulate("phone", False)
+print(f"{'stage':13} {'p50':&gt;6} {'p95':&gt;6}")
+for k, xs in per.items(): print(f"{k:13} {pct(xs,50):6.0f} {pct(xs,95):6.0f}")
+print(f"sum of stage p95s: {sum(pct(xs,95) for xs in per.values()):.0f} ms  "
+      f"vs end-to-end p95: {pct(tot,95):.0f} ms\n")
+for label, ch, spec in [("phone", "phone", False), ("phone+spec", "phone", True),
+                        ("app+spec", "app", True)]:
+    _, t = simulate(ch, spec)
+    print(f"{label:11} p50 {pct(t,50):5.0f} ms   p95 {pct(t,95):5.0f} ms")
+
+CALLS, TURN_S, NEW_TOK, OUT_TOK = 10_000, 8, 300, 40
+DEC_PER_GPU, PRE_PER_GPU, UTIL = 2_100, 25_000, 0.65
+ASR_PER_GPU, TTS_PER_GPU, TALK_SHARE, GPU_HR = 150, 40, 0.4, 2.50
+req = CALLS / TURN_S
+llm = (req * OUT_TOK / DEC_PER_GPU + req * NEW_TOK / PRE_PER_GPU) / UTIL
+asr = CALLS / ASR_PER_GPU; tts = CALLS * TALK_SHARE / TTS_PER_GPU
+total = math.ceil(llm) + math.ceil(asr) + math.ceil(tts)
+print(f"\n{req:.0f} LLM req/s -&gt; LLM {llm:.0f}, ASR {asr:.0f}, TTS {tts:.0f} GPUs = {total}")
+print(f"GPU cost per call-minute at peak: ${total * GPU_HR / (CALLS * 60):.4f}")</pre>
+<p><strong>What to look for:</strong> the sum of stage p95s well above the simulated end-to-end p95 (tails rarely coincide); a phone p50 near one second without speculation and noticeably lower with it; the endpointing stage dominating; and a GPU cost per minute around a tenth of a cent, small next to an assumed $0.010 per minute of carriage.</p>
+</section>
+
+<section data-field="drill">
+<b>Estimate it</b>
+<p>A retailer expects 300,000 calls a day averaging 3 minutes, with a peak hour carrying 12% of the day's calls. Agent turns come every 9 seconds, need 250 new prefill tokens and 45 output tokens, and the agent speaks 35% of the time. Use the lesson's per-GPU assumptions (2,100 decode and 25,000 prefill tokens a second per GPU at 65% utilisation, 150 ASR streams and 40 TTS streams per GPU). (a) Peak concurrency? (b) GPUs per service? (c) GPU cost per call-minute at $2.50 an hour?</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> The peak hour has 0.12 × 300,000 = 36,000 calls, an arrival rate of 10 a second; with 180-second calls, Little's law gives about <strong>1,800 concurrent calls</strong>.</p>
+<p><strong>(b)</strong> LLM requests: 1,800 / 9 = 200 a second. Decode: 200 × 45 = 9,000 tok/s ÷ 2,100 ≈ 4.3 GPUs; prefill: 200 × 250 = 50,000 tok/s ÷ 25,000 = 2 GPUs; total 6.3 ÷ 0.65 ≈ <strong>10 LLM GPUs</strong>. ASR: 1,800 ÷ 150 = <strong>12</strong>. TTS: 1,800 × 0.35 = 630 streams ÷ 40 ≈ <strong>16</strong>. About 38 GPUs at peak, plus a warm minimum and failover share for a second region.</p>
+<p><strong>(c)</strong> 38 × $2.50 = $95 an hour for 1,800 × 60 = 108,000 call-minutes: about <strong>$0.0009 per minute</strong> at peak. Off-peak the same GPUs serve fewer calls unless scaled down, so the daily average is perhaps two to three times higher, still far below typical carriage rates.</p>
+</details>
+<b>Diagnose it</b>
+<p>After a release, the share of calls where callers repeat themselves ("as I was saying...") doubles, voice-to-voice p50 improves by 120 ms, and false barge-ins are unchanged. What happened, and what do you check?</p>
+<details><summary>Answer</summary>
+<p>Faster replies plus more repeats points to <strong>premature endpoints</strong>: the release made the agent end turns sooner, so it answers before callers finish and they have to repeat. Check the release diff for endpointing changes (a lower silence threshold, a higher turn-detector eagerness, a new detector model); then look at the premature-endpoint metric (caller speech resuming within a second of the agent starting) by flow and channel, and listen to a sample. Phone calls with long account numbers or callers who pause mid-sentence will be hit hardest. Roll back the endpointing change or make it channel- and flow-specific, and add a regression scenario with mid-sentence pauses to the simulated-caller suite. The lesson: the latency metric improved because quality got worse, which is why premature endpoints must be a guardrail on every latency change.</p>
+</details>
+</section>

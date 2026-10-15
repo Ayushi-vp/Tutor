@@ -2,8 +2,14 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, NavLink, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth";
 import { ALL_IDS, NAV } from "../content";
+import { PinsProvider } from "../pins";
+import { ReadingMenu } from "../reading";
 import { useProgress } from "../store";
+import { TutorProvider, useTutor } from "../tutor";
+import { AskMenu } from "./AskMenu";
 import { Avatar } from "./Avatar";
+import { TutorPanel } from "./TutorPanel";
+import { XpToast } from "./XpToast";
 
 type Theme = "system" | "light" | "dark";
 
@@ -103,11 +109,20 @@ function UserMenu() {
 }
 
 export function Layout({ children }: { children: ReactNode }) {
+  return <PinsProvider><TutorProvider><Frame>{children}</Frame></TutorProvider></PinsProvider>;
+}
+
+function Frame({ children }: { children: ReactNode }) {
   const [theme, cycleTheme] = useTheme();
+  const tutorOpen = useTutor().open;
   const { user } = useAuth();
   const loc = useLocation();
   const [drawer, setDrawer] = useState(false);
+  const [railCompact, setRailCompact] = useState(() => localStorage.getItem("apc.rail.compact") === "1");
   useEffect(() => { window.scrollTo(0, 0); setDrawer(false); }, [loc.pathname]);
+  useEffect(() => {
+    try { localStorage.setItem("apc.rail.compact", railCompact ? "1" : "0"); } catch { /* ignore */ }
+  }, [railCompact]);
   useEffect(() => {
     if (!drawer) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setDrawer(false); };
@@ -138,6 +153,7 @@ export function Layout({ children }: { children: ReactNode }) {
           <div className="spacer" />
           <Search />
           <Ring />
+          <ReadingMenu />
           <button className="tbtn" type="button" onClick={cycleTheme} aria-label={`Colour theme: ${theme === "system" ? "auto" : theme}. Switch theme`}>
             <span aria-hidden="true">{theme === "system" ? "◐" : dark ? "●" : "○"}</span><span className="tbtn-l">{theme === "system" ? "Auto" : dark ? "Dark" : "Light"}</span>
           </button>
@@ -145,7 +161,7 @@ export function Layout({ children }: { children: ReactNode }) {
           <UserMenu />
         </div>
       </header>
-      <div className="shell">
+      <div className={`shell${railCompact ? " rail-compact" : ""}${tutorOpen ? " tutor-open" : ""}`}>
         <div className={`scrim${drawer ? " open" : ""}`} onClick={() => setDrawer(false)} aria-hidden="true" />
         <nav id="rail" className={`rail${drawer ? " open" : ""}`} aria-label="Sections">
           <div className="rail-top">
@@ -154,12 +170,29 @@ export function Layout({ children }: { children: ReactNode }) {
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M4 4l8 8M12 4l-8 8" /></svg>
             </button>
           </div>
+          <div className="rail-tools">
+            <div className="rail-tools-copy">
+              <span>Learning map</span>
+              <b>Navigator</b>
+            </div>
+            <button className="rail-toggle" type="button" aria-pressed={railCompact}
+              aria-label={railCompact ? "Expand navigation" : "Minimise navigation"}
+              title={railCompact ? "Expand navigation" : "Minimise navigation"}
+              onClick={() => setRailCompact(v => !v)}>
+              <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="2.5" y="2.5" width="13" height="13" rx="2.5" />
+                <path d="M7 3v12" />
+                <path d={railCompact ? "m10 7 2 2-2 2" : "m12 7-2 2 2 2"} />
+              </svg>
+            </button>
+          </div>
           {nav.map((g, gi) => (
-            <div key={g.g} style={{ display: "contents" }}>
+            <div className="rail-group" key={g.g}>
               <div className={`rail-h${gi ? "" : " first"}`}>{g.g}</div>
               {g.items.map(it => (
-                <NavLink key={it.v} to={it.v === "overview" ? "/" : `/${it.v}`} end className="navb">
-                  <span className="ni">{it.i}</span><span>{it.n}</span>
+                <NavLink key={it.v} to={it.v === "overview" ? "/" : `/${it.v}`} end className="navb"
+                  aria-label={railCompact ? `${g.g}: ${it.n}` : undefined} title={railCompact ? it.n : undefined}>
+                  <span className="ni" aria-hidden="true">{it.i}</span><span className="nav-label">{it.n}</span>
                   {!!it.deep && <span className={`ndeep${it.deep < 1 ? " part" : ""}`}
                     title={it.deep < 1 ? `Detailed lessons: ${Math.round(it.deep * 100)}% rewritten` : "Detailed lessons"} />}
                   {it.count !== undefined && <span className="nc">{it.count}</span>}
@@ -170,6 +203,9 @@ export function Layout({ children }: { children: ReactNode }) {
         </nav>
         <main id="main" tabIndex={-1}>{children}</main>
       </div>
+      <TutorPanel />
+      <AskMenu />
+      <XpToast />
     </>
   );
 }

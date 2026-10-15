@@ -1,0 +1,587 @@
+<!-- topic source for torch/pt7; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "pt7",
+  "t": "Mixed precision and memory: autocast, bf16 vs fp16, GradScaler, activations, checkpointing and OOM debugging",
+  "tag": "Memory",
+  "sum": "Where GPU memory goes in a training step and how PyTorch lets you spend less of it: autocast and its op lists, bf16 versus fp16 and when GradScaler is needed, the activation-memory formula, activation checkpointing, the caching allocator's statistics, memory snapshots, and a method for fixing CUDA out-of-memory errors.",
+  "prereq": [
+    [
+      "gpu4",
+      "FP16 has 5 exponent bits (max 65,504, smallest normal 6.1e-5); BF16 has FP32's 8 exponent bits but only 8 bits of precision; tensor cores multiply 16-bit inputs and accumulate in FP32."
+    ],
+    [
+      "gpu9",
+      "Training memory is weights + gradients + optimiser state + activations; ZeRO/FSDP shard the first three; activation checkpointing trades recomputation for activation memory."
+    ],
+    [
+      "pt3",
+      "Autograd saves tensors in the forward pass for use in backward and frees them as backward passes each node; saved-tensor hooks can intercept what is saved."
+    ],
+    [
+      "pt6",
+      "A training step is forward, loss, backward, clip, optimizer.step, scheduler.step, zero_grad; clipping reads .grad and returns the total norm."
+    ]
+  ],
+  "myths": [
+    [
+      "Mixed precision means the model's weights are stored in 16 bits.",
+      "With torch.autocast the parameters stay in float32; autocast casts them to bf16 or fp16 on the fly for operations that benefit (matmuls, convolutions) and keeps numerically sensitive operations in float32. Gradients land in float32 because the parameters are float32. Memory saved comes mainly from activations stored in 16 bits, and speed from tensor cores."
+    ],
+    [
+      "You always need a GradScaler with mixed precision.",
+      "Only with float16. Its narrow exponent range means small gradients underflow to zero, so the loss is scaled up before backward and gradients scaled back down before the step. bfloat16 has float32's exponent range, so gradients do not underflow and no scaler is needed — one reason bf16 became the default on GPUs that support it."
+    ],
+    [
+      "Activation memory is small compared with the weights.",
+      "For transformers at realistic sequence lengths it is usually the largest item. By the formula of Korthikanti et al., one layer of a 7B-class model (h = 4,096, 32 heads) at sequence length 4,096 and batch 1 stores about 3.3 GB of activations without FlashAttention — over 100 GB for 32 layers, against 14 GB of bf16 weights."
+    ],
+    [
+      "If nvidia-smi shows the GPU almost full, the model is using almost all the memory.",
+      "nvidia-smi shows what the process has reserved from the driver, including PyTorch's cache of freed blocks. torch.cuda.memory_allocated() shows what live tensors use. A large gap is cache (and possibly fragmentation), not usage; memory_reserved() matches what nvidia-smi attributes to the process, minus the CUDA context."
+    ],
+    [
+      "Activation checkpointing doubles the training time.",
+      "It re-runs the forward of checkpointed segments during backward, which adds one extra forward — about one third more compute if everything is checkpointed (forward is roughly a third of forward plus backward). Selective checkpointing of only cheap-to-recompute, memory-heavy operations costs much less."
+    ],
+    [
+      "An out-of-memory error means the model is too big for the GPU.",
+      "Often it means a peak is too high: one huge temporary (the logits of a 128k vocabulary, an attention score matrix), fragmentation in the caching allocator, or memory leaked from previous steps by a tensor kept alive with its graph. The snapshot tool shows which allocation hit the limit and from which line of code."
+    ]
+  ],
+  "recap": [
+    "Training memory is parameters + gradients + optimiser state + activations + temporaries; with AdamW and float32 master weights the first three cost about 16 bytes per parameter.",
+    "torch.autocast runs selected ops (matmul, linear, conv) in bf16 or fp16 and keeps sensitive ops (softmax, log_softmax, layer_norm, losses, reductions on CUDA) in float32; parameters and their gradients stay float32.",
+    "bf16 has float32's range and needs no loss scaling; fp16 has more precision but a range of about 6e-8 to 65,504, so gradients underflow without GradScaler.",
+    "GradScaler multiplies the loss by a scale (65,536 initially), unscales gradients before the step, skips steps with inf or NaN gradients and halves the scale, and doubles it after 2,000 clean steps; clip only after scaler.unscale_.",
+    "Activation memory per transformer layer is about s·b·h·(34 + 5·a·s/h) bytes in 16-bit without FlashAttention; FlashAttention removes the quadratic term and checkpointing keeps only each layer's input.",
+    "Activation checkpointing (use_reentrant=False) stores segment inputs and recomputes the rest during backward, trading about one extra forward for most of the activation memory.",
+    "memory_allocated is live tensors, memory_reserved is allocated plus PyTorch's cache, max_memory_allocated is the peak; memory snapshots show every allocation over time with its stack trace.",
+    "Fix an OOM by finding the peak first, then reduce the biggest item: smaller micro-batch with accumulation, checkpointing, chunked loss, bf16 activations, expandable_segments for fragmentation, or sharding."
+  ],
+  "glossary": [
+    [
+      "Activation",
+      "An intermediate tensor produced in the forward pass; the ones autograd saves for backward dominate training memory."
+    ],
+    [
+      "Activation checkpointing",
+      "Saving only some activations (segment inputs) in forward and recomputing the rest during backward, trading compute for memory."
+    ],
+    [
+      "Autocast",
+      "torch.autocast: a context in which eligible operations run in a lower-precision dtype chosen per operation, while others stay in float32."
+    ],
+    [
+      "bfloat16 (BF16)",
+      "A 16-bit float with 8 exponent and 7 stored mantissa bits: float32's range with about 3 significant decimal digits."
+    ],
+    [
+      "Caching allocator",
+      "PyTorch's GPU memory manager that keeps freed blocks for reuse instead of returning them to the driver."
+    ],
+    [
+      "CUDA context",
+      "The per-process state the NVIDIA driver creates on a GPU (kernels, handles); it uses several hundred megabytes outside PyTorch's allocator."
+    ],
+    [
+      "E4M3 / E5M2",
+      "The two 8-bit floating-point formats used for FP8 training: 4 exponent and 3 mantissa bits (more precision) or 5 and 2 (more range)."
+    ],
+    [
+      "expandable_segments",
+      "An allocator option that grows memory segments in place, which reduces fragmentation for workloads whose allocation sizes vary."
+    ],
+    [
+      "float16 (FP16)",
+      "A 16-bit float with 5 exponent and 10 stored mantissa bits: more precision than BF16 but a maximum of 65,504."
+    ],
+    [
+      "Fragmentation",
+      "Free memory split into many blocks too small or badly placed to satisfy a large allocation, so it fails despite enough total free memory."
+    ],
+    [
+      "GELU",
+      "Gaussian Error Linear Unit, a smooth ReLU-like activation used in GPT-style MLPs."
+    ],
+    [
+      "GradScaler",
+      "torch.amp.GradScaler: scales the loss up before backward and the gradients down before the step, skipping steps with non-finite gradients, for FP16 training."
+    ],
+    [
+      "KV cache",
+      "Stored keys and values of previous tokens during generation, so each new token only computes its own (pt10, lm5)."
+    ],
+    [
+      "Loss scaling",
+      "Multiplying the loss by a constant so small FP16 gradients do not underflow to zero, then dividing the gradients by the same constant."
+    ],
+    [
+      "Master weights",
+      "The float32 copy of parameters that the optimiser updates in mixed-precision training, so small updates are not lost to 16-bit rounding."
+    ],
+    [
+      "Memory snapshot",
+      "A recording of every allocation and free with stack traces, saved by torch.cuda.memory._dump_snapshot and viewed at pytorch.org/memory_viz."
+    ],
+    [
+      "Mixed precision",
+      "Training that uses 16-bit formats for most arithmetic and storage of activations while keeping weights, reductions and sensitive operations in float32."
+    ],
+    [
+      "QK-norm",
+      "Normalising queries and keys before the attention dot product to keep attention logits bounded."
+    ],
+    [
+      "Reserved memory",
+      "Memory PyTorch has obtained from the driver: live tensors plus the allocator's cache of free blocks."
+    ],
+    [
+      "Selective checkpointing",
+      "Recomputing only some operations (typically cheap, memory-heavy ones) instead of whole layers."
+    ],
+    [
+      "Tensor cores",
+      "Units in NVIDIA GPUs that perform small matrix multiplications on 16-bit (or narrower) inputs with higher-precision accumulation, much faster than ordinary FP32 arithmetic."
+    ],
+    [
+      "Underflow",
+      "A value too small in magnitude for the format becoming zero (or losing precision as a subnormal)."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What does torch.autocast do?",
+      "Inside the context, PyTorch picks a dtype per operation: matmuls, linear layers and convolutions run in the lower precision you chose (bf16 or fp16) to use tensor cores; numerically sensitive operations such as softmax, log_softmax, layer_norm, exp, sums and losses run in float32 on CUDA; others follow their inputs. Parameters stay float32 and are cast on the fly (with a cache), so gradients are float32. Use it only around forward and loss, not around backward or the optimiser step."
+    ],
+    [
+      "E",
+      "When do you need a GradScaler?",
+      "When autocasting to float16. FP16's smallest normal number is about 6.1e-5 (subnormals reach 6e-8), so many gradient values underflow to zero; scaling the loss by a large factor shifts gradients into range, and the scaler divides them back before the step. With bfloat16 the exponent range equals float32's, so gradients do not underflow and you skip the scaler."
+    ],
+    [
+      "E",
+      "Why is bf16 preferred over fp16 for training on modern GPUs?",
+      "It has float32's exponent range, so activations and gradients neither overflow nor underflow in normal training and loss scaling is unnecessary; the price is lower precision (8 significant bits versus 11), which matters little because accumulation happens in float32. FP16 remains useful on hardware without fast bf16 and for some inference."
+    ],
+    [
+      "M",
+      "Estimate the memory to train a 7B-parameter model with AdamW in mixed precision, before activations.",
+      "Parameters in float32: 7×10⁹ × 4 = 28 GB; gradients in float32: 28 GB; Adam's two moments in float32: 56 GB; total about 112 GB, i.e. 16 bytes per parameter. If you also keep bf16 copies of the weights for compute, add 14 GB. That exceeds one 80 GB GPU before a single activation, which is why such models are trained with sharding (FSDP/ZeRO, pt11), 8-bit optimisers, or both.",
+      "Follow-up: How does FSDP over 8 GPUs change it? — Sharding parameters, gradients and optimiser state divides the 112 GB by 8, to 14 GB per GPU, plus temporarily gathered full layers."
+    ],
+    [
+      "M",
+      "Walk through what GradScaler does on one step and where clipping goes.",
+      "scaler.scale(loss).backward() multiplies the loss by the current scale (65,536 initially) so gradients are 65,536× larger. scaler.unscale_(optimizer) divides each gradient by the scale in place and records whether any is inf or NaN. Clip here, on true-scale gradients. scaler.step(optimizer) skips the step if non-finite values were found, otherwise steps. scaler.update() halves the scale after a skipped step, and doubles it after 2,000 consecutive clean steps.",
+      "Follow-up: What does a skipped step look like in the logs? — The loss and weights do not change for that step and the scale halves; a few skips early in training are normal, frequent skips later mean real instability."
+    ],
+    [
+      "M",
+      "Use the activation-memory formula to estimate activations for one layer with s = 4,096, b = 1, h = 4,096, a = 32, and say what FlashAttention and checkpointing change.",
+      "Per layer s·b·h·(34 + 5·a·s/h) bytes = 16.8M × (34 + 160) ≈ 3.26 GB; the 160 term is the stored attention scores, softmax output and dropout mask, quadratic in s. FlashAttention never materialises those, leaving 34·s·b·h ≈ 0.57 GB. Full activation checkpointing stores only each layer's input, 2·s·b·h ≈ 34 MB, and recomputes the rest during backward. For 32 layers: about 104 GB, 18 GB and 1.1 GB (plus one layer's recomputation at a time).",
+      "Follow-up: Where does 34 come from? — Counting bytes per element of every tensor saved by the attention block (QKV input, Q and K, V, projections, dropout masks), the MLP (input, the 4h hidden and its activation, dropout) and two layer norms, at 2 bytes per element (1 for masks)."
+    ],
+    [
+      "M",
+      "nvidia-smi shows 78 GB used on an 80 GB GPU, but torch.cuda.memory_allocated() says 41 GB. Explain.",
+      "nvidia-smi reports memory reserved by the process from the driver: PyTorch's caching allocator keeps freed blocks to reuse them, so reserved (memory_reserved, about 77 GB here) includes about 36 GB of cached free blocks plus the CUDA context. memory_allocated counts only live tensors. A big, persistent gap that coincides with OOM errors means fragmentation: free blocks exist but none is large enough. expandable_segments:True in PYTORCH_ALLOC_CONF reduces it; torch.cuda.empty_cache() releases cached blocks to other processes but does not help your own process."
+    ],
+    [
+      "M",
+      "How do you use activation checkpointing in PyTorch 2.14, and why pass use_reentrant=False?",
+      "Wrap a segment's forward: out = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False). In forward the segment runs without saving its intermediates; in backward its forward is re-run to regenerate them. The non-reentrant implementation records the graph normally, supports torch.autograd.grad, inputs that do not require grad, and stops recomputation early when the needed tensors are back. On 2.14 calling checkpoint without the argument still only warns, but the docs recommend False and say the argument should always be passed.",
+      "Follow-up: How does dropout behave under recomputation? — checkpoint saves and restores the RNG state (preserve_rng_state=True by default) so the recomputed forward drops the same elements."
+    ],
+    [
+      "M",
+      "A training step OOMs only at the very end of the forward pass. What is the likely culprit in a language model?",
+      "The logits and loss. For batch 8, length 8,192 and a 128,256-token vocabulary, float32 logits are 8 × 8,192 × 128,256 × 4 bytes ≈ 33.6 GB, and cross-entropy needs log-softmax of the same size — at the point where every layer's activations are also held. Fixes: compute the loss in chunks of the sequence, keep logits in bf16 and let the fused loss upcast internally, or use a fused linear-plus-cross-entropy kernel that never materialises the full logits."
+    ],
+    [
+      "H",
+      "Describe a systematic method to fix a CUDA out-of-memory error in training.",
+      "First read the error: it reports the attempted allocation, total capacity, free memory, and how much is allocated versus reserved-but-unallocated (a large reserved-unallocated figure points to fragmentation). Then record a memory snapshot around the failing step and view it: the timeline shows whether memory grows across steps (a leak — something holds tensors or graphs) or peaks within a step (a large temporary or too many activations), and each allocation has a stack trace. Then reduce the largest item: micro-batch with accumulation, checkpointing, chunked loss, FlashAttention via SDPA, bf16 activations, optimizer state sharding, or expandable_segments for fragmentation. Verify with max_memory_allocated after one step.",
+      "Follow-up: How do you distinguish a leak from a peak quickly? — Print memory_allocated() after each step: a leak rises every step; a peak problem shows the same number every step but OOMs at the same point in the step."
+    ],
+    [
+      "H",
+      "Why does mixed-precision training keep float32 master weights, and what goes wrong without them?",
+      "Updates are often tiny relative to the weight: a weight of 1.0 with lr × update = 1e-4 cannot change in bf16, whose spacing near 1.0 is 2⁻⁷ ≈ 0.0078 — the update rounds away, and on 2.14 bf16 1.0 + 0.001 is still 1.0. Over many steps the model stops learning in a way that looks like a plateau. Keeping float32 weights (and optimiser states) for the update, and using 16-bit only for compute and activations, preserves small updates. Pure-bf16 training is possible with tricks such as stochastic rounding or Kahan summation in the optimiser, but plain bf16 weights with AdamW silently stall.",
+      "Follow-up: Where are those float32 weights in torch.autocast training? — They are simply the model's parameters; autocast casts them to bf16 per op and caches the casts within the autocast region."
+    ],
+    [
+      "H",
+      "How would you decide what to checkpoint in a transformer, and what does selective checkpointing buy?",
+      "Rank tensors by memory per unit of recompute cost. In the formula, the attention score, softmax and dropout terms are large (quadratic in s) and cheap to recompute relative to the matmuls; the MLP's 4h hidden activation is large but its recompute requires a big matmul. Korthikanti et al. showed that recomputing only the attention core ('selective activation recomputation') removes most of the memory at a few percent of extra compute, versus about 30–40% for full recomputation. With FlashAttention, which already recomputes attention in its backward, the remaining choices are per-layer: checkpoint every k-th layer, or use PyTorch's selective checkpoint policies to save matmul outputs and recompute pointwise ops.",
+      "Follow-up: What is the memory floor with full checkpointing? — The stored inputs of every layer (2sbh bytes each in bf16) plus one layer's full activations during its recomputation, plus everything that is not activations."
+    ]
+  ],
+  "refs": [
+    [
+      "post",
+      "PyTorch blog — Understanding GPU Memory 1: Visualizing All Allocations over Time (Shi and DeVito, Dec 2023)",
+      "How to record memory history, dump a snapshot and read it in the memory_viz tool, with worked OOM examples.",
+      "https://pytorch.org/blog/understanding-gpu-memory-1/"
+    ],
+    [
+      "paper",
+      "Korthikanti et al. — Reducing Activation Recomputation in Large Transformer Models (2022)",
+      "The per-layer activation-memory formula sbh(34 + 5as/h) and selective activation recomputation.",
+      "https://arxiv.org/abs/2205.05198"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — Automatic Mixed Precision (torch.amp)",
+      "autocast, GradScaler and the per-device op lists (which ops run in 16-bit, which in float32).",
+      "https://docs.pytorch.org/docs/2.14/amp.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — Understanding CUDA Memory Usage",
+      "_record_memory_history, _dump_snapshot and the snapshot visualiser.",
+      "https://docs.pytorch.org/docs/2.14/torch_cuda_memory.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — CUDA semantics: memory management and PYTORCH_ALLOC_CONF",
+      "The caching allocator, memory_allocated vs memory_reserved, and allocator options such as expandable_segments.",
+      "https://docs.pytorch.org/docs/2.14/notes/cuda.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.utils.checkpoint",
+      "checkpoint and checkpoint_sequential, reentrant vs non-reentrant variants, RNG preservation and selective checkpoint policies.",
+      "https://docs.pytorch.org/docs/2.14/checkpoint.html"
+    ],
+    [
+      "paper",
+      "Micikevicius et al. — Mixed Precision Training (ICLR 2018)",
+      "The original recipe: FP16 compute, FP32 master weights and loss scaling.",
+      "https://arxiv.org/abs/1710.03740"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>"torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 3.91 GiB." Every ML engineer has seen it, and most have responded the same way: halve the batch size and try again. Sometimes that works. Often it only moves the problem — the job now runs at half the throughput, or fails an hour later, or fails only on the longest sequences in the dataset. Meanwhile the GPU's memory is a fixed, expensive resource: an 80 GB card running at 50% of its capacity because nobody knows where the other half goes is a direct waste of money.</p>
+<p>Two families of techniques exist to use that memory well, and both are built into PyTorch. <strong>Mixed precision</strong> runs most arithmetic in 16-bit formats on tensor cores, which roughly halves activation memory and multiplies matmul throughput, while keeping the numerically delicate parts in 32-bit. <strong>Memory management</strong> covers what is stored for the backward pass and how to store less (activation checkpointing), how the allocator works and why its numbers disagree with <code>nvidia-smi</code>, and how to record and read a memory snapshot that shows exactly which line of code allocated what.</p>
+<p>Both families have sharp edges that appear in debugging interviews. Training in float16 without a gradient scaler silently loses small gradients. Clipping before unscaling clips the wrong numbers. Casting the whole model to bf16 makes small weight updates round to nothing, and the loss plateaus for no visible reason. Wrapping the backward pass in autocast, or the loss outside it, changes numerics in ways that are hard to see. A model that "fits" at sequence length 2,048 explodes at 8,192, because one term of activation memory grows with the square of the sequence length.</p>
+<p>This lesson builds the picture from the ground up: what occupies memory during a step and how big each part is, with a formula for transformer activations from a NVIDIA paper (Korthikanti et al., 2022) that you can compute by hand; what autocast does operation by operation; bf16 versus fp16 and the mechanics of GradScaler; why the weights stay in float32; activation checkpointing in PyTorch 2.14; the caching allocator's statistics and fragmentation; memory snapshots as described by the PyTorch team in "Understanding GPU Memory"; and a step-by-step method for fixing out-of-memory errors.</p>
+</section>
+
+<section data-field="primer">
+<p>Think of GPU memory during training as a workbench of fixed size. Some things live on the bench permanently: the model's weights, a slot for each weight's gradient, and the optimiser's notebooks (Adam keeps two numbers per weight). Other things come and go every step: as the forward pass runs, it leaves intermediate results on the bench because the backward pass will need them — these are the <strong>activations</strong> — and the pile grows layer by layer until the loss is computed. Then the backward pass works through the pile in reverse, using and clearing each intermediate, while filling in the gradient slots. Temporary scraps — a big matrix that exists for a moment inside one operation — appear and vanish on top of all that. An out-of-memory error is the moment the bench overflows, almost always at the peak: the end of the forward pass, when every activation is still there, plus whatever temporary is being created right then.</p>
+<p>The two families of techniques act on different parts of the bench:</p>
+<ul>
+<li><strong>Mixed precision</strong> makes the things that come and go smaller: activations stored in bf16 or fp16 take half the space of float32, and the matmuls that produce them run on tensor cores several times faster. The permanent items mostly stay in float32 for accuracy.</li>
+<li><strong>Activation checkpointing</strong> stores fewer activations: keep only a few "bookmarks" (the input to each layer) and recompute the rest during backward, paying with extra compute.</li>
+<li><strong>Sharding</strong> (pt11) splits the permanent items across GPUs; <strong>allocator tuning</strong> reduces wasted space between items.</li>
+</ul>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Memory over one training step: permanent weights, gradients and optimizer state form a flat base; activations ramp up during forward to a peak at the loss and ramp down during backward">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="60" y1="260" x2="620" y2="260" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="60" y1="20" x2="60" y2="260" style="fill:none;stroke:var(--line-2)"/>
+    <text x="30" y="140" text-anchor="middle" transform="rotate(-90 30 140)" style="fill:var(--muted)">GPU memory</text>
+    <rect x="60" y="200" width="560" height="60" style="fill:var(--s1);opacity:0.35"/>
+    <text x="340" y="235" text-anchor="middle" style="fill:var(--ink)">weights + gradients + optimiser state (permanent)</text>
+    <polygon points="60,200 300,70 300,200" style="fill:var(--s3);opacity:0.45"/>
+    <polygon points="300,70 560,200 300,200" style="fill:var(--s3);opacity:0.3"/>
+    <text x="200" y="185" text-anchor="middle" style="fill:var(--ink)">activations saved</text>
+    <text x="200" y="168" text-anchor="middle" style="fill:var(--ink-2)">forward: layer by layer ↑</text>
+    <text x="430" y="185" text-anchor="middle" style="fill:var(--ink-2)">backward: freed as used ↓</text>
+    <rect x="292" y="40" width="16" height="30" style="fill:var(--crit);opacity:0.7"/>
+    <text x="316" y="48" style="fill:var(--crit)">peak: last layer + logits/loss temporaries</text>
+    <line x1="60" y1="40" x2="620" y2="40" style="fill:none;stroke:var(--crit);stroke-dasharray:6 4"/>
+    <text x="616" y="34" text-anchor="end" style="fill:var(--crit)">80 GB limit</text>
+    <text x="180" y="280" text-anchor="middle" style="fill:var(--muted)">forward</text>
+    <text x="430" y="280" text-anchor="middle" style="fill:var(--muted)">backward</text>
+    <text x="590" y="280" text-anchor="middle" style="fill:var(--muted)">step</text>
+    <line x1="300" y1="260" x2="300" y2="268" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="560" y1="260" x2="560" y2="268" style="fill:none;stroke:var(--line-2)"/>
+  </g>
+</svg>
+<figcaption>The peak sits at the forward/backward boundary. Mixed precision shrinks the activation triangle, checkpointing flattens it, sharding lowers the base — and an OOM is about the peak, not the average.</figcaption>
+</figure>
+
+<p>Where the workbench analogy breaks: PyTorch does not hand memory back to the driver when a tensor dies; it keeps the space in its own cache for the next allocation of a suitable size, because asking the driver is slow (pt1). So the bench has a second boundary — "space PyTorch is holding" — that is larger than "space currently used", and tools disagree depending on which they report. And because the cache keeps blocks of particular sizes, free space can be split into pieces too small for a large request: fragmentation, an OOM with gigabytes nominally free.</p>
+<p>A second, numerical picture is needed for mixed precision. A 16-bit format is a ruler with fewer markings. bf16 keeps the ruler's full length (float32's range) but has coarse markings (only about three significant decimal digits); fp16 has finer markings but a much shorter ruler (it overflows at 65,504 and cannot represent magnitudes below about 6×10⁻⁸). Matmuls tolerate coarse markings because their results are accumulated in float32 inside the tensor cores. Sums over many elements, softmax's exponentials, normalisation statistics and weight updates do not, which is why they stay in float32.</p>
+<p>If you remember one sentence: <em>memory peaks at the end of the forward pass, activations are usually the biggest item, mixed precision makes them smaller and faster to compute while float32 protects the sensitive parts, and every OOM is fixed by finding the peak and shrinking its largest contributor</em>.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The memory budget of a training step</h4>
+<p>Everything on the GPU during training falls into five groups. Take a model with N parameters trained with AdamW, mixed precision and float32 parameters (the setup <code>torch.autocast</code> gives you):</p>
+<table>
+<thead><tr><th>Item</th><th>Bytes</th><th>Lifetime</th></tr></thead>
+<tr><td>Parameters (float32)</td><td>4N</td><td>whole run</td></tr>
+<tr><td>Gradients (float32, same dtype as parameters)</td><td>4N</td><td>from first backward until zero_grad (or longer)</td></tr>
+<tr><td>AdamW moments m and v (float32)</td><td>8N</td><td>whole run, after first step</td></tr>
+<tr><td>Activations saved for backward</td><td>depends on batch, sequence, architecture</td><td>forward → freed during backward</td></tr>
+<tr><td>Temporaries and workspace</td><td>depends on the largest single op</td><td>inside one op</td></tr>
+</table>
+<p>That is 16 bytes per parameter before activations. For GPT-2 small (124M) it is 2.0 GB; for a 7B model, 112 GB — more than an 80 GB GPU holds, which is why such models are trained with sharded states (pt11) or memory-saving optimisers. Add the CUDA context itself (several hundred megabytes per process, outside PyTorch's accounting) and any communication buffers.</p>
+<p>The activation term needs its own formula, because it is usually the largest and the one you can most easily change.</p>
+
+<h4>2. Activations: the transformer formula and a worked example</h4>
+<p>Korthikanti et al., "Reducing Activation Recomputation in Large Transformer Models" (2022), count every tensor a transformer layer saves for backward when activations are stored in 16-bit (2 bytes per element, 1 byte per dropout-mask element). With sequence length s, micro-batch b, hidden size h and a attention heads, their equation (1) is:</p>
+<pre>activation bytes per layer = s · b · h · (34 + 5 · a · s / h)</pre>
+<p>The 34 collects the linear-in-s terms: the inputs to the QKV projection, Q and K, V, the attention output projection's input, the MLP's input and its 4h-wide hidden activation and GELU output, two layer norms' inputs, and the dropout masks. The 5·a·s/h term is the attention score matrix, the softmax output and the attention-dropout mask — each a × s × s per example — which is why it grows with the <em>square</em> of the sequence length.</p>
+<p>A worked example for a 7B-class layer (h = 4,096, a = 32) at s = 4,096, b = 1:</p>
+<ul>
+<li>s·b·h = 4,096 × 4,096 = 16,777,216.</li>
+<li>5·a·s/h = 5 × 32 × 4,096 / 4,096 = 160.</li>
+<li>Per layer: 16.78M × (34 + 160) = 16.78M × 194 ≈ 3.26 GB. For 32 layers: ≈ 104 GB.</li>
+</ul>
+<p>Three levers change it dramatically. <strong>FlashAttention</strong> (gpu7; in PyTorch, <code>F.scaled_dot_product_attention</code> picks a flash or memory-efficient kernel on supported GPUs) never stores the s × s matrices, so the 160 disappears: 34 × 16.78M ≈ 0.57 GB per layer, 18 GB for 32 layers. <strong>Full activation checkpointing</strong> stores only each layer's input, 2·s·b·h bytes ≈ 34 MB per layer, ≈ 1.1 GB total, plus one layer's activations at a time during recomputation. And <strong>sequence length</strong>: doubling s doubles the 34-term and quadruples the attention term, so a model that fits at 2,048 can fail at 8,192 even with batch 1.</p>
+<p>The logits deserve a separate line because they are not in the per-layer formula. For vocabulary V the output layer produces s·b·V values — 4,096 × 128,256 ≈ 525M per sequence, 1.05 GB in bf16 or 2.1 GB in float32 — and the cross-entropy computes a log-softmax of the same size. At the end of the forward pass, all of that coexists with every layer's activations; it is the most common place for the OOM to fire.</p>
+
+<h4>3. What autocast does, op by op</h4>
+<p><code>torch.autocast(device_type, dtype)</code> is a context manager. Inside it, each eligible operation casts its inputs to the dtype that suits it:</p>
+<ul>
+<li><strong>Lower-precision list</strong> (CUDA "autocast to float16/bfloat16"): <code>matmul</code>, <code>linear</code>, <code>conv*</code>, <code>bmm</code>, <code>baddbmm</code>, attention — the ops that run on tensor cores and tolerate low precision because the hardware accumulates in float32.</li>
+<li><strong>Float32 list</strong> (CUDA "autocast to float32"), from the 2.14 docs: among others <code>softmax</code>, <code>log_softmax</code>, <code>layer_norm</code>, <code>group_norm</code>, <code>exp</code>, <code>log</code>, <code>pow</code>, <code>sum</code>, <code>prod</code>, <code>cumsum</code>, <code>norm</code>, <code>cross_entropy</code>, <code>nll_loss</code>, <code>mse_loss</code>, <code>kl_div</code>, <code>binary_cross_entropy_with_logits</code> — operations whose results are sensitive to rounding or range.</li>
+<li><strong>Widest-input list</strong>: ops such as <code>add</code>, <code>cat</code> and <code>stack</code> with mixed inputs run in the widest input dtype.</li>
+<li>Everything else runs in whatever dtype its inputs have.</li>
+</ul>
+<p>The lists are per device. Running on CPU with bf16 on 2.14, a linear layer's output is bf16 and <code>cross_entropy</code> returns float32, but <code>softmax</code> and <code>layer_norm</code> stay bf16 — the CPU float32 list is shorter than CUDA's. Never assume; check <code>.dtype</code> in the context you run.</p>
+<p>The parameters are not changed. A <code>nn.Linear</code>'s weight stays float32; autocast casts it to bf16 for the matmul and caches that cast for the rest of the autocast region, so a weight used many times (weight tying, a layer called in a loop) is converted once. Because the parameter is float32, its gradient is float32 too — verified on 2.14 by backpropagating through an autocast linear layer.</p>
+<p>The usage pattern:</p>
+<pre>for x, y in loader:
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        logits = model(x)                       # matmuls in bf16, norms/softmax in fp32
+        loss = F.cross_entropy(logits.view(-1, V), y.view(-1))   # fp32
+    loss.backward()                             # outside autocast: backward ops use
+    clip_grad_norm_(model.parameters(), 1.0)    # the dtypes chosen in forward
+    opt.step(); opt.zero_grad()</pre>
+<p>Rules: wrap forward and loss, not backward or the optimiser step (backward automatically runs each op in the dtype its forward used); do not call <code>.half()</code> or <code>.bfloat16()</code> on the model or inputs as well; and, inside an autocast region, if you need a specific op in float32 regardless, wrap it in a nested <code>torch.autocast(..., enabled=False)</code> and cast its inputs with <code>.float()</code>.</p>
+
+<h4>4. bf16 versus fp16</h4>
+<p>Both formats are 16 bits; they split them differently (gpu4):</p>
+<table>
+<thead><tr><th></th><th>float32</th><th>bfloat16</th><th>float16</th></tr></thead>
+<tr><td>Exponent bits</td><td>8</td><td>8</td><td>5</td></tr>
+<tr><td>Stored mantissa bits</td><td>23</td><td>7</td><td>10</td></tr>
+<tr><td>Max</td><td>3.4e38</td><td>3.4e38</td><td>65,504</td></tr>
+<tr><td>Smallest normal</td><td>1.2e-38</td><td>1.2e-38</td><td>6.1e-5</td></tr>
+<tr><td>Spacing near 1.0</td><td>1.2e-7</td><td>7.8e-3</td><td>9.8e-4</td></tr>
+</table>
+<p>fp16's problem is range. Activations can exceed 65,504 (inf), and — more often — gradients are smaller than its smallest normal value. Checked on 2.14: <code>torch.tensor(1e-8).half()</code> is exactly 0, and 7e-8 rounds to the smallest subnormal, 5.96e-8. In a deep network many gradient elements are around 1e-6 to 1e-9; in fp16 they vanish, and training quietly degrades. bf16's problem is precision: in bf16, 1.0 + 0.001 is still 1.0 (checked on 2.14), because the spacing near 1.0 is 2<sup>−7</sup>. That is why bf16 is used for compute and activations but not for weight updates (section 6). On GPUs with fast bf16 (NVIDIA Ampere and later, recent AMD and other accelerators), bf16 is the default for training; fp16 remains for older GPUs and some inference paths.</p>
+
+<h4>5. GradScaler: loss scaling for fp16</h4>
+<p>The fix for fp16's underflow is to multiply the loss by a large factor S before backward. Every gradient is then S times larger — by the chain rule — and shifted into fp16's representable range. Before the optimiser uses them, they are divided by S. If S is too large, some gradients overflow to inf; the step is then skipped and S reduced. <code>torch.amp.GradScaler</code> automates this; on 2.14 its defaults are <code>init_scale=65536.0</code> (2<sup>16</sup>), <code>growth_factor=2.0</code>, <code>backoff_factor=0.5</code>, <code>growth_interval=2000</code>.</p>
+<pre>scaler = torch.amp.GradScaler("cuda")
+for x, y in loader:
+    with torch.autocast("cuda", dtype=torch.float16):
+        loss = F.cross_entropy(model(x), y)
+    scaler.scale(loss).backward()          # gradients are S times too large
+    scaler.unscale_(opt)                   # divide by S in place; detect inf/NaN
+    clip_grad_norm_(model.parameters(), 1.0)   # clip true-scale gradients
+    scaler.step(opt)                       # skipped if inf/NaN was found
+    scaler.update()                        # S /= 2 after a skip; S *= 2 after 2,000 clean steps
+    opt.zero_grad()</pre>
+<p>The order matters in two places. Clipping must come after <code>unscale_</code>; clipping scaled gradients to norm 1.0 clips them to 1/65,536 of what you meant. And <code>scaler.step</code> must be used instead of <code>opt.step</code>, or skipped steps are not skipped. A trace of the scale over a run: it starts at 65,536; if the first backward produces an inf, that step is skipped and the scale becomes 32,768; after 2,000 clean steps it doubles; over a long run it settles where occasional overflows keep it from growing further. A few skipped steps are normal; a scale that keeps falling toward 1 means the model produces infs at any scale — a real numerical problem, not a scaling one. With bf16, don't use a scaler at all.</p>
+
+<h4>6. Why weights stay in float32</h4>
+<p>The 2018 paper that established mixed-precision training (Micikevicius et al., ICLR 2018) kept a float32 "master copy" of the weights for the update, for a reason you can compute. An update is learning rate × (normalised) gradient, often 1e-4 to 1e-6 relative to the weight. A bf16 weight near 1.0 can only change in steps of 0.0078; adding 1e-4 rounds back to the same value. In float32 the spacing near 1.0 is 1.2e-7, so the update survives. With <code>torch.autocast</code>, the parameters <em>are</em> the float32 master copy, so this is automatic. It goes wrong when someone calls <code>model.bfloat16()</code> to save memory and trains with a plain AdamW: many updates round away, the loss plateaus early, and nothing errors. Pure-bf16 training exists, but only with optimisers designed for it (stochastic rounding, compensated summation) or with float32 optimiser states and careful update paths.</p>
+
+<h4>7. Activation checkpointing</h4>
+<p>Checkpointing trades compute for memory: during forward, a checkpointed segment runs without saving its intermediate activations, keeping only its inputs; during backward, when gradients reach that segment, PyTorch re-runs its forward to regenerate what is needed, then backpropagates through it. In PyTorch 2.14:</p>
+<pre>from torch.utils.checkpoint import checkpoint
+class Block(nn.Module):
+    def forward(self, x):                        # x: (B, T, C)
+        x = x + self.attn(self.ln1(x))
+        return x + self.mlp(self.ln2(x))
+
+class Model(nn.Module):
+    def forward(self, x):
+        for blk in self.blocks:
+            x = checkpoint(blk, x, use_reentrant=False)   # store x, recompute blk in backward
+        return self.head(self.ln_f(x))</pre>
+<p>Pass <code>use_reentrant=False</code> explicitly. The docstring on 2.14 says "It is recommended that you use use_reentrant=False" and that the argument "should be passed explicitly"; calling without it still only warns on 2.14 ("Starting in PyTorch 2.9, calling checkpoint without use_reentrant will raise an exception" — it did not, in this version), so do not rely on either behaviour. The non-reentrant version records a normal graph, supports <code>torch.autograd.grad</code>, works when no input requires grad, and stops recomputing as soon as the needed tensors are regenerated. Randomness is handled: by default the RNG state is saved and restored so dropout masks are identical in the recomputation.</p>
+<p>The cost: one extra forward pass of every checkpointed segment. Since a training step is roughly one forward plus a backward costing two forwards, checkpointing everything adds about a third more compute (in practice 20–40%). The saving, from section 2, can take activations from tens of gigabytes to about one. In between: checkpoint every second layer; or use selective checkpointing — keep the expensive matmul outputs and recompute only cheap element-wise ops and attention internals — which Korthikanti et al. showed recovers most of the memory for a few percent of compute. PyTorch exposes policies for this through the <code>context_fn</code> argument of <code>checkpoint</code> (selective activation checkpoint policies).</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Bar chart of activation memory for 32 layers at s=4096: 104 GB baseline, 18 GB with FlashAttention, about 1 GB with full checkpointing">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Activations, 32 layers, h = 4,096, a = 32, s = 4,096, b = 1 (bf16)</text>
+    <text x="210" y="62" text-anchor="end" style="fill:var(--ink)">baseline (stores scores)</text>
+    <rect x="220" y="46" width="390" height="24" style="fill:var(--crit);opacity:0.7"/>
+    <text x="600" y="63" text-anchor="end" style="fill:var(--ink)">104 GB</text>
+    <text x="210" y="112" text-anchor="end" style="fill:var(--ink)">FlashAttention (no s×s)</text>
+    <rect x="220" y="96" width="69" height="24" style="fill:var(--s2)"/>
+    <text x="296" y="113" style="fill:var(--ink)">18 GB</text>
+    <text x="210" y="162" text-anchor="end" style="fill:var(--ink)">+ full checkpointing</text>
+    <rect x="220" y="146" width="5" height="24" style="fill:var(--good)"/>
+    <text x="232" y="163" style="fill:var(--ink)">≈1.1 GB + one layer (0.57 GB) during recompute</text>
+    <line x1="220" y1="185" x2="610" y2="185" style="fill:none;stroke:var(--line-2)"/>
+    <text x="20" y="210" style="fill:var(--ink-2)">Formula: s·b·h·(34 + 5·a·s/h) bytes per layer (Korthikanti et al. 2022, eq. 1).</text>
+    <text x="20" y="230" style="fill:var(--ink-2)">The 5·a·s/h term is quadratic in s: at s = 8,192 the baseline would be ≈ 380 GB.</text>
+  </g>
+</svg>
+<figcaption>The same layer stack, three storage policies. The quadratic attention term dominates at long sequences, which is why fused attention is the first fix and checkpointing the second.</figcaption>
+</figure>
+
+<h4>8. Reading the allocator's numbers</h4>
+<p>PyTorch's CUDA caching allocator (pt1) keeps freed blocks for reuse. Its statistics:</p>
+<ul>
+<li><code>torch.cuda.memory_allocated()</code> — bytes in live tensors right now.</li>
+<li><code>torch.cuda.max_memory_allocated()</code> — the peak of that since start or since <code>reset_peak_memory_stats()</code>; the number that must fit under the limit.</li>
+<li><code>torch.cuda.memory_reserved()</code> — bytes PyTorch holds from the driver: allocated plus cached free blocks. This is roughly what <code>nvidia-smi</code> attributes to your process, minus the CUDA context.</li>
+<li><code>torch.cuda.memory_summary()</code> — a table of all of the above, broken down by block size, plus counts of allocation retries and OOMs.</li>
+</ul>
+<p>The OOM message itself contains these numbers: it says how much it tried to allocate, the GPU's total capacity, how much is free, how much "is allocated by PyTorch" and how much "is reserved by PyTorch but unallocated". A large reserved-but-unallocated figure means fragmentation, and the message suggests the allocator option that addresses it. On 2.14 the environment variable is <code>PYTORCH_ALLOC_CONF</code> (with <code>PYTORCH_CUDA_ALLOC_CONF</code> kept as an alias, per the CUDA semantics notes); <code>PYTORCH_ALLOC_CONF=expandable_segments:True</code> lets the allocator grow segments in place rather than creating many fixed-size ones, which is especially effective when batch shapes vary (variable sequence lengths). The docs mark it experimental, default False.</p>
+<p><code>torch.cuda.empty_cache()</code> returns cached blocks to the driver. It does not give your process more memory — the cache was already available to you — and calling it in a training loop just makes later allocations slower. It is useful only when another process on the same GPU needs the memory.</p>
+
+<h4>9. Memory snapshots</h4>
+<p>When numbers are not enough, record everything. The PyTorch team's post "Understanding GPU Memory 1" (Aaron Shi and Zachary DeVito, December 2023) describes the workflow:</p>
+<pre>torch.cuda.memory._record_memory_history(max_entries=100000)   # start recording
+for _ in range(5):
+    loss = model(x).sum(); loss.backward(); opt.step(); opt.zero_grad()
+torch.cuda.memory._dump_snapshot("snapshot.pickle")            # save
+torch.cuda.memory._record_memory_history(enabled=None)         # stop</pre>
+<p>Drag the file into the viewer at pytorch.org/memory_viz. It plots every allocation over time as a coloured band, so you see the ramp of activations in each forward, the release in backward, optimiser state appearing at the first step, and — crucially — anything that never gets freed. Clicking a band shows the Python and C++ stack trace of the allocation, which names the line of your code. Recording adds overhead, so do it for a few steps, not for a whole run. The post walks through typical findings: a growing staircase across iterations (a leak, usually a tensor kept with its graph), and a tall spike within one step (a single large temporary).</p>
+
+<h4>10. Precision at evaluation and inference</h4>
+<p>The float32 master weights exist to protect weight <em>updates</em>. Without updates the argument disappears, so evaluation and inference can use 16-bit weights directly: <code>model.to(torch.bfloat16).eval()</code> under <code>torch.inference_mode()</code> halves weight memory and is how most serving stacks load models (pt13). Two cautions. The evaluation that decides which checkpoint to keep should use the same precision recipe as training (autocast over float32 weights) or as deployment (16-bit weights), and you should know which — results can differ in the third decimal place, enough to flip a close comparison. And numerically sensitive pieces still deserve float32 at inference: the final log-softmax when you need exact log-probabilities (for evaluation perplexity or ranking), and long-running accumulations such as a KV cache's attention over very long contexts, where kernels accumulate in float32 internally even when inputs are bf16. A quick check is to compare a batch of logits from the float32 and bf16 paths: differences of about 1e-2 in logits are normal for bf16; differences that change the argmax on many tokens point to an overflow or a sensitive op running in low precision.</p>
+<p>Memory at inference is a different budget: no gradients, no optimiser state, no saved activations — only weights, the current layer's temporaries and, for generation, the KV cache (pt10). A 7B model in bf16 is 14 GB of weights; its KV cache at 4,096 tokens and batch 8 is 2 (K and V) × 32 layers × 8 × 4,096 × 4,096 × 2 bytes ≈ 17 GB without grouped-query attention, which is why inference memory planning is about the cache, not the activations.</p>
+<h4>11. A method for CUDA OOM</h4>
+<ol>
+<li><strong>Read the error.</strong> Note the attempted size and the reserved-but-unallocated amount. A small attempted allocation failing with lots reserved means fragmentation; a huge attempted allocation means one big temporary.</li>
+<li><strong>Leak or peak?</strong> Print <code>memory_allocated()</code> after each step for a few steps. Rising every step: a leak — look for losses or outputs stored with graphs (pt3), views of big tensors kept alive (pt1), caches growing. Flat but OOM at the same point: a peak problem.</li>
+<li><strong>Find the peak's contents.</strong> Take a snapshot of one step; identify the top allocations at the peak.</li>
+<li><strong>Shrink the biggest item</strong>, cheapest fix first:
+  <ul>
+  <li>Large logits/loss: chunk the loss over the sequence or use a fused cross-entropy; compute logits only where needed.</li>
+  <li>Attention scores: use <code>F.scaled_dot_product_attention</code> so a fused kernel avoids s × s matrices.</li>
+  <li>Activations in general: autocast to bf16; activation checkpointing; smaller micro-batch with gradient accumulation (pt6) to keep the effective batch.</li>
+  <li>Weights, gradients, optimiser state: sharding (FSDP, pt11), 8-bit optimisers, or CPU offload.</li>
+  <li>Fragmentation: <code>expandable_segments:True</code>; pad or bucket sequence lengths to a few fixed sizes.</li>
+  </ul></li>
+<li><strong>Verify</strong> with <code>max_memory_allocated()</code> after a step, and keep 5–10% headroom: allocation patterns vary between steps (different sequence lengths, the first optimiser step allocating state), and running at 99% invites intermittent failures.</li>
+</ol>
+</section>
+
+<section data-field="deep">
+<h4>Where the 34 comes from, and how parallelism changes it</h4>
+<p>Counting by hand, per layer and per token, in units of h bytes at 2 bytes per element: the attention block stores its input to the QKV projection (2h), Q and K (4h), V (2h, needed for the score-times-V backward), the input to the output projection (2h) and an h-byte dropout mask; the MLP stores its input (2h), the 4h-wide output of the first linear (8h), the activation output (8h) and an h-byte dropout mask; the two layer norms store their inputs (4h). That totals 34h per token, hence 34·s·b·h. The attention internals add 2·a·s per token for the scores, 2·a·s for the softmax output and a·s for the dropout mask — 5·a·s. With tensor parallelism across t GPUs, most of these tensors are split t ways, and with sequence parallelism the rest are too, giving sbh(34 + 5as/h)/t per GPU (the paper's equation 4). Knowing where each term comes from lets you predict what a change does: removing attention dropout removes the a·s mask term; swapping GELU for an activation that can be recomputed from its input removes one 8h term.</p>
+
+<h4>Autocast's weight cache and its interaction with checkpointing and compile</h4>
+<p>Autocast caches the low-precision copy of each float32 parameter for the duration of the outermost autocast region, so a weight used repeatedly is cast once per forward. The cache is cleared on exiting the region. Two consequences: the cached copies are extra memory (one bf16 copy of every weight used — 2N bytes — during forward), and recomputation under activation checkpointing must happen under the same autocast state, which PyTorch's checkpoint handles by recording and restoring the autocast context. Under <code>torch.compile</code> (pt12), autocast is traced into the graph and the casts are fused with neighbouring operations, which removes most of their overhead.</p>
+
+<h4>Float8 training</h4>
+<p>NVIDIA Hopper and Blackwell GPUs have tensor cores for 8-bit floating-point formats (E4M3 and E5M2, gpu4), roughly doubling matmul throughput again over bf16. Training in float8 is not a matter of a third autocast dtype: each tensor needs a scale factor chosen so its values fit the tiny range, chosen per tensor, per row or per block, and updated as distributions shift. In the PyTorch ecosystem this lives in torchao's float8 training support, which swaps <code>nn.Linear</code> layers for float8 versions while keeping master weights and sensitive ops in higher precision. The same principles as this lesson apply — low precision for matmul inputs, high precision for accumulation, master weights and reductions — with the added problem of managing scales.</p>
+
+<h4>Memory fragmentation, mechanically</h4>
+<p>The caching allocator rounds requests up to size classes and allocates large blocks in segments obtained from the driver; a freed block can be split to serve a smaller request, and adjacent free blocks are merged. Fragmentation arises when long-lived allocations land in the middle of segments, so free space around them cannot merge into a large enough block. Variable-shape workloads make it worse: a batch of length 3,000 followed by one of length 3,100 asks for slightly larger blocks every time. Expandable segments map more physical memory into a large virtual address range on demand, so a segment can grow instead of a new one being allocated, and freed memory at the end can be unmapped. Bucketing sequence lengths to a few fixed sizes attacks the same problem from the workload side and also helps <code>torch.compile</code> avoid recompiles (pt12).</p>
+
+<h4>Offloading: CPU memory as overflow</h4>
+<p>When GPU memory is the binding constraint and the host has plenty, tensors can be parked in CPU memory. <code>torch.autograd.graph.save_on_cpu(pin_memory=True)</code> moves every saved activation to pinned host memory during forward and brings it back during backward (pt3's saved-tensor hooks); FSDP2 can offload parameters and optimiser state with an <code>OffloadPolicy</code>. The cost is PCIe bandwidth: at about 25 GB/s, moving 18 GB of activations each way takes over a second per step, so offloading helps only when compute per step is long enough to hide the transfers, or as a last resort to make something fit at all.</p>
+
+<h4>Optimiser state is often the cheapest big win</h4>
+<p>In the 16-bytes-per-parameter budget, AdamW's two moments are half. Three ways to shrink them: shard them across data-parallel GPUs (FSDP/ZeRO, pt11), which divides by the number of GPUs at the cost of communication; store them in 8 bits with block-wise scaling (8-bit Adam variants), which cuts 8N bytes to about 2N with little effect on training in published comparisons; or use optimisers with factored or no second moments (Adafactor-style factorisation, or momentum-only methods), which change the optimisation itself and need validation. For fine-tuning, parameter-efficient methods such as LoRA (lm11) shrink all three terms at once by training only small adapter matrices, leaving the frozen base weights with no gradients or optimiser state at all.</p>
+<h4>Numerical failure modes specific to mixed precision</h4>
+<p>Beyond underflow and overflow, three patterns recur. Attention logits that grow during training can overflow fp16 before softmax; computing softmax in float32 (autocast does) and normalising queries and keys (QK-norm) are the standard defences. Very large losses — sums instead of means over huge batches — can overflow the scaled fp16 loss; use means. And reductions written by hand in a custom module (a variance as <code>x.pow(2).mean()</code> in bf16) lose precision that the built-in normalisation layers protect against by computing in float32; the RMSNorm in pt4 upcasts for this reason.</p>
+</section>
+
+<section data-field="prod">
+<h4>Failure mode: OOM at long sequences or rare batches</h4>
+<p>Symptom: training runs for hours, then OOMs on one batch. Cause: the peak depends on the batch's shape, and the quadratic attention term (or a vocabulary-sized logit tensor) makes the longest batch far more expensive than the average. Fix: cap or bucket sequence lengths, use fused attention, and size the micro-batch for the <em>longest</em> sequence you will see — test that shape at start-up by running one forward/backward on a synthetic batch of the maximum length before training begins.</p>
+
+<h4>Failure mode: memory that grows every step</h4>
+<p>Symptom: <code>memory_allocated()</code> rises steadily; OOM after N steps. Causes: storing loss tensors instead of numbers for logging; keeping outputs with their graphs; caches keyed by tensors; hooks storing activations without detaching; a growing list of per-step metrics on the GPU. The snapshot shows a staircase whose steps have a common stack trace. Fix the reference, not the symptom; <code>empty_cache()</code> does nothing for a leak.</p>
+
+<h4>Failure mode: fp16 training that stops learning or diverges</h4>
+<p>Symptom: with fp16, loss plateaus higher than a float32 run, or GradScaler's scale collapses toward 1 and many steps are skipped. Causes: missing GradScaler (underflowed gradients), clipping before unscaling, attention logits or activations overflowing 65,504, or a loss computed outside autocast in fp16 tensors. Fixes: switch to bf16 if the hardware supports it; otherwise use the scaler correctly, keep softmax and losses in float32, and log the scale and the number of skipped steps.</p>
+
+<h4>Failure mode: "mixed precision made it slower"</h4>
+<p>Symptom: enabling autocast gives little or no speed-up. Causes: matrix dimensions that are not multiples of 8 or 16 (tensor-core kernels prefer aligned shapes — a vocabulary of 50,257 is often padded to 50,304 for this reason, as nanoGPT does), small models where the step is dominated by kernel-launch overhead rather than matmuls (pt12), CPU-bound input pipelines (pt5), or a GPU without fast bf16. Profile before concluding.</p>
+
+<h4>The public case: reading a real snapshot</h4>
+<p>The PyTorch team's "Understanding GPU Memory 1" post is the reference for the snapshot workflow and worth reading with this lesson's budget in mind. Its example traces show exactly the shapes predicted here: the first iteration allocating optimiser state that then persists, each iteration's forward ramp of activations and backward release, and — in its leak example — a staircase where something survives every iteration. It also shows how to record history inside a long-running job with a bounded <code>max_entries</code>, so that when an out-of-memory error finally happens the evidence is already there. The practical takeaway the post's authors stress is to stop guessing: a snapshot names the allocation and the line of code that pushed memory over the limit.</p>
+<h4>Observability</h4>
+<p>Log <code>max_memory_allocated()</code> per step (reset its peak each step) alongside the batch shape, so you can see which shapes approach the limit; log GradScaler's scale and skip count for fp16 runs; and when an OOM occurs in production, have the training script catch <code>torch.OutOfMemoryError</code> once, dump a memory snapshot and <code>memory_summary()</code>, then re-raise, so the failure arrives with its evidence. The PyTorch memory post shows exactly this pattern — recording history from the start of the run with a bounded number of entries, so a snapshot is available when the failure happens.</p>
+
+<h4>Knobs, roughly in order of cost to try</h4>
+<table>
+<thead><tr><th>Knob</th><th>Saves</th><th>Costs</th></tr></thead>
+<tr><td>autocast bf16</td><td>~½ activation memory; faster matmuls</td><td>Numerics checks</td></tr>
+<tr><td>F.scaled_dot_product_attention</td><td>The quadratic s × s term</td><td>Nothing on supported hardware</td></tr>
+<tr><td>Chunked / fused loss</td><td>Most of the logit memory</td><td>Code change</td></tr>
+<tr><td>Smaller micro-batch + accumulation</td><td>Activations ∝ micro-batch</td><td>Lower GPU efficiency per step</td></tr>
+<tr><td>Activation checkpointing</td><td>Most remaining activations</td><td>~20–40% more compute (less if selective)</td></tr>
+<tr><td>expandable_segments</td><td>Fragmentation waste</td><td>Experimental flag</td></tr>
+<tr><td>FSDP / ZeRO sharding</td><td>16N bytes ÷ number of GPUs</td><td>Communication (pt11)</td></tr>
+<tr><td>CPU offload</td><td>Anything you offload</td><td>PCIe time, often large</td></tr>
+</table>
+</section>
+
+<section data-field="lab">
+<p>CPU, PyTorch 2.14 in <code>gpt_env</code>; about 15 minutes. GPU-only steps are marked. Save as <code>pt7_lab.py</code>.</p>
+<pre>import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+# 1. what autocast does on this device
+lin, ln = nn.Linear(64, 64), nn.LayerNorm(64)
+x = torch.randn(8, 64)
+with torch.autocast("cpu", dtype=torch.bfloat16):
+    y = lin(x)
+    print("linear:", y.dtype, "| weight:", lin.weight.dtype,
+          "| softmax:", y.softmax(-1).dtype, "| ce:", F.cross_entropy(y, torch.zeros(8, dtype=torch.long)).dtype)
+
+# 2. fp16 range and bf16 precision
+print("1e-8 in fp16:", torch.tensor(1e-8).half().item(), "| 7e5 in fp16:", torch.tensor(7e5).half().item())
+w = torch.tensor(1.0, dtype=torch.bfloat16)
+print("bf16 1 + 1e-3:", (w + 1e-3).item(), "| fp32:", (torch.tensor(1.0) + 1e-3).item())
+
+# 3. the activation formula
+def act_gb(s, b, h, a, L, flash=False):
+    per = s * b * h * (34 + (0 if flash else 5 * a * s / h))
+    return per * L / 1e9
+for s in (2048, 4096, 8192):
+    print(s, f"{act_gb(s, 1, 4096, 32, 32):.0f} GB  flash {act_gb(s, 1, 4096, 32, 32, True):.0f} GB")
+
+# 4. checkpointing gives the same gradients
+blk = nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, 64))
+xa = torch.randn(4, 64, requires_grad=True)
+blk(xa).sum().backward(); g1 = xa.grad.clone(); xa.grad = None
+checkpoint(blk, xa, use_reentrant=False).sum().backward()
+print("same grads with checkpoint:", torch.allclose(g1, xa.grad))</pre>
+<ol>
+<li>Step 1 on CPU shows bf16 for linear (weight stays float32) and float32 for cross_entropy; note that softmax stays bf16 on CPU, unlike CUDA's list.</li>
+<li>Step 2: 1e-8 becomes 0.0 in fp16 and 7e5 becomes inf; bf16 1 + 0.001 stays 1.0.</li>
+<li>Step 3 prints about 31/104/380 GB without flash and 9/18/36 GB with it: watch the quadratic term take over.</li>
+<li>Step 4 prints True.</li>
+<li><strong>Needs a CUDA GPU:</strong> wrap a forward/backward of a small transformer in <code>torch.cuda.memory._record_memory_history()</code> and <code>_dump_snapshot("s.pickle")</code>, open it at pytorch.org/memory_viz, then add checkpointing and compare peaks. Expect the activation ramp to flatten as in the body's diagram.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Find the bug: an fp16 training loop that "trains" but underperforms</b>
+<p>A team on older GPUs without fast bf16 trains a transformer in fp16. The loss curve is worse than a float32 baseline, most of all in the first tens of thousands of steps; gradient-norm logs show values around 50,000; and raising the learning rate barely changes anything. Find the bugs.</p>
+<pre>scaler = torch.amp.GradScaler("cuda", init_scale=1.0)   # "start safe"
+for x, y in loader:
+    with torch.autocast("cuda", dtype=torch.float16):
+        logits = model(x)
+    loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
+    scaler.scale(loss).backward()
+    gnorm = clip_grad_norm_(model.parameters(), 1.0)
+    scaler.unscale_(opt)
+    scaler.step(opt)
+    scaler.update()
+    opt.zero_grad()</pre>
+<details><summary>Answer</summary>
+<p><strong>Bug 1 — clipping before unscaling.</strong> Once the scale has grown, the gradients are S times too large when clipped, so the logged norm (~50,000) is the scaled norm and clipping to 1.0 shrinks every update by a further large factor: almost every step is clipped to a tiny update, which is why the learning rate seems not to matter. Fix: <code>scaler.unscale_(opt)</code> first, then <code>clip_grad_norm_</code> on true-scale gradients, then <code>scaler.step(opt)</code>.</p>
+<p><strong>Bug 2 — init_scale=1.0 defeats loss scaling.</strong> The point of the scaler is to lift small gradients above fp16's underflow threshold; with a scale of 1 they underflow exactly as without a scaler. The scale only doubles every 2,000 clean steps, so reaching the default 65,536 (2<sup>16</sup>) takes 16 × 2,000 = 32,000 steps — matching "worst in the first tens of thousands of steps". Fix: keep the default <code>init_scale=65536.0</code>; the scaler backs off by itself if that overflows.</p>
+<p><strong>Bug 3 — the loss is computed outside autocast on fp16 logits.</strong> <code>logits</code> left the autocast region as fp16, so cross-entropy runs its log-softmax in fp16, losing precision and risking overflow for large logits. Fix: compute the loss inside the autocast block (autocast runs cross_entropy in float32 on CUDA), or call <code>logits.float()</code> first. After fixing, log <code>scaler.get_scale()</code> and the number of skipped steps; and on hardware with bf16, switch to it and drop the scaler. (A fourth classic variant — calling <code>model.half()</code> as well — removes the float32 master weights; recent PyTorch refuses to unscale fp16 gradients, so it fails loudly.)</p>
+</details>
+<b>Estimate: will it fit?</b>
+<p>You fine-tune a 1.3B-parameter model (24 layers, h = 2,048, 16 heads) with AdamW and autocast bf16 on one 40 GB GPU, at sequence length 2,048 and micro-batch 4, using SDPA (fused attention). Vocabulary 50,304. Does it fit, and what would you change if not?</p>
+<details><summary>Answer</summary>
+<p>States: 16 bytes × 1.3B ≈ 20.8 GB. Activations with fused attention: 34 × s·b·h per layer = 34 × 2,048 × 4 × 2,048 ≈ 0.57 GB; × 24 ≈ 13.7 GB. Logits: 2,048 × 4 × 50,304 × 2 bytes ≈ 0.82 GB in bf16, plus a float32 log-softmax of the same shape ≈ 1.65 GB during the loss. Peak ≈ 20.8 + 13.7 + 2.5 ≈ 37 GB plus the CUDA context and autocast's bf16 weight cache (≈ 2.6 GB): right at or over 40 GB, so it will likely OOM. Cheapest fixes: micro-batch 2 with accumulation 2 (activations and logits halve, ≈ 8 GB saved), or checkpoint every other layer. With either, measure <code>max_memory_allocated()</code> after one step and keep 10% headroom.</p>
+</details>
+</section>

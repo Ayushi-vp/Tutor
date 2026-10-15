@@ -1,0 +1,453 @@
+<!-- topic source for k8s/k8s12; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "k8s12",
+  "t": "Packaging and delivery: Helm, Kustomize and GitOps with Argo CD or Flux",
+  "tag": "Delivery",
+  "sum": "How teams stop copy-pasting YAML: a Helm chart rendered by hand (values precedence, helpers, whitespace, checksums), how Helm stores and rolls back releases and what changed in Helm 4, Kustomize bases, overlays and generators, and GitOps — Argo CD and Flux reconciling a cluster from Git, promotion and rollback by commit — with the Argo CD Helm path-traversal advisory as the case.",
+  "prereq": [
+    ["k8s6", "kubectl apply sends objects to the API server; server-side apply tracks which manager owns which fields; controllers reconcile desired with actual state."],
+    ["k8s7", "Deployments roll out a new ReplicaSet whenever the pod template changes and keep old ones for rollback."],
+    ["k8s9", "ConfigMaps and Secrets hold configuration; changing a ConfigMap does not restart pods that read it as environment variables."],
+    ["swe9", "Build once and promote the same artefact; rolling, blue-green and canary releases; rollback and roll forward."],
+    ["sc15", "Infrastructure as code and GitOps keep desired state in Git, applied by an agent that also reverts drift."]
+  ],
+  "myths": [
+    ["Helm is a deployment tool that runs your application.", "Helm renders templates into Kubernetes manifests and applies them, then records what it applied as a release. Everything after that — scheduling, rollouts, restarts — is done by Kubernetes controllers. helm upgrade returns when the API server has accepted the objects (or, with --wait, when they report ready), not when the application is healthy in any deeper sense."],
+    ["helm rollback restores the previous state of the cluster.", "It re-applies the manifests of an earlier release revision. Data changed by the newer version (database migrations, files on volumes), resources created outside the chart, and CRDs (which Helm does not upgrade or delete) are not rolled back. In GitOps setups, a Helm rollback also fights the Git source of truth unless Git is reverted too."],
+    ["Kustomize is a template language.", "Kustomize deliberately has no templating, variables or loops. It takes complete, valid YAML (a base) and applies declared transformations — patches, name prefixes, labels, image overrides, generated ConfigMaps — to produce variants. That makes every input a valid manifest you can read and diff, at the cost of less flexibility than templates."],
+    ["GitOps means CI runs kubectl apply after merging.", "In GitOps the cluster pulls: an agent running inside the cluster (Argo CD, Flux) continuously compares the cluster with Git and applies differences, and reverts changes made outside Git. CI pushing to the cluster lacks the continuous reconciliation and drift correction, and needs cluster credentials in the CI system."],
+    ["Putting replicas in Git is always right for GitOps.", "If an HPA manages a Deployment's replicas, a replicas value in Git makes the GitOps agent reset it on every sync, fighting the autoscaler. Leave replicas out of the manifest (the API server keeps the current value), or tell the tool to ignore that field."],
+    ["Secrets can't be managed with GitOps.", "Plain Secrets must not be committed, but encrypted forms can: SOPS-encrypted files decrypted by the agent, Sealed Secrets that only the cluster's controller can decrypt, or references to an external store resolved by the External Secrets Operator. Git then holds the declaration, not the plaintext."]
+  ],
+  "recap": [
+    "A Helm chart is a directory with Chart.yaml, default values.yaml and Go templates; helm renders templates with merged values (chart defaults, then -f files in order, then --set) and applies the result as a release.",
+    "Templates use the Go template language with Sprig functions; include, toYaml, nindent and whitespace trimming decide whether the output is valid YAML, and a checksum annotation of a ConfigMap makes pods roll when config changes.",
+    "Helm stores each release revision as a Secret (sh.helm.release.v1.<name>.v<N>) containing the chart, values and rendered manifest, which is what helm history and helm rollback use.",
+    "Helm 3 applied changes with a three-way merge; Helm 4 (November 2025) uses server-side apply for new releases, making ownership conflicts explicit; Helm 3's final feature release is September 2026 with security fixes into February 2027.",
+    "Kustomize builds variants from plain YAML: a base plus overlays that patch, rename, relabel and override images, and generators that add content-hash suffixes so config changes roll pods.",
+    "GitOps keeps desired state in Git and has an in-cluster agent pull, diff and apply it continuously, correcting drift; deploying is a merge and rolling back is a revert.",
+    "Argo CD's repo-server renders manifests (Helm, Kustomize, plain YAML), its application controller compares and syncs them, and Applications declare source, destination, sync policy, pruning and self-healing.",
+    "Flux does the same with separate controllers: source-controller fetches Git, OCI or Helm sources, kustomize-controller and helm-controller apply them.",
+    "Renderers and GitOps agents are privileged: CVE-2022-24348 let a crafted Helm chart make Argo CD's repo-server read values files outside the repository, exposing other applications' secrets."
+  ],
+  "glossary": [
+    ["Application (Argo CD)", "A custom resource naming a source (repository, path, revision, Helm or Kustomize settings), a destination cluster and namespace, and a sync policy."],
+    ["base / overlay", "In Kustomize, a base is a set of resources; an overlay references a base and applies environment-specific changes to it."],
+    ["chart", "A Helm package: templates, default values and metadata, distributed as a directory, a .tgz archive or an OCI artefact."],
+    ["drift", "A difference between the desired state in Git and the live state in the cluster, usually from manual changes."],
+    ["Flux", "A CNCF GitOps toolkit of controllers (source, kustomize, helm, notification, image automation) that reconcile clusters from Git or OCI sources."],
+    ["generator (Kustomize)", "A Kustomize feature that creates ConfigMaps or Secrets from files or literals, adding a hash of the content to the name."],
+    ["GitOps", "Operating a system by declaring its desired state in Git and letting automated agents pull and continuously reconcile it."],
+    ["Helm hook", "A template annotated to run at a point in a release's life (pre-install, post-upgrade…), often a Job such as a migration."],
+    ["helper (named template)", "A reusable template defined with define in _helpers.tpl and inserted with include, such as the chart's full name or common labels."],
+    ["OpenGitOps principles", "Declarative, versioned and immutable, pulled automatically, continuously reconciled."],
+    ["prune", "Deleting live resources that are no longer present in the desired state."],
+    ["release (Helm)", "An installed instance of a chart with a name and a revision history, stored in the cluster."],
+    ["repo-server", "The Argo CD component that clones repositories and renders manifests with Helm, Kustomize or plugins."],
+    ["self-heal", "A GitOps agent re-applying the desired state when someone changes the live cluster by hand."],
+    ["sync", "Applying the rendered desired state to the cluster so live matches Git."],
+    ["sync wave", "An Argo CD annotation that orders resources during a sync, applying lower waves first and waiting for them to be healthy."],
+    ["values", "The configuration inputs of a Helm chart, merged from defaults, files and command-line overrides."]
+  ],
+  "qa": [
+    ["E", "What problem do Helm and Kustomize solve?", "Real applications need many manifests, and the same application runs in several environments with small differences: replicas, image tags, resources, hostnames. Copying YAML per environment drifts and is error-prone. Helm templates the manifests and fills them from values per environment; Kustomize keeps one plain base and applies declared patches per environment. Both produce ordinary Kubernetes objects."],
+    ["E", "What is in a Helm chart?", "Chart.yaml (name, version, appVersion, dependencies), values.yaml (default configuration), templates/ (Go templates that render manifests, plus _helpers.tpl for named templates and NOTES.txt), and optionally charts/ for subchart dependencies, a values schema and CRDs in crds/. helm template renders it locally; helm install or upgrade renders and applies it as a release."],
+    ["E", "What is GitOps?", "A way of operating where the desired state of the system lives in Git, and an agent running in the cluster pulls it, compares it with the live state and applies differences continuously, also reverting manual changes. Deploying means merging a change, rolling back means reverting a commit, and Git history is the audit log."],
+    ["M", "Walk through how Helm renders a value into a Deployment.", "Helm merges values: the chart's values.yaml, then each -f file in order, then --set flags, later overriding earlier. It then executes each template with a context containing .Values, .Release, .Chart and .Capabilities. {{ .Values.replicaCount }} becomes 3; include of a named helper produces the full name; toYaml of the resources map, piped to nindent 12, emits correctly indented YAML; {{- trims whitespace. The rendered documents are parsed as YAML and sent to the API server, and the release record stores them.", "Follow-up: Why does a missing nindent cause errors? — toYaml output starts at column zero, so without re-indenting the lines land outside their parent key and the YAML is invalid or silently wrong."],
+    ["M", "How does helm rollback work, and what does it not undo?", "Each upgrade creates a new revision, stored as a Secret holding the chart, values and rendered manifests. helm rollback web 2 re-applies revision 2's manifests as a new revision. It does not undo data changes made by the newer version, resources created outside the chart, or CRD changes, which Helm does not manage on upgrade. In GitOps setups you revert Git instead, or the agent will re-apply the newer version."],
+    ["M", "How do you make pods restart when a ConfigMap changes?", "Pods that read configuration as environment variables never see changes, and file-mounted values change only eventually and need reloading. Helm charts commonly put an annotation on the pod template containing the sha256 of the rendered ConfigMap; Kustomize's configMapGenerator puts a content hash in the ConfigMap's name and updates references. Either way, a config change changes the pod template, so the Deployment rolls out new pods."],
+    ["M", "Compare Helm and Kustomize.", "Helm templates manifests with a full template language, packages them as versioned charts with dependencies, and tracks releases with history and rollback; it is the standard way to distribute software to others. Kustomize patches plain YAML without templates, is built into kubectl, and is good for your own applications' environment variants. Many teams use both: third-party software via Helm charts, their own apps via Kustomize, sometimes Kustomize patching Helm output."],
+    ["M", "How do you promote a release through environments with GitOps?", "CI builds and pushes an image by digest, then updates the desired version for the first environment in the config repository, by commit or pull request. The GitOps agent syncs it. After checks pass, a promotion is another commit changing the next environment's version — often an automated pull request. Rollback is reverting the commit. Environment differences live in overlays or values files, so promotion changes only the version."],
+    ["M", "What do Argo CD's prune and self-heal do, and what are the risks?", "Prune deletes live resources that were removed from Git; self-heal re-applies Git when someone changes the live cluster. Together they make Git authoritative. Risks: a bad commit that removes a directory can delete production resources, so use prune with care, deletion protection annotations and review; and self-heal reverts emergency hotfixes made with kubectl, so hotfixes must go through Git, with a documented way to pause sync during incidents."],
+    ["H", "Explain CVE-2022-24348 and what it teaches about GitOps tooling.", "Argo CD's repo-server renders Helm charts for any Application a user may create or update. It accepted values-file paths that traversed outside the repository and, as the team found while fixing it, value files that were symlinks inside a chart package. A user with permission to create Applications could point a chart at any YAML file on the repo-server, including decrypted secrets of other applications when SOPS or git-crypt plugins decrypt to disk, and use verbose helm template errors to enumerate files. Fixed in 2.1.9, 2.2.4 and 2.3.0. Lesson: rendering untrusted inputs is code execution-adjacent; isolate renderers, restrict who can create Applications and from which repositories (AppProjects), and avoid decrypting secrets to shared disk."],
+    ["H", "An HPA and Argo CD fight over a Deployment's replicas. Why, and how do you fix it?", "The manifest in Git sets replicas: 3. The HPA scales to 10; Argo CD sees drift from Git and, with self-heal, resets it to 3; the HPA scales back up, and so on, causing pod churn. Fix by removing replicas from the manifest so the API server keeps the current value on apply, or configuring ignoreDifferences for /spec/replicas, and with server-side apply, letting the HPA own that field."],
+    ["H", "Design the delivery system for 40 microservices across dev, staging and three production regions.", "One config repository (or one per team) with a Kustomize base or Helm values per service and overlays per environment and region; CI builds images, signs them and opens pull requests updating digests for dev; promotion to staging and then each production region is an automated pull request gated on checks and, for production, approval. Argo CD with ApplicationSets generates one Application per service per cluster from the directory structure; AppProjects restrict which repositories and namespaces each team can deploy; sync waves order CRDs and migrations; progressive delivery with Argo Rollouts for the riskiest services; secrets via External Secrets. Production regions are promoted one at a time.", "Follow-up: What would you monitor? — Sync status and health per Application, time from merge to synced, drift events, and failed syncs, plus deployment frequency and change failure rate."]
+  ],
+  "refs": [
+    ["docs", "Argo CD security advisory GHSA-63qx-x74g-jcr7 (CVE-2022-24348)", "Path traversal and symlinked values files in Helm charts rendered by the repo-server; fixed in 2.1.9, 2.2.4 and 2.3.0.", "https://github.com/argoproj/argo-cd/security/advisories/GHSA-63qx-x74g-jcr7"],
+    ["docs", "Helm — Chart template guide", "Built-in objects, values, functions and pipelines, named templates, whitespace control.", "https://helm.sh/docs/chart_template_guide/"],
+    ["docs", "Helm blog — Helm 4 Released", "Helm 4.0 (November 2025): server-side apply for new releases and other changes from Helm 3.", "https://helm.sh/blog/helm-4-released/"],
+    ["docs", "Kubernetes — Declarative management with Kustomize", "Bases, overlays, patches, generators and kubectl apply -k.", "https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/"],
+    ["docs", "Argo CD documentation", "Architecture, Applications, sync options, sync waves, ApplicationSets and projects.", "https://argo-cd.readthedocs.io/en/stable/"],
+    ["docs", "Flux documentation", "Source, kustomize and helm controllers, and image automation.", "https://fluxcd.io/flux/"],
+    ["docs", "OpenGitOps principles", "The four principles: declarative, versioned and immutable, pulled automatically, continuously reconciled.", "https://opengitops.dev/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team's first Kubernetes service is five YAML files applied with <code>kubectl apply -f</code> from a laptop. Six months later they run twelve services in three environments. Each service has a Deployment, a Service, a ConfigMap, an HPA, a PodDisruptionBudget, an HTTPRoute and a ServiceAccount, and each environment needs slightly different replicas, resources, hostnames and image tags. Someone copies the staging directory to make production and edits it by hand. A fix to the readiness probe is made in staging and forgotten in production. A colleague scales a Deployment with <code>kubectl scale</code> during an incident and nobody remembers to put it back. A deploy is run from a laptop with an uncommitted change. Nobody can say for certain what is running in production or who changed it.</p>
+<p>Three families of tools address this, at different levels. <strong>Helm</strong> turns manifests into parameterised templates packaged as versioned <em>charts</em>, installs them as <em>releases</em> with history and rollback, and is how most third-party software (databases, ingress controllers, monitoring stacks) is distributed. <strong>Kustomize</strong>, built into <code>kubectl</code>, keeps one plain set of manifests and applies declared patches to produce each environment's variant, without any templating. And <strong>GitOps</strong> — with agents such as Argo CD and Flux — changes who applies the manifests: instead of people or CI pushing to the cluster, an agent in the cluster pulls the desired state from Git, applies it, and keeps putting it back whenever the cluster drifts.</p>
+<p>Each brings its own mechanics and its own sharp edges: template whitespace that silently produces wrong YAML; a rollback that does not roll back a database; config changes that never restart pods; an autoscaler and a GitOps agent fighting over the same field; and the uncomfortable fact that the components rendering your manifests can read a great deal. In 2022 a vulnerability in Argo CD's Helm rendering let any user who could create an Application read files outside their repository, including other applications' decrypted secrets.</p>
+<p>This lesson renders a Helm chart by hand, line by line, follows a release through upgrade and rollback and what Helm 4 changed, builds Kustomize overlays, and then sets up the GitOps loop with Argo CD and Flux, including promotion, rollback, secrets and the failure modes that matter in production.</p>
+</section>
+
+<section data-field="primer">
+<h4>Forms, tracing paper and a librarian</h4>
+<p>Three analogies, one per tool. <strong>Helm is a form with blanks.</strong> The chart's templates are a standard contract with blanks for the name, the number of copies, the image; the values file fills the blanks; the result is a completed contract (a manifest) that Kubernetes understands. Helm also keeps a filed copy of every contract it has submitted for each installation, so it can resubmit an older one to undo a change.</p>
+<p><strong>Kustomize is tracing paper.</strong> You keep one clean drawing (the base: complete, valid manifests). For production you lay a sheet of tracing paper over it and draw only the differences — more replicas here, a bigger memory limit there, a different image tag. The final picture is the base with the overlay on top. Nothing in the base has blanks; you can read it as it is.</p>
+<p><strong>GitOps is a librarian with a catalogue.</strong> The catalogue (Git) says exactly which books should be on which shelves. The librarian (Argo CD or Flux) walks the shelves continuously, puts back anything missing, removes anything that should not be there, and re-shelves books that someone moved. If you want a change, you change the catalogue — through review — and the librarian makes the shelves match.</p>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="GitOps loop: developer merges to the config repository, the in-cluster agent pulls, renders, diffs against the live cluster and applies, and reverts manual drift">
+  <defs><marker id="k8s12-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="30" width="130" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="75" y="52" text-anchor="middle" style="fill:var(--ink)">CI / developer</text>
+    <text x="75" y="68" text-anchor="middle" style="fill:var(--muted)">PR: image digest</text>
+    <rect x="190" y="30" width="140" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="260" y="52" text-anchor="middle" style="fill:var(--ink)">Git config repo</text>
+    <text x="260" y="68" text-anchor="middle" style="fill:var(--muted)">desired state</text>
+    <line x1="140" y1="55" x2="188" y2="55" marker-end="url(#k8s12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="164" y="46" text-anchor="middle" style="fill:var(--muted)">merge</text>
+    <rect x="380" y="20" width="250" height="140" rx="8" style="fill:none;stroke:var(--line-2);stroke-dasharray:5 4"/>
+    <text x="392" y="38" style="fill:var(--muted)">cluster</text>
+    <rect x="400" y="48" width="210" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="505" y="66" text-anchor="middle" style="fill:var(--ink)">agent (Argo CD / Flux)</text>
+    <text x="505" y="82" text-anchor="middle" style="fill:var(--muted)">render → diff → apply</text>
+    <rect x="400" y="110" width="210" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="505" y="135" text-anchor="middle" style="fill:var(--ink)">live objects</text>
+    <line x1="398" y1="62" x2="332" y2="58" marker-end="url(#k8s12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="365" y="50" text-anchor="middle" style="fill:var(--muted)">pull</text>
+    <line x1="490" y1="92" x2="490" y2="108" marker-end="url(#k8s12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="530" y1="108" x2="530" y2="94" marker-end="url(#k8s12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="560" y="104" style="fill:var(--muted)">watch</text>
+    <rect x="190" y="190" width="160" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="270" y="210" text-anchor="middle" style="fill:var(--ink)">kubectl edit (drift)</text>
+    <text x="270" y="226" text-anchor="middle" style="fill:var(--muted)">reverted by self-heal</text>
+    <line x1="350" y1="205" x2="420" y2="152" marker-end="url(#k8s12-arrow)" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/>
+    <text x="75" y="130" text-anchor="middle" style="fill:var(--muted)">rollback =</text>
+    <text x="75" y="146" text-anchor="middle" style="fill:var(--muted)">git revert</text>
+  </g>
+</svg>
+<figcaption>The arrow into the cluster starts inside the cluster: the agent pulls, so CI never holds cluster credentials, and the same loop that deploys also undoes the red dashed path — manual changes.</figcaption>
+</figure>
+<h4>Why not just a script?</h4>
+<p>Before adopting any of this, teams often write a shell script that substitutes variables into YAML with <code>sed</code> or <code>envsubst</code> and pipes the result to <code>kubectl apply</code>. It works for a while, and its failure modes explain what the real tools add. A script has no memory of what it applied last time, so a resource removed from the files is never deleted from the cluster (Helm releases and GitOps pruning track that). It has no idea about Kubernetes structure, so replacing a value inside a list or merging two maps becomes fragile string manipulation (Kustomize's strategic merge and Helm's values merging understand the shapes). It cannot roll back to "what was running before" without someone reconstructing the inputs (Helm revisions and Git history record them). And it runs wherever it is run from, with whatever credentials that place has, so the cluster's state depends on whose laptop last ran it (GitOps moves the applying into the cluster). Each tool in this lesson is, in part, the hard-won answer to one of those problems.</p>
+<p>The tools compose. Helm and Kustomize decide <em>what</em> the manifests are; GitOps decides <em>how and when</em> they reach the cluster. Argo CD and Flux both render Helm charts and Kustomize overlays as part of their loop.</p>
+<p>Where the analogies break: a form, a tracing and a catalogue all describe the cluster's <em>objects</em>, not its data. Re-submitting an old contract, reverting an overlay or rolling back a catalogue entry restores manifests; it does not restore a database schema that the newer version migrated, or files a job wrote. Delivery tools manage desired state; data needs its own plan (swe9's expand-contract migrations, k8s9's snapshots and backups).</p>
+</section>
+
+<section data-field="body">
+<h4>1. What packaging has to do</h4>
+<p>Look at what differs between environments for one service and what stays the same. The same: the container port, probes, labels and selectors, the Service, the security context, the shape of the HPA. Different: the image tag (dev runs today's build, production last week's), replicas and resources, hostnames on the HTTPRoute, a few configuration values, sometimes extra objects (a PodDisruptionBudget only in production). A packaging tool must let you express "the same, except…" without copying, make the result reviewable as ordinary manifests, and, ideally, make config changes roll pods. Helm and Kustomize take opposite approaches to the "except".</p>
+
+<h4>2. A Helm chart's anatomy</h4>
+<pre>web/
+  Chart.yaml          # apiVersion: v2, name: web, version: 1.4.0 (chart), appVersion: "2.7.1" (app)
+  values.yaml         # defaults
+  values.schema.json  # optional JSON Schema for values
+  templates/
+    _helpers.tpl      # named templates (not rendered on their own)
+    deployment.yaml
+    service.yaml
+    configmap.yaml
+    hpa.yaml
+    NOTES.txt         # printed after install
+  charts/             # dependencies (subcharts), declared in Chart.yaml</pre>
+<p>The chart's <code>version</code> is the package's version; <code>appVersion</code> is the version of the software inside, often used as the default image tag. Charts are distributed as <code>.tgz</code> archives in HTTP chart repositories or, increasingly, as OCI artefacts in the same registries as images (<code>helm push web-1.4.0.tgz oci://ghcr.io/myorg/charts</code>), where they can be signed like images (k8s5).</p>
+
+<h4>3. Rendering a template by hand</h4>
+<p>Templates use Go's <code>text/template</code> language extended with the Sprig function library. Here are the relevant pieces of the chart:</p>
+<pre># values.yaml
+replicaCount: 2
+image:
+  repository: ghcr.io/myorg/web
+  tag: ""               # empty: fall back to appVersion
+resources:
+  requests: { cpu: 250m, memory: 256Mi }
+config:
+  LOG_LEVEL: info
+
+# templates/_helpers.tpl
+{{- define "web.fullname" -}}
+{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- define "web.labels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+# templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "web.fullname" . }}
+  labels:
+    {{- include "web.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "web.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "web.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      containers:
+      - name: web
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        {{- with .Values.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}</pre>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Helm rendering pipeline: values from defaults, files and set flags are merged, combined with release and chart objects, executed through templates and helpers, producing manifests applied and stored as a release revision">
+  <defs><marker id="k8s12-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="20" width="140" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="80" y="40" text-anchor="middle" style="fill:var(--ink-2)">values.yaml (chart)</text>
+    <rect x="10" y="60" width="140" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="80" y="80" text-anchor="middle" style="fill:var(--ink-2)">-f values-prod.yaml</text>
+    <rect x="10" y="100" width="140" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="80" y="120" text-anchor="middle" style="fill:var(--ink)">--set image.tag=2.7.2</text>
+    <text x="80" y="148" text-anchor="middle" style="fill:var(--muted)">later wins; maps merge</text>
+    <rect x="190" y="50" width="120" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="250" y="72" text-anchor="middle" style="fill:var(--ink)">.Values +</text>
+    <text x="250" y="88" text-anchor="middle" style="fill:var(--ink)">.Release .Chart</text>
+    <line x1="150" y1="35" x2="188" y2="65" marker-end="url(#k8s12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="150" y1="75" x2="188" y2="75" marker-end="url(#k8s12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="150" y1="115" x2="188" y2="88" marker-end="url(#k8s12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="350" y="40" width="130" height="70" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="415" y="62" text-anchor="middle" style="fill:var(--ink)">templates/*.yaml</text>
+    <text x="415" y="80" text-anchor="middle" style="fill:var(--ink-2)">+ _helpers.tpl</text>
+    <text x="415" y="98" text-anchor="middle" style="fill:var(--muted)">Go template + Sprig</text>
+    <line x1="310" y1="75" x2="348" y2="75" marker-end="url(#k8s12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="520" y="40" width="110" height="70" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="575" y="66" text-anchor="middle" style="fill:var(--ink)">YAML</text>
+    <text x="575" y="84" text-anchor="middle" style="fill:var(--ink)">manifests</text>
+    <line x1="480" y1="75" x2="518" y2="75" marker-end="url(#k8s12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="350" y="170" width="130" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="415" y="192" text-anchor="middle" style="fill:var(--ink)">API server</text>
+    <text x="415" y="208" text-anchor="middle" style="fill:var(--muted)">3-way merge / SSA</text>
+    <rect x="510" y="170" width="120" height="50" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="570" y="190" text-anchor="middle" style="fill:var(--ink)">Secret</text>
+    <text x="570" y="206" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">sh.helm…v3</text>
+    <line x1="575" y1="110" x2="430" y2="168" marker-end="url(#k8s12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="590" y1="110" x2="575" y2="168" marker-end="url(#k8s12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="250" y="200" text-anchor="middle" style="fill:var(--muted)">helm template stops at</text>
+    <text x="250" y="216" text-anchor="middle" style="fill:var(--muted)">"YAML manifests"</text>
+  </g>
+</svg>
+<figcaption>Rendering is a pure function of values, chart and release metadata; only the last two arrows touch the cluster. That is why helm template (or a GitOps repo-server) can render without cluster access, and why reviewing the rendered output catches template mistakes before they ship.</figcaption>
+</figure>
+<p>Now install it for production:</p>
+<pre>helm upgrade --install shop ./web -n prod -f values-prod.yaml --set image.tag=2.7.2</pre>
+<p>with <code>values-prod.yaml</code> containing <code>replicaCount: 6</code> and <code>resources: {requests: {cpu: "1", memory: 1Gi}, limits: {memory: 1Gi}}</code>. Render it step by step.</p>
+<ol>
+<li><strong>Merge values</strong>, later sources overriding earlier ones: the chart's <code>values.yaml</code>, then each <code>-f</code> file in order, then <code>--set</code>. Maps are merged key by key; lists and scalars are replaced. Result: <code>replicaCount: 6</code>; <code>image.repository: ghcr.io/myorg/web</code> (from defaults), <code>image.tag: 2.7.2</code> (from <code>--set</code>); <code>resources</code> is a map, so it is merged: <code>requests</code> from the prod file replaces the default requests map key by key (<code>cpu: "1"</code>, <code>memory: 1Gi</code>), and <code>limits</code> is added; <code>config.LOG_LEVEL: info</code> from defaults.</li>
+<li><strong>Build the context</strong> (the "dot"): <code>.Values</code> (merged values), <code>.Release</code> (<code>Name: shop</code>, <code>Namespace: prod</code>, <code>Revision</code>, <code>IsUpgrade</code>), <code>.Chart</code> (from Chart.yaml), <code>.Capabilities</code> (the cluster's Kubernetes version and APIs) and <code>.Template</code>.</li>
+<li><strong><code>{{ include "web.fullname" . }}</code></strong> runs the named template with the same context: <code>printf "%s-%s"</code> gives <code>shop-web</code>; <code>trunc 63</code> keeps it within the 63-character limit for names; <code>trimSuffix "-"</code> removes a trailing dash that truncation might leave. Output: <code>shop-web</code>.</li>
+<li><strong>Whitespace.</strong> <code>{{-</code> trims all whitespace (including the newline) to its left, <code>-}}</code> to its right. In <code>labels:</code> followed by <code>{{- include "web.labels" . | nindent 4 }}</code>, the <code>{{-</code> eats the newline after <code>labels:</code>; <code>nindent 4</code> then adds a newline and indents every line of the helper's output by four spaces. Result: the two label lines appear correctly nested under <code>labels:</code>. Using <code>indent</code> instead of <code>nindent</code>, or forgetting the dash, produces lines at the wrong depth — sometimes invalid YAML, sometimes valid YAML with the labels attached to the wrong key, which is worse.</li>
+<li><strong><code>{{ .Values.replicaCount }}</code></strong> prints <code>6</code>.</li>
+<li><strong>The image</strong>: <code>.Values.image.tag | default .Chart.AppVersion</code> — <code>default</code> returns its argument if the piped value is empty; the tag is <code>2.7.2</code>, so the line is <code>image: "ghcr.io/myorg/web:2.7.2"</code>. (In production you would set a digest; k8s5.)</li>
+<li><strong><code>{{- with .Values.resources }}</code></strong> sets the dot to the resources map and renders its body only if the map is non-empty. <code>toYaml .</code> serialises the map at column zero; <code>nindent 10</code> places it under <code>resources:</code>.</li>
+<li><strong>The checksum annotation</strong> renders the ConfigMap template itself to a string and takes its SHA-256. If <code>config.LOG_LEVEL</code> changes, the ConfigMap's rendered text changes, the hash changes, the pod template changes, and the Deployment rolls out new pods (k8s9). If nothing changes, the hash is identical and nothing rolls.</li>
+</ol>
+<p>The rendered result (from <code>helm template shop ./web -f values-prod.yaml --set image.tag=2.7.2</code>):</p>
+<pre>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/instance: shop
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+      app.kubernetes.io/instance: shop
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web
+        app.kubernetes.io/instance: shop
+      annotations:
+        checksum/config: 6f1c0b4e…   # sha256 of the rendered ConfigMap
+    spec:
+      containers:
+      - name: web
+        image: "ghcr.io/myorg/web:2.7.2"
+        resources:
+          limits:
+            memory: 1Gi
+          requests:
+            cpu: "1"
+            memory: 1Gi</pre>
+<p>Note <code>toYaml</code> sorted the keys alphabetically (<code>limits</code> before <code>requests</code>) and kept <code>"1"</code> quoted because it came from YAML as a string. Two classic template pitfalls come from types: <code>--set</code> converts <code>true</code>, numbers and <code>null</code> to typed values (use <code>--set-string</code> for literal strings), and large integers can be rendered in scientific notation if they pass through floating point. <code>helm template</code> plus a linter (<code>helm lint</code>, or validating the output with <code>kubeconform</code>) catches most of these before the cluster does.</p>
+
+<h4>4. Releases, upgrades and rollback</h4>
+<p>A <strong>release</strong> is one installation of a chart under a name in a namespace (<code>shop</code> in <code>prod</code>). Every install, upgrade or rollback creates a new <strong>revision</strong>, stored by default as a Secret in the release's namespace named <code>sh.helm.release.v1.shop.v3</code>, labelled <code>owner=helm</code>, containing the chart, the merged values and the rendered manifest (gzipped and base64-encoded). <code>helm history shop</code> lists the revisions with their status (<code>deployed</code>, <code>superseded</code>, <code>failed</code>, <code>pending-upgrade</code>); <code>helm get values</code> and <code>helm get manifest</code> read them back. Because the record is a Secret, it is subject to the 1 MiB object limit — very large charts can hit it.</p>
+<p>On <code>upgrade</code>, Helm renders the new manifests and works out what to change. Helm 3 did this with a <strong>three-way merge</strong>: the old manifest from the last revision, the new manifest, and the live object, so that changes made in the cluster by others (an HPA's replica count, for example) are preserved unless the chart changes the same field. <strong>Helm 4</strong>, released in November 2025, switched new releases to Kubernetes <strong>server-side apply</strong> (k8s6): the API server merges the chart's fields and records Helm as their field manager, so a field owned by another manager produces an explicit conflict instead of a silent overwrite. Releases created by Helm 3 keep their original method when upgraded with Helm 4. Helm 3's final feature release is scheduled for September 2026, with security fixes through February 2027.</p>
+<p><code>helm rollback shop 2</code> re-applies revision 2's manifests as a new revision (say, revision 5). It restores <em>objects</em>, not data. Two more gaps: Helm installs CRDs from a chart's <code>crds/</code> directory on first install but never upgrades or deletes them, so CRD changes need their own process; and <strong>hooks</strong> — templates annotated <code>helm.sh/hook: pre-upgrade</code> and similar, typically Jobs for database migrations — run at defined points but are not themselves rolled back. A failed or interrupted upgrade can leave a release in <code>pending-upgrade</code>, blocking further operations with "another operation is in progress" until it is rolled back.</p>
+
+<h4>5. Kustomize: bases, overlays and generators</h4>
+<p><strong>Kustomize</strong> takes the opposite approach: no templates. A <code>kustomization.yaml</code> lists resources and transformations, and <code>kubectl kustomize</code> (or <code>kubectl apply -k</code>) builds the result.</p>
+<pre>base/
+  kustomization.yaml     # resources: [deployment.yaml, service.yaml, hpa.yaml]
+  deployment.yaml        # a complete, valid Deployment (replicas omitted, image web:latest)
+overlays/prod/
+  kustomization.yaml
+  resources-patch.yaml
+
+# overlays/prod/kustomization.yaml
+resources: [../../base]
+namespace: prod
+labels:
+- pairs: { env: prod }
+  includeSelectors: false
+images:
+- name: ghcr.io/myorg/web
+  newTag: "2.7.2"
+patches:
+- path: resources-patch.yaml
+configMapGenerator:
+- name: web-config
+  literals: [LOG_LEVEL=info]
+
+# overlays/prod/resources-patch.yaml   (strategic merge patch)
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  template:
+    spec:
+      containers:
+      - name: web                  # merged by container name
+        resources:
+          requests: { cpu: "1", memory: 1Gi }
+          limits: { memory: 1Gi }</pre>
+<p>Building the prod overlay: Kustomize loads the base resources, sets <code>metadata.namespace: prod</code> on every object, adds the <code>env: prod</code> label, rewrites any image named <code>ghcr.io/myorg/web</code> to tag <code>2.7.2</code>, and applies the patch with <strong>strategic merge</strong> semantics — Kubernetes-aware merging in which the <code>containers</code> list is merged by each container's <code>name</code>, so only <code>web</code>'s resources change. (JSON 6902 patches with explicit <code>op</code>/<code>path</code> are available for precise edits.) The <code>configMapGenerator</code> creates a ConfigMap named <code>web-config-&lt;hash&gt;</code>, where the suffix is derived from a hash of its contents, and rewrites every reference to <code>web-config</code> in the Deployment to the hashed name. Change <code>LOG_LEVEL</code> and the name changes, so the pod template changes and pods roll — the same effect as Helm's checksum annotation, with old ConfigMaps left for rollbacks until pruned.</p>
+<p>The appeal is that every file is ordinary YAML you can read, validate and diff; the limits are that anything not expressible as a patch or transformer — loops, conditionals, computed values — has no place, by design.</p>
+<table>
+<thead><tr><th></th><th>Helm</th><th>Kustomize</th></tr></thead>
+<tbody>
+<tr><td>Model</td><td>Templates + values</td><td>Plain YAML + patches</td></tr>
+<tr><td>Packaging and distribution</td><td>Versioned charts, repos, OCI, dependencies</td><td>Directories (remote bases by URL)</td></tr>
+<tr><td>Release tracking</td><td>Revisions, history, rollback</td><td>None (left to Git / GitOps)</td></tr>
+<tr><td>Readability</td><td>Templates can be hard to read</td><td>Inputs are valid manifests</td></tr>
+<tr><td>Typical use</td><td>Third-party software; highly configurable apps</td><td>Your own apps across environments</td></tr>
+</tbody>
+</table>
+
+<h4>6. GitOps: the pull model</h4>
+<p>Helm and Kustomize decide what the manifests are. Something still has to apply them. Pushing from CI (<code>helm upgrade</code> in a pipeline) works but has two weaknesses: CI needs credentials that can change production, and nothing notices or corrects changes made outside the pipeline. <strong>GitOps</strong>, summarised by the <strong>OpenGitOps principles</strong>, fixes both: desired state is <em>declarative</em>, <em>versioned and immutable</em> (in Git), <em>pulled automatically</em> by agents, and <em>continuously reconciled</em>. It is the Kubernetes controller pattern (k8s6) applied one level up, with Git as the spec.</p>
+<p><strong>Argo CD</strong> has three main components. The <strong>repo-server</strong> clones repositories and renders manifests — plain YAML, Kustomize, Helm (via <code>helm template</code>) or plugins — caching results by commit. The <strong>application controller</strong> watches live objects in each destination cluster, compares them with the rendered desired state (normalising defaults so that fields the API server fills in do not count as drift), reports each Application as <code>Synced</code> or <code>OutOfSync</code> and <code>Healthy</code>, <code>Progressing</code> or <code>Degraded</code>, and performs syncs. The API server and UI serve users and CI. An <code>Application</code> declares it all:</p>
+<pre>apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: { name: web-prod, namespace: argocd }
+spec:
+  project: shop
+  source:
+    repoURL: https://github.com/myorg/shop-config
+    targetRevision: main
+    path: web/overlays/prod
+  destination: { server: https://kubernetes.default.svc, namespace: prod }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [ServerSideApply=true]</pre>
+<p>With <code>automated</code>, a merge to <code>main</code> is noticed (by polling, every few minutes by default, or immediately via a webhook), rendered, diffed and applied. <code>prune: true</code> deletes live objects that disappeared from Git; <code>selfHeal: true</code> re-applies Git when someone changes the cluster by hand. Ordering within a sync uses <strong>sync waves</strong> (an annotation; lower waves are applied first and must become healthy before the next) and hooks (<code>PreSync</code> Jobs for migrations). <strong>AppProjects</strong> restrict which repositories, clusters and namespaces an Application may use — a security boundary that matters in the prod section. <strong>ApplicationSets</strong> generate Applications from patterns, such as one per directory or per cluster.</p>
+<p><strong>Flux</strong> takes the same approach with a toolkit of controllers: <strong>source-controller</strong> fetches <code>GitRepository</code>, <code>OCIRepository</code> and <code>HelmRepository</code> sources into artefacts; <strong>kustomize-controller</strong> applies <code>Kustomization</code> objects (Flux's resource, which builds a Kustomize directory and applies it with server-side apply, with pruning and health checks); <strong>helm-controller</strong> reconciles <code>HelmRelease</code> objects using the Helm libraries, so releases keep Helm's history; and image-automation controllers can commit new image tags back to Git. Argo CD is known for its UI and multi-cluster application view; Flux for composability and a Kubernetes-native, CLI-first design. Both are CNCF graduated projects.</p>
+
+<h4>7. Promotion, rollback and secrets in GitOps</h4>
+<p>A typical flow for one service:</p>
+<ol>
+<li>CI builds the image once, pushes it, signs it and records its digest (k8s5).</li>
+<li>CI opens a pull request (or commits directly, for dev) changing the image in <code>overlays/dev</code> to the new digest. Merge → Argo CD syncs dev.</li>
+<li>After dev checks pass, an automated pull request makes the same change in <code>overlays/staging</code>, then <code>overlays/prod-eu</code>, then <code>overlays/prod-us</code>, each gated on checks and, for production, approval. Only the version moves; environment differences stay in their overlays.</li>
+<li>Rollback is <code>git revert</code> of the promotion commit; the agent applies the previous digest. The Deployment performs an ordinary rolling update back (k8s7).</li>
+</ol>
+<p>Secrets need care because Git must not hold plaintext. The common choices are SOPS (files encrypted with keys in a KMS, decrypted by the agent at render time — Flux supports it natively, Argo CD through plugins), Sealed Secrets (encrypted with a public key; only the controller in the cluster can decrypt into a Secret), or the External Secrets Operator, where Git holds an <code>ExternalSecret</code> that references a path in Vault or a cloud secret manager and the operator creates the Secret (k8s9). The last keeps secret material out of the GitOps pipeline entirely.</p>
+<p>And one field needs special handling: <strong>replicas</strong>. If an HPA manages a Deployment, a <code>replicas</code> value in Git makes the agent reset it on every sync. Omit <code>replicas</code> from the manifest (the API server keeps the live value), or configure the tool to ignore it; with server-side apply, the HPA's controller owns the field and conflicts are visible.</p>
+
+<h4>8. A change, from commit to production, with times</h4>
+<p>Follow one change through a GitOps setup to see where time goes and where it can go wrong. At 10:00 a developer merges a fix to the application repository. CI builds, tests, scans and signs the image in about eight minutes, and at 10:08 opens a pull request in the configuration repository changing <code>overlays/dev</code> to the new digest; it is auto-merged because dev requires no review. Argo CD learns of the commit by webhook within seconds (without a webhook it polls, every three minutes by default), renders the overlay, sees the Deployment's pod template differ, and syncs at 10:09. The Deployment rolls out (k8s7) and is healthy by 10:11; Argo CD marks the Application Synced and Healthy. Automated checks run against dev, and at 10:20 a promotion pull request for staging opens; after the staging checks, a production pull request opens for one region, needs one approval, and is merged at 11:05. Production regions then follow one at a time.</p>
+<p>Every step is visible and reversible: the commits say what changed and who approved it, the Application's history shows when each environment synced, and rollback at any stage is a revert. Two practical points come out of the timeline. Configure webhooks from the Git host to the GitOps agent, or "merged" and "deployed" can be minutes apart and confuse everyone. And keep promotion automated but gated: the value of GitOps is not speed alone but that the fast path and the safe path are the same path.</p>
+<h4>9. Laying out the configuration repository</h4>
+<p>Two layouts are common. A <strong>separate config repository</strong> holds the manifests or values for many services and environments; application repositories only build images, and CI opens pull requests against the config repository. This keeps deploy history in one place and lets platform teams review environment-wide changes. Keeping manifests <strong>next to the application code</strong> (a <code>deploy/</code> directory) keeps a service self-contained, but then the deploy record is spread across repositories and an image build and its rollout are entangled in one commit. Whichever you choose, avoid one Git <em>branch</em> per environment: merging between long-lived environment branches drifts, conflicts and hides what is actually different; directories per environment (Kustomize overlays, values files) on one main branch make the differences explicit and diffable.</p>
+</section>
+
+<section data-field="deep">
+<h4>Templates versus overlays is a trade-off in where complexity lives</h4>
+<p>Templating puts complexity in the chart: every configurable field is a values key, and popular charts grow hundreds of keys, conditionals and helper functions until reading the template is harder than reading the output. Overlays put complexity in the variants: the base stays readable, but a large organisation can end up with deep chains of overlays whose combined effect is only visible after a build. Both converge on the same discipline: review the <em>rendered output</em>, not just the inputs. Tools that diff rendered manifests between the current and proposed commit in a pull request (Argo CD's diff, <code>flux diff</code>, <code>helm diff</code>) make the effect of a change visible where it is reviewed.</p>
+<h4>Server-side apply and field ownership</h4>
+<p>Server-side apply records, for every field of every object, which <em>field manager</em> last set it: Helm, Argo CD, the HPA controller, a human with kubectl. Applying a manifest that sets a field owned by another manager is a conflict; the applier must either drop the field or force ownership. This makes previously silent fights visible — GitOps versus HPA over replicas, a mutating webhook versus a chart over an injected sidecar — and makes "remove a field from Git" safe: with SSA, fields no longer in the applied configuration are removed if the manager owned them. The cost is learning to read <code>managedFields</code> and deciding deliberately which manager owns what.</p>
+<h4>Ordering, dependencies and CRDs</h4>
+<p>Kubernetes has no global transaction: a sync applies many objects, and some depend on others. A custom resource cannot be created before its CRD is established; a namespace must exist before objects in it; a migration Job should run before the new Deployment. Helm orders installs by kind with a built-in list and supports hooks and weights; Argo CD uses sync waves and phases; Flux uses <code>dependsOn</code> between Kustomizations and health checks. CRDs are the persistent pain point: they are cluster-scoped, shared by every release that uses them, and deleting one deletes every instance of it, so most platforms manage CRDs separately from the applications that use them, with conservative upgrade and no automatic pruning.</p>
+<h4>Multi-cluster and the app-of-apps pattern</h4>
+<p>With dozens of clusters, someone has to create the Argo CD Applications themselves. The app-of-apps pattern stores Application manifests in Git and has one root Application sync them; ApplicationSets generate Applications from generators (a list of clusters registered in Argo CD, directories in a repository, pull requests for preview environments). The same Git change can then fan out to every cluster in waves — one region first — which turns cluster-wide changes (a new admission policy, a CNI upgrade) into ordinary reviewed commits with a staged rollout, precisely the discipline whose absence caused the Reddit outage in sc15.</p>
+<h4>Charts are supply-chain inputs too</h4>
+<p>A third-party Helm chart is code that runs with your deployer's permissions: its templates decide which ClusterRoles, webhooks and privileged DaemonSets get created, and its hooks run Jobs at install time. Pulling <code>latest</code> of a popular chart from a public repository is the same risk as pulling an unpinned image (k8s5). Treat charts accordingly: pin chart versions (and, for OCI charts, digests), mirror them into an internal registry, verify provenance or signatures where publishers provide them, render and review the output of every upgrade — especially RBAC and admission-webhook changes — and scan rendered manifests with policy tools before they reach the cluster. The same applies to Kustomize remote bases referenced by URL.</p>
+<h4>Progressive delivery inside GitOps</h4>
+<p>GitOps decides <em>what</em> version should run; it does not, by itself, roll it out cautiously. Argo Rollouts and Flagger replace the Deployment's simple rolling update with canary or blue-green steps gated on metrics (swe9): a Rollout object in Git describes the steps (5% for five minutes, analysis, 25%…), and the controller shifts traffic through a service mesh or Gateway API weights (k8s8), aborting and scaling back the canary if the analysis fails. Git still holds the desired version; the rollout controller decides how fast reality catches up, and an aborted rollout leaves the cluster on the old version while Git says new — a deliberate, visible divergence for a human to resolve.</p>
+<h4>Rendering in CI versus rendering in the agent</h4>
+<p>Two schools exist for where manifests are rendered. In the first, the GitOps agent renders Helm charts and Kustomize overlays itself from source (Argo CD's repo-server, Flux's controllers). It keeps the repository small and declarative, but the exact manifests applied are only visible in the agent, and the renderer becomes a privileged component with access to many repositories — the risk the prod case illustrates. In the second, CI renders the final manifests and commits them (the "rendered manifests" pattern) to a branch or repository that the agent applies verbatim. Every change to what runs in the cluster is then a reviewable diff of plain YAML, and the agent no longer needs to execute templates or plugins, at the cost of more generated files in Git and a CI step that must stay in sync with tool versions. Teams with strict review requirements or many third-party charts increasingly prefer the second.</p>
+</section>
+
+<section data-field="prod">
+<h4>The case: Argo CD's Helm path traversal (CVE-2022-24348)</h4>
+<p>In February 2022 Argo CD published security advisory GHSA-63qx-x74g-jcr7, crediting Moshe Zioni of Apiiro with the discovery. Argo CD lets users create Applications whose source is a Helm chart, optionally with a list of values files. The repo-server renders such charts by running <code>helm template</code> with those values files on its own file system, where it keeps clones of every repository it serves. The advisory states that all versions were vulnerable to a path-traversal bug allowing arbitrary values files to be passed to Helm, and that while fixing it, the Argo CD team found that chart packages could also contain values files that were symbolic links pointing outside the repository root. A user allowed to create or update Applications, who knew or could guess the path of a YAML file on the repo-server, could therefore make a chart consume it as values and read data they had no right to — and because <code>helm template</code>'s verbose error messages were returned to the user, they could enumerate files. The impact was especially critical where plugins such as git-crypt or SOPS decrypted secret value files to disk before rendering: other applications' secrets sat on the same disk. Fixed versions were 2.3.0, 2.2.4 and 2.1.9; there was no workaround.</p>
+<p>The lesson connects to k8s9's subPath escape: a privileged component following paths and symlinks supplied by less-trusted users. For delivery systems specifically: the renderer runs other people's charts, plugins and Kustomize remote bases, so treat it as a sandbox boundary — restrict which repositories each team may use through AppProjects, avoid decrypting secrets to a shared file system (prefer External Secrets, where plaintext never passes through the GitOps pipeline), keep the agent patched, and limit what the agent's own credentials can do in each cluster.</p>
+<h4>Failure modes in production</h4>
+<ul>
+<li><strong>"another operation (install/upgrade/rollback) is in progress"</strong>: a Helm release stuck in <code>pending-*</code> after an interrupted upgrade. Roll back to the last deployed revision.</li>
+<li><strong>Immutable field changed</strong>: a chart change to a Deployment's <code>selector</code> or a StatefulSet's <code>volumeClaimTemplates</code> is rejected; requires delete-and-recreate or a new resource name.</li>
+<li><strong>Config changed, pods didn't</strong>: no checksum annotation or hashed ConfigMap name.</li>
+<li><strong>Sync loop / constant OutOfSync</strong>: fields defaulted or mutated by controllers and webhooks (replicas, injected sidecars, <code>caBundle</code>s) not ignored or not owned via SSA.</li>
+<li><strong>Prune deletes too much</strong>: a refactor that moves resources between Applications deletes them in one and creates them in the other, briefly or with data loss for PVCs. Use prune-protection annotations on stateful resources.</li>
+<li><strong>Hotfix reverted</strong>: self-heal undoes an emergency <code>kubectl</code> change. Have a documented "pause sync" procedure and make the fix in Git.</li>
+<li><strong>CRD drift</strong>: chart upgrades that need newer CRDs fail because Helm does not upgrade them.</li>
+</ul>
+<h4>What to measure</h4>
+<p>Per Application: sync status, health, last sync time and duration, sync failures. For the pipeline: lead time from merge to synced in each environment, deployment frequency, change failure rate and time to restore (the DORA measures), drift events per week (a high number means people work around Git), and the age of the oldest unpromoted change between environments.</p>
+<h4>Ownership and access</h4>
+<p>Decide who may change what in the configuration repository with the same care as cluster RBAC, because in GitOps the repository <em>is</em> the access path to production. Code owners per directory, required reviews for production overlays, signed commits where your tooling supports them, and branch protection on the main branch translate organisational responsibility into enforceable rules, and the GitOps agent's AppProjects make sure a team's Applications can only deploy to that team's namespaces.</p>
+</section>
+
+<section data-field="lab">
+<p>Steps 1-3 need Helm and kubectl (step 3 also a kind/minikube cluster); step 4 runs here with Python 3.12.</p>
+<ol>
+<li><strong>Render a chart (Needs Helm).</strong>
+<pre>helm create web                          # a starter chart
+helm template shop ./web --set replicaCount=3 | grep -A3 'kind: Deployment'
+helm template shop ./web --set image.tag=1.27 -s templates/deployment.yaml</pre>
+Look at <code>templates/_helpers.tpl</code> and find <code>web.fullname</code>; the rendered name is <code>shop-web</code>. Break the template on purpose (change an <code>nindent 4</code> to <code>indent 4</code>) and run <code>helm lint ./web</code>.</li>
+<li><strong>Kustomize overlay (Needs kubectl).</strong> Create <code>base/</code> with a Deployment and <code>kustomization.yaml</code>, and <code>overlays/prod/</code> as in body section 5, then <code>kubectl kustomize overlays/prod</code>. Look for <code>namespace: prod</code>, the new image tag, the patched resources and a ConfigMap named <code>web-config-&lt;hash&gt;</code>. Change <code>LOG_LEVEL</code> and build again: the suffix and the reference in the Deployment both change.</li>
+<li><strong>Releases (Needs a kind/minikube cluster).</strong> <code>helm install shop ./web</code>, <code>helm upgrade shop ./web --set replicaCount=2</code>, then <code>helm history shop</code> (revisions 1 and 2), <code>kubectl get secrets -l owner=helm</code> (<code>sh.helm.release.v1.shop.v1</code>, <code>.v2</code>), and <code>helm rollback shop 1</code> (creates revision 3). Optionally install Argo CD (<code>kubectl create namespace argocd; kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml</code>), create an Application pointing at a repo of your own, edit a synced Deployment with <code>kubectl scale</code>, and watch self-heal put it back.</li>
+<li><strong>Values precedence and config hashing (runs here).</strong> Save as <code>values.py</code>:
+<pre>import copy, hashlib, json
+def merge(base, over):                       # Helm-style: maps merge, others replace
+    out = copy.deepcopy(base)
+    for k, v in over.items():
+        out[k] = merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else copy.deepcopy(v)
+    return out
+def set_path(vals, dotted, value):           # --set a.b.c=value
+    d = vals
+    *parents, leaf = dotted.split(".")
+    for p in parents: d = d.setdefault(p, {})
+    d[leaf] = value
+defaults = {"replicaCount": 2, "image": {"repository": "ghcr.io/myorg/web", "tag": ""},
+            "resources": {"requests": {"cpu": "250m", "memory": "256Mi"}}, "config": {"LOG_LEVEL": "info"}}
+prod = {"replicaCount": 6, "resources": {"requests": {"cpu": "1", "memory": "1Gi"}, "limits": {"memory": "1Gi"}}}
+vals = merge(defaults, prod); set_path(vals, "image.tag", "2.7.2")
+print(json.dumps(vals, indent=1))
+def config_hash(cfg):                         # stand-in for checksum/config or a Kustomize suffix
+    return hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:10]
+print("checksum/config:", config_hash(vals["config"]))
+vals["config"]["LOG_LEVEL"] = "debug"
+print("after change:    ", config_hash(vals["config"]), "-&gt; pod template changes -&gt; rollout")</pre>
+Expect <code>replicaCount</code> 6, the repository from defaults, tag 2.7.2, requests replaced by the prod values with limits added, and two different hashes. (Real Kustomize uses its own hash encoding; the principle is the same.)</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Diagnose: the deployment that keeps undoing itself</b>
+<p>A team moved a service to Argo CD with automated sync, prune and self-heal. Since then: (1) every few minutes the Deployment's replicas drop from around 12 to 3 and climb back, and users see brief latency spikes; (2) a ConfigMap change merged an hour ago is visible in the cluster, but the pods still log with the old level; (3) during last night's incident an engineer raised a memory limit with <code>kubectl edit</code>, and it reverted within three minutes, causing OOM kills to resume. The manifests are plain YAML in a Kustomize overlay with <code>replicas: 3</code>, a ConfigMap <code>web-config</code> referenced by <code>envFrom</code>, and an HPA. Explain each symptom and fix them.</p>
+<details><summary>Answer</summary>
+<p><strong>(1)</strong> The HPA scales to ~12, Argo CD sees <code>replicas: 3</code> in Git, reports OutOfSync and self-heal applies 3; the HPA scales up again. Fix: remove <code>replicas</code> from the overlay (or add <code>ignoreDifferences</code> for <code>/spec/replicas</code>), and use server-side apply so the HPA owns the field. <strong>(2)</strong> The ConfigMap object changed, but the pods read it through <code>envFrom</code>, which is evaluated only at container start, and the pod template did not change, so no rollout happened. Fix: replace the plain ConfigMap with a <code>configMapGenerator</code> so its name carries a content hash and references update, causing a rollout on every config change (or add a checksum annotation if using Helm). <strong>(3)</strong> Self-heal did exactly its job: the live object differed from Git. Fix the process, not the tool: the emergency change should be a commit (fast-tracked review), or the runbook should include pausing automated sync for that Application (disable self-heal or the automated policy temporarily) and re-enabling it after the fix lands in Git. Raise the memory limit in the overlay now, so the incident fix is permanent. Add alerts on repeated self-heal events, which reveal both automation fights and people working around Git.</p>
+</details>
+</section>

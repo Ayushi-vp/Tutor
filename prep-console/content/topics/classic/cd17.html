@@ -1,0 +1,405 @@
+<!-- topic source for classic/cd17; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "cd17",
+  "t": "Design a real-time leaderboard (100M players, top-k and my rank)",
+  "tag": "Ranking",
+  "sum": "Top-100 and 'what is my rank?' for 100 million players, updated live: what a sorted set must do, how a Redis ZSET's skip list with spans answers rank in O(log n), where one key stops scaling, three ways to shard a leaderboard, approximate ranks from score histograms, daily and weekly boards, ties encoded into the score, and anti-cheat.",
+  "prereq": [
+    ["in9", "Real-time counting: sorted sets serve small leaderboards, hot counters are split, and approximate structures trade exactness for memory."],
+    ["in3", "Redis keeps data in memory, runs commands on one thread per shard, and a key lives entirely on one shard of a cluster."],
+    ["al10", "A heap keeps the best k items in O(log k) per update but cannot tell an arbitrary item its rank."],
+    ["al9", "A linked list gives O(1) splicing once you are at the right node; finding the node is the slow part."],
+    ["al27", "A Fenwick tree keeps prefix sums over an array with O(log n) updates and queries."],
+    ["sc7", "Partitioning by key hash spreads load evenly; partitioning by range keeps neighbours together but risks hot ranges."],
+    ["sc10", "Events can flow through a log such as Kafka to consumers that build derived views, which can be rebuilt by replaying the log."]
+  ],
+  "myths": [
+    ["A leaderboard is a SELECT … ORDER BY score DESC LIMIT 100.", "That works for the top 100 with an index on score. 'What is my rank?' is the hard query: in SQL it is COUNT(*) WHERE score > mine, which on a B-tree index scans every entry above you — 50 million rows for a median player. Ordinary indexes do not store subtree counts, so rank is linear. A structure that keeps counts (a skip list with spans, an order-statistic tree) makes it logarithmic."],
+    ["Redis sorted sets scale to any size because Redis Cluster shards data.", "Cluster shards keys, not the inside of a key. One leaderboard is one key, so all of its members, memory and commands live on one shard and one thread. At 100 million members that is around 10 GB on one node, with every update and rank query serialised on it. Beyond that you shard the leaderboard yourself."],
+    ["Ties are handled automatically.", "Redis orders equal scores by member name, byte by byte — so 'player_a' beats 'player_z' at the same score, which is rarely the rule you want. If 'who got there first' should win, encode it into the score; if tied players should share a rank, compute rank as 1 + the number of strictly higher scores, not as a position."],
+    ["Exact rank matters for everyone.", "A player at rank 48,203,117 cannot tell it apart from 48,203,450, and the number changes many times a second anyway. Exact ranks matter near the top; for everyone else a percentile ('top 34%') or a rank computed from a score histogram is both cheaper and more honest. Choosing where exactness stops is a product decision that removes most of the scaling problem."],
+    ["Anti-cheat is a separate system that can come later.", "If the client reports its own score, the leaderboard is a list of whoever edited a request first, and the top 100 — the only part most people look at — fills with impossible scores within hours. Scores must be computed or validated by the server before they reach the board, which is a design decision for the write path, not an add-on."]
+  ],
+  "recap": [
+    "A leaderboard must update scores, return the top k, return any player's rank and the players around them, all in real time.",
+    "A heap gives top k but not rank; a database index gives order but rank needs a count of everything above you.",
+    "A Redis sorted set pairs a hash table (member to score) with a skip list ordered by score whose links store spans, so rank is the sum of spans walked: O(log n).",
+    "One sorted set lives on one shard: at 100 million members it is about 10 GB and one thread, so very large boards are sharded by score range or by player hash.",
+    "Range sharding answers rank as the count of players in higher shards plus a local rank; hash sharding spreads writes evenly but needs a scatter-gather for rank and a merge for top k.",
+    "Approximate ranks come from a histogram of score buckets: players in higher buckets plus an interpolation inside your bucket.",
+    "Daily and weekly boards are separate keys written alongside the all-time board, expired after the period, and archived at period end.",
+    "Ties are a rule: encode the tie-breaker into the score within 53 bits, or compute competition rank as 1 + count of strictly higher scores.",
+    "The source of truth is a durable log or database of score events; Redis boards are rebuildable views.",
+    "Anti-cheat means server-authoritative scores, plausibility limits on the write path, review before the top ranks, and the ability to remove a player from every board."
+  ],
+  "glossary": [
+    ["Competition rank", "A ranking where tied scores share a rank and the next rank skips ahead (1, 2, 2, 4), computed as 1 plus the number of strictly higher scores."],
+    ["Dense rank", "A ranking where tied scores share a rank and the next rank does not skip (1, 2, 2, 3)."],
+    ["Fan-in", "Combining results from many shards into one answer, as in merging each shard's top k."],
+    ["Histogram (score buckets)", "Counts of how many players have scores in each fixed range, used to estimate rank without storing order."],
+    ["Listpack", "Redis's compact encoding for small collections: a single contiguous block scanned linearly, used for sorted sets of up to 128 entries by default."],
+    ["Order-statistic tree", "A balanced search tree whose nodes store subtree sizes, so it can find an element's rank or the k-th element in O(log n)."],
+    ["Percentile", "The percentage of players with a lower score; 'top 5%' is the 95th percentile."],
+    ["Scatter-gather", "Sending one query to every shard in parallel and combining the replies."],
+    ["Server-authoritative", "A design where the server computes or validates the game outcome instead of trusting what the client reports."],
+    ["Shadow ban", "Hiding a suspected cheater's scores from everyone else while they still see their own, so they do not learn they were detected."],
+    ["Skip list", "A sorted linked list with extra randomly chosen express lanes of forward links, giving expected O(log n) search, insert and delete."],
+    ["Sorted set (ZSET)", "A Redis data type holding unique members each with a numeric score, kept ordered by score."],
+    ["Span", "In a Redis skip list, the number of elements a forward link jumps over; summing spans along a search gives rank."],
+    ["Top-k", "The k highest-scoring items."]
+  ],
+  "qa": [
+    ["E", "How would you build a game leaderboard?", "A Redis sorted set per board: member = player id, score = points. ZADD or ZINCRBY updates a score in O(log n); ZREVRANGE (or ZRANGE … REV) 0 99 returns the top 100; ZREVRANK returns a player's rank in O(log n); ZREVRANGE around that rank returns their neighbours. Persist score events durably elsewhere so the board can be rebuilt."],
+    ["E", "Why is 'my rank' harder than 'top 100'?", "Top 100 reads the first 100 entries of an ordered structure. Rank requires knowing how many entries are above you; a normal ordered index does not store counts, so it must walk them all. Structures that store counts per link or subtree, such as a skip list with spans or an order-statistic tree, answer rank in O(log n)."],
+    ["E", "How does Redis store a sorted set?", "Small sets (by default up to 128 members with short values) use a listpack, a compact array scanned linearly. Larger ones use two structures together: a hash table from member to score for O(1) score lookups, and a skip list ordered by (score, member) whose forward links store spans for rank. Updates touch both."],
+    ["M", "Explain how a skip list answers rank in O(log n).", "Each node has a random number of levels, with each level holding a forward link and a span: how many elements that link jumps over. To find a member's rank, start at the top level of the head, move forward while the next node sorts before or at the target, adding each link's span, and drop a level when you cannot move. The sum of spans when you reach the node is its 1-based rank. Expected path length is O(log n) because each level has about a quarter of the nodes of the one below (Redis uses p = 1/4).", "Follow-up: Why a skip list and not a balanced tree? — Simpler to implement and to extend with spans and range walks, with the same expected complexity; Redis's author chose it for that simplicity."],
+    ["M", "How much memory does a 100-million-player leaderboard need in Redis?", "Roughly 100 bytes per member for the skip list node, the hash table entry and a short member string — about 10 GB. It fits one large node, but a snapshot fork may need copy-on-write headroom, failover must reload or resync 10 GB, and every update and query runs on that shard's one thread. Measure with MEMORY USAGE on a sample before deciding.", "Follow-up: How do you shrink it? — Use short numeric member ids, keep only active players in the live board, and serve inactive players from a percentile estimate."],
+    ["M", "Compare sharding a leaderboard by score range and by player hash.", "Range shards each own a band of scores; top k comes from the top shard alone, and rank is the count of players in all higher shards plus the local rank — cheap if per-shard counts are kept. But scores are skewed, so bands must be set by quantiles, and a player crossing a band boundary must move shards. Hash shards spread writes evenly and never move players, but top k needs the top k of every shard merged, and rank needs ZCOUNT of higher scores on every shard — a scatter-gather per query."],
+    ["M", "How do you implement daily and weekly boards?", "Separate keys per period, such as lb:daily:2026-10-10 and lb:weekly:2026-W41, updated in the same pipeline as the all-time board when a score event arrives. Give each an expiry a little after the period ends, and archive the final standings to durable storage at period close so prizes and history do not depend on Redis. Avoid computing weekly boards by unioning dailies on read; it is O(n) over every member."],
+    ["M", "Two players have the same score. Who ranks higher?", "It is a product rule, and Redis's default — order by member bytes — is almost never it. For 'first to reach the score wins', encode time into the score: score = points × 2^32 + (2^32 − 1 − seconds since season start), which fits in the 53 bits a double holds exactly if points stay below about 2 million. For 'ties share a rank', compute rank as 1 + ZCOUNT of scores strictly greater than the player's.", "Follow-up: What breaks if you exceed 2^53? — Scores lose precision, so two different encoded values may become equal and the tie-breaker silently stops working."],
+    ["M", "How would you show a friends leaderboard?", "Friend lists are small, so compute it on read: fetch the friends' scores with one ZMSCORE call on the all-time board (Redis 6.2+), sort in the application, and cache briefly. Maintaining a separate sorted set per user would multiply writes by the number of followers for every score change."],
+    ["H", "Design approximate ranks for 100 million players.", "Keep exact rank only where it matters, say the top 10,000 in a capped sorted set. For everyone else, maintain a histogram: counts of players per score bucket (for example 1,000 buckets), updated by moving a player from the old bucket to the new one on each score change. Rank ≈ players in all higher buckets + an interpolation within the player's bucket. Keep prefix sums in a Fenwick tree so each update and query is O(log buckets). The error is bounded by the population of one bucket, so make buckets narrower where players are dense.", "Follow-up: How do you choose bucket edges? — By quantiles of the current distribution, recomputed occasionally, so each bucket holds a similar number of players and the error is uniform."],
+    ["H", "How do you keep the top of the board free of cheaters?", "Make scores server-authoritative: game servers compute match results and sign them; the leaderboard writer accepts only signed results. Apply plausibility checks on the write path (maximum points per match, maximum gain per hour, impossible completion times). Hold entries that would enter the top N for automatic or human review before they become visible. Remove confirmed cheaters from every board via the event log so rebuilds do not reintroduce them, and consider shadow banning so they do not learn what triggered detection.", "Follow-up: Why review only the top? — It is where cheating pays (prizes, visibility) and where users look, and it is small enough for expensive checks such as replay verification."],
+    ["H", "Redis lost the leaderboard. How do you recover?", "Redis is a derived view. Rebuild it from the durable source of truth: either the players table of current totals (stream it into ZADD in batches of a few thousand with pipelining), or the score event log replayed from the last snapshot. Meanwhile serve the last cached top 100 and hide 'my rank' or show the last known value. For a 100-million board, rebuilding at a few hundred thousand ZADDs per second takes minutes, which is why a replica and periodic RDB snapshots exist to make a full rebuild rare.", "Follow-up: How do you avoid missing events that arrive during the rebuild? — Record the log offset at which the snapshot was taken, rebuild from the snapshot, then replay the log from that offset with idempotent ZADDs (setting absolute totals rather than increments)."]
+  ],
+  "refs": [
+    ["docs", "Redis sorted sets", "The data type, the leaderboard use case, ordering of equal scores, and the implementation note: a skip list plus a hash table.", "https://redis.io/docs/latest/develop/data-types/sorted-sets/"],
+    ["docs", "Redis ZADD", "Options NX, XX, GT, LT (6.2+), CH and INCR, and the note that scores are doubles exact for integers up to 2^53.", "https://redis.io/docs/latest/commands/zadd/"],
+    ["code", "Redis source: t_zset.c", "The skip list with spans, rank computation and the listpack encoding for small sorted sets.", "https://raw.githubusercontent.com/redis/redis/unstable/src/t_zset.c"],
+    ["paper", "Skip lists: a probabilistic alternative to balanced trees (William Pugh, CACM 1990)", "The original skip list paper: random levels, expected O(log n) search, and how p trades space for speed.", "https://15721.courses.cs.cmu.edu/spring2018/papers/08-oltpindexes1/pugh-skiplists-cacm1990.pdf"],
+    ["docs", "Redis ZCOUNT", "Counting members in a score range in O(log n) — the building block for competition rank and for rank across hash shards.", "https://redis.io/docs/latest/commands/zcount/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A mobile game launches a weekly tournament. On Monday morning the leaderboard is a database table with an index on score, and the top-100 screen loads instantly. By Wednesday there are 30 million players, and the profile screen, which shows "You are ranked #14,203,551", takes eight seconds and pins the database at 100% CPU. The query is <code>SELECT COUNT(*) FROM scores WHERE score &gt; :mine</code>. For a player in the middle of the pack, the index has to be walked across fifteen million entries to answer it — and every player opens their profile after every match. The team caches the rank for five minutes, and players complain that their rank does not move after a win. On Saturday the top 10 fills with scores of 2,147,483,647, the largest 32-bit integer, sent by a modified client.</p>
+<p>A leaderboard looks like the simplest system in this collection — a list sorted by score — and it hides three hard problems. First, <strong>rank is not a lookup</strong>: knowing where you stand requires knowing how many players are above you, and ordinary indexes do not keep that count. Second, <strong>a single sorted structure does not shard naturally</strong>: the top 100 involves everyone, and splitting players across machines splits the order. Third, <strong>the most visible part is the most attacked</strong>: the top of the board is where prizes and attention are, so it is where cheating concentrates.</p>
+<p>In9 used a Redis sorted set for a leaderboard as one part of a real-time counting system. This lesson goes inside it and past its limits. It works out the requirements and arithmetic for a board of 100 million players; the API; why a Redis sorted set answers rank in logarithmic time (a skip list whose links carry counts, worked by hand on six players); where one sorted set stops scaling; three ways to shard a leaderboard and what each costs; approximate ranks from score histograms; daily and weekly boards; ties encoded into the score; and anti-cheat on the write path. The lab builds a skip list with spans, checks its ranks against sorting, and measures the error of histogram ranks.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a marathon with express lanes</h4>
+<p>Picture the finishing order of a marathon written on a very long scroll, one runner per line, fastest first. Finding the top 100 is easy: read the first 100 lines. But "what place did runner 48,112 finish?" means counting lines from the top until you find them, and inserting a new result in the right place means finding that place first. Now add express lanes: alongside the scroll, a second list mentions only every fourth runner and next to each entry notes "4 runners from the previous entry". A third list mentions every sixteenth runner with "16 runners from the previous". To find runner 48,112's place, you skim the coarsest list, adding up the "runners skipped" notes, drop to the finer list when you would overshoot, and so on down to the scroll. You visit only a few dozen entries and you have their place: the sum of the notes. That is a <strong>skip list with spans</strong>, and it is exactly how a Redis sorted set answers "what is my rank?".</p>
+<p>Updates work the same way: a runner whose time changes is removed from the scroll and re-inserted at the new position, with the notes along the path adjusted by one. Each operation touches a logarithmic number of entries, which for 100 million runners is a few dozen.</p>
+<p>The analogy breaks when the scroll no longer fits on one desk. A sorted set lives on one machine and one thread. Split the scroll between two desks by name and neither desk knows a runner's overall place without asking the other; split it by finishing time and runners keep moving between desks as their times change. Most of the design work in a big leaderboard is choosing how to split the scroll — or deciding that most runners only need to know "you finished in the top 34%", which needs no scroll at all.</p>
+
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="Architecture: game servers send signed match results to a score ingest service, which validates them and writes score events to a durable log. A leaderboard writer consumes the log and updates the all-time, weekly and daily boards in Redis and a players table in the database. A read API serves top 100 from a cache, my rank and neighbours from Redis replicas, and approximate percentiles from a histogram. A review queue holds entries that would enter the top ranks.">
+  <defs><marker id="cd17-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="8" y="110" width="90" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="53" y="131" text-anchor="middle" style="fill:var(--ink)">Game servers</text>
+    <text x="53" y="148" text-anchor="middle" style="fill:var(--muted)">signed results</text>
+    <rect x="120" y="110" width="96" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="168" y="131" text-anchor="middle" style="fill:var(--ink)">Score ingest</text>
+    <text x="168" y="148" text-anchor="middle" style="fill:var(--muted)">validate, limits</text>
+    <line x1="98" y1="135" x2="118" y2="135" marker-end="url(#cd17-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="238" y="110" width="84" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="280" y="131" text-anchor="middle" style="fill:var(--ink)">Event log</text>
+    <text x="280" y="148" text-anchor="middle" style="fill:var(--muted)">source of truth</text>
+    <line x1="216" y1="135" x2="236" y2="135" marker-end="url(#cd17-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="344" y="110" width="88" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="388" y="131" text-anchor="middle" style="fill:var(--ink)">Board writer</text>
+    <text x="388" y="148" text-anchor="middle" style="fill:var(--muted)">idempotent</text>
+    <line x1="322" y1="135" x2="342" y2="135" marker-end="url(#cd17-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="460" y="40" width="170" height="80" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="545" y="60" text-anchor="middle" style="fill:var(--ink);font-weight:600">Redis boards</text>
+    <text x="545" y="78" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">lb:all · lb:weekly:W41</text>
+    <text x="545" y="94" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">lb:daily:10-10</text>
+    <text x="545" y="110" text-anchor="middle" style="fill:var(--muted)">+ score histogram</text>
+    <rect x="460" y="150" width="170" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="545" y="174" text-anchor="middle" style="fill:var(--ink)">Players table (totals)</text>
+    <line x1="432" y1="128" x2="458" y2="90" marker-end="url(#cd17-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="432" y1="145" x2="458" y2="168" marker-end="url(#cd17-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="460" y="215" width="170" height="54" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="545" y="235" text-anchor="middle" style="fill:var(--ink)">Read API</text>
+    <text x="545" y="252" text-anchor="middle" style="fill:var(--muted)">top 100 (cached 1 s)</text>
+    <text x="545" y="265" text-anchor="middle" style="fill:var(--muted)">my rank · neighbours · %</text>
+    <path d="M630,80 C660,120 660,210 632,240" marker-end="url(#cd17-arrow)" style="fill:none;stroke:var(--good);stroke-dasharray:4 3"/>
+    <rect x="238" y="200" width="150" height="44" rx="4" style="fill:var(--surface-2);stroke:var(--crit);stroke-dasharray:4 3"/>
+    <text x="313" y="219" text-anchor="middle" style="fill:var(--ink)">Top-N review queue</text>
+    <text x="313" y="235" text-anchor="middle" style="fill:var(--muted)">hold before visible</text>
+    <line x1="388" y1="160" x2="360" y2="198" marker-end="url(#cd17-arrow)" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/>
+  </g>
+</svg>
+<figcaption>Scores enter through one validated path and are recorded in a durable log before any board changes. Every Redis board is a view that can be rebuilt from the log or the players table; the review queue sits exactly where cheating would be most visible.</figcaption>
+</figure>
+
+<h4>The four queries, and why each is different</h4>
+<p>Everything a leaderboard does is one of four operations. <strong>Update a score</strong> — after every match, possibly many per second at peak. <strong>Top k</strong> — the first page of the board, identical for every viewer, so cacheable. <strong>My rank</strong> — different for every viewer, the expensive one. <strong>Around me</strong> — the players just above and below, which is "my rank" followed by a range read. A design that answers all four in logarithmic time for one board is a sorted set; a design for 100 million players across daily, weekly and all-time boards is about how many of those boards you can afford to keep exact, and where.</p>
+<p>One more framing helps in an interview: a leaderboard is a <strong>derived view</strong>. The facts are score events — "player 7 scored 1,500 in match 88" — and the board is a sorted projection of them. Treating it that way answers the durability question (keep the events and totals durably; the board can be rebuilt) and the anti-cheat question (validate events before they become facts), and it frees you to keep several views of the same facts — all-time, weekly, regional, approximate — each shaped for the query it serves.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–18</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">18–25</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">25–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> (1) Record a player's score after each match: either a running total (points accumulated) or a best score (highest single run). (2) Show the global top 100. (3) Show any player's rank and score. (4) Show the 5 players above and below them. (5) Keep all-time, weekly and daily boards, resetting on schedule, with final standings archived for prizes. (6) Show a friends leaderboard. (7) Remove cheaters. Out of scope, said aloud: matchmaking, the game's own scoring rules, prize payment.</p>
+<p><strong>Non-functional.</strong> Updates visible within about a second. Top-100 and my-rank queries under 50 ms at p99. Exact ranks at least for the top of the board; the product team may accept approximate ranks further down. Durable: losing the leaderboard store must not lose anyone's score. Abuse-resistant.</p>
+<p><strong>Clarifying questions.</strong> How many players, how many active daily? Total points or best score — they need different update operations? Do ties share a rank or break by time? Must every player see an exact rank, or is "top 12%" acceptable below some point? Per-region boards or one global board? Are there prizes (which raises the stakes for anti-cheat and for exact, archived final standings)?</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Assume <strong>100 million</strong> registered players on the all-time board, <strong>10 million</strong> daily active, each playing 10 matches a day.</p>
+<p><strong>Writes.</strong> 10M × 10 = 100M score updates per day ÷ 86,400 s ≈ <strong>1,200 per second</strong> on average. Peaks — the evening in the largest region, the last hour of a weekly tournament — run perhaps 10× higher: <strong>12,000 per second</strong>. Each match updates three boards (all-time, weekly, daily), so the store sees up to <strong>36,000 sorted-set writes per second</strong> at peak.</p>
+<p><strong>Reads.</strong> Every match ends with a results screen showing rank: about as many my-rank queries as matches, 12,000 per second at peak, plus profile and board views — say <strong>30,000 rank queries per second</strong> and <strong>20,000 top-100 views per second</strong>. Top 100 is identical for everyone, so a 1-second cache turns 20,000 reads into one read per second per board. Rank queries are per player and cannot be shared.</p>
+<p><strong>Memory.</strong> A Redis sorted set member costs, roughly, a skip list node (score, back pointer, about 1.33 levels of forward pointer plus span on average, and the member string) and a hash table entry — on the order of <strong>100 bytes</strong> for a short member id. All-time: 100M × 100 B ≈ <strong>10 GB</strong>. Weekly: only players active that week, say 30M → 3 GB. Daily: 10M → 1 GB. Total about 14 GB, with replicas doubling it.</p>
+<p><strong>Per-operation cost.</strong> A skip list search over n = 100M with p = 1/4 visits on the order of log<sub>4</sub>(10<sup>8</sup>) ≈ 13 levels, a few nodes per level — dozens of pointer hops, most of them cache misses into a 10 GB structure, so a few microseconds per ZADD or ZREVRANK. One Redis thread doing such commands manages perhaps 100,000-200,000 per second; with 36,000 writes and 30,000 rank reads at peak, the all-time board's single shard is busy but viable, with little headroom and nothing left for growth. That is the number that motivates sharding and approximate ranks later.</p>
+<p><strong>Why not SQL?</strong> Top 100 with an index on score is cheap. Rank as <code>COUNT(*) WHERE score &gt; x</code> walks every index entry above x: 50 million for a median player. Even at 10 million entries per second per core, that is 5 seconds per query; at 30,000 queries per second it is impossible. The rank query alone rules out a plain index.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+<tr><td>Score updates</td><td>10M × 10 ÷ 86,400 × 10 peak</td><td>~12,000/s</td></tr>
+<tr><td>Board writes</td><td>× 3 boards</td><td>~36,000/s</td></tr>
+<tr><td>Rank queries</td><td>results + profile screens</td><td>~30,000/s</td></tr>
+<tr><td>Top-100 reads at the store</td><td>20,000/s behind a 1 s cache</td><td>~1/s per board</td></tr>
+<tr><td>All-time board memory</td><td>100M × ~100 B</td><td>~10 GB on one shard</td></tr>
+<tr><td>SQL rank for a median player</td><td>50M index entries walked</td><td>seconds per query</td></tr>
+</table>
+
+<h4>3 · The API</h4>
+<pre>POST /internal/scores                          (game servers only, mTLS + signed payload)
+  {match_id, player_id, points: 1500, mode: "ranked", ended_at, signature}
+  → 202  (accepted into the log; idempotent on match_id + player_id)
+
+GET /boards/{board}/top?limit=100              board ∈ all | weekly | daily | region:eu …
+  → [{rank: 1, player_id, name, score}, …]    (CDN/app cache, 1 s)
+GET /boards/{board}/players/{player_id}
+  → {rank: 14203551, score: 48210, percentile: 85.8, exact: true}
+GET /boards/{board}/players/{player_id}/around?n=5
+  → [{rank, player_id, score} × 11]
+GET /boards/{board}/friends/{player_id}
+  → [{rank_among_friends, player_id, score}, …]</pre>
+<p>Scores come <em>only</em> from game servers, never from clients — the API's first anti-cheat decision. The ingest call is idempotent on <code>(match_id, player_id)</code> so a retried submission cannot count a match twice. The rank response says whether the rank is exact, because below some depth the system may return an estimate (deep dive C).</p>
+
+<h4>4 · The data model</h4>
+<pre>Durable (database / log):
+  score_events  (match_id, player_id, points, ended_at, board_period, PRIMARY KEY (match_id, player_id))
+  players       (player_id PK, total_points, best_score, updated_at, flagged BOOL)
+  standings_archive (board, period, rank, player_id, score)   -- written at period close
+
+Redis (views, rebuildable):
+  lb:all                 ZSET  member = player_id, score = encoded score
+  lb:weekly:2026-W41     ZSET  (EXPIRE at period end + 7 days)
+  lb:daily:2026-10-10    ZSET  (EXPIRE at period end + 2 days)
+  lb:hist:all            hash or array of bucket counts (approximate rank)</pre>
+<p>Use short numeric member ids, not names, to keep members small (100M × 30 extra bytes is 3 GB). Store names in a separate cache keyed by id and join them only for the top 100 and the around-me page.</p>
+
+<h4>5 · High-level design and the critical path</h4>
+<p><strong>Write path.</strong> A game server finishes a match and posts signed results. The ingest service verifies the signature, applies plausibility checks (deep dive D), and appends a score event to a durable log (or inserts it into <code>score_events</code>, whose primary key makes it idempotent). A <strong>board writer</strong> consumes events in order and, in one pipelined batch, updates the player's total in the database and applies <code>ZINCRBY</code> (for running totals) or <code>ZADD … GT</code> (for best score: only replace if higher, Redis 6.2+) to each affected board. Score events carry their match id, and the writer records the last applied offset, so a restart replays without double-counting.</p>
+<p><strong>Read path.</strong> Top 100: <code>ZRANGE lb:all 0 99 REV WITHSCORES</code>, cached for one second. My rank: <code>ZREVRANK lb:all player</code> (with <code>WITHSCORE</code> on Redis 7.2+ to get the score in the same call), served from a replica to keep load off the primary — a replica may be a few milliseconds behind, which nobody can see. Around me: <code>ZRANGE lb:all (r−5) (r+5) REV WITHSCORES</code> after the rank. Friends: <code>ZMSCORE lb:all f1 f2 … f200</code> (Redis 6.2+) returns all friends' scores in one call; sort them in the application.</p>
+
+<h4>6 · Deep dive A: inside a sorted set — the skip list with spans</h4>
+<p><strong>What the structure must do.</strong> Update a member's score, return the top k, return a member's rank, and return a range around a rank — all in about O(log n). A <strong>heap</strong> (al10) gives the top 1 cheaply but cannot tell an arbitrary member its rank and cannot find a member to update it without an index. A <strong>balanced binary search tree</strong> keeps order; if each node also stores the size of its subtree, it becomes an <strong>order-statistic tree</strong> and can compute rank in O(log n) by adding up the sizes of left subtrees it passes. Redis chose a different structure with the same complexity: a skip list whose links carry counts.</p>
+<p><strong>Two structures, one set.</strong> A large Redis sorted set is a <strong>hash table</strong> mapping member → score (so <code>ZSCORE</code> is O(1) and an update can find the old score) plus a <strong>skip list</strong> of nodes ordered by (score, member). Small sets — by default up to 128 members with values up to 64 bytes (<code>zset-max-listpack-entries</code> and <code>zset-max-listpack-value</code>) — use a <strong>listpack</strong> instead, a compact array scanned linearly, because for tiny sets scanning is faster and uses less memory than pointers. A leaderboard is far past that threshold.</p>
+<p><strong>The skip list.</strong> Level 0 is an ordinary sorted linked list of every member. Each node also appears on level 1 with probability 1/4, on level 2 with probability 1/16, and so on (Redis uses p = 1/4 and caps nodes at 32 levels). Each level is a sparser sorted list — an express lane. A search starts at the highest level of the head node, moves right while the next node sorts before the target, and drops down a level when it would overshoot. Because each level has about a quarter of the nodes of the one below, the expected number of steps is proportional to log n. Insertion picks a random level for the new node, finds its position with the same search, and splices it in on each of its levels — O(1) work per level once you are there, as in any linked list (al9).</p>
+<p><strong>Spans make rank possible.</strong> Each forward link in Redis's skip list stores a <strong>span</strong>: the number of level-0 elements the link jumps over. Searching for a member, add the span of every link you follow; when you arrive, the sum is the member's 1-based position. Worked on six players, ordered by score descending (a leaderboard uses reverse order; the idea is identical):</p>
+<table>
+<thead><tr><th>Position</th><th>Player</th><th>Score</th><th>Levels</th></tr></thead>
+<tr><td>1</td><td>Ana</td><td>980</td><td>2</td></tr>
+<tr><td>2</td><td>Ben</td><td>950</td><td>1</td></tr>
+<tr><td>3</td><td>Cai</td><td>900</td><td>3</td></tr>
+<tr><td>4</td><td>Dev</td><td>870</td><td>1</td></tr>
+<tr><td>5</td><td>Eli</td><td>820</td><td>2</td></tr>
+<tr><td>6</td><td>Fay</td><td>700</td><td>1</td></tr>
+</table>
+<p>The top level (level 2) has one link from the head to Cai, with span 3 (it jumps over Ana, Ben and Cai). Level 1 links head → Ana (span 1), Ana → Cai (span 2), Cai → Eli (span 2). Level 0 links every node with span 1. <strong>Rank of Eli:</strong> at level 2, follow head → Cai (Cai sorts before Eli): total 3. Cai has no further link on level 2, drop to level 1: Cai → Eli: total 5. Arrived — Eli is at position 5, rank 4 counting from 0 as <code>ZREVRANK</code> does. Two links followed instead of five. With 100 million members the same walk follows a few dozen links instead of tens of millions.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="A skip list of six players ordered by score descending, with three levels. Level 2 has a link from head to Cai with span 3. Level 1 has links head to Ana span 1, Ana to Cai span 2, Cai to Eli span 2. Level 0 links every node with span 1. The search for Eli follows head to Cai on level 2, then Cai to Eli on level 1, summing spans 3 plus 2 to get position 5.">
+  <defs><marker id="cd17-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="12" y="52" style="fill:var(--muted)">L2</text>
+    <text x="12" y="102" style="fill:var(--muted)">L1</text>
+    <text x="12" y="152" style="fill:var(--muted)">L0</text>
+    <rect x="36" y="34" width="50" height="130" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="61" y="184" text-anchor="middle" style="fill:var(--muted)">head</text>
+    <rect x="116" y="84" width="60" height="80" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="146" y="184" text-anchor="middle" style="fill:var(--ink)">Ana 980</text>
+    <rect x="206" y="134" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="236" y="184" text-anchor="middle" style="fill:var(--ink)">Ben 950</text>
+    <rect x="296" y="34" width="60" height="130" rx="3" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="326" y="184" text-anchor="middle" style="fill:var(--ink)">Cai 900</text>
+    <rect x="386" y="134" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="416" y="184" text-anchor="middle" style="fill:var(--ink)">Dev 870</text>
+    <rect x="476" y="84" width="60" height="80" rx="3" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="506" y="184" text-anchor="middle" style="fill:var(--ink)">Eli 820</text>
+    <rect x="566" y="134" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="596" y="184" text-anchor="middle" style="fill:var(--ink)">Fay 700</text>
+    <line x1="86" y1="48" x2="294" y2="48" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+    <text x="190" y="42" text-anchor="middle" style="fill:var(--accent);font-weight:600">span 3</text>
+    <line x1="86" y1="98" x2="114" y2="98" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="100" y="92" text-anchor="middle" style="fill:var(--muted)">1</text>
+    <line x1="176" y1="98" x2="294" y2="98" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="235" y="92" text-anchor="middle" style="fill:var(--muted)">span 2</text>
+    <line x1="356" y1="98" x2="474" y2="98" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+    <text x="415" y="92" text-anchor="middle" style="fill:var(--accent);font-weight:600">span 2</text>
+    <line x1="86" y1="149" x2="114" y2="149" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="176" y1="149" x2="204" y2="149" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="266" y1="149" x2="294" y2="149" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="356" y1="149" x2="384" y2="149" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="446" y1="149" x2="474" y2="149" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="536" y1="149" x2="564" y2="149" marker-end="url(#cd17-arrow2)" style="fill:none;stroke:var(--line-2)"/>
+    <text x="330" y="214" text-anchor="middle" style="fill:var(--ink)">rank of Eli: 3 (head → Cai on L2) + 2 (Cai → Eli on L1) = position 5 → ZREVRANK = 4</text>
+  </g>
+</svg>
+<figcaption>Spans turn a search into a count. Every link knows how many players it jumps over, so the path to a player adds up to their position without visiting the players in between. An update re-adjusts only the spans of links on the search path.</figcaption>
+</figure>
+
+<p><strong>What an update costs.</strong> Changing Eli's score is: look up the old score in the hash table (O(1)); delete Eli's node from the skip list (a search, then unlink on each of Eli's levels, decreasing by one the span of every link on the path that jumped over Eli); insert a new node at the new position (a search, splice, and split the spans of the links it lands under). Redis optimises the case where the new score keeps the node in the same place by updating it in place. All of it is O(log n) expected.</p>
+<p><strong>Where it stops.</strong> The structure is excellent and has three hard limits for a huge board. It is <strong>one key</strong>, so Redis Cluster cannot spread it: the whole 10 GB and every command sit on one shard. It is <strong>one thread</strong>, so every write and rank query for that board is serialised. And large keys make operations around them slow: deleting a huge sorted set synchronously blocks the server (use <code>UNLINK</code>, which frees memory in the background), and a full resynchronisation of a replica copies the whole dataset. Read replicas absorb rank queries; writes still all land on one primary.</p>
+
+<h4>7 · Deep dive B: sharding a leaderboard</h4>
+<p>When one board outgrows one shard — in memory, write rate or rank queries — you split it yourself. Three options, each with a different cost.</p>
+<p><strong>By score range.</strong> Shard <em>i</em> holds players whose scores fall in a band [b<sub>i</sub>, b<sub>i+1</sub>). The top k comes from the highest band alone. A player's rank is <em>(number of players in all higher bands) + (local rank in their band)</em>; keep each band's size in a small counter (or call <code>ZCARD</code> on each higher shard) and the global rank is a handful of O(1) reads plus one O(log n). The costs: scores are heavily skewed — most players have low scores — so equal-width bands would put 90% of players in one shard; set band edges by <strong>quantiles</strong> of the current distribution instead, and re-balance occasionally. And a player whose score crosses an edge must move shards: remove from one, add to the other, which is two operations on two shards, briefly double-counting or missing the player unless the writer handles it (order the operations add-then-remove and de-duplicate on read, or accept a one-moment glitch).</p>
+<p><strong>By player hash.</strong> Shard = hash(player_id) mod S. Writes spread perfectly evenly and players never move. But order is split across every shard. Top k: ask each of S shards for its top k and merge the S × k results — cheap, and cacheable anyway. Rank: <em>sum over all shards of the number of players with a higher score</em>, which is <code>ZCOUNT shard (score +inf</code> on every shard, each O(log n), in parallel — a <strong>scatter-gather</strong> for every rank query. With S = 10 and 30,000 rank queries per second, that is 300,000 ZCOUNTs per second across the cluster: workable, but every query's latency is the slowest shard's.</p>
+<p><strong>Tiered: exact top, approximate tail.</strong> Keep a single exact sorted set only for players above a threshold score that admits roughly the top 1 million — about 100 MB, fast, one shard — and serve everyone else from a histogram (deep dive C). When a player's score crosses the threshold, add them to the exact board; trim the exact board occasionally with <code>ZREMRANGEBYRANK</code> as the threshold rises. This is what most very large games do in practice, because it matches what players can perceive: the top cares about exact positions, the middle cares about progress.</p>
+<table>
+<thead><tr><th>Approach</th><th>Top k</th><th>My rank</th><th>Write balance</th><th>Main cost</th></tr></thead>
+<tr><td>One sorted set</td><td>O(log n + k)</td><td>O(log n)</td><td>One shard, one thread</td><td>Size ceiling ~ one node</td></tr>
+<tr><td>Score-range shards</td><td>Top shard only</td><td>Higher-band counts + local rank</td><td>Skewed; quantile edges</td><td>Players move between shards</td></tr>
+<tr><td>Hash shards</td><td>Merge S × k</td><td>Scatter-gather ZCOUNT</td><td>Perfectly even</td><td>Fan-out on every rank query</td></tr>
+<tr><td>Exact top + histogram</td><td>Exact board</td><td>Exact at top, estimate below</td><td>Small exact board</td><td>Rank below threshold is approximate</td></tr>
+</table>
+
+<h4>8 · Deep dive C: approximate ranks</h4>
+<p><strong>The idea.</strong> A player at rank 48 million does not need the exact position; they need to see it move when they improve. Divide the score range into buckets and keep only a count of players per bucket. A player's rank is the number of players in all higher buckets, plus an estimate of how many in their own bucket are above them.</p>
+<p><strong>Worked example.</strong> Scores run 0 to 1,000,000; use 1,000 buckets of width 1,000. A player with 52,345 points is in bucket 52, covering 52,000-52,999. Suppose the buckets above (53 to 999) hold 41,200,000 players in total and bucket 52 holds 180,000. Assuming players are spread evenly inside the bucket, the fraction above 52,345 is (52,999 − 52,345) ÷ 1,000 ≈ 0.65, so about 117,000 of them. Estimated rank ≈ 41,200,000 + 117,000 = <strong>41,317,000</strong>, and the percentile is 1 − 41.3M ÷ 100M ≈ 58.7% — "top 41%". The error is at most the bucket's population (180,000 here) and usually far less; narrower buckets where players are dense shrink it. The lab measures it: with 100,000 players and 1,000 buckets the mean error is about 3 places.</p>
+<p><strong>Keeping it current.</strong> On each score change, decrement the old bucket and increment the new one — two O(1) updates. Computing "players in all higher buckets" naively sums up to 1,000 counters; a <strong>Fenwick tree</strong> (al27) over the bucket counts makes both the update and the suffix sum O(log buckets). Bucket edges set by quantiles (so each bucket holds about the same number of players) make the error uniform across the board; recompute edges daily and rebuild the counts.</p>
+<p><strong>What players see.</strong> Below the exact threshold, show "Top 41%" or a rounded rank ("~41.3M"), and mark it as approximate in the API. Players care that it moves up after a win; with fine buckets it does.</p>
+
+<h4>9 · Deep dive D: time windows, ties and anti-cheat</h4>
+<p><strong>Daily and weekly boards.</strong> Keep one key per period — <code>lb:daily:2026-10-10</code>, <code>lb:weekly:2026-W41</code> — and have the board writer update the all-time, weekly and daily keys for each event in one pipeline (or a <code>MULTI</code> transaction, if they share a hash tag and must change together). Periods are defined in one timezone (usually UTC) and stated in the product, because "daily" means something different in Tokyo and New York. Set an expiry on each key a few days after its period ends, so old boards disappear without a cleanup job. At period close, snapshot the final standings — at least the top N for prizes — to durable storage <em>before</em> the key can expire, and freeze late-arriving events by their match end time so a match finishing at 23:59:58 counts for the right day. A rolling "last 7 days" board is harder: <code>ZUNIONSTORE</code> of seven daily keys is O(N) plus O(M log M) over every member, so compute it periodically (hourly) for display, not on each read.</p>
+<p><strong>Ties.</strong> Redis orders equal scores by member, byte by byte, which is arbitrary from the player's point of view. Pick a rule. <em>First to reach the score wins:</em> fold time into the score. A Redis score is a 64-bit double, which represents integers exactly up to 2<sup>53</sup>. Use score = points × 2<sup>32</sup> + (2<sup>32</sup> − 1 − t), where t is seconds since the season started; the subtraction makes earlier times larger. With points below 2<sup>21</sup> (about 2.1 million), the total stays below 2<sup>53</sup>. Worked: Ana and Ben both have 1,500 points; Ana reached it at t = 3,600 s, Ben at t = 7,200 s. Ana's score is 1,500 × 4,294,967,296 + 4,294,963,695 = 6,446,745,907,695; Ben's is 6,446,745,904,095. Ana ranks higher, and dividing by 2<sup>32</sup> recovers 1,500 for display. <em>Ties share a rank</em> (competition ranking, 1-2-2-4): the rank is 1 + the number of strictly higher scores, i.e. <code>ZCOUNT key (score +inf</code> plus one, an O(log n) call, instead of <code>ZREVRANK</code>, which returns a position and would give tied players different numbers.</p>
+<p><strong>Anti-cheat on the write path.</strong> The first rule is <strong>server-authoritative scoring</strong>: clients never submit scores. Game servers compute the outcome of each match and sign the result; the ingest service rejects anything unsigned. The second is <strong>plausibility checks</strong> before a score reaches any board: a maximum number of points per match for the mode, a maximum gain per hour per player, minimum plausible completion times, and rate limits on matches per player (cd12's limiter, keyed by player). The third is <strong>review before visibility at the top</strong>: an update that would put a player in the top N goes to a review queue — automatic checks such as replaying the match from its recorded inputs, statistical outlier detection on score velocity, account age and device signals — and appears on the public board only when cleared. The top is small, so expensive checks are affordable exactly where cheating pays most. Finally, <strong>removal</strong>: banning a cheater appends an event to the log that removes them from every board (<code>ZREM</code> on each), sets <code>flagged</code> in the players table so rebuilds exclude them, and can be a <strong>shadow ban</strong> — the cheater still sees their own score, but the public reads filter it out — so they do not learn what triggered detection.</p>
+
+<h4>10 · Bottlenecks, failure modes and trade-offs</h4>
+<p><strong>Hot board at the end of a tournament.</strong> The weekly board's last hour can see ten times normal writes as players push for prizes. Pre-size the shard, move rank reads to replicas, and cache top-100 aggressively.</p>
+<p><strong>Losing Redis.</strong> The board is a view; rebuild it from the players table or replay the event log from the last snapshot's offset, using absolute totals (<code>ZADD</code>) rather than increments so replays are idempotent. Serve the cached top 100 and hide exact ranks meanwhile.</p>
+<p><strong>Double-counted matches.</strong> A retried score submission or a consumer restart replays events. Idempotency on (match_id, player_id) at ingest and a tracked log offset in the writer keep totals correct.</p>
+<p><strong>Trade-offs to close on.</strong> Exact versus approximate rank (where to draw the line); one sorted set versus sharded boards (simplicity versus capacity); score-range versus hash sharding (cheap rank versus even writes); freshness versus load (1-second caches for top k); and fairness rules (tie-breaking, period boundaries) that must be decided as product policy and encoded precisely.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why Redis chose a skip list</h4>
+<p>A balanced tree such as a red-black tree or an order-statistic tree gives the same O(log n) bounds, so the choice is about engineering. Skip lists are simple to implement correctly, which matters for code that must also support range queries by score, by rank and by lexicographic order. Their memory layout is tunable through p: with p = 1/4, a node has 1/(1 − p) ≈ 1.33 levels on average, so each node carries about 1.33 forward pointers and spans — less than the two child pointers plus metadata of a binary tree node. Adding spans to support rank is a small change to insertion and deletion. And walking a range forward or backward is just following level-0 links, with no parent pointers or stack. The price is randomness: performance is expected, not guaranteed, but the probability of a badly unbalanced skip list on millions of nodes is vanishingly small.</p>
+
+<h4>Best score versus total score</h4>
+<p>The two common scoring models need different update operations, and getting it wrong silently corrupts the board. A <strong>running total</strong> adds each match's points: <code>ZINCRBY</code>, which is not idempotent — replaying an event adds again — so the writer must track which events it has applied. A <strong>best score</strong> keeps the maximum: <code>ZADD key GT score member</code> (Redis 6.2+) updates only if the new score is higher, and is naturally idempotent because replaying an old score changes nothing. Where possible, make the writer set absolute values from a durable total (<code>ZADD</code> with the total from the database) rather than increments, so that replays and rebuilds converge on the truth.</p>
+
+<h4>Percentiles over distributions, not just counts</h4>
+<p>A histogram with equal-width buckets wastes resolution where few players are and loses it where many are. Two refinements matter at scale. <strong>Quantile buckets</strong> — edges placed so each bucket holds the same share of players — give every player roughly the same rank error. And because score distributions drift (a new season starts everyone at zero; a balance change shifts scores), recompute edges from a sample periodically and rebuild counts in the background. For boards where players want "percentile among people like me", keep histograms per segment (region, level band) and combine them, since histograms over disjoint populations simply add.</p>
+
+<h4>Snapshots and period boundaries need a clock rule</h4>
+<p>A weekly board's final standings decide prizes, so "final" must be precisely defined. Use the match end time (from the game server, not the time the event reached the writer) to choose the period, close the period at a published instant, accept late events for a grace window (say 10 minutes) to allow for delayed submissions, then freeze: snapshot the top N to durable storage with the log offset, and ignore events for that period afterwards. Without the grace window, players lose matches they finished before the deadline; without the freeze, a delayed event can change prize winners after they were announced.</p>
+
+<h4>Friends and group boards scale differently</h4>
+<p>A friends board looks like a small leaderboard per user, and maintaining one sorted set per user is a trap: a score change for a player with 500 friends becomes 500 writes, a fan-out on write problem (the same trade-off as news feeds, cd3). Since friend lists are bounded and small, compute on read: one <code>ZMSCORE</code> for up to a few hundred friends, a sort in the application, and a short cache. Persistent groups such as clans or guilds, which are viewed often and have up to thousands of members, are worth a sorted set each, updated by the writer, because there each score change updates exactly one group board.</p>
+
+<h4>Rank in a relational database, if you must</h4>
+<p>Sometimes the board has to live in an existing SQL database. Rank there is slow because a B-tree index stores order but not counts. Two workable patterns borrow this lesson's ideas. A <strong>bucket table</strong> — one row per score bucket with a player count, updated in the same transaction as the player's score — turns rank into a sum over higher buckets (fast with few buckets) plus a <code>COUNT</code> within the player's own bucket over an index on score, which only walks that one bucket. Or a <strong>periodic rank snapshot</strong>: a batch job computes <code>RANK() OVER (ORDER BY score DESC)</code> every few minutes into a table keyed by player, and the API serves that, accepting minutes of staleness. Both are reasonable for boards of a few million players and modest update rates; neither replaces an in-memory structure for a live board at 100 million.</p>
+
+<h4>Real-time pushes versus polling</h4>
+<p>"Real-time" usually means a player sees their new rank right after a match, which a read after the write gives. Pushing live rank changes to everyone viewing the top 100 is a fan-out problem (cd18): the top 100 changes rarely relative to how often it is viewed, so publish a "top 100 changed" event at most once a second and let clients re-fetch from the cache, rather than streaming every update.</p>
+</section>
+
+<section data-field="prod">
+<h4>The reference implementation: Redis's own documentation and source</h4>
+<p>The Redis documentation presents leaderboards as the canonical use of sorted sets, and its implementation note states the structure precisely: sorted sets are implemented via a dual-ported data structure containing both a skip list and a hash table, so every addition is O(log n), and reading members in order is cheap because they are already sorted. The source (<code>t_zset.c</code>, with constants in <code>server.h</code>) shows the details this lesson relies on: p = 1/4, at most 32 levels, a span stored with every forward link and used to compute rank, and the listpack encoding for sets of up to 128 entries by default. The <code>ZADD</code> page documents the property behind the tie-breaking trick: scores are doubles that represent integers exactly between −2<sup>53</sup> and +2<sup>53</sup>, and members with equal scores are ordered by binary comparison of their bytes.</p>
+<p>Two production details follow from the docs and source. First, version matters: <code>ZADD … GT/LT</code> and <code>ZMSCORE</code> arrived in Redis 6.2, and <code>ZRANK … WITHSCORE</code> in 7.2; a managed service pinned to an older version silently lacks them. Second, the commands that walk ranges or unions — <code>ZRANGE</code> with large windows, <code>ZUNIONSTORE</code>, <code>ZREMRANGEBYSCORE</code> over millions of members — are O(n) in what they touch and block the single thread while they run; schedule them away from peaks or break them into chunks.</p>
+
+<h4>Failure modes you will see</h4>
+<p><strong>Latency spikes on the board shard.</strong> Symptom: rank queries jump from 1 ms to 100 ms periodically. Cause: an O(n) command on the big key (a daily union, a large range read, a synchronous <code>DEL</code> of last week's board) blocking the thread. Detection: Redis <code>SLOWLOG</code> and latency monitoring. Fix: <code>UNLINK</code> instead of <code>DEL</code>, chunked range work, move unions off-peak.</p>
+<p><strong>Ranks that disagree between screens.</strong> Symptom: the results screen says #1,204 and the profile says #1,207. Cause: one reads the primary and one a lagging replica, or one is a cached value. Usually harmless; make it consistent by reading rank and around-me from the same replica in one pipeline.</p>
+<p><strong>Impossible scores at the top.</strong> Symptom: the top 10 shows maximum-integer scores. Cause: a client-reported score path or a missing plausibility check on a new game mode. Detection: alert on any score above the mode's theoretical maximum. Fix: remove via the log, add the check, review the top-N queue.</p>
+<p><strong>Weekly board missing on Monday.</strong> Symptom: the new week's board is empty and last week's expired before the prize snapshot. Cause: TTL shorter than the snapshot job's schedule, or the snapshot job failed. Fix: snapshot is a gated step with an alert; TTL is period end plus days, not hours.</p>
+
+<h4>What to monitor</h4>
+<p>Write rate per board and writer lag behind the event log; rank query latency at p99 per shard; Redis memory per board key and its growth; replica lag; slow log entries on board keys; histogram bucket populations (for rank error); plausibility-check rejection rates per game mode; top-N review queue length and age; and the count of players removed for cheating per day.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> build a skip list with spans, check that it answers rank exactly like sorting does, and measure how far a 1,000-bucket histogram's rank estimate is off. Python 3.12 standard library, a few seconds.</p>
+<pre>"""Skip list with spans (how a ZSET computes rank), checked against sorting, plus histogram ranks."""
+import bisect, random, time
+
+P, MAX_LEVEL = 0.25, 32                     # Redis: p = 1/4, at most 32 levels
+
+class Node:
+    __slots__ = ("key", "fwd", "span")
+    def __init__(self, key, level):
+        self.key, self.fwd, self.span = key, [None] * level, [0] * level
+
+class SkipList:                              # keys are (-score, member): rank 0 = highest score
+    def __init__(self):
+        self.head, self.level, self.n = Node(None, MAX_LEVEL), 1, 0
+
+    def insert(self, key):
+        update, rank, x = [None] * MAX_LEVEL, [0] * MAX_LEVEL, self.head
+        for i in range(self.level - 1, -1, -1):          # walk down, counting skipped nodes
+            rank[i] = 0 if i == self.level - 1 else rank[i + 1]
+            while x.fwd[i] and x.fwd[i].key &lt; key:
+                rank[i] += x.span[i]; x = x.fwd[i]
+            update[i] = x
+        lv = 1
+        while random.random() &lt; P and lv &lt; MAX_LEVEL: lv += 1
+        if lv &gt; self.level:
+            for i in range(self.level, lv):
+                rank[i], update[i] = 0, self.head; self.head.span[i] = self.n
+            self.level = lv
+        node = Node(key, lv)
+        for i in range(lv):                              # splice in and split the spans
+            node.fwd[i] = update[i].fwd[i]; update[i].fwd[i] = node
+            node.span[i] = update[i].span[i] - (rank[0] - rank[i])
+            update[i].span[i] = rank[0] - rank[i] + 1
+        for i in range(lv, self.level): update[i].span[i] += 1
+        self.n += 1
+
+    def rank(self, key):                                 # 0-based: sum the spans you jump over
+        r, x = 0, self.head
+        for i in range(self.level - 1, -1, -1):
+            while x.fwd[i] and x.fwd[i].key &lt;= key:
+                r += x.span[i]; x = x.fwd[i]
+            if x.key == key: return r - 1
+        return None
+
+random.seed(7); N = 100_000
+players = {f"p{i}": random.randint(0, 1_000_000) for i in range(N)}
+sl, t = SkipList(), time.perf_counter()
+for m, s in players.items(): sl.insert((-s, m))
+print(f"inserted {N:,} in {time.perf_counter() - t:.2f}s; levels used: {sl.level}")
+exact = sorted((-s, m) for m, s in players.items())
+for m in random.sample(list(players), 1000):
+    assert sl.rank((-players[m], m)) == bisect.bisect_left(exact, (-players[m], m))
+print("1,000 rank queries match the sorted list")
+
+BUCKET = 1_000                                           # approximate rank from a histogram
+hist = [0] * (1_000_000 // BUCKET + 1)
+for s in players.values(): hist[s // BUCKET] += 1
+suffix = [0] * (len(hist) + 1)
+for b in range(len(hist) - 1, -1, -1): suffix[b] = suffix[b + 1] + hist[b]
+errs = []
+for m in random.sample(list(players), 1000):
+    s = players[m]; b = s // BUCKET
+    approx = suffix[b + 1] + hist[b] * (1 - (s - b * BUCKET + 0.5) / BUCKET)
+    errs.append(abs(approx - sl.rank((-s, m))))
+print(f"approx rank error: mean {sum(errs)/len(errs):.1f}, max {max(errs):.1f} of {N:,} players")</pre>
+<ol>
+<li>Expect about 9 levels for 100,000 members (log<sub>4</sub> 100,000 ≈ 8.3), all 1,000 rank checks passing, and a histogram error of a few places on average.</li>
+<li>Count the links followed in <code>rank()</code> and print the average: it should be a few dozen, against an average position of 50,000.</li>
+<li>Change the scores to a skewed distribution (<code>int(random.paretovariate(1.5) * 1000)</code>) and rerun the histogram: the error grows in the crowded low buckets. Then use quantile edges (sort a sample, take every 100th value as an edge) and watch it fall.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Design it</b>
+<p>A puzzle game has 40 million players. The product wants: a global all-time board, a weekly board with prizes for the top 1,000, exact ranks for the top 100,000, and "Top X%" for everyone else. Peak is 20,000 score updates per second. Ties go to whoever reached the score first. Sketch the data structures, the update path and the memory.</p>
+<details><summary>Answer</summary>
+<p>All-time: an exact sorted set holding only players above the score of rank ~120,000 (a margin over 100,000), about 12 MB, plus a histogram of all 40M players over 2,000 quantile buckets for percentiles. Weekly: an exact sorted set of everyone active that week (say 15M × 100 B ≈ 1.5 GB) because prizes need exact final standings for the top 1,000; key per week with expiry two weeks after, and a gated snapshot of the top 1,000 at close. Scores encoded as points × 2<sup>32</sup> + (2<sup>32</sup> − 1 − seconds since season start), so points must stay under ~2.1 million. Update path: signed result → ingest checks → event log → writer pipelines ZADD/ZINCRBY on the weekly board, the histogram move (old bucket −1, new +1), and the exact all-time board if the new score clears its threshold. 20,000 updates per second spread over these keys is comfortable for two or three shards. Top 1,000 weekly entries pass through a review queue before prizes.</p>
+</details>
+<b>Diagnose it</b>
+<p>After moving the all-time board to a hash-sharded design with 16 shards, p99 latency for "my rank" rose from 2 ms to 40 ms, while p50 barely changed. Writes are fine. Why, and what are your options?</p>
+<details><summary>Answer</summary>
+<p>Rank on a hash-sharded board is a scatter-gather: ZCOUNT on all 16 shards, and the query waits for the slowest. Tail latency of a fan-out is roughly the tail of the worst of 16 calls, so occasional slowness on any shard (a slow command, a garbage-collection pause in the proxy, a network blip) now hits most queries' p99 — while the median is unaffected. Options: send rank queries to replicas and use hedged requests (resend to another replica if one is slow); cache each player's rank briefly after a write; move to score-range sharding, where rank is a few cached band counts plus one local ZREVRANK; or switch to exact-top-plus-histogram, which makes rank a single small sorted set or an O(log buckets) histogram query.</p>
+</details>
+</section>

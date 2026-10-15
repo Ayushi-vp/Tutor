@@ -1,0 +1,542 @@
+<!-- topic source for hld/hd21; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "hd21",
+  "t": "Design a fine-tuning and training platform for many teams",
+  "tag": "ML platform",
+  "sum": "A shared platform running 40 teams' training and fine-tuning jobs on 2,048 GPUs: job submission, gang scheduling and why partial allocation deadlocks, quotas with borrowing and preemption, utilisation maths and backfill, checkpoint size and the optimal checkpoint interval worked by hand, data and checkpoint storage, experiment tracking, evaluation gates and a model registry, automatic failure recovery, cost attribution, and what Llama 3's 54 days of interruptions teach.",
+  "prereq": [
+    [
+      "k8s14",
+      "Kubernetes exposes GPUs as schedulable resources through device plugins; batch tools such as Kueue and Ray add queueing and job semantics on top."
+    ],
+    [
+      "in13",
+      "A container orchestrator reconciles desired state, schedules pods by filtering and scoring nodes, and handles node failures by rescheduling."
+    ],
+    [
+      "gpu9",
+      "Training memory holds weights, gradients, optimiser state and activations; with mixed precision and Adam, state is about 16 bytes per parameter, sharded by ZeRO or FSDP."
+    ],
+    [
+      "gpu8",
+      "Distributed training synchronises GPUs with collectives such as all-reduce over NVLink and InfiniBand; one slow or failed rank stalls everyone."
+    ],
+    [
+      "gpu12",
+      "Choosing hardware means checking fit, bottleneck and interconnect, then estimating cost in GPU-hours."
+    ],
+    [
+      "hd8",
+      "A feature store and training platform give reproducible training data and managed training runs for classic ML models."
+    ],
+    [
+      "hd12",
+      "An evaluation platform runs versioned eval suites and paired regression gates, so a model change can be blocked on evidence."
+    ],
+    [
+      "ae7",
+      "Models, prompts and data are versioned together as releases and promoted through gates and canaries."
+    ]
+  ],
+  "myths": [
+    [
+      "A GPU scheduler is a normal Kubernetes scheduler with GPUs.",
+      "The default scheduler places pods one at a time. A distributed training job needs all its GPUs at once; placing half of it wastes those GPUs while they wait, and two half-placed jobs can deadlock each other forever. Training platforms need gang (all-or-nothing) admission, topology awareness so a job's GPUs share fast interconnect, and queueing with quotas, which is what tools like Kueue, Volcano and Slurm add."
+    ],
+    [
+      "High allocation means high utilisation.",
+      "A GPU can be allocated and idle: waiting for the rest of its gang, stalled on data loading, blocked on a checkpoint write, or running a job whose model FLOPs utilisation is 20%. Platforms report allocation, actual GPU activity and goodput (useful training progress) separately, because each has different causes and fixes."
+    ],
+    [
+      "Checkpoint as often as possible.",
+      "Each checkpoint costs time (training stalls while state is written) and storage. Checkpoint too rarely and each failure loses hours; too often and checkpointing itself eats the run. The optimal interval is roughly √(2 × checkpoint cost × mean time between failures), which in this lesson's large-job example is about 14 minutes."
+    ],
+    [
+      "Failures are rare edge cases.",
+      "At scale they are routine. Meta reported 419 unexpected interruptions in a 54-day period of Llama 3 405B pre-training on 16,000 GPUs, about one every three hours, 78% attributed to confirmed or suspected hardware issues. A platform must detect, isolate and restart automatically; Meta needed significant manual intervention only three times in that period."
+    ],
+    [
+      "Quotas should be hard so teams get what they paid for.",
+      "Hard quotas leave GPUs idle whenever a team is not using its share. Guaranteed quotas with borrowing let idle capacity flow to teams with queued work, and preemption returns it when the owner needs it; the price is that borrowed work must checkpoint and tolerate eviction."
+    ],
+    [
+      "A model is done when training finishes.",
+      "A finished run is a candidate. Before anything serves it, it should pass the evaluation suite against the current production model with a paired comparison, safety and regression tests, serving-cost and latency checks on the target hardware, and have recorded lineage (data, code, base model, licence). The registry promotes on evidence, not on a training job's exit code."
+    ]
+  ],
+  "recap": [
+    "A shared training platform turns a GPU cluster into a service: teams submit jobs with resource requests, the platform queues, schedules, runs, checkpoints, recovers, tracks, evaluates, registers and bills them.",
+    "At 2,048 GPUs and an assumed $2.50 per GPU-hour, the cluster costs about $3.7 million a month, so each point of utilisation is worth about $37,000 a month, which justifies most of the scheduler's complexity.",
+    "Distributed jobs need gang scheduling: all GPUs at once or none, because two partially placed jobs can each hold GPUs the other needs and wait forever; Kueue's all-or-nothing mode evicts and requeues a workload whose pods are not all ready within a timeout (30 minutes by default).",
+    "Gangs create holes: reserving 512 GPUs for a large job leaves GPUs idle while running jobs drain, and backfill fills those holes with short jobs that will finish before the reservation.",
+    "Quotas guarantee each team a share; borrowing lends idle quota within a cohort; preemption reclaims it; priorities separate production retraining from experiments.",
+    "Checkpoint size for full training with mixed-precision Adam is about 14 bytes per parameter (weights, master weights, two optimiser moments): about 1 TB for a 70-billion-parameter model.",
+    "The optimal checkpoint interval is about √(2CM): with a 30-second checkpoint stall and a mean time between failures of 3.1 hours, about 14 minutes, losing about 4% to checkpointing and 9% to failures including a 10-minute restart.",
+    "Failure recovery is automatic: health checks detect GPU, network and host faults, nodes are cordoned, the job restarts from the latest checkpoint on spare nodes, and stragglers are found from communication timings.",
+    "Experiment tracking records code, data, configuration, environment and metrics for every run; evaluation gates and a model registry decide promotion with lineage attached.",
+    "Cost attribution charges teams for GPU-hours allocated (including time spent idle inside their gang), shows goodput and waste separately, and allocates shared idle capacity transparently."
+  ],
+  "glossary": [
+    [
+      "Backfill",
+      "Running small or short jobs in resources reserved for a large job, provided they finish before the large job can start."
+    ],
+    [
+      "Borrowing",
+      "A team's jobs using another team's unused quota, subject to being preempted when the owner needs it."
+    ],
+    [
+      "Checkpoint",
+      "A saved copy of a training run's state (weights, optimiser state, data position, random seeds) from which it can resume."
+    ],
+    [
+      "Cohort",
+      "In Kueue, a group of queues that can borrow unused quota from each other."
+    ],
+    [
+      "Fragmentation",
+      "Free GPUs scattered across many nodes in amounts too small for queued jobs, so capacity is idle but unusable."
+    ],
+    [
+      "Gang scheduling",
+      "Starting all the processes of a distributed job together, or none of them."
+    ],
+    [
+      "Goodput",
+      "The share of allocated GPU time that produces useful training progress, excluding waiting, failures, recomputation after restarts and checkpoint stalls."
+    ],
+    [
+      "Lineage",
+      "The recorded origin of a model: data versions, code commit, base model, configuration and the runs that produced it."
+    ],
+    [
+      "MFU",
+      "Model FLOPs utilisation: the fraction of the hardware's peak arithmetic rate a training job actually uses for the model's computation."
+    ],
+    [
+      "Model registry",
+      "A catalogue of trained models with versions, lineage, evaluation results and promotion stages."
+    ],
+    [
+      "MTBF",
+      "Mean time between failures: for a job on many GPUs, the expected time until any component it depends on fails."
+    ],
+    [
+      "Preemption",
+      "Evicting a running job, usually lower priority or borrowing quota, to free resources for another."
+    ],
+    [
+      "Quota",
+      "The amount of a resource (GPUs of a type) a team is guaranteed in the shared cluster."
+    ],
+    [
+      "Straggler",
+      "A rank in a distributed job that runs slower than the others, slowing every synchronised step."
+    ],
+    [
+      "Topology awareness",
+      "Placing a job's GPUs where they share fast interconnect (the same NVLink domain or network block)."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What does a shared training platform provide that teams would otherwise build themselves?",
+      "A single way to submit jobs with resource requests; queueing, quotas and fair sharing on scarce GPUs; gang and topology-aware scheduling; managed storage for datasets and checkpoints; automatic failure recovery; experiment tracking; standard evaluation gates and a model registry with lineage; and cost reporting. The platform's value is mostly utilisation and reliability of an expensive shared resource."
+    ],
+    [
+      "E",
+      "Why does a distributed training job need gang scheduling?",
+      "Its processes synchronise every step with collective operations, so none can make progress until all are running. Placing some processes while waiting for the rest leaves GPUs allocated and idle, and two jobs that each got part of their request can block each other permanently. Gang scheduling admits a job only when all its GPUs can be placed together."
+    ],
+    [
+      "E",
+      "What goes into a checkpoint?",
+      "Model weights, optimiser state (for Adam, two moment tensors per parameter, often with fp32 master weights), the learning-rate scheduler and step count, the data loader's position and random-number states, and the configuration needed to resume. For full training with mixed precision this is about 14 bytes per parameter; for LoRA fine-tuning it is only the adapter weights and their optimiser state, megabytes to a few gigabytes."
+    ],
+    [
+      "M",
+      "Show how two jobs can deadlock without gang scheduling.",
+      "Suppose 96 GPUs are free and two jobs each need 64. A pod-at-a-time scheduler places pods from both; each ends up with 48 GPUs and waits for 16 more that will never free up, because the other job holds them and also waits. Both jobs hold 96 GPUs doing nothing. With all-or-nothing admission, one job gets 64 and runs, the other waits in the queue, and the remaining 32 GPUs can run smaller jobs.",
+      "Follow-up: What does Kueue do if quotas say a job fits but the cluster cannot actually place it? — With waitForPodsReady, if the admitted workload's pods are not all ready within the timeout (30 minutes by default) it is evicted and requeued with exponential backoff, starting at 60 seconds and capped at an hour by default."
+    ],
+    [
+      "M",
+      "Estimate the cost of idle GPUs and what a 5-point utilisation gain is worth.",
+      "2,048 GPUs × 730 hours is about 1.5 million GPU-hours a month; at an assumed $2.50 an hour that is about $3.7 million. Each point of utilisation is about $37,000 a month, so 5 points is about $187,000 a month, or about $2.2 million a year, enough to fund the scheduler work and backfill, preemption and fragmentation fixes."
+    ],
+    [
+      "M",
+      "Compute the checkpoint size for a 70B model trained with mixed precision and Adam, and how long it takes to write.",
+      "About 14 bytes per parameter: 2 for bf16 weights, 4 for fp32 master weights and 8 for Adam's two fp32 moments, so 70 × 10⁹ × 14 ≈ 980 GB, about 1 TB. Written in parallel from many nodes at an aggregate 20 GB/s that takes about 50 seconds; at 2 GB/s, over 8 minutes. Asynchronous checkpointing copies state to host memory in seconds and uploads in the background, so the training stall is only the copy."
+    ],
+    [
+      "M",
+      "How do quotas, borrowing and preemption work together?",
+      "Each team gets a guaranteed quota per GPU type. When a team is under its quota, its idle share can be borrowed by other teams in the same cohort, so the cluster does not sit idle. When the owner submits work, borrowed jobs are preempted, lowest priority first, and must resume from checkpoints. Priorities separate production retraining, interactive experiments and best-effort batch work, and fair sharing decides who borrows when several teams want spare capacity."
+    ],
+    [
+      "M",
+      "What does the evaluation gate before the model registry check?",
+      "That the candidate is at least as good as the current production model on the task's evaluation suite with a paired non-inferiority test, passes must-pass and safety cases, has no regression on protected slices, meets latency, memory and cost targets on the serving hardware, and has complete lineage (data versions with licences, base model, code, configuration). Only then is it registered as a promotion candidate; serving rollout adds canaries on top."
+    ],
+    [
+      "H",
+      "Derive and apply the optimal checkpoint interval.",
+      "If checkpointing stalls training for C seconds every τ seconds and failures arrive on average every M seconds, the wasted fraction is about C/τ for checkpointing plus (τ/2 + R)/M for each failure's lost work and restart time R. Minimising over τ gives τ ≈ √(2CM). With C = 30 s and M = 3.1 hours (11,100 s), τ ≈ √(666,000) ≈ 816 s, about 14 minutes; waste is 30/816 ≈ 3.7% plus (408 + 600)/11,100 ≈ 9.1% with a 10-minute restart, about 13% in total.",
+      "Follow-up: Which term would you attack first? — The restart time: it is paid on every failure and here costs more than the lost work; hot spare nodes, cached images and fast checkpoint loading can cut it from ten minutes to two, saving about 4 points of the 13."
+    ],
+    [
+      "H",
+      "Where does GPU time go in a busy training cluster, and how do you recover it?",
+      "Fragmentation (free GPUs scattered across nodes, too few per node for queued jobs), gang reservation holes while a large job waits for enough GPUs, quota idleness when borrowing is off, failed and restarted work, checkpoint stalls, data-loader stalls, and jobs running at low MFU. Fixes in order of payoff: borrowing with preemption, backfill into reservation holes, bin-packing small jobs onto partially used nodes, topology-aware placement, automatic recovery with fast restarts, and per-job efficiency reports that show teams their MFU and data stalls."
+    ],
+    [
+      "H",
+      "How do you attribute cost fairly?",
+      "Charge each job for the GPU-hours it held, including time idle inside its own gang, because it prevented others from using them; report its goodput and waste (failures, checkpoint stalls, low utilisation) next to the charge so teams can improve. Storage for datasets and checkpoints is charged by volume and retention. Cluster-wide idle capacity and platform overhead are allocated in proportion to quota or usage, shown explicitly rather than hidden in the rate. Preempted borrowers are not charged for lost work, or borrowing becomes unattractive."
+    ],
+    [
+      "H",
+      "What did the Llama 3 paper report about failures, and what does it imply for a platform?",
+      "During a 54-day period of Llama 3 405B pre-training on 16,000 GPUs there were 466 job interruptions: 47 planned (firmware and kernel upgrades, configuration changes) and 419 unexpected, about 78% attributed to confirmed or suspected hardware issues, with GPU problems alone 58.7%. They still achieved over 90% effective training time and needed significant manual intervention only three times. For a platform: assume failures every few hours at large scale, automate detection and restart, make checkpointing and restart fast, and build tools to find stragglers and hangs in collective communication."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "The Llama 3 Herd of Models",
+      "Meta, 2024, section 3.3.4: 466 interruptions in 54 days of 405B pre-training on 16K GPUs, 419 unexpected, 78% hardware-related, over 90% effective training time, stragglers, diurnal throughput variation and power swings.",
+      "https://arxiv.org/abs/2407.21783"
+    ],
+    [
+      "docs",
+      "Kueue: Setup All-or-nothing with ready Pods",
+      "waitForPodsReady: evict and requeue an admitted workload whose pods are not all ready within the timeout (30 minutes by default), with exponential requeue backoff.",
+      "https://kueue.sigs.k8s.io/docs/tasks/manage/setup_wait_for_pods_ready/"
+    ],
+    [
+      "docs",
+      "Kueue: Concepts",
+      "ResourceFlavor, ClusterQueue, LocalQueue, Workload, Cohort, borrowing, preemption and fair sharing for batch workloads on Kubernetes.",
+      "https://kueue.sigs.k8s.io/docs/concepts/"
+    ],
+    [
+      "paper",
+      "A higher order estimate of the optimum checkpoint interval for restart dumps",
+      "Daly, 2006: refines Young's √(2CM) approximation for the checkpoint interval that minimises expected lost time.",
+      "https://doi.org/10.1016/j.future.2004.11.016"
+    ],
+    [
+      "paper",
+      "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models",
+      "Rajbhandari et al., 2020: the per-parameter memory accounting for mixed-precision Adam (16 bytes including gradients) and sharding it across data-parallel ranks.",
+      "https://arxiv.org/abs/1910.02054"
+    ],
+    [
+      "docs",
+      "MLflow Tracking",
+      "A widely used open-source model for logging runs, parameters, metrics and artifacts, and a model registry with versions and aliases.",
+      "https://mlflow.org/docs/latest/ml/tracking/"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A company has bought 2,048 GPUs. Forty teams want them: one fine-tunes small models for classification every day, one continues pre-training a large model for weeks at a time, one runs evaluation sweeps overnight, one trains recommendation models, and many researchers want "eight GPUs for an hour to try something". At first the GPUs are split by team, each with its own machines. Within a month the familiar picture appears: one team's machines sit idle over the weekend while another team's queue is three days long; a researcher's job grabs half the GPUs it needs and waits all night for the rest; a three-week training run dies on day 12 because one GPU failed and the last checkpoint was from day 9; nobody can say which data a production model was trained on; and finance asks why the cluster costs $3.7 million a month when dashboards show it "60% utilised".</p>
+<p>A shared training platform is the answer, and it is harder than a shared web-service platform for reasons specific to training. Distributed jobs need all their GPUs at once (gang scheduling) and on fast interconnect (topology), which makes scheduling a packing problem with deadlocks if done naively. Jobs run for days, so failures are certain and recovery must be automatic. Checkpoints are terabytes. Utilisation, not raw speed, is the metric money cares about, and it is lost in a dozen small ways. And the platform's output, trained models, must be evaluated, registered and traced before anything serves them.</p>
+<p>The senior design question is to build that platform: job submission, GPU scheduling with quotas, gang scheduling and preemption, data and checkpoint storage, experiment tracking, evaluation gates, a model registry with promotion, failure recovery, and cost attribution, for many teams at once. GPU memory, collectives and Kubernetes basics are taught in gpu9, gpu8 and k8s14; this case is the multi-tenant system around them.</p>
+<p>The lesson follows the interview: requirements and targets; estimates for capacity, cost, utilisation, checkpoint size and failure rate; the API and data; the architecture; deep dives on gang scheduling and utilisation, quotas and preemption, checkpointing and failure recovery with the checkpoint-interval maths, and evaluation gates and the registry; cost attribution; the evaluation plan for the platform; failure modes; and ten times the scale. The real cases are Kueue's documented all-or-nothing scheduling and Meta's published account of 54 days of failures while training Llama 3.</p>
+</section>
+
+<section data-field="primer">
+<h4>What the platform does</h4>
+<p>A team describes a job: a container image with their training code, the command, the resources (64 H100 GPUs on the same network block, 2 TB of local disk), the dataset versions to read, where to write checkpoints, a priority and a maximum runtime. The platform queues it against the team's quota, waits until all 64 GPUs can be placed together, starts every process, streams data, writes checkpoints on a schedule, watches health, restarts from the latest checkpoint on failure, records metrics and artifacts in experiment tracking, runs evaluation when training ends, registers the model with its lineage if it passes, and reports what it cost. From the team's point of view, "train this" is one command; from the platform's, it is a sequence of scheduling, storage, reliability and governance decisions.</p>
+<h4>The mental model: an airport with runways and gates</h4>
+<p>Think of an airport. Airlines (teams) have guaranteed slots (quotas). A wide-body flight (a large training job) needs a large gate and a long runway at the same time; giving it the gate but not the runway is useless and blocks the gate. Small regional flights can use a gate that is waiting for a delayed wide-body, as long as they leave before it arrives (backfill). When a slot owner's flight arrives, a flight using that slot on loan is moved (preemption). Every aircraft is inspected between flights; when one has a fault, the passengers are moved to a spare aircraft and continue from where they were (checkpoint and restart). Before a new aircraft type carries passengers it is certified (evaluation gates and registry). And the airport bills airlines for gate time, including time a gate was held for them (cost attribution).</p>
+<p>The analogy breaks in one important place: a flight's passengers do not lose progress when the plane is swapped, but a training job loses everything since its last checkpoint. That single fact drives a whole deep dive: how often to checkpoint, how big checkpoints are, and how fast a job can restart.</p>
+<figure>
+<svg viewBox="0 0 640 310" width="100%" role="img" aria-label="Training platform architecture. Teams submit jobs via CLI or SDK to the job API. The admission layer applies quotas, cohorts and borrowing, priorities and preemption, and gang admission (Kueue-style). The scheduler does topology-aware placement on the GPU cluster (256 nodes of 8 GPUs). Jobs read versioned datasets from object storage and write checkpoints to a checkpoint store with fast local staging. A health monitor detects GPU, network and host faults, cordons nodes and triggers restart from checkpoint on spares. Experiment tracking records runs; on completion the evaluation service runs gates; passing models go to the model registry with lineage. Metering produces cost attribution per team.">
+<defs><marker id="hd21-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+<g style="font-family:var(--sans);font-size:12px">
+<rect x="10" y="30" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="55" y="49" text-anchor="middle" style="fill:var(--ink)">40 teams</text><text x="55" y="65" text-anchor="middle" style="fill:var(--muted)">CLI · SDK</text>
+<rect x="116" y="30" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="161" y="56" text-anchor="middle" style="fill:var(--ink)">Job API</text>
+<rect x="222" y="22" width="150" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:2"/><text x="297" y="42" text-anchor="middle" style="fill:var(--ink)">Admission</text><text x="297" y="58" text-anchor="middle" style="fill:var(--muted)">quota · borrow · preempt</text><text x="297" y="73" text-anchor="middle" style="fill:var(--muted)">gang (all-or-nothing)</text>
+<rect x="388" y="30" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="443" y="49" text-anchor="middle" style="fill:var(--ink)">Placement</text><text x="443" y="65" text-anchor="middle" style="fill:var(--muted)">topology-aware</text>
+<rect x="514" y="22" width="116" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="572" y="44" text-anchor="middle" style="fill:var(--ink)">GPU cluster</text><text x="572" y="60" text-anchor="middle" style="fill:var(--muted)">256 × 8 GPUs</text><text x="572" y="74" text-anchor="middle" style="fill:var(--muted)">+ spare nodes</text>
+<line x1="100" y1="52" x2="114" y2="52" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="206" y1="52" x2="220" y2="52" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="372" y1="52" x2="386" y2="52" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="498" y1="52" x2="512" y2="52" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<rect x="388" y="112" width="110" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s4)"/><text x="443" y="131" text-anchor="middle" style="fill:var(--ink)">Datasets</text><text x="443" y="147" text-anchor="middle" style="fill:var(--muted)">versioned</text>
+<rect x="514" y="112" width="116" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s4)"/><text x="572" y="131" text-anchor="middle" style="fill:var(--ink)">Checkpoints</text><text x="572" y="147" text-anchor="middle" style="fill:var(--muted)">async · tiered</text>
+<line x1="498" y1="134" x2="530" y2="84" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="572" y1="82" x2="572" y2="110" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<rect x="222" y="112" width="150" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--crit)"/><text x="297" y="131" text-anchor="middle" style="fill:var(--ink)">Health monitor</text><text x="297" y="147" text-anchor="middle" style="fill:var(--muted)">cordon · restart</text>
+<path d="M514,70 L480,96 L374,128" marker-end="url(#hd21-arrow)" style="stroke:var(--crit);fill:none;stroke-dasharray:3 3"/>
+<path d="M297,112 L297,84" marker-end="url(#hd21-arrow)" style="stroke:var(--crit);fill:none;stroke-dasharray:3 3"/>
+<rect x="10" y="190" width="130" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s5)"/><text x="75" y="209" text-anchor="middle" style="fill:var(--ink)">Experiment</text><text x="75" y="225" text-anchor="middle" style="fill:var(--muted)">tracking</text>
+<rect x="160" y="190" width="130" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--s6)"/><text x="225" y="209" text-anchor="middle" style="fill:var(--ink)">Eval gates</text><text x="225" y="225" text-anchor="middle" style="fill:var(--muted)">hd12 suites</text>
+<rect x="310" y="190" width="130" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/><text x="375" y="209" text-anchor="middle" style="fill:var(--ink)">Model registry</text><text x="375" y="225" text-anchor="middle" style="fill:var(--muted)">lineage · stages</text>
+<rect x="460" y="190" width="170" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/><text x="545" y="209" text-anchor="middle" style="fill:var(--ink)">Metering</text><text x="545" y="225" text-anchor="middle" style="fill:var(--muted)">GPU-h · goodput · $</text>
+<line x1="140" y1="212" x2="158" y2="212" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<line x1="290" y1="212" x2="308" y2="212" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none"/>
+<path d="M572,156 L572,170 L75,170 L75,188" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none;stroke-dasharray:3 3"/>
+<line x1="545" y1="170" x2="545" y2="188" marker-end="url(#hd21-arrow)" style="stroke:var(--ink-2);fill:none;stroke-dasharray:3 3"/>
+<text x="320" y="270" text-anchor="middle" style="fill:var(--muted)">Scheduling decides utilisation; checkpoints and health decide goodput; gates and registry decide what ships.</text>
+</g>
+</svg>
+<figcaption>The top row is the scarce-resource problem: admission and placement turn queued requests into running gangs. The middle row is the reliability loop: health checks and checkpoints turn inevitable failures into short pauses. The bottom row is governance: every run is recorded, evaluated and, if it passes, registered with where it came from.</figcaption>
+</figure>
+<h4>Three numbers the platform lives by</h4>
+<p><strong>Allocation</strong> is the share of GPUs assigned to some job. <strong>Activity</strong> is the share of time allocated GPUs are actually computing. <strong>Goodput</strong> is the share of allocated GPU time that turns into useful training progress, after subtracting waiting inside gangs, checkpoint stalls, work lost to failures and restarts. A cluster can be 95% allocated, 70% active and 55% goodput; each gap has different causes and different owners, and the platform's job is to make all three visible and to raise them.</p>
+<p>A reader who stops here has the shape: quota-aware, all-or-nothing admission with borrowing and preemption; topology-aware placement; checkpoints and automatic recovery that keep failures cheap; tracking, gates and a registry that decide what ships; and metering that tells every team what their work cost and how much of it was useful.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–17</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">17–23</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">23–47</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">47–55</span><span class="ck-t">Eval &amp; failures</span></div><div class="ck"><span class="ck-m">55–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> Submit training, fine-tuning and evaluation jobs from a CLI, SDK or pipeline, with resource requests (GPU type and count, topology constraints, memory, disk), dataset references, priority and maximum runtime; queue per team with quotas; gang and topology-aware scheduling; borrowing and preemption; logs, metrics and interactive debugging access; managed checkpoint storage with retention policies; automatic restart from checkpoint on failure; experiment tracking; post-training evaluation and promotion to a model registry; per-team and per-job cost reports. Out of scope, said aloud: serving (hd1), the evaluation methods themselves (hd12) and data labelling.</p>
+<p><strong>Utilisation targets.</strong> GPU allocation above 90% when queues are non-empty; cluster goodput above 75%; large-job (256+ GPU) goodput above 85%.</p>
+<p><strong>Latency targets.</strong> Small jobs (≤ 8 GPUs) start within 10 minutes at p90 when the team is under quota; a job interrupted by a hardware failure resumes within 15 minutes, excluding queueing when no spare capacity exists.</p>
+<p><strong>Fairness.</strong> Each team receives its guaranteed quota within an hour of asking for it (preempting borrowers); idle quota is lendable; no team can starve others through job count.</p>
+<p><strong>Governance.</strong> Every registered model has complete lineage (dataset versions with licences, base model, code commit, configuration, environment image) and evaluation results; promotion requires passing gates; access to datasets follows their classification.</p>
+<p><strong>Clarifying questions.</strong> "What is the mix of job sizes and durations?" "Owned cluster, cloud, or both?" "Which GPU types and interconnect?" "Do teams need interactive notebooks on GPUs?" "How is the cluster funded: central budget or chargeback?"</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p><strong>Capacity and cost.</strong> 256 nodes × 8 GPUs = 2,048 GPUs. A month is about 730 hours: about 1.5 million GPU-hours. At an assumed fully loaded $2.50 per GPU-hour (hardware amortisation, power, networking, operations), the cluster costs about <strong>$3.7 million a month</strong>. One point of utilisation is about <strong>$37,000 a month</strong>; raising goodput from 60% to 75% is worth about $560,000 a month. This is the number that justifies the platform.</p>
+<p><strong>Workload mix.</strong> Suppose a typical day has about 600 jobs: 400 small (1 to 8 GPUs, minutes to hours: LoRA fine-tunes, evaluations, debugging), 180 medium (16 to 64 GPUs, hours to a day: full fine-tunes of mid-size models), and a handful of large ones (256 to 1,024 GPUs, days to weeks: continued pre-training). By GPU-hours the large jobs dominate even though they are few, so their scheduling and reliability set the cluster's goodput.</p>
+<p><strong>Checkpoint sizes.</strong> With mixed-precision training and Adam, each parameter carries bf16 weights (2 bytes), fp32 master weights (4) and two fp32 optimiser moments (8): <strong>about 14 bytes per parameter</strong> in a checkpoint (gradients are not saved). A 70-billion-parameter model: 70 × 10⁹ × 14 ≈ <strong>980 GB</strong>, about 1 TB. An 8-billion-parameter full fine-tune: about 112 GB. A LoRA fine-tune saves only the adapter and its optimiser state: often under 1 GB.</p>
+<p><strong>Checkpoint bandwidth.</strong> A 1 TB checkpoint written in parallel by 64 nodes at 300 MB/s each to object storage (aggregate about 19 GB/s) takes about 50 seconds; if the storage tier sustains only 2 GB/s for this job, over 8 minutes. Writing synchronously would stall 512 GPUs for that time. Asynchronous checkpointing copies state into host memory (seconds), resumes training, and uploads in the background; the training stall drops to the copy time.</p>
+<p><strong>Failure rate.</strong> Meta reported 419 unexpected interruptions in 54 days of Llama 3 405B pre-training on 16,000 GPUs: about one every 3.1 hours for the whole job, or roughly one per 50,000 GPU-hours. Scaled to this cluster: a 512-GPU job, a thirtieth the size, can expect a failure roughly every four days; the cluster as a whole sees several job-interrupting failures a day. Each costs the work since the last checkpoint plus restart time.</p>
+<p><strong>Storage.</strong> Datasets: a few petabytes in object storage, versioned. Checkpoints: if 300 medium and large runs a week keep 5 checkpoints averaging 100 GB, 150 TB a week; retention policies (keep the last 3 and milestone checkpoints, expire the rest after 30 days unless the run is registered) keep this to a few hundred terabytes.</p>
+<p><strong>The insight to say out loud.</strong> The cluster's cost is fixed; what the platform controls is how much of it becomes useful training. Every design choice is judged by points of goodput, each worth tens of thousands of dollars a month.</p>
+
+<h4>3 · API and data</h4>
+<pre>platform submit job.yaml
+  team: search-ranking          priority: experiment        # production | experiment | best-effort
+  image: registry/ft-trainer:2026-10-01
+  command: ["torchrun", "--nnodes=8", "--nproc-per-node=8", "train.py", "--config", "cfg.yaml"]
+  resources: { gpu: { type: h100, count: 64 }, topology: same-block, gang: true }
+  data: [ "datasets/query-logs@v41", "datasets/labels@v12" ]
+  checkpoint: { every: auto, keep_last: 3, async: true }
+  max_runtime: 36h
+  on_success: { evaluate: "suite/ranker@v7", register: "models/ranker" }
+-&gt; job_id: j_7c1...  state: Queued (position 4 in search-ranking, quota 128/256 used)
+
+platform status j_7c1   platform logs j_7c1 --rank 17   platform cost --team search-ranking --month 2026-09</pre>
+<p><strong>Data.</strong> <em>Jobs</em>: spec, team, priority, state history (queued, admitted, running, preempted, failed, restarted, succeeded) with timestamps, placement (nodes), attempts. <em>Quotas</em>: per team and GPU type, guaranteed amount, borrowing limits, cohort. <em>Runs</em> (experiment tracking): parameters, metrics over steps, artifacts, code commit, dataset versions, image, checkpoints, parent run (for resumed or derived runs). <em>Models</em> (registry): versions, lineage, evaluation results, stage (candidate, staging, production, archived), approvals. <em>Usage ledger</em>: per job and interval, GPUs held, active, goodput estimate, cost.</p>
+
+<h4>4 · High-level design</h4>
+<p>The platform runs on Kubernetes with a batch layer such as Kueue for queueing and admission (k8s14, in13). A submitted job becomes a <strong>workload</strong> in its team's queue. <strong>Admission</strong> checks quota (the team's guaranteed share plus what it may borrow in its cohort), priority and whether the whole gang can be placed; if a higher-priority job needs room, it selects borrowers to preempt. <strong>Placement</strong> assigns nodes respecting topology: a 64-GPU job gets 8 whole nodes in one network block so its collectives stay on the fastest links. The job's pods start together; the training framework rendezvous, loads the latest checkpoint if one exists, and streams data from versioned datasets through a caching layer on local NVMe. The <strong>health monitor</strong> watches GPU errors, memory errors, interconnect counters, collective-operation timeouts and step-time outliers; on a fault it cordons the node, the job's processes are stopped, and the platform re-admits the job onto a spare node from the latest checkpoint. <strong>Experiment tracking</strong> receives metrics and artifacts throughout. On success, the <strong>evaluation service</strong> runs the declared suite; passing models are written to the <strong>registry</strong> with lineage. <strong>Metering</strong> samples allocation and activity per job and writes the usage ledger.</p>
+<p>Walk one job. The search-ranking team submits a 64-GPU fine-tune. Their quota is 256 GPUs; 128 are in use, so the job fits within its guarantee. The cluster has 70 free GPUs, but scattered: 6 whole free nodes (48 GPUs) and 22 GPUs spread across 11 nodes. The job needs 8 whole nodes in one block. Admission finds a best-effort job from another team borrowing 2 nodes in that block, preempts it (it checkpoints within its 2-minute grace period and requeues), and admits the gang. All 64 processes start within 90 seconds. Twenty hours later a GPU on node 5 reports an uncorrectable memory error; the collective on that step times out after 10 minutes; the health monitor cordons node 5; the job restarts on a spare node from the checkpoint written 9 minutes before the error; it loses about 19 minutes of progress plus 6 minutes of restart. It finishes at hour 31, the evaluation gate passes, and the model is registered as a candidate.</p>
+
+<h4>5 · Deep dive: gang scheduling, topology and utilisation</h4>
+<p><strong>The deadlock.</strong> A default scheduler places pods one at a time as resources appear. Take 96 free GPUs and two queued jobs, each needing 64. Pods from both are placed as they come; each job ends up holding 48 GPUs, and each waits for 16 more that will never free up, because the other job holds them and is waiting too. 96 GPUs are allocated and doing nothing, indefinitely. <strong>Gang scheduling</strong> (all-or-nothing admission) prevents it: a job is admitted only when its whole request can be placed, so one job runs on 64 GPUs and the other waits in the queue while the remaining 32 GPUs serve smaller jobs.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Left: without gang scheduling, 96 free GPUs; job A gets 48 and job B gets 48, both waiting for 16 more: deadlock, 96 GPUs idle. Right: with all-or-nothing admission, job A gets 64 and runs, job B waits in queue, 32 GPUs run small jobs.">
+<g style="font-family:var(--sans);font-size:12px">
+<text x="150" y="20" text-anchor="middle" style="fill:var(--crit);font-weight:600">Pod-at-a-time: deadlock</text>
+<text x="480" y="20" text-anchor="middle" style="fill:var(--good);font-weight:600">All-or-nothing: progress</text>
+<rect x="30" y="40" width="120" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="90" y="66" text-anchor="middle" style="fill:var(--ink)">A: 48 / 64</text><text x="90" y="84" text-anchor="middle" style="fill:var(--crit)">waiting</text>
+<rect x="160" y="40" width="120" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/><text x="220" y="66" text-anchor="middle" style="fill:var(--ink)">B: 48 / 64</text><text x="220" y="84" text-anchor="middle" style="fill:var(--crit)">waiting</text>
+<path d="M90,100 C90,140 220,140 220,102" style="stroke:var(--crit);fill:none" marker-end="url(#hd21-arrow)"/>
+<path d="M220,100 C220,160 90,160 90,102" style="stroke:var(--crit);fill:none" marker-end="url(#hd21-arrow)"/>
+<text x="155" y="180" text-anchor="middle" style="fill:var(--crit)">each holds what the other needs</text>
+<text x="155" y="198" text-anchor="middle" style="fill:var(--muted)">96 GPUs allocated, 0 doing work</text>
+<rect x="360" y="40" width="160" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/><text x="440" y="66" text-anchor="middle" style="fill:var(--ink)">A: 64 / 64</text><text x="440" y="84" text-anchor="middle" style="fill:var(--good)">running</text>
+<rect x="530" y="40" width="80" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/><text x="570" y="66" text-anchor="middle" style="fill:var(--ink)">32 GPUs</text><text x="570" y="84" text-anchor="middle" style="fill:var(--muted)">small jobs</text>
+<rect x="360" y="120" width="250" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--s2);stroke-dasharray:4 3"/><text x="485" y="145" text-anchor="middle" style="fill:var(--ink)">B queued until 64 can be placed together</text>
+<text x="485" y="190" text-anchor="middle" style="fill:var(--muted)">timeout + requeue recovers if placement</text>
+<text x="485" y="206" text-anchor="middle" style="fill:var(--muted)">still fails (Kueue waitForPodsReady)</text>
+</g>
+</svg>
+<figcaption>Partial allocation is worse than none: it holds GPUs without producing anything and can block indefinitely. All-or-nothing admission accepts a queue in exchange for guaranteed progress, and a timeout with requeue handles the cases where quota said a job fits but physical placement did not.</figcaption>
+</figure>
+<p><strong>Kueue's mechanism.</strong> Kueue admits workloads against quotas and, with <code>waitForPodsReady</code> configured, watches an admitted workload until all its pods are ready. If they are not ready within the timeout (30 minutes by default), Kueue cancels the admission, suspends the job and requeues it, with exponential backoff that starts at 60 seconds, doubles, and is capped at 3,600 seconds by default. This recovers from the case where quota accounting says capacity exists but the physical cluster (fragmented nodes, a failing node, topology constraints) cannot place every pod. An optional <code>blockAdmission</code> setting admits gangs one at a time to rule out deadlock completely, at the cost of slower admission when jobs could have started concurrently.</p>
+<p><strong>Topology.</strong> A data-parallel or tensor-parallel job exchanges gradients or activations every step. Inside a node, GPUs talk over NVLink at hundreds of GB/s; between nodes, over InfiniBand or RoCE at tens of GB/s per GPU, and fastest within one network block. A 64-GPU job spread over 30 partially free nodes across blocks can run several times slower than the same job on 8 whole nodes in one block. So placement prefers whole nodes and single blocks for multi-node jobs, and packs small jobs onto partially used nodes so whole nodes stay free for gangs.</p>
+<p><strong>Where utilisation goes, worked.</strong> Suppose a 512-GPU job reaches the head of the queue when 300 GPUs are free. To start it, the scheduler must wait for 212 more GPUs to drain from running jobs. If those jobs finish at a steady rate over the next four hours, the free pool grows from 300 to 512 roughly linearly, and the average idle count during the wait is about (300 + 512) / 2 ≈ 400 GPUs: about 1,600 idle GPU-hours, roughly $4,000, just to start one job, and about 0.1% of the month's capacity. Do that daily and it is several points of utilisation. <strong>Backfill</strong> recovers most of it: the scheduler computes when the large job will be able to start (from running jobs' declared maximum runtimes) and admits small queued jobs into the idle GPUs if they will finish before then. Backfill needs runtime estimates, which is why <code>max_runtime</code> is a required field, enforced by killing jobs that overrun it while borrowing reserved capacity.</p>
+<p><strong>Fragmentation.</strong> Free GPUs scattered in ones and twos across many nodes cannot host multi-node jobs. Bin-packing small jobs tightly (fill partly used nodes first), occasionally migrating or preempting checkpointable small jobs to consolidate whole nodes, and offering a node pool reserved for small jobs keep fragmentation down.</p>
+
+<h4>6 · Deep dive: quotas, borrowing, priorities and preemption</h4>
+<p><strong>Guaranteed quotas.</strong> Each team has a guaranteed number of GPUs per type (in Kueue terms, a ClusterQueue's nominal quota for a ResourceFlavor). Guarantees sum to at most the cluster size so they can all be honoured at once.</p>
+<p><strong>Borrowing.</strong> When a team is under its quota, the unused part is lent to teams in the same <strong>cohort</strong> that have queued work, up to borrowing limits. Without borrowing, a team's idle evening capacity would sit unused while another team's queue grows; with it, the cluster stays busy.</p>
+<p><strong>Preemption.</strong> When the owning team submits work and its quota is occupied by borrowers, the scheduler preempts borrowed workloads, lowest priority and most recently started first, giving each a grace period to checkpoint. This makes borrowing safe for owners, and it is why borrowed and best-effort work must checkpoint often.</p>
+<p><strong>Priority classes.</strong> <em>Production</em> (scheduled retraining of models that serve users) can preempt experiments; <em>experiment</em> is the default; <em>best-effort</em> runs only on borrowed or otherwise idle capacity. A per-team cap on concurrently admitted workloads and fair-sharing weights stop one team from crowding the queue with thousands of tiny jobs.</p>
+<p><strong>Reservations for large jobs.</strong> A week-long 1,024-GPU run cannot wait for organic draining every time it is interrupted. Large runs get calendar reservations (a block of nodes held for them, with backfill of preemptible work), arranged with the teams whose quota they borrow.</p>
+
+<h4>7 · Deep dive: checkpointing and failure recovery</h4>
+<p><strong>What fails.</strong> At scale, GPUs, GPU memory, network links and switches, hosts and software all fail. In Meta's 54-day Llama 3 period, faulty GPUs alone accounted for 148 of 419 unexpected interruptions, GPU HBM memory for 72, software bugs for 54 and network switches or cables for 35; about 78% were confirmed or suspected hardware. Because training is synchronous, one failed GPU stops the whole job.</p>
+<p><strong>The cost of a failure.</strong> When a failure occurs, the job loses the work since its last checkpoint (on average half the interval, τ/2) and pays a restart time R: detecting the failure, cordoning the node, rescheduling onto a spare, starting containers, loading the checkpoint and re-warming data loaders. Checkpointing itself costs a stall C every τ seconds.</p>
+<p><strong>The optimal interval.</strong> With mean time between failures M, the fraction of time wasted is approximately</p>
+<pre>waste(τ) ≈ C / τ  +  (τ / 2 + R) / M</pre>
+<p>Setting the derivative to zero gives <strong>τ* ≈ √(2 C M)</strong>, Young's approximation (Daly later refined it). Work it for a large job like Llama 3's: M = 54 days × 24 hours / 419 ≈ 3.1 hours ≈ 11,100 seconds. With asynchronous checkpointing, the stall C is about 30 seconds. τ* = √(2 × 30 × 11,100) = √666,000 ≈ <strong>816 seconds, about 14 minutes</strong>. Waste: 30 / 816 ≈ 3.7% for checkpointing, and with R = 10 minutes, (408 + 600) / 11,100 ≈ 9.1% for failures: about <strong>13% total</strong>. Two lessons fall out. First, with a 5-minute synchronous checkpoint (C = 300 s) the optimum moves to about 43 minutes and total waste rises to about 29%: asynchronous checkpointing is worth roughly 16 points of goodput here. Second, the restart time R is the largest single term at the optimum; cutting it from 10 minutes to 2 with hot spare nodes, pre-pulled images and fast checkpoint loading saves about 4 points, more than any tuning of τ.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Waste versus checkpoint interval for M = 11,100 seconds and R = 600 seconds. Asynchronous checkpoints (C = 30 seconds): total waste about 17% at 5 minutes, minimum about 13% at 14 minutes, 15% at 30 minutes, 22% at 60 minutes. Synchronous checkpoints (C = 300 seconds): about 39% at 17 minutes, minimum about 29% at 43 minutes, 33% at 80 minutes.">
+<g style="font-family:var(--sans);font-size:12px">
+<line x1="60" y1="190" x2="610" y2="190" style="stroke:var(--line-2);fill:none"/>
+<line x1="60" y1="20" x2="60" y2="190" style="stroke:var(--line-2);fill:none"/>
+<text x="54" y="194" text-anchor="end" style="fill:var(--muted)">0%</text>
+<text x="54" y="109" text-anchor="end" style="fill:var(--muted)">20%</text>
+<text x="54" y="24" text-anchor="end" style="fill:var(--muted)">40%</text>
+<text x="60" y="206" text-anchor="middle" style="fill:var(--muted)">0</text>
+<text x="200" y="206" text-anchor="middle" style="fill:var(--muted)">20 min</text>
+<text x="340" y="206" text-anchor="middle" style="fill:var(--muted)">40 min</text>
+<text x="480" y="206" text-anchor="middle" style="fill:var(--muted)">60 min</text>
+<text x="600" y="206" text-anchor="middle" style="fill:var(--muted)">80 min</text>
+<path d="M95,119 L130,134 L158,136 L200,133 L270,125 L340,116 L480,95 L600,73" style="stroke:var(--s1);stroke-width:2;fill:none"/>
+<path d="M179,22 L200,38 L270,62 L361,68 L480,63 L600,48" style="stroke:var(--crit);stroke-width:2;fill:none"/>
+<circle cx="158" cy="136" r="5" style="fill:var(--good)"/>
+<text x="170" y="160" style="fill:var(--good)">async C = 30 s: optimum ≈ 14 min, ≈ 13%</text>
+<circle cx="361" cy="68" r="5" style="fill:var(--crit)"/>
+<text x="370" y="88" style="fill:var(--crit)">sync C = 300 s: ≈ 43 min, ≈ 29%</text>
+<text x="330" y="224" text-anchor="middle" style="fill:var(--muted)">checkpoint interval τ (M = 3.1 h, restart R = 10 min)</text>
+</g>
+</svg>
+<figcaption>Checkpoint too often and the stalls add up; too rarely and each failure throws away more work. The curve is flat near its minimum, so the exact interval matters less than the stall cost C and the restart time R, which shift the whole curve. Cheap checkpoints and fast restarts beat clever tuning.</figcaption>
+</figure>
+<p><strong>Making failures cheap.</strong> <em>Asynchronous, sharded checkpoints</em>: each rank saves its shard (FSDP or ZeRO state, gpu9) to host memory and uploads in the background; a two-tier scheme keeps the latest checkpoint on fast local or nearby storage for quick restart and copies to durable object storage less often. <em>Detection</em>: GPU error counters, ECC errors, thermal throttling, NIC errors, and collective-operation timeouts (a hung all-reduce often has no explicit error; a watchdog that times out the collective and dumps which ranks did not arrive turns a silent hang into a diagnosable failure). <em>Hot spares</em>: a few idle nodes per block let a job resume without waiting in the queue. <em>Straggler detection</em>: step-time and per-rank communication timings flag a GPU that is slow but not failed; Meta described stragglers that slowed thousands of GPUs and tools that prioritised suspect communications to find them. <em>Elasticity</em> for frameworks that support it: continue on fewer ranks while a replacement arrives.</p>
+
+<h4>8 · Deep dive: data, experiment tracking, evaluation gates and the registry</h4>
+<p><strong>Data.</strong> Datasets are immutable, versioned snapshots in object storage (a table format or content-addressed shards with a manifest), referenced by version in the job spec, with classification and licence metadata that the platform checks against the team's access. A read-through cache on node-local NVMe avoids re-downloading for repeated epochs and restarts; data loaders record their position so resumption does not repeat or skip examples, which matters for reproducibility and for not over-weighting data after restarts.</p>
+<p><strong>Experiment tracking.</strong> Every run records parameters, metrics by step, system metrics (step time, GPU activity, data-loader wait), artifacts, code commit, image digest and dataset versions, in a tracking service such as MLflow. Resumed runs link to their parent; sweeps group runs. The point is that any number in a later report can be traced to exactly what produced it.</p>
+<p><strong>Evaluation gates.</strong> A job declares the evaluation suite it must pass. On completion, the evaluation service (hd12) runs the candidate and the current production model on the same versioned suite, applies a paired non-inferiority test on the main metric, checks must-pass and safety cases and protected slices, and measures serving latency, memory and cost on the target hardware (hd1). Results are attached to the run.</p>
+<p><strong>The registry.</strong> Passing models become registry versions with lineage (datasets and licences, base model and its licence, code, configuration, run IDs, evaluation results) and a stage: candidate, staging, production, archived. Promotion to production requires the gate results and an approval, and deployment proceeds through canaries in the serving platform (ae7). A model whose training data is later found to be unusable (a licence problem, a data deletion request) can be traced through lineage to every version and deployment derived from it.</p>
+
+<h4>9 · Cost attribution</h4>
+<p>Each job is charged for the GPU-hours it held, at the rate for its GPU type, from admission to release, including time its own gang spent idle (it blocked others). The report beside the charge shows the job's goodput: time lost to waiting for data, checkpoint stalls, failures and restarts, and its average activity. Storage is charged by bytes and retention class. Borrowed capacity is charged at a discount and preempted work's lost time is not charged, or teams stop borrowing. What no job holds (idle capacity, spare nodes, platform overhead) is shown as a separate line and allocated in proportion to each team's guaranteed quota, so the price of reserving capacity is visible. Many organisations start with showback (reports without money moving) and move to chargeback once numbers are trusted.</p>
+
+<h4>10 · Evaluating the platform</h4>
+<p>The platform has its own metrics and experiments. <strong>Efficiency</strong>: allocation, activity and goodput per GPU type and team; idle GPU-hours by cause (fragmentation, gang reservation, quota idleness); MFU distribution of large jobs. <strong>Service</strong>: queue wait by job size and priority; time to reclaim quota; time to resume after failure. <strong>Reliability</strong>: interruptions per 10,000 GPU-hours by cause; share of failures handled without humans. <strong>Governance</strong>: share of production models with complete lineage and gate results. Scheduler changes are tested on a simulator replaying real job traces, then rolled out to one cluster partition first, compared on goodput and queue wait.</p>
+
+<h4>11 · Failure modes and trade-offs</h4>
+<table>
+<thead><tr><th>Failure</th><th>Symptom</th><th>Defence</th></tr></thead>
+<tbody>
+<tr><td>Gang deadlock</td><td>GPUs allocated, jobs pending</td><td>All-or-nothing admission, ready timeout, requeue</td></tr>
+<tr><td>Fragmentation</td><td>Free GPUs but large jobs wait</td><td>Bin-packing, small-job pools, consolidation</td></tr>
+<tr><td>Silent hang</td><td>Job "running", no progress</td><td>Collective watchdogs, step-progress alerts</td></tr>
+<tr><td>Slow restart</td><td>Large goodput loss per failure</td><td>Hot spares, cached images, local checkpoint tier</td></tr>
+<tr><td>Checkpoint storm</td><td>Storage saturated, stalls lengthen</td><td>Staggered schedules, async writes, tiering</td></tr>
+<tr><td>Quota hoarding</td><td>Idle guaranteed GPUs, long queues elsewhere</td><td>Borrowing with preemption, visible idle cost</td></tr>
+</tbody>
+</table>
+<p>The trade-offs to name: utilisation against queue wait (backfill and borrowing raise one and can lengthen the other for large jobs); strict fairness against throughput; checkpoint frequency against stall cost; topology strictness against start time; and central governance against team speed, since gates add hours to every release.</p>
+
+<h4>12 · What changes at 10× scale</h4>
+<p>At 20,000 GPUs across several data centres, a single job can be as large as Llama 3's, and the platform's concerns become those Meta described: failures every few hours for one job, power swings of tens of megawatts when thousands of GPUs pause together for a checkpoint or collective, and throughput varying by time of day with temperature. Scheduling becomes global (placing jobs across clusters by capacity, data location and network), checkpoint storage needs dedicated high-bandwidth tiers, and failure handling must be almost entirely automated. Multi-tenant fairness becomes a planning process: large runs are booked weeks ahead, and smaller teams rely on borrowing and best-effort capacity around them.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why allocation, activity and goodput diverge</h4>
+<p>A job can hold 64 GPUs (allocation) while they compute only 60% of the time (activity: the rest is waiting for data, checkpoint copies or slow collectives), and of that compute, some repeats work lost after a failure (goodput lower still). The fixes are owned by different people: allocation by the scheduler, activity by the job's code and data pipeline, goodput by checkpointing and reliability. Publishing all three per job, per team and for the cluster, with causes, turns a vague "the cluster is underused" into specific work items with owners.</p>
+<h4>MFU as a per-job efficiency signal</h4>
+<p>Model FLOPs utilisation compares the arithmetic a job's model needs per second with the hardware's peak. A large well-tuned training job might reach 40% to 50%; a fine-tune with small batches and heavy data loading might be at 15%. The platform cannot fix teams' code, but it can compute MFU from step time, model size and tokens per step, show it next to cost, and offer reference configurations. Raising a large job's MFU from 30% to 40% is worth as much as a third more GPUs for that job.</p>
+<h4>Preemption needs cooperative jobs</h4>
+<p>Preemption is only cheap if the evicted job checkpoints quickly when told to and resumes cleanly. The platform sends a termination signal with a grace period, and the training library saves state on signal; jobs that cannot checkpoint in the grace period lose work. A platform therefore distinguishes preemptible and non-preemptible workloads, admits only preemptible ones on borrowed capacity, and provides a training library that handles signals, checkpoints and resumption correctly so teams do not each reinvent it.</p>
+<h4>Correlated failures and the power grid</h4>
+<p>Failures are not independent. A switch failure takes out a whole block; a bad firmware rollout affects every node it reaches; a cooling problem throttles a row. Spreading spares across failure domains and rolling maintenance slowly protects against correlated loss. And synchronised behaviour at scale has physical effects: Meta noted that tens of thousands of GPUs pausing together, for checkpoints or collectives, swing data-centre power by tens of megawatts, and observed a 1 to 2% daily throughput variation from midday temperatures. At large scale, checkpoint schedules are a facilities concern as well as a software one.</p>
+<h4>Reproducibility has limits, so record what you can</h4>
+<p>Bit-for-bit reproducibility of GPU training is hard (non-deterministic kernels, different hardware, restarts changing data order). The platform aims for traceability instead: the exact code, image, data versions, configuration, seeds and restart history, so a result can be explained and approximately reproduced, and differences can be bounded. For regulated models, deterministic settings and pinned hardware can be required at a known cost in speed.</p>
+<h4>Fine-tuning workloads are different from pre-training</h4>
+<p>Most jobs on a company platform are fine-tunes and evaluations: short, small, numerous, with base models of tens of gigabytes that every job loads. That favours a base-model cache on node-local storage (loading 140 GB of weights from object storage for every 20-minute job wastes more time than the training), packing several small LoRA jobs per node, and fast job start over raw throughput. Platforms that optimise only for the rare giant run serve most of their users badly.</p>
+<h4>Interactive work needs its own lane</h4>
+<p>Researchers debugging a training script want a GPU now, for an hour, with a notebook or a shell; batch queues that start jobs in ten minutes and kill them at their maximum runtime are the wrong tool. Mixing interactive sessions into the batch pool also wastes GPUs, because an open notebook holds its GPU while its owner reads a paper. Platforms give interactive work a small separate pool with short leases, idle detection that releases GPUs after, say, 30 minutes without activity, and smaller GPU slices where the hardware supports partitioning (k8s14). The interactive pool's size is a trade-off made explicit: every GPU reserved for fast, wasteful interactive use is a GPU not available to batch work, so its utilisation and wait time are reported like any other pool's.</p>
+</section>
+
+<section data-field="prod">
+<h4>How it fails in practice</h4>
+<p><strong>The midnight deadlock.</strong> A research team submitted forty 32-GPU sweep jobs at once; with pod-at-a-time scheduling, dozens started partially and the cluster filled with half-placed gangs, while a production retraining job waited behind them. All-or-nothing admission with a ready timeout, and a per-team cap on concurrently admitted workloads, ended it.</p>
+<p><strong>The hang that looked like work.</strong> A 256-GPU job reported "running" for nine hours with no progress after one GPU's NVLink connection stalled; there was no error, just a collective that never completed. A watchdog on step progress and collective-operation timeouts now kills and restarts such jobs within 15 minutes, with a dump of which ranks were missing.</p>
+<p><strong>The checkpoint storm.</strong> Twenty large jobs configured to checkpoint on the hour saturated the storage tier at :00; each write took six times longer than usual, stalls grew, and two jobs timed out. Checkpoint times are now staggered by the platform and writes are asynchronous with a local first tier.</p>
+<p><strong>The restart that cost more than the failure.</strong> Restarts took 25 minutes because every node pulled a 30 GB container image and reloaded a 1 TB checkpoint from object storage. Pre-pulled images on spare nodes and a nearby checkpoint tier cut restarts to under five minutes, which for a large job failing every few hours was worth more than any scheduler tuning.</p>
+<h4>What to monitor</h4>
+<p>Cluster: allocation, activity, goodput, idle GPU-hours by cause, fragmentation (largest placeable gang), spare-node pool. Jobs: queue wait by size and priority, admissions, preemptions, ready timeouts and requeues, failures by cause, time to resume, checkpoint duration and size, step time and MFU, data-loader wait. Teams: quota use, borrowing, cost, goodput. Storage: checkpoint and dataset volume, write bandwidth, retention compliance.</p>
+<h4>Knobs people tune</h4>
+<p>Quotas, borrowing limits and cohorts; priority classes and preemption policy; ready timeout and requeue backoff; backfill aggressiveness; spare-node count per block; checkpoint interval defaults and retention; maximum runtimes; per-team admission caps; GPU-hour rates.</p>
+<h4>The real cases: Kueue and Llama 3's 54 days</h4>
+<p>Kueue, a Kubernetes project for batch workloads, is a concrete open-source version of this design's admission layer: ResourceFlavors describe kinds of nodes, ClusterQueues hold quotas and fair-sharing rules, LocalQueues give each team a queue, Cohorts let ClusterQueues borrow each other's unused quota, and preemption reclaims it. Its documented all-or-nothing mode (<code>waitForPodsReady</code>) watches admitted workloads until all pods are ready, and if that does not happen within the timeout (30 minutes by default) it suspends and requeues the workload, with backoff starting at 60 seconds, doubling, and capped at 3,600 seconds; an optional sequential-admission setting rules out deadlocks at the cost of admission speed. Meta's Llama 3 paper (2024) gives the reliability numbers this lesson is built on: during a 54-day snapshot of 405B pre-training on 16,000 GPUs, 466 job interruptions, of which 47 were planned (firmware and kernel upgrades, operator-initiated changes) and 419 unexpected; about 78% of unexpected interruptions were confirmed or suspected hardware issues and GPU issues alone were 58.7%. Despite this, the team reported higher than 90% effective training time, needed significant manual intervention only three times, and described the tools that made it possible: reduced job start-up and checkpointing time, flight-recorder tracing of collective operations to diagnose hangs, automatic timeouts on stalled communication, straggler detection, and attention to environmental effects such as a 1 to 2% diurnal throughput variation and power swings of tens of megawatts.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> compute the optimal checkpoint interval and its waste, then simulate a small GPU cluster to compare first-come-first-served gang scheduling with backfill. Python 3.12, standard library only.</p>
+<ol>
+<li>Save as <code>trainplat_lab.py</code> and run <code>python trainplat_lab.py</code>.</li>
+<li>Block 1 prints τ* = √(2CM) and the waste breakdown for asynchronous (C = 30 s) and synchronous (C = 300 s) checkpoints with M = 3.1 hours and R = 10 minutes. Check about 14 minutes and 13% versus about 43 minutes and 29%. Then set R to 120 seconds.</li>
+<li>Block 1 also prints the checkpoint size for 8B and 70B models at 14 bytes per parameter.</li>
+<li>Block 2 simulates 256 GPUs over two weeks with a mix of small, medium and occasional large gang jobs. Compare utilisation and average wait for FIFO gang scheduling and for FIFO with backfill (small jobs may start if they finish before the head job's reservation).</li>
+<li>Increase the share of large jobs and see utilisation under FIFO fall while backfill holds up better.</li>
+</ol>
+<pre>"""Checkpoint-interval maths and a gang-scheduling simulator with backfill. Python 3.12, stdlib."""
+import heapq, math, random
+
+M = 54 * 24 * 3600 / 419            # mean time between failures, seconds (Llama 3 snapshot)
+R = 600                              # restart time, seconds
+for label, C in (("async", 30), ("sync", 300)):
+    tau = math.sqrt(2 * C * M)
+    ck, fail = C / tau, (tau / 2 + R) / M
+    print(f"{label:5} C={C:3}s  tau*={tau / 60:5.1f} min  checkpoint {ck:5.1%}  failures {fail:5.1%}  total {ck + fail:5.1%}")
+for params in (8e9, 70e9):
+    print(f"checkpoint for {params / 1e9:.0f}B params at 14 B/param: {params * 14 / 1e9:,.0f} GB")
+
+def simulate(backfill, seed=1, gpus=256, hours=336, large_share=0.03):
+    rng = random.Random(seed)
+    jobs, t = [], 0.0
+    while t &lt; hours:                                   # ~2 jobs/hour: offered load ~85% of 256 GPUs
+        t += rng.expovariate(2)
+        r = rng.random()
+        if r &lt; large_share: size, dur = 128, rng.uniform(8, 24)
+        elif r &lt; 0.30: size, dur = rng.choice([16, 32, 64]), rng.uniform(1, 8)
+        else: size, dur = rng.choice([1, 2, 4, 8]), rng.uniform(0.2, 3)
+        jobs.append((t, size, dur))
+    free, now, queue, running, busy, waits = gpus, 0.0, [], [], 0.0, []
+    events = [(a, "arrive", i) for i, (a, _, _) in enumerate(jobs)]
+    heapq.heapify(events)
+    while events:
+        when, kind, i = heapq.heappop(events)
+        busy += (gpus - free) * (min(when, hours) - min(now, hours)); now = when
+        if kind == "arrive": queue.append(i)
+        else: free += jobs[i][1]
+        started = True
+        while started and queue:
+            started = False
+            head = queue[0]
+            if jobs[head][1] &lt;= free:                     # gang fits: start head
+                queue.pop(0); free -= jobs[head][1]; waits.append(now - jobs[head][0])
+                heapq.heappush(events, (now + jobs[head][2], "end", head)); started = True
+            elif backfill:                                 # reservation time for the head job
+                ends = sorted((e for e in events if e[1] == "end"))
+                avail, shadow = free, math.inf
+                for e_t, _, j in ends:
+                    avail += jobs[j][1]
+                    if avail &gt;= jobs[head][1]: shadow = e_t; break
+                for j in queue[1:]:
+                    if jobs[j][1] &lt;= free and now + jobs[j][2] &lt;= shadow:
+                        queue.remove(j); free -= jobs[j][1]; waits.append(now - jobs[j][0])
+                        heapq.heappush(events, (now + jobs[j][2], "end", j)); started = True
+                        break
+    return busy / (gpus * hours), sum(waits) / len(waits)
+
+for bf in (False, True):
+    util, wait = simulate(bf)
+    print(f"{'backfill' if bf else 'FIFO gang':9}: utilisation {util:.1%}, mean wait {wait:.1f} h")</pre>
+<p><strong>What to look for:</strong> the async and sync rows reproducing the lesson's 14 and 43 minutes; restart time R = 120 s cutting total waste by several points, more than tuning τ; checkpoint sizes of about 112 GB and 980 GB; and backfill raising utilisation and cutting mean wait compared with strict FIFO, with the gap widening as large jobs become more common. The simulator ignores topology and failures, so its absolute numbers are optimistic; the comparison is the point.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A team plans a 1,024-GPU, 21-day continued pre-training run of a 70-billion-parameter model on your cluster. Use one unexpected failure per 50,000 GPU-hours, a 1 TB checkpoint, and restart time R = 8 minutes. (a) What is the job's MTBF? (b) If asynchronous checkpointing stalls for 40 seconds, what is the optimal interval and expected waste? (c) How many failures should they expect, and roughly how many GPU-hours will be lost?</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> 50,000 GPU-hours / 1,024 GPUs ≈ <strong>49 hours</strong> (about 176,000 seconds).</p>
+<p><strong>(b)</strong> τ* = √(2 × 40 × 176,000) = √14.1 million ≈ 3,750 s, about <strong>62 minutes</strong>. Waste: 40 / 3,750 ≈ 1.1% for checkpoints plus (1,875 + 480) / 176,000 ≈ 1.3% for failures: about <strong>2.4%</strong>.</p>
+<p><strong>(c)</strong> 21 days = 504 hours, so about 504 / 49 ≈ <strong>10 failures</strong>. Total waste of 2.4% of 1,024 × 504 ≈ 516,000 GPU-hours is about <strong>12,400 GPU-hours</strong>, roughly $31,000 at $2.50. Plan for more than the average (failures cluster, and some need human diagnosis), reserve a spare node per block, and make sure the checkpoint tier can absorb a 1 TB write every hour without disturbing other jobs.</p>
+</details>
+<b>Diagnose it</b>
+<p>Cluster allocation is 93%, but finance reports that useful training output fell 20% this quarter, and teams complain of long waits for 64-GPU jobs while dashboards show 150 free GPUs most of the day. What is happening, and what do you change?</p>
+<details><summary>Answer</summary>
+<p><strong>Free but unplaceable GPUs:</strong> 150 free GPUs scattered across many nodes (fragmentation) cannot host 8-whole-node jobs; check the largest placeable gang over time and how small jobs are packed. <strong>Allocated but not useful:</strong> 93% allocation with falling output suggests goodput loss: measure activity and goodput per job; look for jobs waiting on data (a dataset moved to a slower tier), checkpoint stalls (a new default to checkpoint more often, or synchronous writes), more failures and slow restarts, or hangs counted as running. <strong>Changes</strong>: bin-pack small jobs and dedicate a small-job node pool; add backfill with runtime limits; publish per-job goodput and MFU with the cost report; add progress watchdogs; fix the data path and checkpoint policy found by the investigation; and track "largest placeable gang" and goodput as headline platform metrics alongside allocation.</p>
+</details>
+</section>

@@ -1,0 +1,400 @@
+<!-- topic source for k8s/k8s13; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "k8s13",
+  "t": "Debugging Kubernetes: CrashLoopBackOff, OOMKilled, ImagePullBackOff, probes and kubectl techniques",
+  "tag": "Operations",
+  "sum": "A systematic way to debug workloads: read status, events and last state; decode exit codes; work through Pending, ContainerCreating, ImagePullBackOff, CrashLoopBackOff, OOMKilled, probe failures, Running-but-not-Ready and stuck Terminating, each traced from real kubectl describe output; and the tools — logs --previous, events, ephemeral debug containers, node debugging — with Zalando's liveness-probe lessons and the Kubernetes Failure Stories as the case.",
+  "prereq": [
+    ["k8s6", "The scheduler binds pods; the kubelet runs them through the CRI and reports status; components record events; the API server is the single source of truth."],
+    ["k8s7", "Pods have phases, conditions and per-container states; restart policies restart exited containers; Deployments roll out ReplicaSets."],
+    ["k8s10", "Exceeding a memory limit gets a container OOM-killed with exit code 137; node pressure triggers eviction; requests decide scheduling."],
+    ["k8s8", "Services route to ready pods through EndpointSlices; DNS resolves Service names; NetworkPolicy can block traffic."]
+  ],
+  "myths": [
+    ["CrashLoopBackOff is an error type.", "It is a waiting state: the container has exited repeatedly and the kubelet is waiting an increasing delay before starting it again. The actual error is in the previous run — its exit code and reason in Last State, and its logs, which you get with kubectl logs --previous."],
+    ["kubectl logs shows why a container crashed.", "kubectl logs shows the current container instance, which in a crash loop is often a fresh start with little or nothing logged. The crashed instance's output is under --previous. And if the process was killed by the kernel (OOMKilled) or by the kubelet (liveness failure), the application may have logged nothing at all; the reason is in describe."],
+    ["Exit code 137 means out of memory.", "137 means the process was killed by SIGKILL (128 + 9). The OOM killer is one sender; another is the kubelet sending SIGKILL after the grace period when a liveness probe failed or the pod was deleted and the process ignored SIGTERM. Check the termination reason (OOMKilled versus Error) and the events."],
+    ["A failing liveness probe means the app is broken, so restarting helps.", "Liveness probes often fail because the app is overloaded (slow responses exceed the 1-second default timeout) or because the probe checks a dependency. Restarting then removes capacity and cold-starts caches exactly when load is highest, turning a slowdown into a cascading outage. Liveness should detect only unrecoverable states such as deadlocks."],
+    ["If kubectl exec doesn't work, you can't debug the container.", "Minimal and distroless images have no shell, but kubectl debug can add an ephemeral container with any tools image to the running pod, sharing its namespaces and, with --target, its process namespace; kubectl debug --copy-to creates a modified copy; and kubectl debug node/<name> gives a shell with the node's file system at /host."],
+    ["A pod that is Running is healthy.", "Running only means the containers have been started and at least one is running. A pod can be Running but not Ready (failing its readiness probe, so it receives no traffic), restarting repeatedly, or ready but returning errors. Check READY, RESTARTS, conditions and the application's own metrics."]
+  ],
+  "recap": [
+    "Debugging follows the pod's life: is it scheduled (Pending), created (ContainerCreating), pulled (ImagePullBackOff), running and staying up (CrashLoopBackOff), ready (readiness), and serving correctly (Services, DNS, policy)?",
+    "kubectl describe pod shows the state, Last State with reason and exit code, restart count, conditions and recent events; kubectl get events and the controller's own describe fill in the rest.",
+    "Exit codes encode the cause: 1 or another small number is the application's own error, 126/127 a command that cannot run or is not found, 137 SIGKILL (OOM kill or forced termination), 139 a segmentation fault, 143 SIGTERM.",
+    "CrashLoopBackOff is the kubelet waiting before restarting a repeatedly failing container, starting at 10 seconds and doubling to a 5-minute cap, reset after 10 minutes of successful running.",
+    "ImagePullBackOff and ErrImagePull mean the image cannot be fetched: wrong name or tag, missing pull credentials, rate limits, registry unreachable or wrong architecture.",
+    "OOMKilled means the container exceeded its memory limit; read memory.stat in the cgroup or the container's memory metrics, and fix the leak, the limit or the workers.",
+    "Liveness probes restart containers and must test only the process's own ability to make progress; readiness probes gate traffic; startup probes protect slow starters.",
+    "kubectl logs --previous, kubectl debug with ephemeral containers, kubectl debug node, port-forward and the events stream are the core tools, and none require a shell in the image.",
+    "Pods stuck Terminating usually have finalizers waiting for a controller, or a node that is gone; force deletion skips safety checks and should be the last step, not the first."
+  ],
+  "glossary": [
+    ["CrashLoopBackOff", "The waiting state of a container that keeps exiting; the kubelet delays each restart longer, up to five minutes."],
+    ["CreateContainerConfigError", "A waiting reason meaning the kubelet cannot build the container's configuration, typically a missing ConfigMap, Secret or key referenced by env."],
+    ["ephemeral container", "A temporary container added to a running pod with kubectl debug for troubleshooting; it cannot be removed or restarted and has no resources or probes."],
+    ["ErrImagePull / ImagePullBackOff", "Waiting reasons for a failed image pull and the back-off before retrying it."],
+    ["event", "A short-lived API object recording something a component did or observed (Scheduled, Pulled, BackOff, Unhealthy), retained for about an hour by default."],
+    ["exit code", "The number a process returns when it ends; 128 + N means it was killed by signal N."],
+    ["finalizer", "A key on an object's metadata that blocks its deletion until a controller removes it after cleanup."],
+    ["Last State", "The record in kubectl describe of a container's previous run: when it started and finished, its exit code and reason."],
+    ["liveness probe", "A periodic check whose repeated failure makes the kubelet restart the container."],
+    ["port-forward", "kubectl port-forward: a tunnel from a local port through the API server and kubelet to a port in a pod."],
+    ["readiness probe", "A periodic check whose failure removes the pod from Service endpoints without restarting it."],
+    ["restart count", "How many times a container in a pod has been restarted by the kubelet."],
+    ["startup probe", "A check that must succeed before liveness and readiness probes start, giving slow applications time to start."],
+    ["termination message", "A short message a container writes to /dev/termination-log (or the end of its logs) that appears in its terminated state."]
+  ],
+  "qa": [
+    ["E", "A pod is in CrashLoopBackOff. What do you do first?", "Run kubectl describe pod to see Last State — the reason, exit code and timestamps of the previous run — plus restart count and events. Then kubectl logs <pod> --previous (and -c for the right container) to see what the crashed instance printed. The exit code and logs together usually name the cause: a configuration error, a missing dependency, an OOM kill, or a liveness probe killing it."],
+    ["E", "What does ImagePullBackOff mean and what causes it?", "The kubelet failed to pull the container image and is backing off before retrying. Causes: a typo in the image name or tag, a tag that does not exist, a private registry without imagePullSecrets or node credentials, registry rate limits, network or DNS problems reaching the registry, or no manifest for the node's architecture. The events in describe show the registry's error message."],
+    ["E", "What is the difference between a liveness and a readiness probe?", "Readiness decides whether the pod receives traffic: when it fails, the pod is removed from Service endpoints but keeps running. Liveness decides whether the container is restarted: after failureThreshold consecutive failures (3 by default, every 10 seconds), the kubelet kills and restarts it. Startup probes delay both until a slow-starting app is up."],
+    ["M", "Exit code 137 — how do you tell an OOM kill from something else?", "137 is SIGKILL. kubectl describe shows Last State Terminated with Reason: OOMKilled when the kernel killed it for exceeding its memory limit; Reason: Error with 137 means something else sent SIGKILL — usually the kubelet after the grace period, because a liveness probe failed or the pod was deleted and the process ignored SIGTERM. Events show 'Liveness probe failed… will be restarted' in the second case; node logs and memory.events in the cgroup confirm OOM kills."],
+    ["M", "A pod has been Pending for ten minutes. How do you debug it?", "kubectl describe pod and read the FailedScheduling event: it lists, per reason, how many nodes were rejected — insufficient CPU or memory (requests too big or cluster full), untolerated taints, node affinity or topology spread unsatisfied, volume node affinity conflicts, unbound PVCs. If there is no event at all, the scheduler never saw it (scheduler down, or a schedulerName nobody serves). Then fix the request, add capacity, add tolerations, or fix the volume."],
+    ["M", "A pod is Running but 0/1 Ready. What do you check?", "The readiness probe: describe shows 'Readiness probe failed' events with the HTTP status, timeout or command output. Check that the probe's port and path match what the app serves, that the timeout (1 second by default) is realistic, that the app has finished starting (use a startup probe), and whether readiness depends on a downstream that is failing. While not ready, the pod is excluded from Service endpoints."],
+    ["M", "How do you debug a container that has no shell?", "kubectl debug -it <pod> --image=busybox --target=<container> adds an ephemeral container that shares the pod's network namespace and, with --target, the target container's process namespace, so ps shows its processes and /proc/<pid>/root exposes its file system. kubectl debug <pod> --copy-to=<new> --set-image=*=<debug-image> creates a modifiable copy. kubectl debug node/<node> runs a pod in the host namespaces with the node's file system at /host."],
+    ["M", "What causes CreateContainerConfigError?", "The kubelet could not build the container's configuration before starting it: most often an env var or envFrom referencing a ConfigMap or Secret (or a key in one) that does not exist in the namespace, or an invalid security context such as runAsNonRoot with a non-numeric image user. describe shows the exact message, such as couldn't find key DATABASE_URL in Secret prod/db."],
+    ["H", "Explain how liveness probes can cause a cascading failure and how to design them safely.", "If the liveness check depends on a database and the database slows, every pod's liveness fails, the kubelet restarts all of them, caches go cold and start-up load hits the struggling database, so the outage becomes total. The same happens under CPU saturation when a liveness endpoint misses its 1-second timeout. Safe design: liveness checks only that the process can make progress (a local endpoint, no dependencies), with generous timeouts and failure thresholds; readiness handles dependencies and overload by taking a pod out of rotation; startup probes cover slow starts; and many services need no liveness probe at all.", "Follow-up: When is a liveness probe genuinely useful? — For applications that can deadlock or wedge without exiting, where a restart reliably fixes it, and where the probe can tell that state apart from slowness."],
+    ["H", "Pods of a Deployment are being killed every few hours with exit code 137 but no OOMKilled reason. What could it be?", "Something sends SIGKILL other than the OOM killer. Candidates: liveness probe failures during load spikes (events say 'Liveness probe failed'); node-pressure eviction (the pod would show Evicted and be replaced); preemption by higher-priority pods (Preempted events); consolidation or node drains (Karpenter or autoscaler events) where the app ignores SIGTERM and is killed after the grace period. Correlate the timestamps of Last State with events, node events and autoscaler logs."],
+    ["H", "Walk through debugging 'the service returns 503 since the last deploy' from first command to fix.", "kubectl get pods -l app=x: are new pods Ready and not restarting? If not ready, describe for readiness failures and logs. If ready, kubectl get endpointslices for the Service: are pod IPs listed with ready true, and does the Service's selector and targetPort match the new pods' labels and port (a renamed port or changed label is common)? Then from a debug pod, curl the pod IP directly and the Service name to split app, Service and DNS problems; check NetworkPolicy and the Gateway's route status. Roll back with kubectl rollout undo if users are affected while you investigate."],
+    ["H", "A namespace has been stuck in Terminating for an hour. Why, and how do you resolve it safely?", "Namespace deletion waits until every object in it is deleted, and objects with finalizers wait for their controller to remove them. Typical blockers are custom resources whose operator was deleted first (so nobody removes their finalizer), or an unavailable aggregated API that prevents the namespace controller from listing resources. Find them with kubectl api-resources --namespaced -o name | xargs -n1 kubectl get -n <ns>, and the namespace's status conditions. Fix the cause — reinstall the operator or restore the API — and let cleanup run; only remove finalizers manually when you know the external cleanup they guard is unnecessary."]
+  ],
+  "refs": [
+    ["post", "Henning Jacobs (Zalando) — Liveness Probes are Dangerous (2019)", "How liveness probes, especially with dependency checks, cause cascading restarts, with DOs and DON'Ts.", "https://srcco.de/posts/kubernetes-liveness-probes-are-dangerous.html"],
+    ["post", "Kubernetes Failure Stories", "A curated list of public Kubernetes incident write-ups, collected by Zalando engineers.", "https://k8s.af/"],
+    ["docs", "Kubernetes — Debug running pods", "Logs, ephemeral containers, kubectl debug, copies of pods and node debugging.", "https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/"],
+    ["docs", "Kubernetes — Debug pods", "A guide to Pending, waiting and crashing pods and what to check for each.", "https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/"],
+    ["docs", "Kubernetes — Pod lifecycle", "Phases, container states, restart policy, the CrashLoopBackOff back-off and its 1.33 alpha tuning options.", "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/"],
+    ["docs", "Kubernetes — Configure liveness, readiness and startup probes", "Probe types, timing fields and their defaults.", "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"],
+    ["docs", "Kubernetes — Determine the reason for pod failure", "Termination messages and terminationMessagePolicy.", "https://kubernetes.io/docs/tasks/debug/debug-application/determine-reason-pod-failure/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>It is 2 a.m. and the pager says checkout is failing. <code>kubectl get pods</code> shows a column of words — <code>CrashLoopBackOff</code>, <code>0/1 Running</code>, <code>ImagePullBackOff</code>, <code>Pending</code>, <code>Terminating</code> — and a restart count of 47. The engineer on call tries <code>kubectl logs</code> and gets two lines of start-up banner. They try <code>kubectl exec … bash</code> and get "executable file not found", because the image is distroless. They restart the Deployment, which makes everything worse for ten minutes. The cause, when they find it an hour later, was printed in plain text all along — in the previous container's logs, in the <code>Last State</code> section of <code>kubectl describe</code>, in an event that said exactly which Secret key was missing.</p>
+<p>Debugging Kubernetes is less about clever tricks than about knowing where each kind of failure leaves its evidence. Every component in k8s6 writes something down: the scheduler records why a pod could not be placed; the kubelet records image pulls, probe failures, kills and back-offs as events and as the container's last state; the kernel's OOM killer leaves a reason and an exit code; controllers record what they created and why they stalled. A small number of commands reads all of it, and a small number of patterns covers most incidents.</p>
+<p>Some failures are made worse by Kubernetes' own machinery when it is configured carelessly. The best-known example is the liveness probe that checks a database: one slow query, and the kubelet restarts every replica of every service at once. Zalando's engineers, who run hundreds of clusters, wrote this up in 2019 under the title "Liveness Probes are Dangerous" and started a public collection of Kubernetes failure stories so that others could learn from such incidents without repeating them.</p>
+<p>This lesson gives a systematic method — follow the pod's life from scheduling to serving and ask, at each stage, "did this step happen, and if not, what does the evidence say?" — and then works through each common state with real <code>kubectl describe</code> output: Pending, ContainerCreating, ImagePullBackOff, CreateContainerConfigError, CrashLoopBackOff (with exit codes decoded), OOMKilled, probe failures, Running but not Ready, Ready but failing, and stuck Terminating. It ends with the toolkit for images without shells and for node-level problems, and with what to put in place so the next 2 a.m. is shorter.</p>
+</section>
+
+<section data-field="primer">
+<h4>A parcel's tracking page</h4>
+<p>When a parcel goes missing you do not search every warehouse. You open the tracking page and find the last scan: "accepted", "sorted", "out for delivery", "delivery attempted — no access". The last successful step tells you where to look, and the failed step usually comes with a reason.</p>
+<p>A pod has the same kind of tracking history, and the stages always happen in the same order:</p>
+<figure>
+<svg viewBox="0 0 640 290" width="100%" role="img" aria-label="Debugging flowchart following the pod lifecycle from Pending to serving traffic, with the status shown at each failure and the first command to run">
+  <defs><marker id="k8s13-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="10" width="150" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="85" y="32" text-anchor="middle" style="fill:var(--ink)">1 scheduled?</text>
+    <rect x="10" y="62" width="150" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="85" y="84" text-anchor="middle" style="fill:var(--ink)">2 sandbox + volumes?</text>
+    <rect x="10" y="114" width="150" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="85" y="136" text-anchor="middle" style="fill:var(--ink)">3 image pulled?</text>
+    <rect x="10" y="166" width="150" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="85" y="188" text-anchor="middle" style="fill:var(--ink)">4 stays running?</text>
+    <rect x="10" y="218" width="150" height="34" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="85" y="240" text-anchor="middle" style="fill:var(--ink)">5 ready?</text>
+    <rect x="10" y="256" width="150" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="85" y="276" text-anchor="middle" style="fill:var(--ink)">6 serving correctly?</text>
+    <line x1="85" y1="44" x2="85" y2="60" marker-end="url(#k8s13-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="85" y1="96" x2="85" y2="112" marker-end="url(#k8s13-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="85" y1="148" x2="85" y2="164" marker-end="url(#k8s13-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="85" y1="200" x2="85" y2="216" marker-end="url(#k8s13-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="180" y="24" style="fill:var(--crit)">Pending</text>
+    <text x="180" y="40" style="fill:var(--ink-2)">describe → FailedScheduling: resources, taints, PVC</text>
+    <text x="180" y="76" style="fill:var(--crit)">ContainerCreating (stuck), CreateContainerConfigError</text>
+    <text x="180" y="92" style="fill:var(--ink-2)">events: FailedMount, CNI errors, missing ConfigMap/Secret key</text>
+    <text x="180" y="128" style="fill:var(--crit)">ErrImagePull / ImagePullBackOff</text>
+    <text x="180" y="144" style="fill:var(--ink-2)">events: not found, unauthorized, toomanyrequests</text>
+    <text x="180" y="180" style="fill:var(--crit)">CrashLoopBackOff, OOMKilled, rising RESTARTS</text>
+    <text x="180" y="196" style="fill:var(--ink-2)">Last State exit code + logs --previous</text>
+    <text x="180" y="232" style="fill:var(--crit)">Running 0/1</text>
+    <text x="180" y="248" style="fill:var(--ink-2)">events: Readiness probe failed</text>
+    <text x="180" y="276" style="fill:var(--ink-2)">endpoints, DNS, NetworkPolicy, Gateway, app metrics</text>
+  </g>
+</svg>
+<figcaption>Find the first stage that did not complete; everything below it is a symptom. Each stage has its own status word and its own first command, so the status column of kubectl get pods already tells you which row to read.</figcaption>
+</figure>
+<p>The tracking page itself is three commands. <code>kubectl get pods</code> gives the one-word summary per pod: STATUS, READY, RESTARTS. <code>kubectl describe pod</code> gives the full record: each container's current state and <strong>Last State</strong> (the previous run's exit code and reason), the pod's conditions, and the most recent <strong>events</strong> for that pod. <code>kubectl logs --previous</code> gives what the crashed instance printed before it died. Most incidents are solved by reading these three in order, before touching anything.</p>
+<h4>Who wrote each clue</h4>
+<p>Every line of evidence was written by one component, and knowing which tells you how far the pod got. A <code>FailedScheduling</code> event comes from the scheduler: the pod never reached a node. <code>FailedMount</code>, <code>Pulling</code>, <code>BackOff</code>, <code>Unhealthy</code> and <code>Killing</code> come from the kubelet on the pod's node: the pod is bound and the node is trying. <code>OOMKilled</code> in Last State was recorded by the runtime after the kernel killed the process. <code>SuccessfulCreate</code> or <code>FailedCreate</code> on a ReplicaSet comes from its controller: if pods do not even exist, look there, because an admission webhook or a quota may have refused them. The <em>From</em> column in the events table is therefore as informative as the message, and a missing kind of event — no scheduler event at all, no kubelet events — points straight at the component that is not doing its job.</p>
+<p>The second habit is to stop before "fixing". Restarting pods, deleting them or scaling up destroys evidence — the previous container's logs, the last state, the pod that showed the problem — and in some failure modes (liveness cascades, overloaded dependencies) makes the outage worse. Read first, then act; if users are hurting, roll back the last change (k8s7), which is usually safer than any improvised fix.</p>
+<p>Where the analogy breaks: a tracking page keeps its history forever, but Kubernetes events are kept for only about an hour by default, logs of a container are only kept for the current and previous instance, and a deleted pod takes its status with it. Evidence evaporates, so capture it early — and ship events and logs somewhere durable before you need them.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The core commands and what each one shows</h4>
+<table>
+<thead><tr><th>Command</th><th>Shows</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><code>kubectl get pods -o wide</code></td><td>Status, ready count, restarts, node, IP</td><td>Which pods, where, how bad</td></tr>
+<tr><td><code>kubectl describe pod P</code></td><td>Container states and Last State, conditions, events</td><td>The "why" for almost every state</td></tr>
+<tr><td><code>kubectl logs P [-c C] --previous</code></td><td>Output of the crashed instance</td><td>Crash causes the app printed</td></tr>
+<tr><td><code>kubectl get events -n NS --sort-by=.lastTimestamp</code></td><td>Everything recorded in the namespace</td><td>Scheduling, pulls, kills, controller actions</td></tr>
+<tr><td><code>kubectl describe deploy/rs/sts</code></td><td>Controller conditions and events</td><td>Rollouts that stall, pods never created</td></tr>
+<tr><td><code>kubectl get pod P -o yaml</code></td><td>Full spec and status</td><td>Exact fields: probes, env, resources</td></tr>
+<tr><td><code>kubectl debug …</code></td><td>Shell with tools next to the app or on the node</td><td>Images without shells, network and node checks</td></tr>
+<tr><td><code>kubectl top pod/node</code></td><td>Current CPU and memory (metrics-server)</td><td>Resource pressure at a glance</td></tr>
+</tbody>
+</table>
+<p>One thing to know about <code>kubectl get pods</code>: the STATUS column is a convenience computed by kubectl from the pod's phase and container states, not a field in the API. "CrashLoopBackOff", "ImagePullBackOff", "Init:0/2" and "Terminating" are not phases; the phase is still Pending or Running. Read the container states in describe for the real picture.</p>
+
+<h4>2. Exit codes: decode before you read logs</h4>
+<p>When a container stops, its process's exit status is recorded. Shells and runtimes use the convention that a process killed by signal N reports <strong>128 + N</strong>. That makes the last state's exit code the fastest clue:</p>
+<table>
+<thead><tr><th>Exit code</th><th>Meaning</th><th>Typical cause in Kubernetes</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Success</td><td>A process that should keep running exited (wrong command, daemon that forks to background)</td></tr>
+<tr><td>1, 2 …</td><td>The application's own error</td><td>Configuration missing, dependency unreachable at start, unhandled exception</td></tr>
+<tr><td>126</td><td>Command cannot be executed</td><td>Not executable, wrong permissions</td></tr>
+<tr><td>127</td><td>Command not found</td><td>Typo in command, binary missing in image, shell-form command in a shell-less image</td></tr>
+<tr><td>128 + 9 = 137</td><td>SIGKILL</td><td>OOM kill (reason OOMKilled), or killed after grace period (liveness failure, deletion, eviction)</td></tr>
+<tr><td>128 + 11 = 139</td><td>SIGSEGV</td><td>Native crash: segfault in a C extension, incompatible library or architecture</td></tr>
+<tr><td>128 + 15 = 143</td><td>SIGTERM</td><td>Stopped gracefully on request (deletion, liveness restart with a handler)</td></tr>
+</tbody>
+</table>
+<p>The <strong>reason</strong> next to the exit code narrows it further: <code>OOMKilled</code> (the kernel, k8s10), <code>Error</code> (non-zero exit), <code>Completed</code> (exit 0), <code>ContainerCannotRun</code> or <code>StartError</code> (the runtime could not start the process at all — exec format errors from wrong-architecture images, k8s1, land here). Applications can also write a short explanation to <code>/dev/termination-log</code>, which appears as the termination message.</p>
+
+<h4>3. CrashLoopBackOff, worked</h4>
+<p>When a container exits and the pod's restart policy says to restart it, the kubelet does — after a delay that starts at 10 seconds and doubles each time (20, 40, 80, 160 s) up to a cap of 5 minutes, and resets once the container has run successfully for 10 minutes. While waiting, the container's state is <code>Waiting</code> with reason <code>CrashLoopBackOff</code>. (Kubernetes 1.33 added alpha options to shorten this — a 1-second initial delay and 60-second cap, or a per-node maximum — but the defaults above apply unless your cluster enables them.)</p>
+<figure>
+<svg viewBox="0 0 640 170" width="100%" role="img" aria-label="Timeline of restarts with back-off delays of 10, 20, 40, 80, 160 and then 300 seconds between short-lived runs">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="20" y1="110" x2="620" y2="110" style="fill:none;stroke:var(--line-2)"/>
+    <rect x="20" y="96" width="6" height="14" style="fill:var(--crit)"/>
+    <rect x="31" y="96" width="6" height="14" style="fill:var(--crit)"/>
+    <rect x="47" y="96" width="6" height="14" style="fill:var(--crit)"/>
+    <rect x="74" y="96" width="6" height="14" style="fill:var(--crit)"/>
+    <rect x="124" y="96" width="6" height="14" style="fill:var(--crit)"/>
+    <rect x="221" y="96" width="6" height="14" style="fill:var(--crit)"/>
+    <rect x="404" y="96" width="6" height="14" style="fill:var(--crit)"/>
+    <rect x="587" y="96" width="6" height="14" style="fill:var(--crit)"/>
+    <text x="30" y="88" style="fill:var(--muted)">10</text>
+    <text x="42" y="74" style="fill:var(--muted)">20</text>
+    <text x="58" y="88" style="fill:var(--muted)">40</text>
+    <text x="96" y="74" style="fill:var(--muted)">80 s</text>
+    <text x="168" y="88" style="fill:var(--muted)">160 s</text>
+    <text x="310" y="88" style="fill:var(--muted)">300 s (cap)</text>
+    <text x="490" y="88" style="fill:var(--muted)">300 s</text>
+    <text x="20" y="134" style="fill:var(--ink-2)">red = container runs for a moment and exits; gaps = Waiting: CrashLoopBackOff</text>
+    <text x="20" y="152" style="fill:var(--ink-2)">after ~10 min of successful running, the delay resets to 10 s</text>
+    <text x="20" y="30" style="fill:var(--ink);font-weight:600">Restart back-off (default)</text>
+  </g>
+</svg>
+<figcaption>Within a few minutes the gaps reach five minutes, so a crash-looping pod spends almost all its time waiting — which is why "it's restarting" quickly becomes "it's down", and why the cause is always in the previous run, not the current one.</figcaption>
+</figure>
+<p>Here is a real-shaped <code>kubectl describe pod</code> for a crash-looping API (trimmed):</p>
+<pre>Name:         api-6b7d9c5f4-q8xkz
+Namespace:    shop
+Status:       Running
+Containers:
+  api:
+    Image:          ghcr.io/myorg/api@sha256:3f9c…
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    1
+      Started:      Sat, 04 Oct 2026 02:11:40 +0000
+      Finished:     Sat, 04 Oct 2026 02:11:42 +0000
+    Ready:          False
+    Restart Count:  6
+    Environment Variables from:
+      api-config    ConfigMap  Optional: false
+Conditions:
+  Ready             False
+Events:
+  Type     Reason     Age                  From     Message
+  ----     ------     ----                 ----     -------
+  Normal   Pulled     7m (x7 over 13m)     kubelet  Container image "ghcr.io/myorg/api@sha256:3f9c…" already present on machine
+  Normal   Created    7m (x7 over 13m)     kubelet  Created container: api
+  Normal   Started    7m (x7 over 13m)     kubelet  Started container api
+  Warning  BackOff    2m (x26 over 12m)    kubelet  Back-off restarting failed container api in pod api-6b7d9c5f4-q8xkz</pre>
+<p>Read it top to bottom. The image is present and the container is created and started each time, so stages 1-3 are fine. Last State says the previous run lasted two seconds and exited with code 1 and reason <code>Error</code>: the application itself gave up, not the kernel or the kubelet. Restart count 6 over 13 minutes matches the back-off schedule. Nothing about probes. So the answer is in the application's output:</p>
+<pre>$ kubectl logs api-6b7d9c5f4-q8xkz --previous
+Traceback (most recent call last):
+  File "/app/api/settings.py", line 14, in &lt;module&gt;
+    DATABASE_URL = os.environ["DATABASE_URL"]
+KeyError: 'DATABASE_URL'</pre>
+<p>The new release renamed the variable in the ConfigMap to <code>DB_URL</code>. Fix the ConfigMap or the code and roll forward, or <code>kubectl rollout undo</code> while you do. Without <code>--previous</code>, <code>kubectl logs</code> would have shown the current instance, which in the waiting state has no output at all.</p>
+<p>Three other common shapes of the same state:</p>
+<ul>
+<li><strong>Exit code 0, reason Completed, still CrashLoopBackOff</strong>: the process finished successfully but the restart policy is <code>Always</code>. The command runs a one-shot script, or a daemon forks to the background and the foreground process exits. Make the main process stay in the foreground, or use a Job (k8s7).</li>
+<li><strong>Exit code 127 or 126</strong>: the command does not exist or cannot run in this image — a typo in <code>command</code>, a shell-form command in a distroless image (k8s3), a script without execute permission.</li>
+<li><strong>Exit code 139</strong>: a native crash. Common after a base-image change that brought an incompatible library, or an image built for another architecture under emulation.</li>
+</ul>
+
+<h4>4. OOMKilled</h4>
+<pre>    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+      Started:      Sat, 04 Oct 2026 01:52:03 +0000
+      Finished:     Sat, 04 Oct 2026 02:06:47 +0000
+    Restart Count:  3
+    Limits:
+      memory:  2Gi
+    Requests:
+      cpu:     500m
+      memory:  2Gi</pre>
+<p>The container ran for about fifteen minutes and was killed by the kernel for exceeding its 2 GiB limit (k8s10). The application logs usually end mid-sentence: there was no chance to log anything. Questions to answer:</p>
+<ol>
+<li><strong>Growth or spike?</strong> Graph <code>container_memory_working_set_bytes</code> for the pod: a steady climb over the fifteen minutes is a leak or an unbounded cache; a sudden jump is one large request, a batch job or a data load.</li>
+<li><strong>What kind of memory?</strong> From a debug container or the node, read the cgroup's <code>memory.stat</code>: large <code>anon</code> is heap; large <code>shmem</code> is <code>/dev/shm</code> or memory-backed emptyDirs (data-loader workers); large <code>file</code> is page cache that could not be reclaimed fast enough.</li>
+<li><strong>Does the runtime know its limit?</strong> A JVM, Node.js or a worker pool sized from the node's memory rather than the container's will overshoot (k8s3).</li>
+<li><strong>Is the limit simply too low for the real workload?</strong> If usage is legitimate, raise the limit — and the request with it.</li>
+</ol>
+<p>Distinguish this from <strong>eviction</strong>, where the pod (not just the container) is terminated by the kubelet under node pressure: the pod's status shows <code>reason: Evicted</code> and a message such as "The node was low on resource: memory", and its controller creates a replacement elsewhere.</p>
+
+<h4>5. Image pull failures</h4>
+<pre>Events:
+  Warning  Failed     12s (x3 over 52s)  kubelet  Failed to pull image "ghcr.io/myorg/api:2.7.3": failed to resolve reference "ghcr.io/myorg/api:2.7.3": ghcr.io/myorg/api:2.7.3: not found
+  Warning  Failed     12s (x3 over 52s)  kubelet  Error: ErrImagePull
+  Normal   BackOff    1s (x4 over 51s)   kubelet  Back-off pulling image "ghcr.io/myorg/api:2.7.3"
+  Warning  Failed     1s (x4 over 51s)   kubelet  Error: ImagePullBackOff</pre>
+<p><code>ErrImagePull</code> is a failed attempt; <code>ImagePullBackOff</code> is the wait before the next one (with the same doubling back-off). The registry's message decides the fix:</p>
+<ul>
+<li><strong>not found / manifest unknown</strong>: wrong repository or tag, or CI never pushed it. Check with <code>docker buildx imagetools inspect</code> or <code>crane manifest</code> from outside the cluster.</li>
+<li><strong>unauthorized / 403 / pull access denied</strong>: private registry without credentials. Add <code>imagePullSecrets</code> (a <code>kubernetes.io/dockerconfigjson</code> Secret) to the pod or its service account, or configure node-level credentials.</li>
+<li><strong>toomanyrequests</strong>: registry rate limit (Docker Hub, k8s5). Authenticate or use a mirror.</li>
+<li><strong>i/o timeout, no such host</strong>: the node cannot reach the registry: DNS, egress firewall, proxy, private endpoint.</li>
+<li><strong>no matching manifest for linux/arm64</strong>: the image has no variant for the node's architecture (k8s1).</li>
+</ul>
+
+<h4>6. Pending, ContainerCreating and configuration errors</h4>
+<p><strong>Pending with FailedScheduling.</strong> The scheduler explains itself:</p>
+<pre>  Warning  FailedScheduling  30s  default-scheduler  0/6 nodes are available: 2 node(s) had untolerated taint {nvidia.com/gpu: present}, 4 Insufficient memory. preemption: 0/6 nodes are available: 6 No preemption victims found for incoming pod.</pre>
+<p>Six nodes: two are GPU nodes the pod does not tolerate, four lack enough unrequested memory for its request, and nothing lower-priority could be preempted. Options: reduce the request if it is inflated, add capacity (or check why the autoscaler did not, k8s11), or add a toleration if the pod belongs on GPU nodes. Other common reasons in the same message: <code>didn't match Pod's node affinity/selector</code>, <code>didn't match pod topology spread constraints</code>, <code>had volume node affinity conflict</code>, <code>pod has unbound immediate PersistentVolumeClaims</code> (k8s9). No event at all means no scheduler has looked at it (k8s6's drill).</p>
+<p><strong>ContainerCreating for minutes.</strong> The pod is bound but the kubelet cannot finish preparing it. Events name the step: <code>FailedMount</code> or <code>FailedAttachVolume</code> (a volume, often a Multi-Attach error or a missing Secret volume, k8s9), <code>FailedCreatePodSandBox</code> with a CNI error (no IPs left, the CNI DaemonSet not running on that node, k8s8).</p>
+<p><strong>CreateContainerConfigError.</strong> The kubelet could not assemble the container's configuration, so it never started it:</p>
+<pre>  Warning  Failed  5s (x4 over 40s)  kubelet  Error: couldn't find key DATABASE_URL in Secret shop/db</pre>
+<p>or <code>container has runAsNonRoot and image has non-numeric user (app), cannot verify user is non-root</code> (k8s3). The message is exact; fix the reference.</p>
+
+<h4>7. Probes: when health checks cause the failure</h4>
+<p>Probes (sc15, k8s7) are run by the kubelet with defaults of <code>periodSeconds: 10</code>, <code>timeoutSeconds: 1</code>, <code>successThreshold: 1</code>, <code>failureThreshold: 3</code>. A liveness failure looks like this:</p>
+<pre>  Warning  Unhealthy  40s (x3 over 60s)  kubelet  Liveness probe failed: Get "http://10.244.1.17:8080/healthz": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+  Normal   Killing    40s                kubelet  Container api failed liveness probe, will be restarted</pre>
+<p>The probe timed out three times in a row (one second each), so the kubelet killed the container: SIGTERM, then SIGKILL after the grace period, giving exit code 143 or 137 with reason <code>Error</code> — easily mistaken for an OOM. Ask why <code>/healthz</code> took more than a second. If the app was busy (CPU saturated, throttled by a CPU limit, k8s10, or in a long garbage-collection pause), the liveness probe has just restarted a slow but working container, losing its in-flight requests and its warm cache, and the remaining pods now carry more load and may fail their probes too. If <code>/healthz</code> checks the database, a database slowdown fails every pod's liveness at once.</p>
+<p>The rules that prevent this: liveness checks only that the process can make progress (a trivial local endpoint, no dependencies); thresholds and timeouts generous enough to survive GC pauses and load spikes (for example <code>timeoutSeconds: 5</code>, <code>failureThreshold: 6</code>); readiness — which removes the pod from traffic instead of killing it — is where dependency and overload checks belong; a <code>startupProbe</code> protects slow starters, so the liveness probe does not kill a JVM that needs 60 seconds to warm up; and many services are better off with no liveness probe at all.</p>
+<p><strong>Running but not Ready</strong> is the readiness probe failing:</p>
+<pre>  Warning  Unhealthy  3s (x40 over 6m)  kubelet  Readiness probe failed: HTTP probe failed with statuscode: 503</pre>
+<p>The pod is out of the Service's endpoints and receives no traffic. Check the probe's port and path against what the app really serves (a port renamed in the new release, a health path that moved), whether the app is still warming up, and whether readiness depends on a failing downstream — in which case every pod is unready and the Service has no endpoints at all.</p>
+
+<h4>8. Ready, but the service still fails</h4>
+<p>If pods are Running, Ready and not restarting, but clients see errors, move down the path traffic takes (k8s8):</p>
+<ol>
+<li><strong>Endpoints.</strong> <code>kubectl get endpointslices -l kubernetes.io/service-name=api</code>. Empty, or missing the new pods, means the Service's selector does not match the pods' labels, or <code>targetPort</code> names a port the pods do not have.</li>
+<li><strong>From inside.</strong> Start a debug pod (<code>kubectl run -it --rm dbg --image=nicolaka/netshoot -- bash</code>) and test in layers: <code>curl &lt;pod-ip&gt;:8080</code> (the app), <code>curl api.shop:80</code> (Service and DNS), <code>nslookup api.shop</code> (DNS alone). The first layer that fails is the culprit.</li>
+<li><strong>Policy.</strong> If direct pod access fails only from some namespaces, a NetworkPolicy is likely; check policies selecting the pods and the caller's egress.</li>
+<li><strong>Entry point.</strong> For external traffic, the Gateway's and HTTPRoute's <code>status</code> conditions say whether the route is accepted and its backends resolved; the load balancer's health checks say whether nodes or pods are considered healthy.</li>
+<li><strong>The application.</strong> Logs, metrics and traces — the cluster may be fine and the bug in the code; <code>kubectl port-forward pod/api-… 8080</code> lets you hit one pod directly from your laptop.</li>
+</ol>
+
+<h4>9. Debugging without a shell: kubectl debug</h4>
+<p>Distroless and minimal images (k8s3) have no shell or tools. <strong>Ephemeral containers</strong> solve this by adding a temporary container to a running pod:</p>
+<pre>kubectl debug -it pod/api-6b7d9c5f4-q8xkz --image=busybox:1.37 --target=api -- sh
+/ # ps aux                       # sees the api process (shared process namespace via --target)
+/ # ls /proc/1/root/app          # the api container's file system
+/ # wget -qO- localhost:8080/healthz   # same network namespace as the pod</pre>
+<p>The ephemeral container shares the pod's network namespace, so <code>localhost</code> is the app; with <code>--target</code> it also joins the target container's process namespace, so it can see the app's processes and, through <code>/proc/&lt;pid&gt;/root</code>, its files and mounted Secrets (which is why creating ephemeral containers requires its own RBAC permission). Ephemeral containers cannot be removed and have no resource limits or probes; they disappear with the pod. Two variants: <code>kubectl debug pod/X --copy-to=X-debug --set-image=api=busybox:1.37</code> or <code>--share-processes</code> creates a modified copy of the pod (useful when the original crashes too fast to attach to, since you can change its command to <code>sleep</code>); and <code>kubectl debug node/worker-3 -it --image=ubuntu</code> runs a privileged-enough pod in the node's host namespaces with the node's root file system mounted at <code>/host</code>, from which <code>chroot /host</code>, <code>crictl ps</code>, <code>journalctl -u kubelet</code> and the cgroup files are reachable. <code>--profile</code> (general, baseline, restricted, netadmin, sysadmin) chooses the security settings of the debug container.</p>
+
+<h4>10. Stuck Terminating</h4>
+<p>A pod that stays <code>Terminating</code> long after its grace period usually has one of two causes. Its node is gone or unreachable, so no kubelet will ever confirm the containers stopped (k8s6); the pod object waits, which for StatefulSets is a deliberate safety guarantee (k8s7). Or it has <strong>finalizers</strong> — keys in <code>metadata.finalizers</code> that block deletion until a controller removes them after cleanup — and the controller responsible is not running. The same applies to namespaces stuck terminating, usually because of custom resources whose operator was deleted first. <code>kubectl delete --force --grace-period=0</code> removes the pod object without waiting for confirmation; if the node is actually alive, the containers may keep running while a replacement starts, which for anything with a volume or a unique identity is how split-brain happens. Find the cause first; force deletion is the last step.</p>
+
+<h4>11. kubectl techniques that save time</h4>
+<p>A few commands turn the method into seconds rather than minutes. <code>kubectl get pods -A --field-selector=status.phase=Pending</code> lists every pending pod in the cluster; <code>kubectl get pods -o wide --sort-by=.status.containerStatuses[0].restartCount</code> puts the restart-heavy ones last. <code>kubectl events --for pod/api-6b7d9c5f4-q8xkz --types=Warning</code> shows only that pod's warnings, and <code>kubectl get events -A --field-selector type=Warning --sort-by=.lastTimestamp</code> gives a cluster-wide incident view. JSONPath extracts exactly the field you need, for example <code>kubectl get pod P -o jsonpath='{range .status.containerStatuses[*]}{.name}{" "}{.lastState.terminated.reason}{" "}{.lastState.terminated.exitCode}{"\n"}{end}'</code> to list each container's last termination reason and code. <code>kubectl logs -l app=api --prefix --since=10m</code> reads recent logs from every pod of a service at once. <code>kubectl rollout history</code> and <code>kubectl rollout status --timeout=120s</code> tie symptoms to the release that caused them. <code>kubectl wait --for=condition=Ready pod -l app=api --timeout=60s</code> makes scripts and runbooks wait correctly instead of sleeping. <code>kubectl auth can-i create pods/ephemeralcontainers -n shop</code> tells you whether you are allowed to debug before you try. And adding <code>-v=6</code> (or <code>-v=8</code> for bodies) to any command shows the API calls it makes, which settles "is it kubectl, RBAC or the API server?" in one line.</p>
+<p>These are worth putting into a team runbook with the outputs annotated, because at 2 a.m. nobody remembers JSONPath syntax, and a runbook that turns "read Last State for every container" into one pasted command is the difference between a ten-minute and an hour-long diagnosis.</p>
+</section>
+
+<section data-field="deep">
+<h4>Events are lossy; plan for it</h4>
+<p>Events are ordinary API objects with a time-to-live (one hour by default, set on the API server), and repeated events are aggregated into counts ("x26 over 12m"). Under load, components rate-limit event creation, and big clusters often store events in a separate etcd to protect the main one. The consequences: events for an incident that happened overnight are gone by morning, and events for a burst may be incomplete. Production platforms export events to their logging system with an event exporter, so incident timelines can be reconstructed, and alert on warning events by reason (BackOff, FailedScheduling, FailedMount, Unhealthy) rather than waiting for someone to run describe.</p>
+<h4>Logs live on the node</h4>
+<p>Container output goes to files on the node, managed by the kubelet and runtime (under <code>/var/log/pods/</code>), rotated at a size limit (10 MiB per file by default) and keeping a few files. <code>kubectl logs</code> streams them through the API server and kubelet. Only the current and previous container instances are reachable; earlier crashes, deleted pods and pods on dead nodes take their logs with them. That is why cluster-level log collection (a DaemonSet shipping files to a central store) is part of any real platform, and why applications should log to stdout and stderr rather than to files inside the container, which no one collects and which fill the writable layer (k8s2).</p>
+<h4>Signals, grace periods and what the app sees</h4>
+<p>Every way a container is stopped by Kubernetes — deletion, rollout, scale-down, eviction, preemption, liveness failure, node drain — goes through the same sequence: <code>preStop</code> hook, then SIGTERM to PID 1, then SIGKILL after <code>terminationGracePeriodSeconds</code> (k8s1, k8s7). The exit code tells you whether the app exited on SIGTERM (143) or had to be killed (137). Seeing 137 with reason <code>Error</code> on every rollout means the app ignores SIGTERM, which also means in-flight requests are cut off on every deploy; fix PID 1 before chasing anything else. The termination reason, events from the component that initiated the stop (kubelet, scheduler for preemption, eviction API, Karpenter or the cluster autoscaler) and the timing pattern together identify who pulled the trigger.</p>
+<h4>Debugging the node and the runtime</h4>
+<p>Some failures are below the pod: a kubelet that cannot talk to the API server (expired certificates), a container runtime that hangs, a full disk, exhausted PIDs or inodes, a kernel bug. Node conditions (<code>MemoryPressure</code>, <code>DiskPressure</code>, <code>PIDPressure</code>, <code>Ready</code>) summarise the kubelet's view; the Node Problem Detector adds conditions and events for kernel deadlocks, file-system corruption and runtime problems. From a node debug pod: <code>journalctl -u kubelet -u containerd</code>, <code>crictl ps -a</code> and <code>crictl logs</code> for containers the API no longer shows, <code>df -h</code> and <code>df -i</code>, and <code>dmesg</code> for OOM-killer reports and hardware errors. When a node is sick in ways that are hard to fix, cordon, drain and replace it; nodes are cattle.</p>
+<h4>Admission and quota: failures before a pod exists</h4>
+<p>Sometimes there is no failing pod to describe, because the pod was never created. A Deployment shows fewer ready replicas than desired, and <code>kubectl get pods</code> shows nothing new. The ReplicaSet's events explain it: <code>FailedCreate … exceeded quota</code> (a ResourceQuota on the namespace), <code>violates PodSecurity "restricted"</code> (Pod Security Admission rejected the template), or <code>admission webhook … denied the request</code> (a policy engine such as Kyverno). Because these rejections happen in the API server's write path (k8s6), they appear on the controller that tried to create the pod, not on any pod — a common blind spot when people only ever describe pods.</p>
+<h4>Making the next incident shorter</h4>
+<p>The most effective debugging work happens before the incident. Structured logs with request IDs; metrics for every service's request rate, errors and latency; traces across services; events and logs exported off-cluster; dashboards for restarts, OOM kills, throttling and pending pods; alerts on symptoms users feel rather than on every warning event; runbooks for the states in this lesson; and a habit of rolling back first and debugging second when users are affected. And the design rules that prevent whole classes of incident: safe probes, PID 1 that handles SIGTERM, accurate requests, memory limits equal to requests, and images that identify their source.</p>
+<h4>Reproducing a failure safely</h4>
+<p>When a failure cannot be understood from the evidence, reproduce it outside production rather than experimenting on the live service. <code>kubectl get pod P -o yaml</code> gives the exact spec; strip the status and node-specific fields and apply it in a staging namespace with the same image digest, ConfigMaps and Secrets (or safe copies), and the same resource limits. A crash that reproduces there can be investigated freely: change the command to <code>sleep</code> and step through start-up with a debug container, lower the memory limit to trigger the OOM on purpose, or point the readiness probe at the endpoint you suspect. A crash that does <em>not</em> reproduce narrows the cause to something about the production environment — data, traffic, a dependency, the node — which is itself a strong clue.</p>
+</section>
+
+<section data-field="prod">
+<h4>The case: "Liveness Probes are Dangerous" and the Kubernetes Failure Stories</h4>
+<p>Henning Jacobs, then at Zalando, which operated a large fleet of Kubernetes clusters, published "Liveness Probes are Dangerous" in September 2019, adapted from Zalando's internal developer documentation. The post's opening point is that a wrong liveness probe "can worsen high-load situations (cascading failure + potential long container/app start)" and that "a Liveness Probe in combination with an external DB health check dependency is the worst situation: a single DB hiccup will restart all your containers!" It walks through the defaults (period 10 s, timeout 1 s, failure threshold 3), recommends always defining a readiness probe for HTTP services, warns against liveness probes that check dependencies or share an overloaded thread pool with request handling, and against probes on a separate management port that stays healthy while the main port is broken. Its conclusion is not "never use liveness probes" but "use them only with a clear use case and an understanding of the consequences".</p>
+<p>Jacobs and colleagues also started <strong>Kubernetes Failure Stories</strong> (k8s.af), a curated list of public incident write-ups from many companies: DNS and ndots latency, CPU limits and throttling, OOM kills, etcd and API-server overload, admission webhooks blocking clusters, autoscaling surprises, cloud integration failures. Reading through it is the fastest way to learn which failure modes recur in practice; nearly every entry maps onto a mechanism in this track, and most were diagnosed with exactly the commands in this lesson. The meta-lesson the collection makes is that Kubernetes incidents are rarely exotic: they come from defaults left unexamined (probe timeouts, DNS settings, limits) interacting with load.</p>
+<h4>A triage runbook</h4>
+<ol>
+<li>Scope: one pod, one Deployment, one node, one namespace or everything? <code>kubectl get pods -A | grep -v Running</code>, node status, recent changes (deploys, config, cluster upgrades).</li>
+<li>If a deploy just happened and users are affected: <code>kubectl rollout undo</code> (or revert in Git), then investigate.</li>
+<li>Describe one failing pod; identify the first stage that failed (primer figure).</li>
+<li>Read Last State and logs <code>--previous</code>; decode the exit code.</li>
+<li>For Pending or ContainerCreating, read events; for Ready-but-failing, walk endpoints → pod → Service → DNS → policy → entry point.</li>
+<li>Capture evidence (describe output, logs, events) before restarting or deleting anything.</li>
+<li>After the fix, write down what the evidence said and what alert would have caught it sooner.</li>
+</ol>
+<h4>Common traps during response</h4>
+<p>Restarting everything (<code>kubectl rollout restart</code>) as a first move hides the evidence and, in a liveness cascade or an overloaded dependency, restarts the cascade. Scaling up a service whose bottleneck is a database adds load to the database. Force-deleting stuck pods risks two writers on one volume. Editing live objects in a GitOps-managed cluster gets reverted within minutes (k8s12). The safe defaults are: capture evidence, roll back the last change, then debug.</p>
+<h4>Signals worth alerting on</h4>
+<p>Containers restarting more than N times in M minutes; pods in CrashLoopBackOff, ImagePullBackOff or CreateContainerConfigError for more than a few minutes; OOM kills (<code>kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}</code>); pods Pending longer than the expected scale-up time; Deployments whose available replicas are below desired for minutes; readiness failures across many pods of one service at once (a dependency problem); nodes NotReady or under pressure.</p>
+</section>
+
+<section data-field="lab">
+<p>Steps 1-3 need a kind or minikube cluster; step 4 runs here with Python 3.12.</p>
+<ol>
+<li><strong>Break it four ways (Needs a kind/minikube cluster).</strong>
+<pre>kubectl run crash --image=busybox:1.37 -- sh -c 'echo starting; exit 3'
+kubectl run oom --image=python:3.12-slim --overrides='{"spec":{"containers":[{"name":"oom","image":"python:3.12-slim","command":["python","-c","b=bytearray(300*1024*1024)"],"resources":{"limits":{"memory":"128Mi"}}}]}}'
+kubectl run badimg --image=ghcr.io/nonexistent/image:nope
+kubectl run cfg --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"cfg","image":"busybox:1.37","command":["sleep","3600"],"env":[{"name":"X","valueFrom":{"secretKeyRef":{"name":"missing","key":"k"}}}]}]}}'
+kubectl get pods -w</pre>
+Expect <code>CrashLoopBackOff</code> (exit code 3, logs <code>--previous</code> show "starting"), <code>OOMKilled</code> (exit 137), <code>ImagePullBackOff</code> (events: not found or denied), and <code>CreateContainerConfigError</code> (secret "missing" not found). Run <code>kubectl describe pod</code> on each and find the line that names the cause.</li>
+<li><strong>A probe that kills (Needs a cluster).</strong> Deploy <code>nginx:1.27</code> with a liveness probe on path <code>/nope</code>: events show <code>Liveness probe failed: HTTP probe failed with statuscode: 404</code> and <code>Container … failed liveness probe, will be restarted</code>, and RESTARTS climbs every ~30 s. Change it to a readiness probe instead: the pod stays up, <code>0/1</code>, with no restarts.</li>
+<li><strong>Debug a shell-less container (Needs a cluster).</strong> <code>kubectl run dl --image=gcr.io/distroless/static-debian12 --command -- /pause</code> will fail (no such binary — exit 127 or StartError): note the reason. Then run any distroless app image and attach with <code>kubectl debug -it pod/&lt;name&gt; --image=busybox:1.37 --target=&lt;container&gt;</code>; run <code>ps</code> and <code>ls /proc/1/root</code>. Try <code>kubectl debug node/kind-control-plane -it --image=busybox:1.37</code> and <code>ls /host/var/log/pods</code>.</li>
+<li><strong>A describe-output triager (runs here).</strong> Save as <code>triage.py</code>:
+<pre>import re
+SIG = {137: "SIGKILL (OOM kill or killed after grace period)", 143: "SIGTERM (graceful stop)",
+       139: "SIGSEGV (native crash)", 127: "command not found", 126: "command not executable",
+       0: "exited successfully but restartPolicy wants it running"}
+def triage(text):
+    state = re.search(r"State:\s+(\w+)\s+Reason:\s+(\S+)", text)
+    last = re.search(r"Last State:\s+Terminated\s+Reason:\s+(\S+)\s+Exit Code:\s+(\d+)", text)
+    events = re.findall(r"(Warning|Normal)\s+(\w+)\s+.*?\s{2,}(\S+)\s{2,}(.*)", text)
+    out = []
+    if state: out.append(f"now: {state.group(1)} / {state.group(2)}")
+    if last:
+        reason, code = last.group(1), int(last.group(2))
+        meaning = SIG.get(code, "application error" if code &lt; 128 else f"killed by signal {code-128}")
+        out.append(f"last run: {reason}, exit {code} = {meaning}")
+        out.append("next: kubectl logs --previous" if reason == "Error" and code &lt; 128 else
+                   "next: check memory limit and memory.stat" if reason == "OOMKilled" else
+                   "next: look for liveness/eviction/preemption events")
+    for typ, reason, src, msg in events:
+        if typ == "Warning": out.append(f"event {reason} from {src}: {msg.strip()}")
+    return "\n".join(out)
+sample = """    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+Events:
+  Warning  BackOff    2m (x26 over 12m)  kubelet  Back-off restarting failed container api"""
+print(triage(sample))</pre>
+Expect it to report the waiting state, "OOMKilled, exit 137 = SIGKILL…", the memory hint and the BackOff event. Paste the real describe outputs from step 1 into <code>sample</code> and compare its verdicts with your own.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Diagnose: every pod restarts during the evening peak</b>
+<p>Every evening at about 19:00, all 30 pods of a Java API restart within two minutes, latency spikes and errors last ten minutes. Describe on a restarted pod shows <code>Last State: Terminated, Reason: Error, Exit Code: 137</code>, <code>Restart Count: 1</code>, and no OOMKilled. Container spec: <code>limits: {cpu: "1", memory: 3Gi}</code>, <code>requests: {cpu: 500m, memory: 3Gi}</code>; liveness probe <code>httpGet /health</code> on port 8080, default timing; <code>/health</code> runs <code>SELECT 1</code> against Postgres and pings Redis. The database team reports a nightly report starting at 18:58 that makes queries slower for a few minutes. Explain the chain of events and fix it.</p>
+<details><summary>Answer</summary>
+<p><strong>Chain:</strong> at 18:58 the report slows Postgres. <code>/health</code> runs a query, so its latency rises; the evening peak also pushes the 1-CPU limited JVM into CFS throttling (k8s10), slowing the health handler further. With the default <code>timeoutSeconds: 1</code> and <code>failureThreshold: 3</code>, three consecutive slow responses within 30 seconds fail liveness on every pod at nearly the same time. The kubelet kills each container: SIGTERM, then SIGKILL after the grace period (exit 137, reason Error — not an OOM). All 30 JVMs restart together, with cold JIT and connection pools, under peak traffic, and their start-up queries hit the already slow database. Ten minutes of errors follow — a cascading failure caused by the health check, exactly the scenario Zalando's post describes.</p>
+<p><strong>Fix:</strong> make liveness check only the JVM's ability to respond (a trivial endpoint with no dependencies, served off the main request thread pool), with <code>timeoutSeconds: 5</code> and <code>failureThreshold: 6</code>, or remove it; move the database and Redis checks into readiness so slow dependencies take pods out of rotation instead of killing them (and consider not failing readiness on every dependency blip, or every pod becomes unready together); add a startup probe for JVM warm-up; remove or raise the CPU limit to stop throttling; make the app exit cleanly on SIGTERM so restarts that do happen are graceful. Ask the database team to move the report to a replica. Verify by watching restarts and probe failure events during the next evening peak.</p>
+</details>
+</section>

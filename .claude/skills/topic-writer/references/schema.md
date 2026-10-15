@@ -9,6 +9,7 @@ and the HTML fields in `<section data-field="...">` blocks.
 | `id` | string | Stable, e.g. `net4`. Never change an existing id — progress is stored against it. |
 | `t` | string | Title. |
 | `tag` | string | Short group label shown on the card (e.g. `Transport`). |
+| `difficulty` | `"E" \| "M" \| "H"` | Required for track topics. Easy/Medium/Hard; completing it earns 50/100/200 XP. Judge the topic's place in its track: foundations E, core working knowledge M, advanced/production depth H. Design cases omit it. |
 | `sum` | string | One-sentence summary under the title (≤ 200 chars). Plain text. |
 | `prereq` | `[id, refresher][]` | Topic ids from any track + one plain-text sentence recalling what the reader needs from it. Empty/omitted for true foundations. |
 | `why` | HTML | |

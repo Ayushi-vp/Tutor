@@ -1,0 +1,549 @@
+<!-- topic source for classic/cd12; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "cd12",
+  "t": "Design a distributed rate limiter service",
+  "tag": "Traffic control",
+  "sum": "Shared counters for a fleet of gateways: the four algorithms replayed on one trace, the race in a naive INCR + EXPIRE and the atomic Lua fix, local versus global limits and their accuracy/latency trade-off, multi-region limits, fail-open versus fail-closed, and rate-limiting LLM tokens.",
+  "prereq": [
+    ["ld2", "Fixed window, sliding-window log, sliding-window counter and token bucket, built inside one process: what each stores per key and how each treats bursts."],
+    ["sc12", "Rate limiting caps what each client may send; load shedding drops work when the server itself is overloaded; retries without backoff amplify overload."],
+    ["sc2", "An API gateway sits in front of services and runs per-request policy (authentication, routing, limits) before forwarding."],
+    ["in3", "Redis is a single-threaded in-memory store sharded by key slot; each command is atomic, and replication to replicas is asynchronous."],
+    ["os4", "A race condition happens when two actors read shared state and then write based on what they read, with the other's write landing in between."],
+    ["sc17", "Multi-region systems trade consistency for latency: cross-region round trips cost tens to hundreds of milliseconds."]
+  ],
+  "myths": [
+    ["Redis INCR is atomic, so any limiter built on it is race-free.", "Each Redis command is atomic on its own, but a limiter usually needs several steps: read a value, decide, increment, set an expiry. A GET followed by INCR lets two gateways both read 99 against a limit of 100 and both allow; an INCR followed by a separate EXPIRE can leave a counter with no expiry if the client dies in between, blocking that user forever. Put the whole decision in one Lua script, or design the steps so each one is safe on its own."],
+    ["Splitting the global limit evenly across gateway nodes is equivalent to a global limit.", "Only if traffic is spread evenly, which it rarely is. A client holding one long-lived HTTP/2 connection lands on one node and gets only 1/N of its limit; a client spread across all nodes at once can get its full limit on each node during a burst. And N changes every time the fleet autoscales."],
+    ["A rate limiter should fail closed, because letting traffic through defeats its purpose.", "For general API limits the limiter protects capacity, and a limiter outage that rejects every request is a full outage caused by the protection layer. Stripe fails open and relies on other defences. Fail closed only where a single allowed request is expensive or dangerous (login attempts, SMS sends, payouts), and even then prefer a strict local fallback to rejecting everything."],
+    ["The sliding-window log is the best algorithm because it is exact.", "It is exact and it stores a timestamp for every accepted request in the window. At 1,000 requests per minute per key that is up to 1,000 entries per key — tens of kilobytes — and millions of keys make it hundreds of gigabytes. Cloudflare measured its two-counter approximation wrong on only 0.003% of 400 million requests. Exactness is rarely worth that memory."],
+    ["Rate limiting is only about requests per second.", "Requests differ in cost. An LLM API limits input and output tokens per minute as well as requests, a search API may weight expensive queries more, and long streaming requests need a concurrency limit. The limiter must accept a cost per request, and sometimes reconcile it after the request finishes."]
+  ],
+  "recap": [
+    "A distributed rate limiter is a decision service consulted on every request: given a key and a cost, allow or reject, fast and without becoming the outage itself.",
+    "Fixed windows allow up to twice the limit across a boundary; a sliding-window log is exact but stores every timestamp; a sliding-window counter weights the previous window and is nearly exact with two numbers; a token bucket allows a burst up to its capacity and refills at a steady rate.",
+    "Shared counters live in a store like Redis, sharded by key, with all keys for one client hashed to the same shard so one script can update them together.",
+    "Check-then-act (GET then INCR) overshoots under concurrency, and INCR then a separate EXPIRE can leak a counter with no expiry; one Lua script makes read-decide-write atomic in one round trip.",
+    "Using the store's clock (Redis TIME) inside the script avoids clock skew between gateway nodes.",
+    "Purely local limits are fast but inaccurate when traffic is uneven or the fleet size changes; global limits are accurate but add a network hop; hybrids sync or lease tokens and bound the overshoot.",
+    "Multi-region limits are usually enforced per region, with the global limit split by traffic share or reconciled asynchronously, because a cross-region round trip per request is too slow.",
+    "General API limiters fail open with a local backstop; security-critical limiters fail closed; either way the limiter call has a tight timeout.",
+    "Stripe runs request-rate and concurrency limiters plus two load shedders, all token buckets in Redis, and dark-launches each one; Cloudflare counts per data centre with a sliding-window counter.",
+    "For LLM APIs the unit is tokens: input tokens are known at admission, output tokens are counted as they are generated, so admission uses an estimate and reconciles afterwards."
+  ],
+  "glossary": [
+    ["429 Too Many Requests", "The HTTP status code for a rejected rate-limited request, defined in RFC 6585; it may carry a Retry-After header."],
+    ["Atomic", "Done as one indivisible step, so no other operation can observe or interleave with a half-finished state."],
+    ["Check-then-act race", "A bug where a value is read, a decision is made, and a write follows in a separate step, so a concurrent writer can invalidate the decision in between."],
+    ["Concurrency limiter", "A limiter on how many requests from one client may be in progress at once, rather than how many may start per second."],
+    ["Dark launch (shadow mode)", "Running a new limiter so it records what it would have rejected without actually rejecting anything."],
+    ["Descriptor", "A key-value pair describing a request (API key, route, IP) that rules match against to choose a limit."],
+    ["Fail closed", "Rejecting requests when the limiter cannot decide, for example because its store is down."],
+    ["Fail open", "Allowing requests when the limiter cannot decide."],
+    ["Fixed window", "Counting requests per calendar interval (this minute) and resetting the count at the boundary."],
+    ["GCRA", "Generic cell rate algorithm: a token bucket stored as a single timestamp, the theoretical arrival time of the next allowed request."],
+    ["Hash tag", "In Redis Cluster, the part of a key inside braces; only that part is hashed, so keys sharing it land in the same slot."],
+    ["Hot key", "A single key receiving so much traffic that the one shard holding it becomes a bottleneck."],
+    ["Load shedding", "Rejecting work because the server is overloaded, independent of which client sent it."],
+    ["Lua script (Redis)", "A script Redis runs to completion without interleaving any other command, making multi-step logic atomic."],
+    ["Overshoot", "Requests admitted above the configured limit because of approximation, synchronisation delay or races."],
+    ["Quota", "A long-period allowance (per day or month) usually tied to billing, which needs durable and exact counting."],
+    ["Retry-After", "An HTTP response header telling the client how many seconds to wait before retrying."],
+    ["Sliding-window counter", "An approximation of a trailing window: the current window's count plus the previous window's count weighted by how much of it still overlaps."],
+    ["Sliding-window log", "An exact trailing-window limiter that stores the timestamp of each accepted request."],
+    ["Token bucket", "A limiter holding up to a capacity of tokens that refill at a steady rate; each request spends tokens and is rejected if there are not enough."],
+    ["Token lease", "A batch of tokens a gateway node takes from the central store to spend locally, reducing round trips at the cost of some accuracy."],
+    ["TPM / RPM", "Tokens per minute and requests per minute, the two usual units of LLM API limits."]
+  ],
+  "qa": [
+    ["E", "Why does a rate limiter for a fleet of gateways need shared state?", "Because a client's requests are spread across many gateway nodes by the load balancer, and each node alone only sees its share. To enforce '100 per minute for this API key', someone must count all of that key's requests, which means a shared counter (or nodes that exchange counts). The design question is how to share it without adding much latency or a single point of failure."],
+    ["E", "Compare fixed window and token bucket.", "A fixed window counts requests per calendar interval and resets at the boundary, so a client can send the full limit at the end of one window and again at the start of the next — twice the limit in a short span. A token bucket holds up to a capacity of tokens refilled at a steady rate; it allows a burst up to the capacity and then a smooth rate, with no boundary effect. Both need only two numbers per key.", "Follow-up: When is fixed window fine? — For long-period quotas (requests per day) where boundary bursts do not hurt, and when you want counts that line up with billing periods."],
+    ["E", "What should a rate-limited client see?", "HTTP 429 Too Many Requests with a Retry-After header saying when to try again, and headers on every response showing the limit, the remaining allowance and when it resets, so well-behaved clients can slow down before being rejected. The error body should say which limit was hit. Clients should back off with jitter rather than retrying immediately."],
+    ["M", "What is the race in a naive Redis limiter, and how do you fix it?", "Two races. GET-then-INCR lets concurrent gateways read the same count below the limit and all proceed, overshooting. INCR then EXPIRE as separate calls means a client that crashes between them leaves a counter with no expiry, which grows past the limit and blocks the user permanently. Fix both by running the logic in one Lua script, which Redis executes atomically, or by structuring it so each step is safe alone (SET with NX and EX to create the key with its expiry, then INCR).", "Follow-up: Does MULTI/EXEC work too? — It makes INCR and EXPIRE execute together, but it cannot branch on a value read inside the transaction, so decision logic like a token bucket still needs a script."],
+    ["M", "Why read the time inside the Redis script rather than pass it from the gateway?", "Gateway nodes' clocks differ by milliseconds or more. If each node passes its own 'now', a node with a fast clock refills buckets early and a slow one can make time go backwards for a key, producing negative refills or extra tokens. Using the store's clock gives every decision for a key one consistent timeline. Modern Redis replicates script effects rather than re-running scripts, so calling TIME in a script is safe.", "Follow-up: What if the Redis primary fails over? — The new primary's clock may differ slightly; refill computation should clamp negative elapsed time to zero."],
+    ["M", "How do you size the Redis cluster for 500,000 API requests per second?", "One script call per request (all rules for a key in one script), so 500,000 calls per second. Assume a conservative 50,000 script calls per second per shard: 10 primaries, 15-20 with headroom, each with a replica. Memory is small: 10 million active keys × 3 rules × about 100 bytes is 3 GB. The binding constraint is per-shard CPU and hot keys, not memory.", "Follow-up: What about one customer sending 100,000 requests per second? — That key lives on one shard; split it into sub-counters across shards, or enforce part of its limit locally on each gateway."],
+    ["M", "Local limits or a central store: how do you choose?", "Central gives an accurate global count at the cost of a network hop (sub-millisecond in a region) and a dependency. Local gives zero added latency but each node sees only part of the traffic, so you split the limit by node count, which is wrong when traffic is uneven or the fleet scales. Most systems use central counters for per-customer limits and local token buckets as a coarse first line and fallback.", "Follow-up: How do you reduce central calls? — Batch: let a node take a lease of tokens, or sync counts every 100 ms, accepting a bounded overshoot."],
+    ["M", "Should the limiter fail open or closed when Redis is unavailable?", "It depends on what an extra request costs. General API rate limits fail open — a limiter outage should not become an API outage — with a local per-node token bucket as a backstop so a flood is still bounded. Limits that defend against abuse where each request has a real cost (login attempts, SMS sends, payouts) fail closed or fall back to a strict local limit. Either way, the limiter call has a tight timeout (a few milliseconds) and a circuit breaker.", "Follow-up: How would you know the fallback is working? — Emit a metric for every fail-open decision and alert on it; dark-launch the fallback path regularly."],
+    ["M", "How do you change limits safely?", "Treat rules as configuration with versioning and staged rollout. Deploy a new or tighter rule in shadow mode first, logging what it would reject, and compare against expectations; then enforce for a fraction of keys; then everywhere. Validate rules before pushing (a limit of zero, or a typo matching every key, is an instant outage). Stripe recommends dark-launching each limiter for exactly this reason."],
+    ["H", "How do you enforce a global limit across three regions?", "Avoid a synchronous cross-region call per request; it adds 50-150 ms. Either split the limit statically by each region's traffic share (simple, but a client that moves regions sees a smaller limit), or enforce locally and exchange counts asynchronously every second or so, accepting overshoot of up to the client's rate times the sync delay in each other region. Some providers route a client consistently to one region or data centre (Cloudflare relies on anycast to send one IP to the same location) so counting can stay local.", "Follow-up: What is the overshoot bound for async sync? — Roughly (regions − 1) × per-region rate × sync interval; at 300 requests per second per region, three regions and 1 s sync, up to 600 extra requests."],
+    ["H", "Design a concurrency limiter for long-running requests.", "Rate limits do not bound how many requests are in flight; long streams can pile up. Keep a sorted set per client in Redis with in-flight request ids scored by start time. On start, a script removes entries older than a timeout (crashed requests that never finished), checks the set size against the limit, and adds the id if allowed. On finish, remove the id. The timeout cleanup is essential, because without it a crash leaks a slot forever.", "Follow-up: Why not a simple counter with INCR and DECR? — A crash between start and finish leaks an increment forever; ids with timestamps can be expired."],
+    ["H", "How would you rate-limit an LLM API by tokens rather than requests?", "Use separate token buckets for requests, input tokens and output tokens per minute. Input tokens are known at admission (count them with the tokenizer) and can be charged up front; output tokens are unknown, so either charge them as they are generated during streaming or reserve an estimate and refund the difference at the end. Anthropic's API documents this shape: requests, input tokens and output tokens per minute with a token bucket, input tokens estimated at the start and adjusted, output tokens counted as they are produced, and cached input tokens not counted for most models.", "Follow-up: Why not charge max_tokens up front? — It over-reserves badly (most responses are far shorter than the maximum), so clients would hit limits while capacity sits idle; charging actual output avoids that."],
+    ["H", "How would this change if an ML model were in the path, for example to decide limits?", "An abuse model can score each client and adjust its bucket size or put it in a stricter tier, but the model must stay off the per-request hot path: score asynchronously from logs and write the resulting tier into the rules store, so the limiter itself still does a constant-time check. Keep hard caps the model cannot exceed, log its decisions for review, and roll out changes in shadow mode like any other rule.", "Follow-up: What goes wrong with a model setting limits? — Feedback loops: limiting a client changes its traffic, which changes its features. Evaluate against held-out decisions, not just the model's own outputs."]
+  ],
+  "refs": [
+    ["post", "Scaling your API with rate limiters (Stripe, Paul Tarjan, 2017)", "Stripe's four limiters — request rate, concurrent requests, fleet usage load shedder, worker utilisation load shedder — built as token buckets in Redis, failing open and dark-launched.", "https://stripe.com/blog/rate-limiters"],
+    ["post", "How we built rate limiting capable of scaling to millions of domains (Cloudflare, 2017)", "Per-data-centre counting with memcache, the sliding-window counter approximation and its measured error: 0.003% of 400 million requests wrongly allowed or limited.", "https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"],
+    ["docs", "Redis INCR: the rate limiter patterns", "The official per-second counter patterns, including the INCR-then-EXPIRE race and the Lua script that fixes it.", "https://redis.io/docs/latest/commands/incr/"],
+    ["docs", "Redis: scripting with Lua", "Why scripts execute atomically, how they are cached, and how script effects are replicated.", "https://redis.io/docs/latest/develop/programmability/eval-intro/"],
+    ["code", "Envoy rate limit service (envoyproxy/ratelimit)", "A production global rate limit service: descriptors, rule configuration, Redis or memcache backends, shadow mode.", "https://github.com/envoyproxy/ratelimit"],
+    ["docs", "Claude API rate limits", "A real token-based limit: requests, input tokens and output tokens per minute with a token bucket, cache-aware input counting, and rate-limit response headers.", "https://platform.claude.com/docs/en/api/rate-limits"],
+    ["docs", "RFC 6585: Additional HTTP Status Codes", "Defines 429 Too Many Requests and its optional Retry-After header.", "https://www.rfc-editor.org/rfc/rfc6585"],
+    ["docs", "IETF draft: RateLimit header fields for HTTP", "The emerging standard for advertising limits and remaining quota in response headers.", "https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>It is 02:13 and the on-call engineer for a payments API is paged: latency on every endpoint has tripled. The cause, found twenty minutes later, is a single customer whose nightly reconciliation script has a bug — it retries every failed call immediately, forever, from 400 threads. That one customer is now sending 30,000 requests per second, and the database behind the API is spending its time on them while every other customer times out. There is a rate limit of 100 requests per second per API key, written into the gateway years ago. It is enforced separately on each of 60 gateway machines, so the customer is actually allowed 6,000 per second. And the counters reset at the top of every second, so even that is exceeded in bursts.</p>
+<p>A rate limiter exists so that one client, by accident or on purpose, cannot consume capacity that belongs to everyone. Inside one process it is a small algorithm — a counter or a bucket of tokens — and the low-level design case ld2 builds those. The problem changes completely when the limit must hold across a fleet: dozens or hundreds of gateway nodes in several regions, each seeing a slice of each client's traffic, all needing to agree on one count, within a millisecond, for every single request, without the limiter itself becoming the thing that takes the API down.</p>
+<p>That is a distributed systems problem in miniature. Shared counters invite races. A central store adds a network hop and a dependency. Local counters are fast but disagree. Regions are 100 ms apart. Clocks differ. And the limiter must decide what to do when its own store is unreachable — allow everything, or reject everything — which is a business decision dressed as a technical one.</p>
+<p>This lesson works through the design in interview order: requirements; estimates (decisions per second, store sizing, memory per algorithm, latency budget); the API and rule model; the high-level design and the critical path of one check; then three deep dives. The first replays fixed window, sliding log, sliding counter and token bucket on the same request trace, so their differences are concrete. The second is the race in a naive Redis INCR + EXPIRE and the atomic Lua fix. The third is local versus global limits, multi-region limits, and fail-open versus fail-closed. The real cases are Stripe's account of its four limiters and Cloudflare's per-data-centre counting; the lab replays all four algorithms on one trace and reproduces the check-then-act race.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: one club, many doors, one clicker</h4>
+<p>Picture a nightclub with a fire limit of 300 people. With one door and one bouncer holding a clicker, enforcing it is trivial: click in, click out, stop at 300. Now the club opens six doors to handle the queue. Each bouncer has a clicker, and each sees only the people at their door. If each stops at 50 (300 ÷ 6), the limit holds — until one door gets twice the queue of the others and turns people away while the club is half empty. If each bouncer radios the others before letting anyone in, the count is right, but every entry waits for a radio call, and if the radio dies, nobody knows what to do. The compromises are the interesting part: bouncers report their counts every minute; or the manager hands each bouncer a strip of 20 wristbands, and they come back for more when they run out.</p>
+<p>Every piece of that maps onto the design. The doors are <strong>gateway nodes</strong> behind a load balancer. The clicker is a <strong>counter</strong> or <strong>token bucket</strong> per client key. The radio is a call to a <strong>shared store</strong> (Redis is the usual choice). Reporting every minute is <strong>periodic synchronisation</strong>; the strip of wristbands is a <strong>token lease</strong>. The question of what to do when the radio fails is <strong>fail-open versus fail-closed</strong>.</p>
+<p>The analogy breaks in two useful places. A club has one fire limit; an API has many overlapping limits per request — per API key, per endpoint, per IP address, per organisation — all checked together. And a person is one unit, while requests differ hugely in cost: a cheap read, an expensive search, an LLM call generating 4,000 tokens. The limiter has to count in the right units.</p>
+
+<h4>What the service actually does</h4>
+<p>Strip away the algorithms and a rate limiter service answers one question per request: <em>given these descriptors (who is calling, what they are calling) and this cost, allow or reject — and if rejecting, when should they retry?</em> The answer must come back in about a millisecond, because it sits on the path of every request. It must be correct enough that a misbehaving client is actually stopped, and cheap enough that checking does not cost more than the requests it protects. And it must degrade gracefully, because a limiter that fails by rejecting everything is an outage you built yourself.</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Architecture: clients reach a load balancer that spreads requests across gateway nodes. Each gateway has a limiter client with cached rules and a local token bucket backstop. The limiter client calls a Redis cluster, sharded by key with hash tags, running a Lua script per check. A rules service pushes rule configuration to gateways. Allowed requests go to backend services; rejected requests get 429 with Retry-After. Decisions are logged to metrics.">
+  <defs><marker id="cd12-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="120" width="70" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="45" y="142" text-anchor="middle" style="fill:var(--ink)">Clients</text>
+    <text x="45" y="158" text-anchor="middle" style="fill:var(--muted)">API keys</text>
+    <rect x="100" y="120" width="70" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="135" y="142" text-anchor="middle" style="fill:var(--ink)">Load</text>
+    <text x="135" y="158" text-anchor="middle" style="fill:var(--ink)">balancer</text>
+    <line x1="80" y1="145" x2="98" y2="145" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="200" y="50" width="160" height="190" rx="6" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="280" y="44" text-anchor="middle" style="fill:var(--muted)">gateway fleet (N nodes)</text>
+    <rect x="215" y="65" width="130" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="280" y="86" text-anchor="middle" style="fill:var(--ink)">Gateway 1</text>
+    <text x="280" y="103" text-anchor="middle" style="fill:var(--muted)">rules + local bucket</text>
+    <rect x="215" y="125" width="130" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="280" y="146" text-anchor="middle" style="fill:var(--ink)">Gateway 2</text>
+    <text x="280" y="163" text-anchor="middle" style="fill:var(--muted)">rules + local bucket</text>
+    <text x="280" y="205" text-anchor="middle" style="fill:var(--muted)">… gateway N</text>
+    <line x1="170" y1="140" x2="213" y2="95" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="170" y1="148" x2="213" y2="150" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="410" y="120" width="140" height="70" rx="4" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:1.5"/>
+    <text x="480" y="142" text-anchor="middle" style="fill:var(--ink)">Redis cluster</text>
+    <text x="480" y="160" text-anchor="middle" style="fill:var(--muted)">sharded by {key}</text>
+    <text x="480" y="177" text-anchor="middle" style="fill:var(--muted)">Lua: read-decide-write</text>
+    <line x1="345" y1="100" x2="408" y2="135" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--crit)"/>
+    <line x1="345" y1="152" x2="408" y2="155" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--crit)"/>
+    <text x="378" y="112" text-anchor="middle" style="fill:var(--crit)">~0.5 ms</text>
+    <rect x="410" y="30" width="140" height="44" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="480" y="50" text-anchor="middle" style="fill:var(--ink)">Rules service</text>
+    <text x="480" y="66" text-anchor="middle" style="fill:var(--muted)">versioned, shadow mode</text>
+    <line x1="410" y1="56" x2="347" y2="80" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <rect x="410" y="222" width="140" height="44" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="480" y="242" text-anchor="middle" style="fill:var(--ink)">Backend services</text>
+    <text x="480" y="258" text-anchor="middle" style="fill:var(--good)">allowed</text>
+    <line x1="345" y1="170" x2="408" y2="236" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--good)"/>
+    <path d="M215,165 L190,265 L60,265 L45,172" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--crit);stroke-dasharray:4 3"/>
+    <text x="125" y="282" text-anchor="middle" style="fill:var(--crit)">429 + Retry-After</text>
+    <rect x="575" y="120" width="55" height="70" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="602" y="150" text-anchor="middle" style="fill:var(--ink)">Metrics</text>
+    <text x="602" y="166" text-anchor="middle" style="fill:var(--muted)">decisions</text>
+    <line x1="550" y1="155" x2="573" y2="155" marker-end="url(#cd12-arrow)" style="fill:none;stroke:var(--line-2)"/>
+  </g>
+</svg>
+<figcaption>The limiter is not a separate hop for the request itself: each gateway asks the shared store "may this key spend this much?" in one round trip, then forwards or rejects. Rules arrive out of band and are cached; the local bucket on each node is the backstop when the store is slow or down.</figcaption>
+</figure>
+
+<h4>Where the limiter lives</h4>
+<p>You can put the limiting logic in three places, and an interviewer will ask why you chose one. In the <strong>client library</strong>: cheap, but you do not control clients. In the <strong>gateway or sidecar</strong> in front of services (sc2): every request passes through it, it knows the API key after authentication, and it can reject before any backend work happens — the usual answer. Or as a <strong>separate rate-limit service</strong> that gateways call over the network (Envoy's global rate limit service works this way): rules and logic are centralised, at the cost of one more network hop. A common compromise is a thin limiter client library inside the gateway that talks directly to Redis, with rules pushed from a central service — the shape drawn above.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–20</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">20–28</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">28–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> (1) Define rules: a limit (for example 100 requests per second, or 1,000 per minute) on a combination of <strong>descriptors</strong> — API key, organisation, endpoint, IP address, user tier. (2) For each request, check all matching rules with a cost (default 1) and return allow or reject, the remaining allowance and the time until reset. (3) Return HTTP 429 Too Many Requests with a Retry-After header on rejection, and rate-limit headers on every response. (4) Change rules at runtime without deploys, including <strong>shadow mode</strong> (log what would be rejected without rejecting). (5) Expose metrics: decisions per rule and key, top limited keys. Out of scope, said aloud: billing-grade monthly quotas (which need durable exact counting — mention it as a separate system), DDoS mitigation at the network layer (net14), and bot detection.</p>
+<p><strong>Non-functional.</strong> Added latency under about 1 ms at p50 and 2-5 ms at p99. Accuracy: within a few percent of the configured limit; small overshoot is acceptable, systematic under-admission of good clients is not. Availability: the limiter must never be the reason the API is down. Scale: hundreds of thousands to millions of decisions per second across regions. Fairness: one client cannot consume another's allowance.</p>
+<p><strong>Clarifying questions.</strong> What is being protected — capacity (so approximate is fine) or money (so be strict)? Are limits per second, per minute, per day? Does the limit need to be global across regions, or per region? Do requests have different costs (an LLM call counts tokens)? What should happen if the limiter's store is down? The answers pick the algorithm and the failure policy.</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Assume an API platform with <strong>500,000 requests per second</strong> at peak across <strong>3 regions</strong>, <strong>10 million active API keys</strong>, and <strong>3 rules</strong> checked per request (per key per second, per key per endpoint per minute, per IP per minute).</p>
+<p><strong>Checks per second.</strong> 500,000 × 3 = <strong>1.5 million rule evaluations per second</strong>. If all three rules for a request are evaluated in one call to the store (possible when their keys live on the same shard, explained below), that is <strong>500,000 store calls per second</strong>.</p>
+<p><strong>Store throughput.</strong> Redis executes commands on one thread per shard; a small Lua script doing a few hash reads and writes takes on the order of tens of microseconds. Plan conservatively for <strong>50,000 script calls per second per shard</strong>: 500,000 ÷ 50,000 = 10 primaries worldwide, 15-20 with 50% headroom, each with a replica. Per region, the busiest might carry 40% of traffic: 200,000 calls per second, 6-8 primaries.</p>
+<p><strong>Memory, by algorithm.</strong> A token bucket needs two numbers per key and rule (tokens, last refill time); stored as a small Redis hash with its key name and overhead, about <strong>100 bytes</strong>. 10M keys × 3 rules × 100 B = <strong>3 GB</strong>. A fixed window or sliding-window counter is similar (one or two counters). A <strong>sliding-window log</strong> stores one entry per accepted request in the window: at a limit of 1,000 per minute, a busy key has up to 1,000 sorted-set entries at roughly 64 bytes each — <strong>64 KB per key</strong>. If even 1 million keys were near their limits, that is <strong>64 GB</strong> for one rule, and 10 million would be 640 GB. That single estimate is why logs are reserved for low limits.</p>
+<p><strong>Latency budget.</strong> If the API's p99 target is 200 ms, the limiter can have 2-5 ms of it. An in-region round trip to Redis is roughly 0.2-1 ms, which fits. A cross-region round trip is 50-150 ms, which does not: <em>global limits cannot be checked synchronously across regions on every request</em>. The estimate decides a later deep dive.</p>
+<p><strong>Bandwidth.</strong> A check request and reply are a few hundred bytes: 500,000 × 300 B = 150 MB/s spread across gateways and shards — not a constraint.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+<tr><td>Rule evaluations</td><td>500k req/s × 3 rules</td><td>1.5M/s</td></tr>
+<tr><td>Store calls (rules batched)</td><td>one script per request</td><td>500k/s</td></tr>
+<tr><td>Redis primaries</td><td>500k ÷ 50k, + headroom</td><td>15-20 (+ replicas)</td></tr>
+<tr><td>Token-bucket memory</td><td>10M × 3 × 100 B</td><td>~3 GB</td></tr>
+<tr><td>Sliding-log memory (1k/min)</td><td>1k entries × 64 B per busy key</td><td>64 KB/key; 64 GB per 1M busy keys</td></tr>
+<tr><td>Latency: in-region / cross-region</td><td>round trip</td><td>~0.5 ms / 50-150 ms</td></tr>
+</table>
+
+<h4>3 · The API</h4>
+<p>Two APIs: the internal check API the gateway uses, and what the end client sees.</p>
+<pre>POST /v1/ratelimit/check                      (internal; usually gRPC)
+  {domain: "public_api",
+   descriptors: [{api_key: "k_123"}, {api_key: "k_123", route: "/v1/search"}, {ip: "203.0.113.7"}],
+   cost: 1}
+  → {decision: "OVER_LIMIT",
+     statuses: [{rule: "key_per_sec",  limit: 100,  remaining: 0,  reset_after_ms: 400},
+                {rule: "key_route_min", limit: 1000, remaining: 212, reset_after_ms: 31000},
+                {rule: "ip_per_min",   limit: 600,  remaining: 590, reset_after_ms: 52000}]}
+
+Client response on rejection:
+  HTTP/1.1 429 Too Many Requests
+  Retry-After: 1
+  RateLimit-Limit: 100
+  RateLimit-Remaining: 0
+  RateLimit-Reset: 1
+  {"error": {"type": "rate_limit_error", "message": "100 requests/second per API key exceeded"}}</pre>
+<p>A request is allowed only if <em>every</em> matching rule allows it, and a rejected request should not consume allowance from the rules that would have allowed it — a detail the multi-rule script in deep dive B handles by deciding every rule before spending from any. 429 is defined in RFC 6585; the <code>RateLimit-*</code> header names come from an IETF draft, and many APIs still use their own <code>X-RateLimit-*</code> names. The point is that clients can see their remaining budget and slow down before they hit the wall.</p>
+
+<h4>4 · The data model</h4>
+<pre>rules (config store, versioned, pushed to gateways):
+  {id: "key_per_sec", domain: "public_api", match: {api_key: "*"},
+   algorithm: "token_bucket", capacity: 100, refill_per_sec: 100,
+   shadow: false, fail_mode: "open"}
+  {id: "login_per_ip", match: {route: "/login", ip: "*"},
+   algorithm: "sliding_counter", limit: 10, window_s: 60, fail_mode: "closed"}
+
+counters (Redis, sharded by hash tag, all with TTLs):
+  rl:{k_123}:key_per_sec          → hash {tokens: 37.5, ts: 1767000000.123}
+  rl:{k_123}:key_route_min:/v1/search:29450000 → integer (current window count)
+  rl:{ip:203.0.113.7}:ip_per_min:29450000      → integer</pre>
+<p>The braces are a Redis Cluster <strong>hash tag</strong>: only the part inside <code>{…}</code> is hashed to pick a shard, so every counter for API key <code>k_123</code> lands on the same shard and one script can read and update them together. The IP rule has a different tag and may live elsewhere, so in practice per-key rules are batched into one call and the IP rule is a second call (or is enforced locally). Every counter carries a TTL (time to live: an expiry after which Redis deletes the key) so idle keys disappear; nothing about a rate limit needs to live longer than its window.</p>
+
+<h4>5 · High-level design and the critical path</h4>
+<p>One request, step by step: (1) The load balancer sends it to any gateway node. (2) The gateway authenticates it and extracts descriptors (API key, route, client IP). (3) It matches descriptors against its cached rules — a pure in-memory step. (4) For the key's rules, it calls the Redis shard owning <code>{k_123}</code> with one Lua script, passing each rule's parameters and the cost. The script reads the counters, refills or slides them, decides for all rules, and only if all allow, spends from all of them; it returns the decision and remaining counts. (5) The gateway adds rate-limit headers and either forwards the request or returns 429. (6) It emits a decision metric asynchronously. Total added latency: one in-region round trip plus microseconds of script time.</p>
+<p>Around this path sit the <strong>rules service</strong> (stores rule versions, validates them, pushes them to gateways, supports shadow mode and gradual rollout) and <strong>observability</strong> (which keys are being limited, by which rule, and how often the limiter failed open). The limiter client in each gateway also holds a <strong>local token bucket</strong> per key as a coarse backstop for when Redis is slow or unreachable.</p>
+
+<h4>6 · Deep dive A: four algorithms on one request trace</h4>
+<p>ld2 builds the four algorithms inside one process. Here the point is to see how differently they behave on the same traffic, because choosing between them is a product decision. The rule is <strong>4 requests per 10 seconds</strong>. A single client sends 12 requests at t = 1, 6, 8, 9, 9.5, 10.5, 11, 12, 14, 17, 19 and 23 seconds. For the windows, "window 0" is [0, 10), "window 1" is [10, 20) and "window 2" is [20, 30).</p>
+<p><strong>Fixed window.</strong> Count accepted requests per window; reject when the window's count has reached 4. Window 0 accepts t = 1, 6, 8, 9 and rejects 9.5. At t = 10 the count resets: 10.5, 11, 12 and 14 are accepted, then 17 and 19 rejected. Window 2 accepts 23. Total accepted: 9. Look at the 8 seconds from t = 6 to t = 14: <strong>7 requests got through</strong> against a limit of 4 per 10 s — nearly twice the limit, because the boundary at t = 10 wiped the count. That is the fixed window's defining flaw.</p>
+<p><strong>Sliding-window log.</strong> Keep the timestamp of each accepted request; a new request is allowed if fewer than 4 accepted timestamps fall in the trailing 10 seconds (t − 10, t]. At t = 9.5 the log holds 1, 6, 8, 9 → reject. At 10.5 the window is (0.5, 10.5], still 4 → reject. At 11 the window (1, 11] has dropped t = 1 → 3 → accept. At 12 and 14: 6, 8, 9, 11 → reject. At 17: (7, 17] holds 8, 9, 11 → accept. At 19: (9, 19] holds 11, 17 → accept (9 has just left). At 23: accept. Total 8, and no 10-second span ever holds more than 4. Exact — at the price of storing every timestamp.</p>
+<p><strong>Sliding-window counter.</strong> Keep only the counts for the current and previous fixed windows, and estimate the trailing-window count as <em>previous × (fraction of the previous window still inside the trailing window) + current</em>, assuming the previous window's requests were evenly spread. Allow if the estimate plus this request's cost is at most 4. At t = 10.5: previous = 4, 0.5 s into window 1 so 95% of the previous window overlaps: 4 × 0.95 + 0 = 3.8; 3.8 + 1 = 4.8 &gt; 4 → reject. At 11: 3.6 → reject; at 12: 3.2 → reject. At 14: 4 × 0.6 = 2.4 → accept (current becomes 1). At 17: 4 × 0.3 + 1 = 2.2 → accept. At 19: 0.4 + 2 = 2.4 → accept. At 23 (window 2, previous = 3): 3 × 0.7 = 2.1 → accept. Total 8 — the same count as the exact log, from two numbers. It differs in <em>which</em> requests pass: it rejected 11 (which the log allowed) and allowed 14 (which the log rejected), because its "evenly spread" assumption is wrong for a window whose four requests were bunched at the end. Cloudflare measured this approximation on 400 million requests and found 0.003% wrongly allowed or limited.</p>
+<p><strong>Token bucket.</strong> Capacity 4 tokens, refilled at 0.4 tokens per second (4 per 10 s — the same long-run rate), starting full. Each request needs 1 token. t = 1: 4 → 3. t = 6: 3 + 5 × 0.4 = 5, capped at 4 → 3. t = 8: 3.8 → 2.8. t = 9: 3.2 → 2.2. t = 9.5: 2.4 → 1.4 (accepted — the bucket still holds part of its burst allowance). t = 10.5: 1.8 → 0.8. t = 11: 1.0 → 0. t = 12: 0.4 → <strong>reject</strong>. t = 14: 1.2 → 0.2. t = 17: 1.4 → 0.4. t = 19: 1.2 → 0.2. t = 23: 1.8 → 0.8. Total <strong>11</strong>. The bucket is the most permissive here because it expresses "4 per 10 s" as "a burst of 4, then 0.4 per second", which lets through anything not faster than the drip once the burst is spent. Over a long run its average still converges to 0.4 per second.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Twelve requests at times 1, 6, 8, 9, 9.5, 10.5, 11, 12, 14, 17, 19 and 23 seconds, limit 4 per 10 seconds. Four rows show which requests each algorithm accepts: fixed window accepts 9 including a burst of 7 within 10 seconds around the boundary at t=10; sliding log accepts 8; sliding counter accepts 8; token bucket with capacity 4 refilling 0.4 per second accepts 11.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="320" y="18" text-anchor="middle" style="fill:var(--ink);font-weight:600">Same 12 requests, limit 4 per 10 s: who gets through?</text>
+    <line x1="295.0" y1="34" x2="295.0" y2="236" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <line x1="480.0" y1="34" x2="480.0" y2="236" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <line x1="110.0" y1="236" x2="572.5" y2="236" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="110.0" y="252" text-anchor="middle" style="fill:var(--muted)">0s</text>
+    <text x="202.5" y="252" text-anchor="middle" style="fill:var(--muted)">5s</text>
+    <text x="295.0" y="252" text-anchor="middle" style="fill:var(--muted)">10s</text>
+    <text x="387.5" y="252" text-anchor="middle" style="fill:var(--muted)">15s</text>
+    <text x="480.0" y="252" text-anchor="middle" style="fill:var(--muted)">20s</text>
+    <text x="572.5" y="252" text-anchor="middle" style="fill:var(--muted)">25s</text>
+    <line x1="128.5" y1="40" x2="128.5" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="221.0" y1="40" x2="221.0" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="258.0" y1="40" x2="258.0" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="276.5" y1="40" x2="276.5" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="285.8" y1="40" x2="285.8" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="304.2" y1="40" x2="304.2" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="313.5" y1="40" x2="313.5" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="332.0" y1="40" x2="332.0" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="369.0" y1="40" x2="369.0" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="424.5" y1="40" x2="424.5" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="461.5" y1="40" x2="461.5" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="535.5" y1="40" x2="535.5" y2="48" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="10" y="48" style="fill:var(--ink-2)">requests</text>
+    <text x="10" y="82" style="fill:var(--ink)">Fixed window</text>
+    <line x1="110.0" y1="78" x2="572.5" y2="78" style="fill:none;stroke:var(--line-2)"/>
+    <circle cx="128.5" cy="78" r="5" style="fill:var(--good)"/>
+    <circle cx="221.0" cy="78" r="5" style="fill:var(--good)"/>
+    <circle cx="258.0" cy="78" r="5" style="fill:var(--good)"/>
+    <circle cx="276.5" cy="78" r="5" style="fill:var(--good)"/>
+    <text x="285.8" y="83" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <circle cx="304.2" cy="78" r="5" style="fill:var(--good)"/>
+    <circle cx="313.5" cy="78" r="5" style="fill:var(--good)"/>
+    <circle cx="332.0" cy="78" r="5" style="fill:var(--good)"/>
+    <circle cx="369.0" cy="78" r="5" style="fill:var(--good)"/>
+    <text x="424.5" y="83" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="461.5" y="83" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <circle cx="535.5" cy="78" r="5" style="fill:var(--good)"/>
+    <text x="580.5" y="82" style="fill:var(--muted)">9 pass</text>
+    <text x="10" y="124" style="fill:var(--ink)">Sliding log</text>
+    <line x1="110.0" y1="120" x2="572.5" y2="120" style="fill:none;stroke:var(--line-2)"/>
+    <circle cx="128.5" cy="120" r="5" style="fill:var(--good)"/>
+    <circle cx="221.0" cy="120" r="5" style="fill:var(--good)"/>
+    <circle cx="258.0" cy="120" r="5" style="fill:var(--good)"/>
+    <circle cx="276.5" cy="120" r="5" style="fill:var(--good)"/>
+    <text x="285.8" y="125" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="304.2" y="125" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <circle cx="313.5" cy="120" r="5" style="fill:var(--good)"/>
+    <text x="332.0" y="125" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="369.0" y="125" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <circle cx="424.5" cy="120" r="5" style="fill:var(--good)"/>
+    <circle cx="461.5" cy="120" r="5" style="fill:var(--good)"/>
+    <circle cx="535.5" cy="120" r="5" style="fill:var(--good)"/>
+    <text x="580.5" y="124" style="fill:var(--muted)">8 pass</text>
+    <text x="10" y="166" style="fill:var(--ink)">Sliding counter</text>
+    <line x1="110.0" y1="162" x2="572.5" y2="162" style="fill:none;stroke:var(--line-2)"/>
+    <circle cx="128.5" cy="162" r="5" style="fill:var(--good)"/>
+    <circle cx="221.0" cy="162" r="5" style="fill:var(--good)"/>
+    <circle cx="258.0" cy="162" r="5" style="fill:var(--good)"/>
+    <circle cx="276.5" cy="162" r="5" style="fill:var(--good)"/>
+    <text x="285.8" y="167" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="304.2" y="167" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="313.5" y="167" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="332.0" y="167" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <circle cx="369.0" cy="162" r="5" style="fill:var(--good)"/>
+    <circle cx="424.5" cy="162" r="5" style="fill:var(--good)"/>
+    <circle cx="461.5" cy="162" r="5" style="fill:var(--good)"/>
+    <circle cx="535.5" cy="162" r="5" style="fill:var(--good)"/>
+    <text x="580.5" y="166" style="fill:var(--muted)">8 pass</text>
+    <text x="10" y="208" style="fill:var(--ink)">Token bucket</text>
+    <line x1="110.0" y1="204" x2="572.5" y2="204" style="fill:none;stroke:var(--line-2)"/>
+    <circle cx="128.5" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="221.0" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="258.0" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="276.5" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="285.8" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="304.2" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="313.5" cy="204" r="5" style="fill:var(--good)"/>
+    <text x="332.0" y="209" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <circle cx="369.0" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="424.5" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="461.5" cy="204" r="5" style="fill:var(--good)"/>
+    <circle cx="535.5" cy="204" r="5" style="fill:var(--good)"/>
+    <text x="580.5" y="208" style="fill:var(--muted)">11 pass</text>
+    <rect x="213.6" y="64" width="162.79999999999998" height="28" rx="4" style="fill:none;stroke:var(--crit);stroke-dasharray:3 2"/>
+  </g>
+</svg>
+<figcaption>Dots passed, crosses were rejected. The dashed box shows the fixed window letting 7 requests through in 8 seconds (t = 6 to 14) because its count resets at t = 10. The sliding log and counter hold the line at 4; the token bucket allows more in total because it refills continuously at 0.4/s, which is the same long-run rate expressed as a burst plus a steady drip.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Algorithm</th><th>State per key</th><th>Accepted (of 12)</th><th>Behaviour</th><th>Use when</th></tr></thead>
+<tr><td>Fixed window</td><td>1 counter</td><td>9</td><td>Up to 2× at boundaries</td><td>Daily quotas, coarse protection</td></tr>
+<tr><td>Sliding log</td><td>1 timestamp per request</td><td>8</td><td>Exact</td><td>Low limits that must be exact (login attempts)</td></tr>
+<tr><td>Sliding counter</td><td>2 counters</td><td>8</td><td>Nearly exact, smooth</td><td>Per-minute API limits at scale</td></tr>
+<tr><td>Token bucket</td><td>tokens + timestamp</td><td>11</td><td>Burst then steady rate</td><td>Most API rate limits; bursty clients</td></tr>
+</table>
+<p>The choice is about what the limit means to the customer. "No more than 1,000 per minute, ever" is a sliding window. "Up to 100 per second sustained, with short bursts allowed" is a token bucket, and it is what most public APIs advertise (Stripe's request-rate limiter is a token bucket; Anthropic's API documents its limits as token buckets). Fixed windows survive where counts must line up with calendar periods.</p>
+
+<h4>7 · Deep dive B: shared counters and the race</h4>
+<p><strong>The naive version.</strong> Each gateway does: <code>count = GET key</code>; if count &lt; limit, <code>INCR key</code> and allow; else reject. Every individual Redis command is atomic, but this is two commands with a decision between them. Suppose the limit is 100 and the count is 99. Gateways A and B each receive a request at the same moment. A runs GET → 99. B runs GET → 99. Both decide "under the limit". A runs INCR → 100. B runs INCR → 101. Both requests are allowed. With 50 gateways all receiving requests for a key that is at its limit during a burst, the overshoot can be tens of requests per window. This is the <strong>check-then-act race</strong> (os4) in a distributed costume.</p>
+<p><strong>A better order, and a new race.</strong> INCR returns the new value atomically, so "INCR first, then compare" removes the first race: A gets 100 (allowed), B gets 101 (rejected). For a fixed window, the key also needs an expiry so it resets. The Redis documentation's own example does exactly this: <code>INCR key</code>; if the result is 1 (the key was just created), <code>EXPIRE key 1</code>. And it flags the race: if the client crashes, times out or is killed after the INCR but before the EXPIRE, the key exists <em>without an expiry</em>. It never resets. Its count grows past the limit and stays there, and that user is rejected forever — until someone deletes the key by hand. Under load, with timeouts and deploys killing gateway processes mid-request, "rare" happens daily across a fleet.</p>
+<p><strong>The atomic fix: one Lua script.</strong> Redis runs a Lua script to completion without running any other command in between; its documentation describes the guarantee as all of the script's effects having either not yet happened or already happened. So read, decide and write become one indivisible step, in one network round trip:</p>
+<pre>-- fixed window: KEYS[1] = counter key, ARGV[1] = limit, ARGV[2] = window seconds
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+if n &gt; tonumber(ARGV[1]) then return 0 end
+return 1</pre>
+<p>A token bucket needs real decision logic — refill by elapsed time, compare, spend — so a script is the natural home for it:</p>
+<pre>-- token bucket: KEYS[1] = bucket key; ARGV = capacity, refill_per_sec, cost
+local cap, rate, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local t = redis.call('TIME')                          -- the store's clock, not the gateway's
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or cap                  -- missing key = full bucket
+local ts = tonumber(b[2]) or now
+tokens = math.min(cap, tokens + math.max(0, now - ts) * rate)
+local allowed = 0
+if tokens &gt;= cost then tokens = tokens - cost; allowed = 1 end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate * 1000))  -- idle until full = forget
+return {allowed, tostring(tokens)}</pre>
+<p>Three details carry the design. <strong>The clock</strong> comes from Redis's <code>TIME</code>, so every decision for one key uses one timeline; if each gateway passed its own time, a node whose clock ran 200 ms fast would refill buckets early, and the <code>math.max(0, …)</code> guard exists because time can still step backwards after a failover. (Older Redis versions re-ran scripts on replicas, which made reading the clock unsafe; Redis switched to replicating a script's effects by default in 5.0 and exclusively in 7.0.) <strong>The expiry</strong> is the time to refill from empty to full: after that, a missing key and a full bucket are the same thing, so forgetting it is free. <strong>The return value</strong> includes the remaining tokens so the gateway can fill rate-limit headers.</p>
+<p><strong>Multiple rules in one call.</strong> To check "per key per second" and "per key per endpoint per minute" together, the script takes several keys, computes every rule's decision first, and spends from all only if all allow. Redis Cluster requires every key a script touches to be in the same slot, which is what the <code>{k_123}</code> hash tag guarantees.</p>
+<p><strong>Without scripts.</strong> If scripts are not available (some managed caches restrict them), make each step individually safe: <code>SET key 0 EX 60 NX</code> creates the counter with its expiry in one atomic command if it does not exist, and a following <code>INCR</code> can no longer leak an expiry-less key. Memcache-based designs like Cloudflare's rely on atomic increments on keys that already include the window number, and let the cache's own eviction and expiry clean up.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Sequence comparison. Left: gateways A and B both GET the count 99, both decide to allow, both INCR, ending at 101 with two requests allowed against a limit of 100. Right: A and B each send one Lua script; Redis runs A's script fully (99 to 100, allow) then B's (100, reject).">
+  <defs><marker id="cd12-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="160" y="18" text-anchor="middle" style="fill:var(--crit);font-weight:600">GET, then INCR: both allowed</text>
+    <text x="50" y="40" text-anchor="middle" style="fill:var(--ink)">A</text>
+    <text x="160" y="40" text-anchor="middle" style="fill:var(--ink)">Redis</text>
+    <text x="270" y="40" text-anchor="middle" style="fill:var(--ink)">B</text>
+    <line x1="50" y1="48" x2="50" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="160" y1="48" x2="160" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="270" y1="48" x2="270" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="50" y1="65" x2="158" y2="75" marker-end="url(#cd12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="95" y="62" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">GET → 99</text>
+    <line x1="270" y1="80" x2="162" y2="90" marker-end="url(#cd12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="225" y="77" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">GET → 99</text>
+    <text x="50" y="118" text-anchor="middle" style="fill:var(--muted)">99&lt;100 ok</text>
+    <text x="270" y="118" text-anchor="middle" style="fill:var(--muted)">99&lt;100 ok</text>
+    <line x1="50" y1="140" x2="158" y2="150" marker-end="url(#cd12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="95" y="137" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">INCR → 100</text>
+    <line x1="270" y1="160" x2="162" y2="170" marker-end="url(#cd12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="225" y="157" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">INCR → 101</text>
+    <text x="160" y="215" text-anchor="middle" style="fill:var(--crit)">2 allowed, limit 100 exceeded</text>
+    <line x1="320" y1="30" x2="320" y2="255" style="fill:none;stroke:var(--line-2)"/>
+    <text x="480" y="18" text-anchor="middle" style="fill:var(--good);font-weight:600">One Lua script each: serialised</text>
+    <text x="370" y="40" text-anchor="middle" style="fill:var(--ink)">A</text>
+    <text x="480" y="40" text-anchor="middle" style="fill:var(--ink)">Redis</text>
+    <text x="590" y="40" text-anchor="middle" style="fill:var(--ink)">B</text>
+    <line x1="370" y1="48" x2="370" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="480" y1="48" x2="480" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="590" y1="48" x2="590" y2="250" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="370" y1="65" x2="478" y2="75" marker-end="url(#cd12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="415" y="62" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">EVALSHA</text>
+    <line x1="590" y1="68" x2="482" y2="78" marker-end="url(#cd12-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="545" y="62" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">EVALSHA</text>
+    <rect x="430" y="88" width="100" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="480" y="105" text-anchor="middle" style="fill:var(--ink)">A: 99→100</text>
+    <text x="480" y="121" text-anchor="middle" style="fill:var(--good)">allow</text>
+    <rect x="430" y="136" width="100" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="480" y="153" text-anchor="middle" style="fill:var(--ink)">B: 100, full</text>
+    <text x="480" y="169" text-anchor="middle" style="fill:var(--crit)">reject</text>
+    <line x1="478" y1="185" x2="372" y2="195" marker-end="url(#cd12-arrow2)" style="fill:none;stroke:var(--good)"/>
+    <line x1="482" y1="190" x2="588" y2="200" marker-end="url(#cd12-arrow2)" style="fill:none;stroke:var(--crit)"/>
+    <text x="480" y="232" text-anchor="middle" style="fill:var(--good)">exactly 100 allowed</text>
+  </g>
+</svg>
+<figcaption>Left, the gap between reading and writing is where the second gateway slips in. Right, Redis runs each script start to finish before the next, so the second script sees the first one's write. The fix costs nothing extra: it is still one round trip per check.</figcaption>
+</figure>
+
+<h4>8 · Deep dive C: local versus global, regions, and failure policy</h4>
+<p><strong>Purely local.</strong> Each gateway enforces limit ÷ N with an in-memory bucket. Zero added latency, no dependency. The problems: (1) <em>uneven traffic</em> — a client using one long-lived HTTP/2 connection lands all its requests on one node and gets only 1/N of its limit; (2) <em>fleet changes</em> — when autoscaling moves N from 20 to 40, every client's effective limit silently halves unless every node learns the new N; (3) <em>burst overshoot</em> — a client spread across all nodes can spend each node's full burst capacity simultaneously.</p>
+<p><strong>Purely central.</strong> Every check is a round trip to the shard owning the key: accurate (within the algorithm's own approximation), about 0.5 ms in-region, and a dependency on every request. This is what Stripe describes: token buckets in a central Redis.</p>
+<p><strong>Hybrids, with the overshoot computed.</strong> <em>Periodic sync:</em> each node counts locally and every 100 ms pushes its delta to Redis and pulls the global count. Between syncs, each node decides on stale information. Worked bound: limit 1,000 per minute for a key, 20 nodes, and the key has 50 requests of allowance left. If the client suddenly sends to all 20 nodes, each node believes 50 remain and can allow up to 50 before the next sync — up to 1,000 admitted against 50, a large overshoot for an abusive client. The fix is to give each node only a share: allow at most remaining ÷ N per interval, which over-restricts clients concentrated on one node. <em>Token leasing:</em> a node takes a lease of tokens from the central bucket (say 10% of remaining, at least 1) and spends them locally, returning to Redis only when the lease runs out. Overshoot is bounded by the outstanding leases; round trips drop by the lease size; unused leases are returned or expire. This is the "strip of wristbands" from the primer, and it is the usual answer for very high-rate keys.</p>
+<table>
+<thead><tr><th>Approach</th><th>Added latency</th><th>Accuracy</th><th>Store load</th><th>Main risk</th></tr></thead>
+<tr><td>Local only</td><td>0</td><td>Poor if traffic uneven or N changes</td><td>None</td><td>Wrong limits silently</td></tr>
+<tr><td>Central per request</td><td>~0.5 ms in-region</td><td>Good</td><td>1 call per request</td><td>Store is on the hot path</td></tr>
+<tr><td>Periodic sync</td><td>0 on request path</td><td>Overshoot ≈ rate × interval × nodes</td><td>N calls per interval per key</td><td>Bursts between syncs</td></tr>
+<tr><td>Token lease</td><td>0 for most requests</td><td>Overshoot ≤ outstanding leases</td><td>1 call per lease</td><td>Leases stranded on dead nodes</td></tr>
+</table>
+<p><strong>Multiple regions.</strong> The estimate already ruled out a synchronous cross-region call per request. Three workable designs: (1) <em>Per-region limits.</em> Split the global limit by each region's traffic share (a customer with 60% of traffic in us-east gets 60% of the limit there); simple and common, but wrong when a client's traffic shifts regions. (2) <em>Local enforcement, asynchronous reconciliation.</em> Each region counts locally and broadcasts its counts every second or so; each region enforces against local count plus the last-known remote counts. The overshoot is bounded by the client's rate in other regions times the sync delay: at 300 requests per second in each of three regions and a 1-second delay, up to 600 extra. Counters that only grow within a window merge cleanly across regions (sum the per-region counts), which is the idea behind a grow-only counter, one of the simplest CRDTs (conflict-free replicated data types: structures whose copies can be merged in any order and still agree). (3) <em>Route the client to one place.</em> Cloudflare relies on anycast sending traffic from one IP address to the same data centre under normal conditions, so it counts per data centre and never needs a global counter; the trade-off it accepts is that a client whose traffic is split across locations is counted separately in each.</p>
+<p><strong>Fail-open versus fail-closed.</strong> When Redis is slow or unreachable, the limiter must decide without its data. <strong>Fail open</strong> means allow; <strong>fail closed</strong> means reject. For general API limits, failing closed turns a limiter outage into a total API outage; Stripe states it fails open and accepts that rate limiting is briefly not enforced. The mature version is <em>fail open with a backstop</em>: when the store is unavailable, each gateway falls back to its local bucket at limit ÷ N (or somewhat higher), so a flood is still bounded. For limits whose purpose is to stop abuse that costs real money or security — login attempts (credential stuffing), SMS or email sends (toll fraud), payouts — fail closed, or fall back to a strict local limit. Whatever the policy, the limiter call needs a hard timeout (2-5 ms) and a circuit breaker (sc12), because a limiter that waits 30 seconds for a dead Redis is worse than either policy. Make the policy per rule, as in the data model's <code>fail_mode</code>, and emit a metric for every fallback decision.</p>
+
+<h4>9 · Bottlenecks, failure modes and trade-offs</h4>
+<p><strong>Hot keys.</strong> One customer at 100,000 requests per second puts all its checks on one Redis shard. Options: split its counter into k sub-keys with different hash tags, each holding limit ÷ k, and pick a sub-key at random per request; or give that customer leased tokens so most checks are local.</p>
+<p><strong>Failover resets.</strong> Redis replication is asynchronous; when a primary fails, the replica may be a few milliseconds to seconds behind, so some counters reset or step back. For rate limiting, a brief over-admission after a failover is acceptable — another reason not to use this system for billing-grade quotas, which need durable, exactly-once counting.</p>
+<p><strong>Retry storms.</strong> Rejected clients that retry immediately multiply the load the limiter sees and keep themselves rejected. Return Retry-After, document backoff with jitter, and consider charging rejected requests a small cost so tight retry loops stay limited.</p>
+<p><strong>Rule mistakes.</strong> A rule with limit 0, or one whose match pattern accidentally covers every key, is an instant self-inflicted outage. Validate rules, roll them out in shadow mode first, then to a fraction of keys, and keep rollback one click away.</p>
+<p><strong>The limiter as a dependency.</strong> Each gateway call to Redis is another thing that can be slow. Keep connections pooled, scripts loaded (call by SHA, reload on the "no such script" error after failover), and the timeout tight.</p>
+<p><strong>Trade-offs to close on.</strong> Accuracy versus latency (central versus local versus leased); exactness versus memory (log versus counters); bursts versus smoothness (token bucket versus sliding window); availability versus protection (fail-open versus fail-closed, chosen per rule); global versus regional (synchronous checks are too slow, so global limits are approximations).</p>
+</section>
+
+<section data-field="deep">
+<h4>Stripe's four limiters: rate limiting is one of several layers</h4>
+<p>Stripe's write-up separates four mechanisms, and the separation is the lesson. A <strong>request rate limiter</strong> caps each user's requests per second (with bursts allowed) and fires constantly — Stripe says it rejected millions of requests in a month. A <strong>concurrent requests limiter</strong> caps how many requests a user has in flight (their example is 20), which catches clients hammering expensive endpoints; it fired about 12,000 times in a month. A <strong>fleet usage load shedder</strong> reserves a share of capacity for critical requests — with a 20% reservation, non-critical traffic above its 80% allocation is rejected. And a <strong>worker utilisation load shedder</strong> sheds traffic by priority tier when workers are overloaded; it rejected about 100 requests in the month. The first two are per-client fairness; the last two protect the service as a whole regardless of who is sending. An interview answer that only has the first is incomplete.</p>
+
+<h4>Concurrency limiting done safely</h4>
+<p>A counter of in-flight requests (INCR at start, DECR at finish) leaks forever when a request's process dies between the two. The robust form stores request ids: a sorted set per client with each in-flight request's id scored by its start time. On start, a script removes members older than the maximum request duration (cleaning up crashed requests), checks the set's size against the limit, and adds the new id if allowed; on finish, it removes the id. The timeout-based cleanup turns a leak into a bounded delay.</p>
+
+<h4>GCRA: one number per key</h4>
+<p>The generic cell rate algorithm stores, per key, a single timestamp: the "theoretical arrival time" (TAT) of the next request if the client sent at exactly the allowed rate. For a rate of one request per T seconds and a burst tolerance τ, a request at time t is allowed if t ≥ TAT − τ; if allowed, TAT becomes max(TAT, t) + T. It makes the same decisions as a token bucket but needs one value and one comparison, which makes it cheap in a script and easy to expire. ld2 derives it in detail.</p>
+
+<h4>Counting in the right unit: tokens for LLM APIs</h4>
+<p>For an LLM API a request is the wrong unit: one call may process 200 tokens, the next 200,000, and GPU cost scales with tokens. Providers limit requests per minute and tokens per minute, often input and output separately. The difficulty is that output tokens are unknown when the request is admitted. Anthropic's documentation describes one concrete answer: limits on requests, input tokens and output tokens per minute, implemented as token buckets; input tokens estimated at the start of a request and adjusted to the actual count; output tokens counted in real time as they are produced, so the <code>max_tokens</code> parameter does not count against the limit; and, for most models, input tokens read from the prompt cache not counted at all. In a design you build, the general pattern is <em>reserve, then reconcile</em>: charge what you know at admission (input tokens from the tokenizer, plus perhaps an estimate of output), stream the response while charging output as it is generated, and refund or charge the difference at the end. The limiter's script takes a <code>cost</code> argument precisely so this works.</p>
+
+<h4>Priorities and fairness inside a limit</h4>
+<p>Not all requests from one customer are equal: a checkout call matters more than an analytics export. Tiered buckets — separate allowances per priority, or a shared bucket where low-priority requests must leave a reserve of tokens untouched — let a customer's critical traffic keep flowing while their batch jobs are throttled. Across customers, weighted fair sharing of a common capacity (each tenant gets a share proportional to its plan, unused share is lent out) is the multi-tenant version, and is how GPU capacity is often divided on shared inference platforms.</p>
+
+<h4>Quotas are a different system</h4>
+<p>"10 million requests per month, then billing stops you" sounds like a rate limit with a long window, but its requirements are opposite: it must be durable (a Redis failover must not reset a month's usage), exact enough to bill, and auditable. Build it as an append-only usage log aggregated into a database, checked asynchronously with a small allowance of overage, and keep the per-second rate limiter as the fast, approximate, forgetful system it should be.</p>
+
+<h4>Adaptive limits</h4>
+<p>Static limits are guesses. Adaptive systems change the admitted rate from feedback: when backend latency or error rates rise, lower the global admission rate (the way TCP's congestion control backs off), and raise it slowly when healthy. Per-client limits then protect fairness, while the adaptive limit protects the service. The risk is oscillation, so changes are damped and bounded.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real cases: Stripe and Cloudflare</h4>
+<p><strong>Stripe</strong> (Paul Tarjan, "Scaling your API with rate limiters", 2017) describes the four limiters above, implemented with the token bucket algorithm on a centralised Redis (or ElastiCache) store. Three operational choices stand out. It <strong>fails open</strong>: if Redis is unavailable, requests continue, because the limiter should never be the cause of an outage. It <strong>dark-launches</strong> every limiter, watching the traffic it would have blocked before enforcing. And it returns <strong>429</strong> for rate limiting and <strong>503</strong> for load shedding, so clients can tell "you are sending too much" from "we are overloaded". The write-up also makes the case that rate limiting is a reliability feature for the provider, not a punishment for clients: the request-rate limiter fires constantly, and that is it working.</p>
+<p><strong>Cloudflare</strong> ("How we built rate limiting capable of scaling to millions of domains", 2017) faced a different scale: limits configured by millions of customers on traffic arriving at data centres worldwide. Two decisions made it tractable. First, <strong>count per data centre</strong>: anycast routing normally sends one client IP to the same location, so a per-location counter sees all of that client's traffic, avoiding cross-location coordination and its latency; counters live in a memcache cluster (behind Twemproxy) in each location. Second, the <strong>sliding-window counter</strong>: two numbers per counter, updated with atomic increments and no transactions. Its worked example — 42 requests in the previous minute, 18 so far in the current one, 15 seconds in — estimates 42 × 0.75 + 18 = 49.5 requests against a limit of 50. Measured on 400 million requests from 270,000 sources, only 0.003% were wrongly allowed or limited, with an average 6% difference between the real and approximate rates.</p>
+<p>Put side by side, the two cases show the axis interviewers want you to reason along: Stripe needs per-customer correctness across a fleet in a few regions and centralises in Redis; Cloudflare needs global scale and pushes counting to the edge, trading cross-location accuracy for latency and availability.</p>
+
+<h4>Failure modes you will see</h4>
+<p><strong>The permanently blocked user.</strong> Symptom: one key rejected forever after a deploy. Cause: a counter created without an expiry (the INCR-then-EXPIRE race). Detection: alert on limiter keys with no TTL (<code>TTL key</code> returns −1). Fix: atomic scripts, plus a sweeper for the existing bad keys.</p>
+<p><strong>Silent fail-open.</strong> Symptom: an abusive client is not limited during an incident. Cause: Redis timeouts triggering fail-open without anyone noticing. Detection: a metric and alert on fallback decisions.</p>
+<p><strong>Limits halving after autoscaling.</strong> Symptom: customers complain of 429s at half their contracted rate. Cause: local limits computed as limit ÷ N with a stale or new N. Fix: central counting, or nodes that learn N from the fleet registry.</p>
+<p><strong>Hot shard.</strong> Symptom: p99 limiter latency rises on one Redis shard. Cause: one large customer or a scraping IP. Fix: split the key or lease tokens.</p>
+
+<h4>What to monitor</h4>
+<p>Decisions per second by rule and outcome; top limited keys; limiter call latency (p50/p99) and timeout rate; fallback (fail-open/closed) decisions; Redis CPU and memory per shard; keys without TTL; shadow-mode would-reject counts before every rule rollout; and, from the client side, 429 rate per customer, since a sudden rise usually means a client bug, not an attack.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> replay the four algorithms on the lesson's request trace, then reproduce the check-then-act race with threads and fix it with an atomic step. Python 3.12 standard library, a few seconds.</p>
+<pre>"""Four rate limiters on one trace, then the GET-then-INCR race vs an atomic check."""
+import threading, time
+
+LIMIT, WIN = 4, 10.0
+TRACE = [1, 6, 8, 9, 9.5, 10.5, 11, 12, 14, 17, 19, 23]
+
+def fixed(ts):
+    counts, out = {}, []
+    for t in ts:
+        w = int(t // WIN); ok = counts.get(w, 0) &lt; LIMIT
+        if ok: counts[w] = counts.get(w, 0) + 1
+        out.append(ok)
+    return out
+
+def sliding_log(ts):
+    log, out = [], []
+    for t in ts:
+        log = [a for a in log if a &gt; t - WIN]; ok = len(log) &lt; LIMIT
+        if ok: log.append(t)
+        out.append(ok)
+    return out
+
+def sliding_counter(ts):
+    counts, out = {}, []
+    for t in ts:
+        w = int(t // WIN)
+        est = counts.get(w - 1, 0) * (WIN - (t - w * WIN)) / WIN + counts.get(w, 0)
+        ok = est + 1 &lt;= LIMIT
+        if ok: counts[w] = counts.get(w, 0) + 1
+        out.append(ok)
+    return out
+
+def token_bucket(ts, cap=4, rate=0.4):
+    tokens, last, out = cap, 0.0, []
+    for t in ts:
+        tokens = min(cap, tokens + (t - last) * rate); last = t
+        ok = tokens &gt;= 1 - 1e-9                       # tolerate float rounding
+        if ok: tokens -= 1
+        out.append(ok)
+    return out
+
+for fn in (fixed, sliding_log, sliding_counter, token_bucket):
+    res = fn(TRACE)
+    print(f"{fn.__name__:&gt;16}: " + " ".join("✓" if r else "✗" for r in res) + f"  ({sum(res)} allowed)")
+
+# --- the race: 50 gateways, one key at its last 10 units of allowance -------------
+store, lock = {"k": 90}, threading.Lock()              # the lock stands in for Redis's single thread
+
+def naive(results):                                    # GET, think, INCR: three separate steps
+    seen = store["k"]; time.sleep(0.002)               # network hop + gateway logic
+    if seen &lt; 100:
+        with lock: store["k"] += 1
+        results.append(True)
+
+def atomic(results):                                   # what one Lua script does
+    with lock:
+        if store["k"] &lt; 100: store["k"] += 1; results.append(True)
+
+for fn in (naive, atomic):
+    store["k"], results = 90, []
+    threads = [threading.Thread(target=fn, args=(results,)) for _ in range(50)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    print(f"{fn.__name__:&gt;6}: allowed {len(results)} with 10 remaining; counter ends at {store['k']}")</pre>
+<ol>
+<li>The first block should print 9, 8, 8 and 11 allowed — the same marks as the timeline figure. Change <code>TRACE</code> to put 4 requests at t = 9.1-9.9 and 4 at t = 10.1-10.9 and watch the fixed window let all 8 through.</li>
+<li>The race block: the naive version typically allows far more than 10 (often all 50), because every thread reads 90 before any write lands; the atomic version allows exactly 10 and the counter ends at 100.</li>
+<li>Set the token bucket's <code>rate</code> to 0.1 and <code>cap</code> to 1: it becomes a strict "one per 10 s" limiter. Then try <code>cap=8, rate=0.4</code> to see how capacity controls burst size independently of the long-run rate.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>Your API gateway fleet has 40 nodes behind a round-robin load balancer. A customer's contract says 2,000 requests per minute. Today each node runs a local token bucket of 50 per minute (2,000 ÷ 40). (a) The customer's SDK uses 4 long-lived HTTP/2 connections. What rate do they actually get? (b) Autoscaling takes the fleet to 80 nodes for a sale and nobody updates the bucket size. Now what? (c) Propose a design and estimate its Redis load if the customer sends at their full limit and 5,000 other customers average 300 per minute.</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> HTTP/2 multiplexes all requests over a connection, and a connection-level load balancer pins each connection to one node. Four connections reach at most 4 nodes, each allowing 50 per minute: <strong>200 per minute</strong>, a tenth of the contract. The customer sees 429s at 10% of their limit and files a ticket — a correct "limit" configured in a way that is wrong for real traffic.</p>
+<p><strong>(b)</strong> With 80 nodes, a client spread evenly across all nodes could get 80 × 50 = <strong>4,000 per minute</strong>, twice the contract, while the pinned customer still gets 200. Local limits are wrong in both directions depending on traffic shape and fleet size.</p>
+<p><strong>(c)</strong> Central token buckets in Redis, one script call per request: the customer at 2,000 per minute is 33 calls per second; 5,000 others at 300 per minute is 5,000 × 5 = 25,000 calls per second. Total about <strong>25,000 calls per second</strong> — within one shard's capacity at the 50,000 planning figure, but use 3 shards with replicas for headroom and failure tolerance. Keep a local bucket per node at 2,000 ÷ N × 2 as a fail-open backstop. If one customer later grows to 100,000 per minute, lease tokens to nodes in batches of, say, 20 to cut its Redis calls by 20× with overshoot bounded by 40 nodes × 20 = 800 tokens.</p>
+</details>
+<b>Diagnose it</b>
+<p>After a gateway deploy, a handful of customers are rejected on every request with "100 requests/second exceeded", even when they send one request per minute. Other customers are fine. Redis shows their counter keys with values in the tens of thousands. What happened and what do you change?</p>
+<details><summary>Answer</summary>
+<p>Their counter keys have no expiry. The limiter runs INCR and, if the result is 1, a separate EXPIRE. During the deploy, gateway processes were killed between those two commands for a few keys, so those keys were created without a TTL. They never reset; every request increments them further; the comparison fails forever. Confirm with <code>TTL key</code>, which returns −1 (no expiry) for the affected keys. Immediate fix: delete or set expiries on keys with no TTL. Real fix: make creation and expiry atomic — a Lua script that does INCR and EXPIRE together, or <code>SET key 0 EX 1 NX</code> before INCR — and add an alert on limiter keys without a TTL. The general lesson: in a distributed limiter, every multi-step update is a race the next deploy will find.</p>
+</details>
+</section>

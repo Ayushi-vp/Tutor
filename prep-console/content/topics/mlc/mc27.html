@@ -1,0 +1,440 @@
+<!-- topic source for mlc/mc27; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "mc27",
+  "t": "Int8 quantisation: absmax, zero-point, scales, int8 matmul and outliers",
+  "tag": "Inference",
+  "sum": "Store weights in 8 bits and multiply them without losing the model: absmax and zero-point quantisation worked by hand, per-tensor versus per-channel versus per-group scales measured as SNR, a quantised matmul that accumulates in int32 (and why int16 overflows), the zero-point expansion, the outlier features that break vector-wise int8 in large models and LLM.int8()'s mixed-precision fix, and the memory each choice saves.",
+  "prereq": [
+    ["lm12", "Quantisation stores weights in fewer bits to cut memory and bandwidth; a 7B model is 14 GB in 16-bit and about 7 GB in 8-bit."],
+    ["gpu4", "Number formats: float32, float16 and bfloat16 trade range for precision; integers have a fixed, evenly spaced grid."],
+    ["mc21", "LoRA adapters on a frozen base; QLoRA quantises that base to 4 bits."],
+    ["mc11", "A layer is a matrix product y = x·W; its cost and error depend on the inner dimension being summed over."],
+    ["mc16", "Attention and feed-forward projections are large matrix products, which is where quantised kernels apply."]
+  ],
+  "myths": [
+    ["Quantisation just rounds every number to 8 bits.", "Rounding needs a scale: int8 has 255 evenly spaced levels, so a tensor is first divided by a scale that maps its range onto those levels. The choice of scale — one per tensor, per channel or per small group, symmetric or with a zero point — decides almost all the error. Rounding is the easy part."],
+    ["One outlier in a tensor costs only that value's accuracy.", "With a shared scale, the largest magnitude sets the step size for every value. In the lesson's example, a single 60 among values around 1 makes the step 0.47, so 0.5 rounds to 0.47, −1.2 to −1.42 and −0.1 to 0. Large transformers have such outliers systematically in a few feature dimensions, which is why plain int8 fails beyond a few billion parameters."],
+    ["Multiplying int8 matrices produces int8 results.", "A dot product of length 4,096 of int8 values can reach 4,096 × 127 × 127 ≈ 66 million, far beyond int8 or int16. Hardware multiplies int8 pairs and accumulates in int32, then rescales to floating point once at the end. Accumulating in int16 silently wraps around — the test shows it."],
+    ["Symmetric quantisation is always good enough.", "Symmetric (absmax) quantisation centres the grid on zero. For one-sided data such as post-ReLU activations, half the grid is wasted on negative values that never occur. Zero-point (asymmetric) quantisation shifts the grid to the data's actual range, gaining roughly one bit: 47.0 versus 40.8 dB SNR on the lesson's post-ReLU data."],
+    ["8-bit weights mean 8 bits per weight.", "Scales must be stored too. One 16-bit scale per group of 128 weights adds 0.125 bits, so per-group int8 is 8.125 bits per weight and int4 4.125 bits. Per-channel scales are negligible for large matrices; per-tensor scales cost nothing but give the most error."]
+  ],
+  "recap": [
+    "Quantisation maps floating-point values to a small integer grid through a scale (and possibly a zero point), and dequantisation maps them back.",
+    "Absmax (symmetric) int8 uses scale = 127 / max|x|, q = round(x·scale), x ≈ q / scale; the rounding error is at most half a step.",
+    "Zero-point (asymmetric) int8 uses step = (max − min)/255 and a zero point so that min maps to −128 and max to 127, using the whole grid for one-sided data.",
+    "Granularity trades accuracy for overhead: per tensor (one scale), per channel (one per output column), per group (one per block of, say, 128 weights).",
+    "Error is measured as signal-to-noise ratio in decibels, 10·log10(Σx² / Σ(x − x̂)²); every 6 dB is about one bit of precision.",
+    "A quantised matmul multiplies int8 values, accumulates in int32 and rescales once by the outer product of row scales of X and column scales of W.",
+    "With zero points, (A − za)(B − zb) expands into A·B plus cheap row and column sum corrections, so the int8 product stays the core.",
+    "Large transformers develop outlier feature dimensions with huge magnitudes; a few columns destroy the precision of every row they appear in.",
+    "LLM.int8() multiplies the outlier dimensions (any value at least 6.0) in 16-bit and the other 99.9% in vector-wise int8, keeping quality at about half the memory.",
+    "Memory: 16-bit to int8 halves weight storage, int4 quarters it, plus scale overhead."
+  ],
+  "glossary": [
+    ["Absmax quantisation", "Symmetric quantisation scaling by the largest absolute value so that it maps to ±127."],
+    ["Accumulator", "The register that sums products in a dot product; for int8 inputs it is int32 to avoid overflow."],
+    ["Dequantisation", "Converting integers back to approximate real values by undoing the scale and zero point."],
+    ["Granularity", "How many values share one scale: a whole tensor, a channel (row or column), or a small group."],
+    ["int8", "8-bit signed integers, −128 to 127."],
+    ["Mixed-precision decomposition", "Splitting a matrix product so a few outlier dimensions are computed in higher precision and the rest in int8."],
+    ["Outlier feature", "A hidden dimension whose activations are consistently much larger in magnitude than the others."],
+    ["Per-channel quantisation", "One scale per output channel (a column of W here), adapting to each channel's range."],
+    ["Per-group quantisation", "One scale per block of consecutive weights (for example 128), localising the effect of outliers."],
+    ["Scale", "The factor converting between real values and integer levels; its inverse is the step size."],
+    ["SNR", "Signal-to-noise ratio, here 10·log10 of signal energy over error energy, in decibels."],
+    ["Vector-wise quantisation", "Quantising X with one scale per row and W with one scale per column, so each dot product has its own pair of scales."],
+    ["Zero point", "The integer that represents real zero in asymmetric quantisation, shifting the grid to fit the data's range."]
+  ],
+  "qa": [
+    ["E", "Quantise [0.5, −1.2, 3.0, −0.1] to int8 with absmax.", "Scale = 127 / 3.0 = 42.33. Multiply and round: 21.2 → 21, −50.8 → −51, 127, −4.2 → −4. Dequantise by dividing: [0.496, −1.205, 3.0, −0.094]. Errors are below half a step, 0.5/42.33 = 0.0118."],
+    ["E", "What is the difference between symmetric and asymmetric quantisation?", "Symmetric (absmax) maps zero to zero and ±max|x| to ±127: simple, no zero point, but wasteful when data is one-sided. Asymmetric maps the actual min to −128 and max to 127 using a step (max − min)/255 and an integer zero point: the full grid covers the data, at the cost of handling the zero point in matmuls."],
+    ["E", "Why accumulate int8 products in int32?", "Each product can be up to 127 × 127 = 16,129, and a dot product sums thousands of them: 4,096 terms can reach about 66 million. int16 tops out at 32,767 and would wrap around; int32 holds about ±2.1 billion, enough for inner dimensions in the tens of thousands. Hardware int8 instructions accumulate into int32 for exactly this reason."],
+    ["M", "Compare per-tensor, per-channel and per-group scales.", "Per-tensor: one scale, no overhead, but the largest value anywhere sets every step. Per-channel: one scale per output column, adapting to columns with different ranges — 43.2 versus 33.0 dB SNR in the lesson when column scales vary. Per-group: one scale per block of, say, 128 weights within a column, so a local outlier only affects its block — 36.4 versus 28.0 dB for per-channel on weights with scattered outliers — at 0.125 extra bits per weight with 16-bit scales.", "Follow-up: Why not per-element scales? — Then the scales are as big as the weights and nothing is saved."],
+    ["M", "How does a vector-wise int8 matmul work?", "Quantise X with one scale per row and W with one scale per column. Multiply the int8 matrices with int32 accumulation to get C_i32. Each entry C[i, j] is a dot product of row i and column j, so it is dequantised by dividing by s_x[i]·s_w[j] — the outer product of the scale vectors. The result equals the float product of the dequantised matrices, exactly up to floating-point rounding."],
+    ["M", "How do zero points enter a matmul?", "With A ≈ (A_q − z_a)/s_a and B ≈ (B_q − z_b)/s_b, the integer part is (A_q − z_a)(B_q − z_b) = A_q·B_q − z_a·colsum(B_q) − z_b·rowsum(A_q) + K·z_a·z_b. The int8 × int8 product stays the heavy core; the corrections are row and column sums computed once, so asymmetric quantisation costs little extra compute.", "Follow-up: Why is symmetric quantisation preferred for weights? — Weights are roughly symmetric around zero, so a zero point gains little, and dropping it removes the correction terms entirely."],
+    ["M", "What is SNR and how do you read it?", "10·log10(Σ x² / Σ (x − x̂)²): the ratio of signal energy to quantisation-error energy in decibels. Each additional bit of precision adds about 6 dB, so 8-bit uniform quantisation of well-behaved data lands around 40-50 dB. Comparing SNR across scale choices on the same tensor tells you which keeps more information; relative error is about 10^(−SNR/20)."],
+    ["M", "Why are outliers the central problem for LLM quantisation?", "Dettmers et al. found that beyond about 6.7B parameters, transformers develop a handful of hidden dimensions with very large activations — magnitudes of 6 and far above — in most sequence positions and layers. With row-wise scales for activations, each row's scale is set by its outlier, so the ordinary features in that row are quantised to a few levels and the layer's output degrades. Their perplexity table shows 8-bit absmax and row-wise methods falling apart at 13B while LLM.int8() matches 16-bit."],
+    ["H", "Describe LLM.int8().", "Two parts. Vector-wise quantisation: separate scales per row of the hidden states and per column of the weights. Mixed-precision decomposition: find the feature dimensions where any activation reaches at least 6.0 in magnitude — about 0.1% of dimensions, at most 7 in models up to 13B — and compute those columns of X times the corresponding rows of W in 16-bit, the rest in int8, then add. Over 99.9% of values are multiplied in 8-bit; quality matches 16-bit up to 175B parameters; memory roughly halves (1.96× smaller for BLOOM-176B).", "Follow-up: What does it cost? — Finding outliers and splitting the matmul adds overhead, so for small models it can be slower than 16-bit; the paper reports speedups only for very large matrix multiplications."],
+    ["H", "Weight-only versus weight-and-activation quantisation: which and when?", "Weight-only (int8 or int4 weights, 16-bit activations, dequantised on the fly) attacks memory and bandwidth, which dominate single-stream decoding, and avoids the activation-outlier problem, so it is the common choice for LLM inference. Quantising activations too enables true int8 matmuls, which help when compute-bound (large batches), but requires handling outliers — mixed-precision decomposition, or methods that migrate activation outliers into the weights before quantising."],
+    ["H", "Estimate memory for a 70B model under different schemes.", "16-bit: 70e9 × 2 bytes = 140 GB. Int8 with per-group (128) 16-bit scales: 70e9 × 8.125 / 8 ≈ 71 GB. Int4 with the same groups: 70e9 × 4.125 / 8 ≈ 36 GB. LLM.int8() is about half of 16-bit, near 70 GB, since only 0.1% of dimensions stay in 16-bit. Add the KV cache and activations, which weight quantisation does not shrink."],
+    ["H", "How would you validate a quantised model before shipping?", "Layer-level: SNR or relative error of each quantised layer's output on real activations, to find sensitive layers. Model-level: perplexity on held-out text and task evaluations versus the 16-bit model, with confidence intervals (ld25), including long-context and code tasks where small errors compound. Look for outlier-sensitive failures: specific prompts or languages that degrade. Keep sensitive layers (often the first and last) in higher precision if needed."]
+  ],
+  "refs": [
+    ["paper", "LLM.int8(): 8-bit matrix multiplication for transformers at scale (Dettmers, Lewis, Belkada, Zettlemoyer; NeurIPS 2022)", "Absmax and zero-point int8, vector-wise quantisation, the outlier threshold 6.0, mixed-precision decomposition keeping >99.9% of values in 8-bit, perplexity results to 13B and zero-shot results to 175B, and the 1.96× memory reduction for BLOOM-176B.", "https://arxiv.org/abs/2208.07339"],
+    ["paper", "Integer quantization for deep learning inference: principles and empirical evaluation (Wu et al., NVIDIA 2020)", "Affine and scale quantisation, per-tensor versus per-channel granularity, and the int32-accumulation matmul formulation.", "https://arxiv.org/abs/2004.09602"],
+    ["paper", "QLoRA: efficient finetuning of quantized LLMs (Dettmers et al., 2023)", "4-bit NormalFloat with block-wise (64-element) scales and double quantisation of the scales.", "https://arxiv.org/abs/2305.14314"],
+    ["docs", "NumPy: numpy.round", "Round half to even, the rounding rule used by the quantisers here.", "https://numpy.org/doc/stable/reference/generated/numpy.round.html"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A 70-billion-parameter model in 16-bit floating point is 140 GB of weights. That does not fit on one 80 GB GPU, and even where it fits, every generated token requires reading all 140 GB from memory — the bottleneck of decoding. Storing the weights in 8 bits halves both problems; 4 bits quarters them. That is why quantisation is one of the first things done to a model before it is served, and why "implement int8 quantisation" is a standard ML coding question: it checks whether you understand that the hard part is not rounding but choosing scales, how quantised matrix products really execute, and why large language models broke the simple methods that worked for years on smaller networks.</p>
+<p>The simple method is absmax: divide every value in a tensor by its largest magnitude, multiply by 127, round. It works when values are well behaved. It fails when one value is much larger than the rest, because that value sets the step size for everyone. In 2022, Dettmers and colleagues showed that transformers beyond about 6.7 billion parameters systematically develop exactly such values — a handful of hidden dimensions with activations of magnitude 6 and much higher, in most layers and positions — and that 8-bit methods which ignore them degrade sharply, while their LLM.int8() method, which multiplies those few dimensions in 16-bit and everything else in int8, matched 16-bit quality up to 175 billion parameters at about half the memory.</p>
+<p>This lesson builds the pieces from scratch in NumPy: absmax and zero-point quantisation worked by hand on a four-value vector, and the same vector with one outlier; per-tensor, per-channel and per-group scales compared by signal-to-noise ratio; a quantised matrix product that multiplies int8 values and accumulates in int32, checked against a triple-loop version and against float, plus a demonstration that an int16 accumulator overflows; the zero-point product expansion; and an LLM.int8()-style decomposition that lifts a layer with outlier features from 25 dB to 48 dB SNR. It ends with the memory each scheme saves.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: a ruler with 255 marks</h4>
+<p>Imagine measuring things with a ruler that has exactly 255 evenly spaced marks, and you may only record which mark is closest. Before measuring a set of objects you choose how long the ruler is. If all your objects are between −3 and 3 cm, a 6 cm ruler gives marks every 0.024 cm — excellent. If one object in the set is 60 cm long, the ruler must be 120 cm and the marks are almost half a centimetre apart: the 60 cm object is measured fine, and every small object is now recorded to the nearest half centimetre — 0.5 becomes 0.47, 0.1 becomes 0. You could buy one ruler per drawer (per channel), or one per small box of objects (per group), so each set gets a ruler matched to its own range. And if your objects are all positive, a ruler centred on zero wastes half its marks; sliding the ruler so its first mark sits at your smallest object (a zero point) doubles the resolution.</p>
+<p>The 255 marks are the <strong>int8 grid</strong>; the ruler's length is set by the <strong>scale</strong>; one ruler per tensor, channel or group is <strong>granularity</strong>; sliding the ruler is the <strong>zero point</strong>; the 60 cm object is an <strong>outlier</strong>. Measuring the giant object with a separate tape measure and the rest with the fine ruler is <strong>mixed-precision decomposition</strong>.</p>
+<p>The analogy breaks in the matrix product: a quantised layer does not just store numbers, it multiplies them and sums thousands of products. The sum is done on the integer marks — exactly — and converted back to centimetres once at the end, which is why the conversion factors (scales) must be chosen so each dot product has a single, simple one.</p>
+
+<h4>What quantisation buys, and where it costs</h4>
+<p>Two different resources improve. Memory: weights take half (int8) or a quarter (int4) of the space of 16-bit, so bigger models fit on fewer GPUs and more memory is left for the KV cache of long contexts and many concurrent requests. Speed: at small batch sizes, decoding time is mostly the time to read the weights, so reading half as many bytes can nearly halve the time per token — but only if the kernels stream the low-bit weights directly. The cost is error, and how much depends on choices this lesson makes explicit: which values share a scale, whether the grid is centred, and what happens to the few values that do not fit. A good quantisation recipe is mostly a good answer to those three questions.</p>
+
+<h4>What the interviewer is checking</h4>
+<p>Whether you can write the formulas without notes and work an example; whether you know that scale granularity, not rounding, drives error, and can show it with a measurement; whether your matmul accumulates in int32 and applies scales once per output; whether you can expand a zero-point product; and whether you can explain, with numbers, why large language models broke naive int8 and how LLM.int8() fixed it.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Three int8 grids for the same values. Top: absmax with max 3.0, step 0.024, values 0.5, minus 1.2, 3.0 and minus 0.1 land on fine marks. Middle: with an outlier of 60, the step becomes 0.47 and the small values collapse onto a handful of marks, minus 0.1 rounding to 0. Bottom: zero-point for values between minus 1.2 and 3.0 shifts the grid so minus 1.2 maps to minus 128 and 3.0 to 127.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="10" y="28" style="fill:var(--ink)">absmax, max 3.0</text>
+    <line x1="150" y1="40" x2="630" y2="40" style="fill:none;stroke:var(--line-2)"/>
+    <text x="150" y="58" text-anchor="middle" style="fill:var(--muted)">−127</text>
+    <text x="390" y="58" text-anchor="middle" style="fill:var(--muted)">0</text>
+    <text x="630" y="58" text-anchor="middle" style="fill:var(--muted)">127</text>
+    <circle cx="430" cy="40" r="5" style="fill:var(--s1)"/>
+    <circle cx="294" cy="40" r="5" style="fill:var(--s1)"/>
+    <circle cx="630" cy="40" r="5" style="fill:var(--s1)"/>
+    <circle cx="382" cy="40" r="5" style="fill:var(--s1)"/>
+    <text x="390" y="28" text-anchor="middle" style="fill:var(--good)">step 0.024: all four values well resolved</text>
+    <text x="10" y="108" style="fill:var(--ink)">absmax, outlier 60</text>
+    <line x1="150" y1="120" x2="630" y2="120" style="fill:none;stroke:var(--line-2)"/>
+    <text x="150" y="138" text-anchor="middle" style="fill:var(--muted)">−127</text>
+    <text x="390" y="138" text-anchor="middle" style="fill:var(--muted)">0</text>
+    <text x="630" y="138" text-anchor="middle" style="fill:var(--muted)">127</text>
+    <circle cx="392" cy="120" r="5" style="fill:var(--crit)"/>
+    <circle cx="384" cy="120" r="5" style="fill:var(--crit)"/>
+    <circle cx="390" cy="120" r="5" style="fill:var(--crit)"/>
+    <circle cx="630" cy="120" r="5" style="fill:var(--s1)"/>
+    <text x="390" y="108" text-anchor="middle" style="fill:var(--crit)">step 0.47: 0.5→1, −1.2→−3, −0.1→0 (crushed near zero)</text>
+    <text x="10" y="188" style="fill:var(--ink)">zero-point, −1.2…3.0</text>
+    <line x1="150" y1="200" x2="630" y2="200" style="fill:none;stroke:var(--line-2)"/>
+    <text x="150" y="218" text-anchor="middle" style="fill:var(--muted)">−128</text>
+    <text x="630" y="218" text-anchor="middle" style="fill:var(--muted)">127</text>
+    <circle cx="150" cy="200" r="5" style="fill:var(--s3)"/>
+    <circle cx="282" cy="200" r="5" style="fill:var(--s3)"/>
+    <circle cx="630" cy="200" r="5" style="fill:var(--s3)"/>
+    <circle cx="214" cy="200" r="5" style="fill:var(--s3)"/>
+    <text x="390" y="188" text-anchor="middle" style="fill:var(--s3)">step 0.0165, zero point −55: the whole grid is used</text>
+  </g>
+</svg>
+<figcaption>The same 255 levels serve every value that shares a scale. One outlier stretches the grid until ordinary values occupy only a few marks near zero — the failure LLM.int8() was designed around. A zero point does the opposite: it fits the grid to the data's actual range.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<h4>1. The problem as it is usually asked</h4>
+<p>"Implement int8 quantisation and dequantisation for a weight matrix, symmetric and asymmetric, with per-tensor and per-channel scales. Implement a quantised matrix multiply. Measure the error. What goes wrong for large language models and how is it fixed?" Clarify: int8 range (−127…127 for symmetric so ±127 are both representable; −128…127 for asymmetric); rounding (round half to even, as NumPy does); the layout (y = x·W with W of shape (in, out), so a "channel" is an output column); how error is measured (SNR in dB). Outline: hand examples, loop versions, vectorised quantiser with three granularities, int8 matmul with int32 accumulation, zero-point expansion, outlier decomposition, tests, memory arithmetic.</p>
+
+<h4>2. The maths in plain words</h4>
+<p><strong>Absmax.</strong> Find the largest absolute value; the scale is 127 divided by it, so that value maps to ±127. Multiply everything by the scale and round to the nearest integer. To get approximate values back, divide by the scale. Each value moves by at most half a step, and the step is max|x|/127.</p>
+<p><strong>Zero-point.</strong> Find the minimum and maximum; the step is their difference divided by 255, so the range spans all 256 integer levels. Choose the integer zero point so that the minimum maps to −128. Each value becomes round(x / step) + zero point, clipped to −128…127; to dequantise, subtract the zero point and multiply by the step.</p>
+<p><strong>Granularity.</strong> Compute those statistics over the whole tensor, over each output column, or over each group of consecutive weights inside a column. Finer groups fit their own ranges better and cost more scales.</p>
+<p><strong>Quantised matmul.</strong> If each row of X has its own scale and each column of W has its own, then each output element is a dot product between one row and one column, which shares exactly one pair of scales. So multiply the integers, add the products up in a wide integer register, and divide the total by the two scales once.</p>
+
+<h4>3. The equations</h4>
+<pre>absmax:      s = 127 / max|x|          q = clip(round(x·s), −127, 127)          x̂ = q / s
+             |x − x̂| ≤ 0.5 / s
+zero-point:  Δ = (max − min) / 255     z = round(−128 − min/Δ)
+             q = clip(round(x/Δ) + z, −128, 127)                              x̂ = (q − z)·Δ
+granularity: per tensor: one s;  per channel: s_j per column j;  per group: s_gj per (block of g rows, column)
+SNR:         10·log10( Σ x² / Σ (x − x̂)² )  dB        (≈ 6 dB per bit)
+
+vector-wise matmul (X: n×k, row scales s_x;  W: k×m, column scales s_w):
+             C_i32[i, j] = Σ_t Xq[i, t]·Wq[t, j]        (int8 × int8 → int32 accumulate)
+             C[i, j] ≈ C_i32[i, j] / (s_x[i]·s_w[j])
+zero points: (A − z_a)(B − z_b) = A·B − z_a·colsum(B) − z_b·rowsum(A) + K·z_a·z_b
+LLM.int8():  O = {h : any |X[:, h]| ≥ 6.0}
+             C ≈ X[:, O]·W[O, :] (16-bit)  +  vector-wise int8( X[:, ¬O], W[¬O, :] )
+memory:      bits/weight = b + scale_bits / g          (8.125 for int8 with 16-bit scales per 128)</pre>
+
+<h4>4. A worked example by hand</h4>
+<p><strong>Absmax.</strong> x = [0.5, −1.2, 3.0, −0.1]. max|x| = 3.0, scale = 127/3 = 42.333. x·scale = [21.17, −50.80, 127.00, −4.23] → round → <strong>[21, −51, 127, −4]</strong>. Dequantised: [21, −51, 127, −4]/42.333 = <strong>[0.4961, −1.2047, 3.0, −0.0945]</strong>. Errors: 0.0039, 0.0047, 0, 0.0055 — all below half a step, 0.5/42.333 = 0.0118.</p>
+<p><strong>Zero-point.</strong> min = −1.2, max = 3.0, step = 4.2/255 = 0.016471. Zero point = round(−128 − (−1.2/0.016471)) = round(−128 + 72.86) = round(−55.14) = <strong>−55</strong>. x/step = [30.36, −72.86, 182.14, −6.07] → round [30, −73, 182, −6] → + (−55) = <strong>[−25, −128, 127, −61]</strong>: the minimum lands on −128 and the maximum on 127. Dequantised: ([−25, −128, 127, −61] + 55) × 0.016471 = <strong>[0.4941, −1.2024, 2.9976, −0.0988]</strong>. The step is 0.0165 against absmax's 0.0236, because absmax spent half its grid on values below −1.2 that never occur.</p>
+<p><strong>The outlier.</strong> Replace 3.0 with 60. Absmax scale = 127/60 = 2.1167, step 0.47. x·scale = [1.06, −2.54, 127, −0.21] → <strong>[1, −3, 127, 0]</strong> → dequantised <strong>[0.472, −1.417, 60, 0]</strong>. The small values now have errors of 0.03, 0.22 and 0.1 — the −0.1 has vanished — because one value set the step for all. This is the whole outlier problem in four numbers. The first block asserts all of it.</p>
+<pre class="run">import numpy as np
+
+# The hand-worked example: one vector, absmax (symmetric) and zero-point (asymmetric) int8.
+x = np.array([0.5, -1.2, 3.0, -0.1])
+s = 127 / np.abs(x).max()                                      # 127 / 3.0 = 42.333
+q = np.round(x * s).astype(np.int8)
+assert q.tolist() == [21, -51, 127, -4]
+deq = q / s
+assert np.allclose(deq, [0.49606, -1.20472, 3.0, -0.09449], atol=1e-5)
+
+scale = (x.max() - x.min()) / 255                              # 4.2 / 255 = 0.016471
+zp = int(np.round(-128 - x.min() / scale))                     # -128 + 72.86 -&gt; -55
+qz = np.clip(np.round(x / scale) + zp, -128, 127).astype(np.int8)
+assert zp == -55 and qz.tolist() == [-25, -128, 127, -61]      # the full range [-128, 127] is used
+deqz = (qz.astype(np.int32) - zp) * scale
+assert np.allclose(deqz, [0.49412, -1.20235, 2.99765, -0.09882], atol=1e-5)
+
+# One outlier ruins absmax for everyone else in the vector.
+xo = np.array([0.5, -1.2, 60.0, -0.1])
+so = 127 / 60.0
+qo = np.round(xo * so)
+assert qo.tolist() == [1.0, -3.0, 127.0, -0.0]                 # 0.5 -&gt; 1 level, -0.1 -&gt; 0
+assert np.allclose(qo / so, [0.47244, -1.41732, 60.0, 0.0], atol=1e-5)
+
+def snr_db(ref, approx):
+    return 10 * np.log10((ref ** 2).sum() / ((ref - approx) ** 2).sum())</pre>
+
+<h4>5. The naive implementation</h4>
+<p>Two loops make the definitions concrete. <code>quant_absmax_loop</code> finds the maximum magnitude with a Python generator and quantises element by element with Python's <code>round</code> (which, like <code>np.round</code>, rounds halves to even). <code>matmul_int8_loop</code> is a triple loop that multiplies int8 pairs into a Python integer "accumulator", asserts it stays within the int32 range, and divides by the row and column scales once per output element — exactly what an integer matrix-multiply unit does, one multiply-add at a time.</p>
+<pre class="run">def quant_absmax_loop(W):
+    """Per-tensor symmetric int8, element by element."""
+    m = max(abs(v) for v in W.ravel())
+    sc = 127.0 / m
+    Q = np.empty(W.shape, dtype=np.int8)
+    for i in range(W.shape[0]):
+        for j in range(W.shape[1]):
+            Q[i, j] = int(round(W[i, j] * sc))                  # Python round: half to even, like np.round
+    return Q, sc
+
+def matmul_int8_loop(Xq, Wq, sx, sw):
+    """int8 x int8 products accumulated in an int32 'register', then dequantised once.
+    sx: one scale per row of X, sw: one scale per column of W (1-D)."""
+    n, k = Xq.shape
+    m = Wq.shape[1]
+    C = np.empty((n, m))
+    for i in range(n):
+        for j in range(m):
+            acc = 0                                             # int32 accumulator (Python int, checked below)
+            for t in range(k):
+                acc += int(Xq[i, t]) * int(Wq[t, j])
+            assert -2 ** 31 &lt;= acc &lt; 2 ** 31
+            C[i, j] = acc / (sx[i] * sw[j])
+    return C</pre>
+
+<h4>6. The vectorised implementation</h4>
+<p><code>quantize</code> handles all granularities with one reduction: for a per-tensor scale it reduces over everything, for per-channel over the rows (axis 0, giving one scale per column), and for per-group it first reshapes the (K, N) weight into (K/g, g, N) and reduces over the middle axis, giving one scale per group per column. <code>keepdims</code> keeps the scales broadcastable. The symmetric branch clips to ±127; the asymmetric branch computes a step and an integer zero point per slice. <code>dequantize</code> reverses either, reshaping groups back. <code>matmul_int8</code> casts to int32 and multiplies — NumPy's integer matmul accumulates in the operands' dtype, so the cast is what provides the int32 accumulator — then divides by the outer product of scales via broadcasting. <code>matmul_zeropoint</code> implements the four-term expansion. <code>llm_int8</code> finds the outlier columns of X (any |value| ≥ 6.0), multiplies them with the corresponding rows of W in floating point, quantises the rest vector-wise, and adds the two parts.</p>
+<pre class="run">def quantize(W, axis=None, group=None, symmetric=True):
+    """int8 quantisation with one scale per tensor (axis=None), per slice along `axis`
+    (axis=0: one scale per column), or per group of `group` consecutive rows within each column.
+    Returns (q, scale, zero_point) with W ≈ (q - zp) / scale broadcastable."""
+    Wv = W
+    if group is not None:                                       # (K, N) -&gt; (K//g, g, N): a scale per (group, column)
+        K, N = W.shape
+        Wv = W.reshape(K // group, group, N)
+        red = 1
+    else:
+        red = axis
+    if symmetric:
+        m = np.abs(Wv).max(axis=red, keepdims=True)
+        sc = 127.0 / np.where(m == 0, 1.0, m)
+        q = np.clip(np.round(Wv * sc), -127, 127).astype(np.int8)
+        zp = np.zeros_like(sc, dtype=np.int32)
+    else:
+        lo, hi = Wv.min(axis=red, keepdims=True), Wv.max(axis=red, keepdims=True)
+        step = np.where(hi &gt; lo, (hi - lo) / 255.0, 1.0)
+        zp = np.round(-128 - lo / step).astype(np.int32)
+        q = np.clip(np.round(Wv / step) + zp, -128, 127).astype(np.int8)
+        sc = 1.0 / step
+    return q, sc, zp
+
+def dequantize(q, sc, zp, shape=None):
+    out = (q.astype(np.int32) - zp) / sc
+    return out.reshape(shape) if shape is not None else out
+
+def matmul_int8(Xq, Wq, sx, sw):
+    """Vector-wise int8 matmul: X quantised per row (sx: (n,1)), W per column (sw: (1,m)).
+    Products of int8 values are accumulated in int32, then scaled by the outer product of scales."""
+    acc = Xq.astype(np.int32) @ Wq.astype(np.int32)             # exact integer accumulation
+    return acc / (sx * sw)
+
+def matmul_zeropoint(Aq, za, Bq, zb):
+    """(A - za)(B - zb) for zero-point tensors, expanded so the int8 x int8 product stays the core:
+    A·B - za·colsum(B) - zb·rowsum(A) + K·za·zb   (per-tensor zero points)."""
+    A, B = Aq.astype(np.int32), Bq.astype(np.int32)
+    K = A.shape[1]
+    return A @ B - za * B.sum(axis=0, keepdims=True) - zb * A.sum(axis=1, keepdims=True) + K * za * zb
+
+def llm_int8(X, W, threshold=6.0):
+    """LLM.int8()-style mixed-precision decomposition: feature columns of X holding any |value| &gt;= threshold
+    (and the matching rows of W) are multiplied in floating point; the rest in vector-wise int8."""
+    outl = np.any(np.abs(X) &gt;= threshold, axis=0)               # outlier feature dimensions
+    C = X[:, outl] @ W[outl]                                    # 16-bit path in the real thing
+    Xr, Wr = X[:, ~outl], W[~outl]
+    Xq, sx, _ = quantize(Xr, axis=1)                            # per row of X
+    Wq, sw, _ = quantize(Wr, axis=0)                            # per column of W
+    return C + matmul_int8(Xq, Wq, sx, sw), int(outl.sum())</pre>
+
+<h4>7. Testing it</h4>
+<p>Nine checks. <strong>(1)</strong> Loop and vectorised absmax produce identical integers and scale, and the round-trip error is at most half a step. <strong>(2)</strong> On a 256 × 64 matrix whose column magnitudes vary by large random factors, per-channel scales give <strong>43.2 dB</strong> against <strong>33.0 dB</strong> per-tensor — the per-tensor scale is set by the biggest column and starves the small ones. <strong>(3)</strong> On a 1,024 × 64 matrix with 40 weights scattered and multiplied by 25, per-group scales (128 rows per group) give <strong>36.4 dB</strong> against per-channel's <strong>28.0 dB</strong>: a column's outlier only ruins its own block of 128. <strong>(4)</strong> On post-ReLU activations (all ≥ 0), zero-point quantisation gives <strong>47.0 dB</strong> against symmetric's <strong>40.8 dB</strong>, about one extra bit. <strong>(5)</strong> The vectorised int8 matmul equals the triple loop, equals the float product of the dequantised matrices, and approximates the true product at above 30 dB; and multiplying two int16 vectors of 4,096 copies of 127 without widening wraps around, while the int32 version gives exactly 66,064,384. <strong>(6)</strong> The zero-point expansion equals multiplying the shifted integers directly. <strong>(7)</strong> A 64 × 1,024 activation matrix with four feature columns scaled up 40× (to magnitudes of tens, like the outliers in large models) times a 1,024 × 256 weight: vector-wise int8 gives <strong>25.1 dB</strong>; the decomposition finds exactly those 4 columns (0.4% of features), multiplies them in float, and reaches <strong>48.0 dB</strong>. <strong>(8)</strong> Bits per weight with 16-bit scales per 128 are 8.125 (int8) and 4.125 (int4); a 7B model is 14.0 GB in 16-bit and 7.11 GB in grouped int8. <strong>(9)</strong> If PyTorch is installed, its rounding gives the same per-channel integers (except rare exact-half ties) and its int32 matmul gives the same accumulated result.</p>
+<pre class="run">rng = np.random.default_rng(0)
+
+# 1. Loop and vectorised quantisers agree; round-trip error is at most half a step.
+W = rng.normal(size=(64, 48))
+Ql, scl = quant_absmax_loop(W)
+Qv, scv, _ = quantize(W)
+assert np.array_equal(Ql, Qv) and np.isclose(scl, scv.item())
+assert np.abs(W - dequantize(Qv, scv, 0)).max() &lt;= 0.5 / scl + 1e-12
+
+# 2. Per-channel scales beat a per-tensor scale when columns have different ranges.
+Wc = rng.normal(size=(256, 64)) * np.exp(rng.normal(scale=1.5, size=(1, 64)))   # column scales vary a lot
+q_t, s_t, z_t = quantize(Wc)
+q_c, s_c, z_c = quantize(Wc, axis=0)
+snr_t, snr_c = snr_db(Wc, dequantize(q_t, s_t, z_t)), snr_db(Wc, dequantize(q_c, s_c, z_c))
+assert snr_c &gt; snr_t + 3                                       # per-channel is much better here
+
+# 3. Per-group scales (128 rows per group) beat per-channel when weights have local outliers.
+Wg = rng.normal(size=(1024, 64)); Wg[rng.integers(0, 1024, 40), rng.integers(0, 64, 40)] *= 25
+q_g, s_g, z_g = quantize(Wg, group=128)
+q_c2, s_c2, z_c2 = quantize(Wg, axis=0)
+snr_g = snr_db(Wg, dequantize(q_g, s_g, z_g, Wg.shape))
+snr_c2 = snr_db(Wg, dequantize(q_c2, s_c2, z_c2))
+assert snr_g &gt; snr_c2
+
+# 4. Asymmetric (zero-point) quantisation wins on one-sided data such as post-ReLU activations.
+A = np.maximum(rng.normal(size=(128, 64)), 0)
+snr_sym = snr_db(A, dequantize(*quantize(A)))
+snr_asym = snr_db(A, dequantize(*quantize(A, symmetric=False)))
+assert snr_asym &gt; snr_sym + 3                                  # roughly one extra bit of resolution
+
+# 5. int8 matmul with int32 accumulation: the loop, the vectorised version and float on the
+#    dequantised values all agree; an int16 accumulator overflows at realistic sizes.
+X = rng.normal(size=(8, 512)); Wm = rng.normal(size=(512, 16))
+Xq, sx, _ = quantize(X, axis=1); Wq, sw, _ = quantize(Wm, axis=0)
+C_vec = matmul_int8(Xq, Wq, sx, sw)
+C_loop = matmul_int8_loop(Xq[:2], Wq[:, :3], sx[:2, 0], sw[0, :3])
+assert np.allclose(C_vec[:2, :3], C_loop)
+assert np.allclose(C_vec, dequantize(Xq, sx, 0) @ dequantize(Wq, sw, 0))
+assert snr_db(X @ Wm, C_vec) &gt; 30                              # about 1% error in a 512-long dot product
+big = np.full((1, 4096), 127, dtype=np.int16)
+with np.errstate(over="ignore"):
+    wrapped = (big @ big.T)[0, 0]                              # NumPy integer matmul accumulates in int16
+assert int(wrapped) != 127 * 127 * 4096 and (big.astype(np.int32) @ big.T.astype(np.int32))[0, 0] == 66_064_384
+
+# 6. The zero-point product expansion equals multiplying the shifted integers directly.
+Aq = rng.integers(-128, 128, size=(5, 32)).astype(np.int8); Bq = rng.integers(-128, 128, size=(32, 7)).astype(np.int8)
+za, zb = -17, 9
+direct = (Aq.astype(np.int32) - za) @ (Bq.astype(np.int32) - zb)
+assert np.array_equal(matmul_zeropoint(Aq, za, Bq, zb), direct)
+
+# 7. Outlier features: vector-wise int8 collapses, the mixed-precision decomposition recovers.
+Xo = rng.normal(size=(64, 1024)); Wo = rng.normal(size=(1024, 256)) * 0.02
+cols = rng.choice(1024, size=4, replace=False)
+Xo[:, cols] *= 40                                              # a few feature dimensions with huge values
+ref = Xo @ Wo
+Xq_o, sx_o, _ = quantize(Xo, axis=1); Wq_o, sw_o, _ = quantize(Wo, axis=0)
+snr_vec = snr_db(ref, matmul_int8(Xq_o, Wq_o, sx_o, sw_o))
+C_mixed, n_out = llm_int8(Xo, Wo)
+snr_mix = snr_db(ref, C_mixed)
+assert n_out == 4 and snr_mix &gt; snr_vec + 10                   # 4 of 1,024 columns (0.4%) in float
+
+# 8. Memory: bits per weight including scale overhead.
+def bits_per_weight(bits, group=None, scale_bits=16):
+    return bits + (scale_bits / group if group else 0)
+assert bits_per_weight(8, 128) == 8.125 and bits_per_weight(4, 128) == 4.125
+params = 7e9
+assert round(params * 2 / 1e9, 1) == 14.0 and round(params * bits_per_weight(8, 128) / 8 / 1e9, 2) == 7.11
+
+# 9. Cross-check the per-channel quantiser and the int8 matmul against PyTorch, if available.
+try:
+    import torch
+    step = torch.tensor(1.0 / s_c)                             # (1, 64): torch-style step sizes
+    tq = torch.clamp(torch.round(torch.tensor(Wc) / step), -127, 127).to(torch.int8)
+    assert (tq.numpy() == q_c).mean() &gt; 0.999                  # identical except rare exact-half ties
+    acc_t = torch.tensor(Xq, dtype=torch.int32) @ torch.tensor(Wq, dtype=torch.int32)
+    assert np.allclose(acc_t.numpy() / (sx * sw), C_vec)
+except ImportError:
+    pass
+if __name__ == "__main__":
+    print(f"per-tensor {snr_t:.1f} dB, per-channel {snr_c:.1f} dB; per-channel {snr_c2:.1f} vs per-group {snr_g:.1f} dB")
+    print(f"post-ReLU: symmetric {snr_sym:.1f} dB, zero-point {snr_asym:.1f} dB")
+    print(f"outliers: vector-wise int8 {snr_vec:.1f} dB, LLM.int8() decomposition {snr_mix:.1f} dB")</pre>
+
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Signal-to-noise ratios from the tests. Columns with different ranges: per-tensor 33.0 dB, per-channel 43.2 dB. Scattered weight outliers: per-channel 28.0 dB, per-group of 128 36.4 dB. Post-ReLU activations: symmetric 40.8 dB, zero-point 47.0 dB. Activations with outlier features: vector-wise int8 25.1 dB, LLM.int8 decomposition 48.0 dB.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="128" y="38" text-anchor="end" style="fill:var(--ink)">per-tensor</text><rect x="136" y="24" width="297" height="18" style="fill:var(--s2)"/><text x="439" y="38" style="fill:var(--ink)">33.0 dB</text><text x="128" y="64" text-anchor="end" style="fill:var(--ink)">per-channel</text><rect x="136" y="50" width="389" height="18" style="fill:var(--s1)"/><text x="531" y="64" style="fill:var(--ink)">43.2 dB</text><text x="128" y="90" text-anchor="end" style="fill:var(--ink)">per-channel*</text><rect x="136" y="76" width="252" height="18" style="fill:var(--s2)"/><text x="394" y="90" style="fill:var(--ink)">28.0 dB</text><text x="128" y="116" text-anchor="end" style="fill:var(--ink)">per-group 128*</text><rect x="136" y="102" width="328" height="18" style="fill:var(--s1)"/><text x="470" y="116" style="fill:var(--ink)">36.4 dB</text><text x="128" y="142" text-anchor="end" style="fill:var(--ink)">symmetric†</text><rect x="136" y="128" width="367" height="18" style="fill:var(--s2)"/><text x="509" y="142" style="fill:var(--ink)">40.8 dB</text><text x="128" y="168" text-anchor="end" style="fill:var(--ink)">zero-point†</text><rect x="136" y="154" width="423" height="18" style="fill:var(--s1)"/><text x="565" y="168" style="fill:var(--ink)">47.0 dB</text><text x="128" y="194" text-anchor="end" style="fill:var(--ink)">vector-wise‡</text><rect x="136" y="180" width="226" height="18" style="fill:var(--s2)"/><text x="368" y="194" style="fill:var(--ink)">25.1 dB</text><text x="128" y="220" text-anchor="end" style="fill:var(--ink)">LLM.int8()‡</text><rect x="136" y="206" width="432" height="18" style="fill:var(--s1)"/><text x="574" y="220" style="fill:var(--ink)">48.0 dB</text>
+    <text x="136" y="246" style="fill:var(--muted)">* scattered weight outliers · † post-ReLU data · ‡ activations with 4 outlier features · every 6 dB ≈ 1 bit</text>
+  </g>
+</svg>
+<figcaption>Each pair is the same data quantised two ways to 8 bits. The better choice is worth 6-23 dB — one to nearly four bits of effective precision — which is why granularity, symmetry and outlier handling matter more than the bit width alone.</figcaption>
+</figure>
+
+<h4>8. Numerical and practical traps</h4>
+<p><strong>Zero scales.</strong> An all-zero channel has max|x| = 0; guard the division (the code substitutes 1). <strong>Clipping range.</strong> Symmetric quantisation should clip to ±127, not −128, so that x and −x quantise symmetrically. <strong>Rounding mode.</strong> np.round and Python's round use round-half-to-even; other libraries may round half away from zero, which changes a few integers — compare with a tolerance on agreement, not equality. <strong>Accumulator width.</strong> Never accumulate int8 products in int8 or int16. <strong>Scale precision.</strong> Store scales in at least 16-bit float; an 8-bit scale multiplies every weight's error. <strong>Calibration for activations.</strong> Activation ranges change per input; computing scales on the fly (dynamic) is accurate but costs time, while fixed scales from calibration data (static) must cover rare large values without wasting range.</p>
+
+<h4>9. Edge cases worth naming</h4>
+<p><strong>Constant tensors</strong>: zero-point step is zero — handle by using step 1 and storing the constant. <strong>A single large value per channel</strong>: per-group helps only if the group is smaller than the channel. <strong>Very small matrices</strong>: scale overhead dominates; keep them in 16-bit (biases, layer norms). <strong>Embedding and output layers</strong>: often more sensitive, commonly kept at higher precision. <strong>Outlier threshold</strong>: 6.0 is the paper's value for their models; data or model families with different activation scales may need tuning.</p>
+
+<h4>10. Complexity</h4>
+<p>Quantising an n-element tensor is O(n) — one pass for statistics, one to scale and round. The int8 matmul is O(n·k·m) multiply-adds like any matmul, but each is an 8-bit operation that hardware performs at 2-4× the throughput of 16-bit and with half the memory traffic; dequantisation is O(n·m). The LLM.int8() decomposition adds O(n·k) to scan for outliers and a small 16-bit matmul over |O| columns. Memory: b/8 bytes per weight plus scales.</p>
+
+<h4>11. Talking through the design</h4>
+<p>Lead with the formulas and a hand example, then the granularity trade-off with numbers, the int8-times-int8-into-int32 matmul with scales applied once per output, and the zero-point expansion. Then the outlier story: why one value ruins a shared scale, why large models have systematic outlier dimensions, and LLM.int8()'s decomposition. Close with memory arithmetic and how you would validate a quantised model.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why outliers appear in large transformers</h4>
+<p>Dettmers et al. tracked feature dimensions with magnitude at least 6.0 that appear in at least 25% of layers and 6% of sequence positions. In their analysis these emerge as models grow — a phase change around 6.7B parameters — after which they occur in almost all layers and positions, concentrated in very few dimensions (at most 7 for models up to 13B, up to 150,000 outlier values per 2,048-token sequence in a 13B model). They are not noise: removing them hurts attention and prediction badly. Later work links such dimensions to mechanisms like attention sinks and to layer normalisation interactions. Whatever their cause, their systematic placement is what makes the fix possible: if they lived in random dimensions, a column-wise split would not isolate them.</p>
+
+<h4>Weight-only quantisation and on-the-fly dequantisation</h4>
+<p>For single-stream decoding, the bottleneck is reading weights, not multiplying them. Weight-only schemes keep activations in 16-bit, store weights in int8 or int4 with group scales, and dequantise each block in fast on-chip memory just before multiplying in 16-bit. Bandwidth falls by 2-4×, activation outliers are irrelevant, and the error is confined to the weights. Methods such as GPTQ (a post-training method that quantises weights column by column) choose the rounding of each weight to compensate errors in others using second-order information, and AWQ (activation-aware weight quantisation) protects the weight channels that see the largest activations; both target 4-bit weights with group sizes around 128.</p>
+
+<h4>Moving outliers instead of isolating them</h4>
+<p>An alternative to mixed precision is to make activations easier to quantise by moving their scale into the weights. Because y = x·W = (x·diag(1/c))·(diag(c)·W), dividing each activation channel by a factor c and multiplying the corresponding weight row by the same factor leaves the output unchanged. Choosing c to shrink outlier channels flattens the activations at the cost of making some weights larger, which weights tolerate better because they are static and can use finer scales. SmoothQuant is the best-known example; it enables int8 for both weights and activations without a 16-bit side path.</p>
+
+<h4>Lower than 8 bits</h4>
+<p>At 4 bits there are only 16 levels, so the distribution of levels matters. QLoRA's 4-bit NormalFloat places levels at quantiles of a normal distribution, matching how pretrained weights are distributed, with block-wise scales over 64 weights and a second quantisation of the scales themselves to save memory. Formats with floating-point structure (FP8, 8-bit floating point, in its variants, and microscaling formats that share an exponent across a small block) are increasingly supported in hardware, combining a coarse shared scale with per-element exponent bits — the same "scale per group" idea built into the number format.</p>
+
+<h4>Quantisation-aware training versus post-training quantisation</h4>
+<p>Everything in this lesson is post-training quantisation (PTQ): take a trained model, choose scales, round. Quantisation-aware training (QAT) instead simulates rounding during training — the forward pass uses quantised values, the backward pass treats rounding as the identity (the straight-through estimator) — so the weights learn to sit where rounding hurts least. QAT recovers more accuracy at very low bit widths but needs training compute and data, which is why PTQ dominates for large language models and QAT for small models deployed on constrained hardware. The scale formulas, granularities and int8 matmul are the same in both.</p>
+
+<h4>Accumulation and the dequantise-once rule</h4>
+<p>The efficiency of integer matmuls relies on applying scales once per output, not per product. That works only if every product contributing to an output shares the same pair of scales — which is why activations are scaled per row and weights per column (vector-wise), and why per-group weight scales along the inner dimension force either partial sums per group (rescaled and added in floating point) or dequantising weights to 16-bit before the multiply. Knowing which granularities are "matmul-friendly" is what separates a quantiser that saves memory from one that also saves time.</p>
+</section>
+
+<section data-field="prod">
+<h4>Where quantisation runs</h4>
+<p>Quantised weights are the norm for serving large language models: int8 and int4 weight-only formats in inference servers and local runtimes, LLM.int8() in the bitsandbytes library that made 8-bit loading of very large models practical, 4-bit NormalFloat for QLoRA fine-tuning, and FP8 on recent accelerators for both training and inference. Each is a choice of the knobs in this lesson: bits, granularity, symmetric or zero-point, and what to do about outliers.</p>
+
+<h4>Failure modes and symptoms</h4>
+<p><strong>Quality cliff at scale.</strong> Symptom: a quantisation recipe that worked on a 1B model breaks a 13B one. Cause: emergent outlier features. Fix: outlier handling (decomposition, smoothing) or weight-only quantisation.</p>
+<p><strong>Specific tasks degrade.</strong> Symptom: perplexity barely moves but long-context or arithmetic tasks drop. Cause: small per-layer errors compounding, or sensitive layers. Fix: evaluate on the tasks that matter; keep sensitive layers in higher precision.</p>
+<p><strong>No speedup.</strong> Symptom: memory falls but latency does not. Cause: no fused low-bit kernel, so weights are dequantised into a separate buffer; or compute-bound batch sizes where weight bandwidth was not the bottleneck; or per-group scales that the kernel handles slowly. Fix: use kernels designed for the format; measure at the batch sizes you serve.</p>
+<p><strong>NaNs or garbage.</strong> Cause: zero scales, overflowing accumulators, or scales stored in too low a precision. Fix: guards and tests like this lesson's.</p>
+
+<p><strong>Calibration mismatch.</strong> Symptom: a statically quantised model works on benchmark prompts and degrades on production traffic. Cause: activation scales calibrated on data with smaller ranges than real inputs (different languages, long documents, code). Fix: calibrate on representative traffic, or use dynamic activation scales.</p>
+
+<h4>What to monitor and tune</h4>
+<p>Per-layer output SNR on calibration data; perplexity and task scores versus 16-bit with intervals; memory per GPU and tokens per second at production batch sizes; fraction of outlier dimensions (if using decomposition) and its variation across inputs. Tune bits, group size (64-128 is common), symmetric versus asymmetric per tensor type, outlier threshold, and which layers stay in higher precision.</p>
+
+<h4>A cost estimate</h4>
+<p>A 13B model: 16-bit weights 26 GB; int8 with per-channel scales about 13 GB; int4 with groups of 128 and 16-bit scales 13e9 × 4.125 / 8 ≈ 6.7 GB. At batch size one, decoding reads the weights once per token, so on a GPU with 2 TB/s of bandwidth the floor is about 13 ms per token in 16-bit, 6.5 ms in int8 and 3.4 ms in int4 — assuming the kernels actually stream low-bit weights rather than dequantising them through memory.</p>
+
+<h4>The reference for this problem</h4>
+<p>Dettmers, Lewis, Belkada and Zettlemoyer, "LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale" (NeurIPS 2022), describe absmax and zero-point int8 and the int32 accumulation of int8 products; vector-wise quantisation with a scale per row of the hidden states and per column of the weights, dequantised by the outer product of scales; and mixed-precision decomposition, in which feature dimensions containing any value of magnitude at least α = 6.0 — about 0.1% of dimensions — are multiplied in 16-bit and the rest in int8, so that more than 99.9% of values are multiplied in 8-bit. Their perplexity table shows 8-bit absmax, zero-point, row-wise and vector-wise methods degrading at 13B while LLM.int8() matches 32-bit (12.45 perplexity), and they report memory reduced 1.96× for BLOOM-176B.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then vary it, break it and measure it. Python 3.12 with NumPy (the gpt_env venv); PyTorch only for the optional cross-check.</p>
+<ol>
+<li>Run the four blocks as one script. All assertions pass and it prints the SNR comparisons.</li>
+<li><strong>Vary by hand.</strong> Quantise [2.0, −0.4, 0.9, −1.7] with absmax and with zero-point by hand, then check with <code>quantize(x[None, :])</code>.</li>
+<li><strong>Measure bits.</strong> Repeat test 2 with 4-bit symmetric quantisation (levels −7…7) and confirm the SNR drops by about 6 dB per bit removed.</li>
+<li><strong>Vary group size.</strong> On the scattered-outlier matrix, sweep group sizes 16, 32, 64, 128, 256 and 1,024 and plot SNR against bits per weight including 16-bit scales.</li>
+<li><strong>Move the threshold.</strong> In <code>llm_int8</code>, try thresholds 3, 6 and 20 on test 7's data: count outlier columns and SNR each time.</li>
+<li><strong>Smooth instead.</strong> Divide X's columns by c = sqrt(max|X[:, h]|) and multiply W's rows by c, then quantise both vector-wise with no decomposition. Compare SNR with test 7.</li>
+</ol>
+<p>All of these run in well under a second, so sweep freely and keep a small table of SNR against bits per weight for each scheme — the shape of that table is what the interview answer should convey. What to look for: 6 dB per bit; diminishing returns from smaller groups as scale overhead grows; a threshold too low sends many columns to float, too high misses outliers; and smoothing recovers much of the decomposition's benefit without a 16-bit path.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>(a) A layer computes y = x·W with an inner dimension of 16,384. What is the largest possible int32 accumulator magnitude for int8 inputs, and is int32 safe? (b) A 34B model is served with int4 weights in groups of 64 with 16-bit scales and zero points (both per group). What is the weight memory?</p>
+<details><summary>Answer</summary>
+<pre class="run">worst = 16384 * 127 * 127
+assert worst == 264_257_536 and worst < 2 ** 31 - 1          # about 12% of the int32 range
+bits_d = 4 + (16 + 16) / 64                                   # scale and zero point per group of 64
+mem_d = 34e9 * bits_d / 8 / 1e9
+assert bits_d == 4.5 and round(mem_d, 2) == 19.12</pre>
+<p>(a) 16,384 × 127 × 127 = <strong>264,257,536</strong>, about 12% of int32's maximum of 2,147,483,647, so int32 is safe with a wide margin; it would take an inner dimension of about 133,000 to risk overflow with worst-case values (and then the -128 corner case of asymmetric data deserves a check too). int16 would overflow after just 3 worst-case products. (b) Each group of 64 weights carries a 16-bit scale and a 16-bit zero point: 4 + 32/64 = <strong>4.5 bits per weight</strong>, so 34e9 × 4.5 / 8 = <strong>19.1 GB</strong>, versus 68 GB in 16-bit. The overhead of per-group metadata (0.5 bits here) is why some formats quantise the scales themselves.</p>
+</details>
+</section>

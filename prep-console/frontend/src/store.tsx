@@ -6,6 +6,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { ApiError, call } from "./api";
 import { progressKey, useAuth } from "./auth";
 import { pct, todayKey } from "./util";
+import { announceXp } from "./xp";
 
 export type Status = "done" | "rev";
 export interface MockLog { round: string; at: number; used: number; notes: string }
@@ -27,6 +28,7 @@ interface Api {
   setStatus(id: string, status: Status | null): void;
   cycle(id: string, target: Status): void;
   setSrs(id: string, box: number, due: string): void;
+  setNote(id: string, text: string): void;
   addMock(round: string, used: number, notes: string): void;
   importState(data: unknown): Promise<string>;
   resetProgress(): Promise<void>;
@@ -55,6 +57,8 @@ export function ProgressProvider({ children }: { children: ReactNode }) {
   const [mode, setMode] = useState<Mode>(uid === null ? "local" : "loading");
   const modeRef = useRef<Mode>(mode);
   modeRef.current = mode;
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const { expired } = auth;
 
   const fail = useCallback((e: unknown) => {
@@ -77,6 +81,8 @@ export function ProgressProvider({ children }: { children: ReactNode }) {
   }, [fail]);
 
   const setStatus = useCallback((id: string, status: Status | null) => {
+    // Announced outside the updater, which React may run twice.
+    if (status === "done" && stateRef.current.items[id] !== "done") announceXp(id);
     setState(s => {
       const prev = s.items[id] || null;
       const items = { ...s.items };
@@ -96,6 +102,14 @@ export function ProgressProvider({ children }: { children: ReactNode }) {
     setSrs: (id, box, due) => {
       setState(s => ({ ...s, srs: { ...s.srs, [id]: { box, due } } }));
       send("PUT", `/api/srs/${encodeURIComponent(id)}`, { box, due });
+    },
+    setNote: (id, text) => {
+      setState(s => {
+        const notes = { ...s.notes };
+        if (text.trim()) notes[id] = text.trim(); else delete notes[id];
+        return { ...s, notes };
+      });
+      send("PUT", `/api/notes/${encodeURIComponent(id)}`, { text });
     },
     addMock: (round, used, notes) => {
       setState(s => ({ ...s, logs: [...s.logs, { round, at: Date.now(), used, notes }],

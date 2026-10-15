@@ -1,0 +1,413 @@
+<!-- topic source for classic/cd18; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "cd18",
+  "t": "Design live comments and reactions for a streaming event (Twitch chat, YouTube Live)",
+  "tag": "Fan-out",
+  "sum": "Five million viewers on one stream: holding the connections, a fan-out tree that sends each message once per server instead of once per viewer, sampling and rate limits when chat is faster than anyone can read, reactions aggregated into counts, moderation in the path, per-stream ordering, and the hot-stream and reconnect-storm problems — with Twitch's Edge/Pubsub design and LinkedIn's live-likes system as the real cases.",
+  "prereq": [
+    ["cd2", "Chat: persistent connections on connection servers, a registry of which server holds which user, and fan-out to groups."],
+    ["net11", "WebSockets give a full-duplex connection; Server-Sent Events stream server-to-client over plain HTTP; both keep one long-lived connection per client."],
+    ["cd12", "A rate limiter keeps a token bucket per key and rejects or delays requests beyond the configured rate."],
+    ["sc10", "Pub/sub decouples publishers from subscribers through topics; delivery can be at-most-once or at-least-once."],
+    ["in1", "A durable log such as Kafka retains messages by offset so consumers can replay, at the cost of each consumer reading whole partitions."],
+    ["net13", "A server holds many sockets with event-driven I/O (epoll); each connection costs kernel buffers and file descriptors."],
+    ["sc12", "Retries with exponential backoff and jitter keep many clients from retrying in lockstep."]
+  ],
+  "myths": [
+    ["Every viewer must receive every message.", "On a big stream, chat arrives at thousands of messages per second and a person can read perhaps five to ten. Delivering everything to everyone multiplies cost by the viewer count to send text nobody sees. Large live chats deliberately show each viewer a sample, while guaranteeing the messages that matter to that viewer: their own, replies and mentions, moderator and paid messages."],
+    ["Fan-out means the server loops over the viewers and sends to each.", "At 5 million viewers that loop is the whole design's bottleneck. Fan-out is a tree: the stream's publisher sends each message once to each connection server (tens of them), and each server sends to its own local connections, encoding the frame once and writing the same bytes to every socket. Work at each layer is bounded by its fan-out, not by the total audience."],
+    ["Kafka is the natural backbone for live chat.", "A log gives durability and replay, but a consumer reads whole partitions, so every connection server would read every stream's messages to find the few streams its viewers watch. LinkedIn's live-likes design explicitly avoided Kafka for this reason, routing through an in-memory subscription table and accepting that a message can be dropped. Use a log to persist chat for replay and moderation, not as the delivery path."],
+    ["Reactions are just very short messages.", "A million viewers tapping a heart every few seconds is hundreds of thousands of events per second, and nobody wants to see each one. Reactions are counted, not delivered: connection servers sum them per short window, an aggregator merges the sums, and viewers receive a total every half second that the client animates."],
+    ["Moderation can happen after delivery.", "Once a slur has been shown to five million people, removing it a minute later does not undo it. Cheap checks — bans, timeouts, blocklists, link rules — must run synchronously before fan-out, with a strict latency budget; heavier classifiers run in parallel and can hold borderline messages or retract them, and retractions travel through the same fan-out."]
+  ],
+  "recap": [
+    "Live chat is a write path (accept, limit, moderate, sequence one message) feeding a read path that fans each message out to millions of open connections.",
+    "Connections are held by edge servers, around 100,000 per machine; a viewer joining a stream subscribes their edge to that stream's topic.",
+    "Fan-out is a tree: one send per edge (or relay) per message, then local delivery with the frame encoded once and written to every socket.",
+    "When chat is faster than people can read, each viewer gets a sample, capped at a few messages per second, with their own messages, mentions, moderator and paid messages always delivered.",
+    "Per-user rate limits and slow mode control what enters; per-stream ingest caps bound the worst case.",
+    "Reactions are aggregated into counts per short window at the edge and merged centrally; viewers receive totals, not events.",
+    "Cheap moderation runs synchronously before fan-out; classifiers run in parallel and can hold or retract; deletions are broadcast like messages.",
+    "One sequencer per stream gives every message a sequence number, so all viewers see the same relative order and can resume after reconnecting.",
+    "Delivery is at-most-once and real-time; durability for replay and audit comes from writing accepted messages to a log or store off the hot path.",
+    "Hot streams and reconnect storms are the characteristic failures: pre-provision edges, cap join rates, and make clients reconnect with jitter."
+  ],
+  "glossary": [
+    ["At-most-once delivery", "A message is delivered once or not at all; it is never redelivered, so it can be lost but not duplicated."],
+    ["Conflation", "Replacing a stream of updates with only the latest value per interval, so slow consumers see fewer, more current updates."],
+    ["Edge (connection) server", "A server that holds clients' long-lived connections and delivers messages to them."],
+    ["Encode once", "Serialising a message into its wire format one time and writing the same bytes to many sockets."],
+    ["Fan-out", "Delivering one message to many recipients."],
+    ["Frame", "One unit of data sent on a WebSocket or SSE connection; batching puts several messages in one frame."],
+    ["Hot stream", "A stream with so many viewers or messages that it overloads the resources dedicated to one topic."],
+    ["IRC", "Internet Relay Chat, a long-established text chat protocol; Twitch's chat speaks it so bots can use standard IRC libraries."],
+    ["Jitter", "A random delay added to retries or reconnects so that many clients do not act at the same instant."],
+    ["Pub/sub", "A messaging pattern where publishers send to a topic and every subscriber to the topic receives the message."],
+    ["Reconnect storm", "Many clients reconnecting at once, for example after a server dies, overwhelming the servers they reconnect to."],
+    ["Relay", "An intermediate server in a fan-out tree that receives a message once and forwards it to many downstream servers."],
+    ["Sampling", "Delivering a subset of messages to each viewer, chosen by rules and randomness, instead of all of them."],
+    ["Slow mode", "A per-channel rule that each user may send at most one message every N seconds."],
+    ["SSE", "Server-Sent Events: a server-to-client stream over a long-lived HTTP response."],
+    ["Subscription registry", "A table of which edge servers have viewers for which streams, used to route messages only where they are needed."],
+    ["WebSocket", "A protocol that upgrades an HTTP connection to a long-lived, two-way message channel."]
+  ],
+  "qa": [
+    ["E", "How do you deliver a chat message to millions of viewers?", "In a tree. Viewers hold WebSocket or SSE connections to edge servers. When a viewer joins a stream, their edge subscribes to that stream's topic. A published message goes once to each subscribed edge, and each edge writes it to its local viewers, encoding the frame once. The publisher's work scales with the number of edges, each edge's with its own connections."],
+    ["E", "WebSocket or SSE for live comments?", "Both work. SSE is server-to-client over ordinary HTTP, which proxies and CDNs handle easily, and clients can send comments with normal POST requests; LinkedIn's live-likes system uses SSE. WebSocket is two-way on one connection, which suits chat where sending is frequent and protocols like Twitch's IRC-based one. The fan-out design is the same either way."],
+    ["E", "Why rate-limit chat if the system can handle the load?", "Because readability is the real limit: beyond a few messages per second nobody can read the chat, and spam drowns real conversation. Per-user limits and slow mode keep individual users from flooding; a per-stream cap bounds the cost of a single stream; and sampling decides what each viewer sees from what remains."],
+    ["M", "Estimate the cost of naive fan-out for a 5-million-viewer stream.", "If 5% of viewers send one message every 30 seconds, that is about 8,300 messages per second. Sending each to every viewer is 8,300 × 5 million ≈ 41 billion deliveries per second — absurd. Capping what each viewer sees at 10 per second brings it to 50 million per second across the edge fleet; with 75 edges that is about 670,000 per edge per second, and batching into 5 frames per second per connection cuts socket writes to 500,000 per edge.", "Follow-up: What is the bandwidth? — Ten messages of ~150 bytes per second per viewer is 1.5 KB/s; × 5 million ≈ 7.5 GB/s total, about 150 MB/s per edge before compression."],
+    ["M", "How does each viewer get a sample without losing what matters?", "Split delivery into two lanes. A broadcast lane carries a sampled subset of the stream, capped per viewer per second, chosen randomly or with weights (subscribers, longer messages). A directed lane always delivers messages addressed to this viewer — their own (echoed immediately by the client, confirmed by the server), replies, mentions — plus moderator and paid messages. The edge merges both lanes in sequence order."],
+    ["M", "Where does moderation sit in the path?", "Synchronously before fan-out for cheap checks: is the user banned or timed out, does the text hit the channel's blocklist, are links allowed, is slow mode respected — a few milliseconds against cached state. Heavier classifiers (toxicity models) run in parallel; borderline messages can be held for a moderator, and messages flagged after delivery are retracted with a delete event that fans out like a message. A channel can also add a short delay to all chat to give moderation time.", "Follow-up: What if the classifier is slow? — It must never block the stream: time out and fall back to the synchronous rules, then retract later if it flags the message."],
+    ["M", "How do reactions work at a million per second?", "Do not deliver reaction events. Each edge counts reactions from its viewers per type per window (say 250 ms) and sends a small summary upstream; an aggregator merges summaries from all edges and publishes totals, say every 500 ms, through the same fan-out; clients animate the totals. Inbound becomes (edges × windows per second) messages instead of a million, and outbound is one tiny update per viewer per half second."],
+    ["M", "How do you keep chat in order?", "Give each stream one sequencer — the ingest partition that owns the stream — which stamps every accepted message with an increasing sequence number. Edges deliver in sequence order and clients display by it, so every viewer sees the same relative order even though each sees a different sample. Ordering across different streams is not needed. After a reconnect, the client sends its last sequence number and the edge replays recent messages from a small per-stream buffer."],
+    ["H", "Design the fan-out for one stream with 10 million viewers.", "About 100 edges at 100,000 connections each. The stream's publisher sending to 100 edges is cheap, but if every edge received every raw message it would need the full rate; so the stream node down-samples the broadcast lane once (say to 200 messages per second) and fans that out through a two-level tree — publisher to 10 relays, each relay to 10 edges — while directed messages go straight to the viewer's edge via a registry. Each edge encodes each batch once and writes it to its connections. Pre-provision the edges before the event; autoscaling is too slow for a launch spike.", "Follow-up: Why down-sample centrally instead of at each edge? — It cuts the traffic into every edge by the sampling ratio and makes the broadcast sample identical for all viewers, which keeps conversations coherent."],
+    ["H", "An edge server with 100,000 connections dies. What happens?", "Those clients detect the closed connection and reconnect through the load balancer to other edges. If they all reconnect immediately, 100,000 handshakes (TLS included) hit the remaining edges in the same second — a reconnect storm that can take down another edge and cascade. Clients must reconnect with exponential backoff and random jitter over several seconds, edges must cap accepted handshakes per second, and the reconnecting client resumes from its last sequence number so it does not miss its own context.", "Follow-up: How do you drain an edge for a deploy? — Stop sending it new connections, then close its existing ones gradually over minutes, telling clients to reconnect, so the load moves smoothly."],
+    ["H", "Should chat delivery be at-least-once?", "No, for the live view. Redelivering after failures would create duplicates and delay, and a viewer cannot tell that one of hundreds of sampled messages was lost. Delivery is at-most-once and fast. Durability is separate: accepted messages are written asynchronously to a log or database for replay alongside the recording, moderation review and audit. The exception is the directed lane for messages that matter (your own message's confirmation, a moderator warning), where a lightweight acknowledgement and resend is worth it."],
+    ["H", "How would an ML model fit into this system?", "Three places, all off the per-delivery hot path. A toxicity or spam classifier on ingest, run in parallel with a strict timeout, able to hold or retract. A ranking model that chooses which messages enter the broadcast sample (quality, diversity, not just recency), scored once per message at the stream node, never per viewer. And summarisation or highlight detection over the chat log for moderators or the recording. Each needs a fallback rule when the model is slow, and logged decisions so moderators can audit them.", "Follow-up: What is the risk of a ranking model for the sample? — It can amplify whatever it rewards (outrage, a group's spam); keep randomness in the sample and monitor the share of messages from each user."]
+  ],
+  "refs": [
+    ["post", "Twitch engineering: an introduction and overview (Twitch, 2015)", "Chat as a Go system: Edge nodes speaking IRC over TCP and WebSockets, Pubsub distributing messages between Edge nodes in a hierarchical fan-out, Clue for business-logic checks such as bans, Room for viewer lists.", "https://blog.twitch.tv/en/2015/12/18/twitch-engineering-an-introduction-and-overview-a23917b71a25/"],
+    ["video", "Streaming a million likes/second: real-time interactions on live video (Akhilesh Gupta, LinkedIn, QCon London 2020)", "SSE connections held by Akka actors, per-frontend subscription tables, dispatchers with a shared subscription store, cross-data-centre fan-out on publish, and why not Kafka.", "https://www.infoq.com/presentations/linkedin-play-akka-distributed-systems"],
+    ["post", "How Discord scaled Elixir to 5,000,000 concurrent users (Discord, 2017)", "Fanning out a busy guild's messages to tens of thousands of sessions, and Manifold: grouping recipients by node so each node receives one send.", "https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users"],
+    ["docs", "HTML Living Standard: server-sent events", "The EventSource API and the text/event-stream format, including event ids and Last-Event-ID for resuming after a reconnect.", "https://html.spec.whatwg.org/multipage/server-sent-events.html"],
+    ["docs", "RFC 6455: The WebSocket protocol", "Framing, the opening handshake and close semantics.", "https://datatracker.ietf.org/doc/html/rfc6455"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>The final of an esports tournament is streaming to five million people. The chat panel beside the video is part of the event: viewers cheer, spam an emote when a player makes a play, ask questions the casters read out. In the deciding moment, a tenth of the audience types at once. A naive chat backend takes each new message and sends it to every connected viewer. At 8,000 messages per second and 5 million viewers, that is 40 billion deliveries per second; the chat servers saturate their network links within seconds, messages arrive a minute late, then not at all, and the connection servers start dropping viewers, who all reconnect at the same moment and knock over the servers that were still standing. Meanwhile, someone posts a slur that is shown to everyone before anyone can remove it, and a bot posts the same scam link four hundred times.</p>
+<p>Live comments look like group chat (cd2) with a bigger group, but the numbers change the problem. In a group chat of 100, everyone should receive every message, durably, in order. In a live chat of five million, nobody can read more than a handful of messages per second, so delivering everything is not just expensive but pointless; the audience joins and leaves in waves around the broadcast; reactions arrive at a million per second; and anything harmful is shown to millions within a second unless it is stopped before fan-out. The design is about fan-out economics and deliberate loss.</p>
+<p>This lesson works through the design in interview order: requirements; the arithmetic of connections, message rates, deliveries and bandwidth; the API and data model; the architecture and the path of one message; then three deep dives. The first is the fan-out topology: subscription registries, trees of relays, encoding once and batching. The second is what to do when chat is too fast to read: rate limits, slow mode, per-viewer sampling with a directed lane for messages that matter, and reaction aggregation. The third is moderation in the path, ordering, and the hot-stream and reconnect-storm failures. The real cases are Twitch's description of its Edge and Pubsub chat tiers and LinkedIn's system that streams a million likes per second; the lab measures how much sampling, batching and aggregation remove.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a stadium, a PA system and a scoreboard</h4>
+<p>Picture a stadium of 80,000 people. Everyone can shout, but nobody hears every voice; you hear the people near you and the roar of the crowd. The stadium does not try to relay every shout to every seat. Instead it has a public-address system that carries a few selected voices (the announcer reading out messages) over the public-address (PA) system to every section through a hierarchy of amplifiers — one feed to each section's speakers, not one to each seat. It has a big screen that shows the crowd's mood as one number ("noise level: 112 dB") rather than each scream. Stewards stop people with banners that break the rules <em>before</em> they reach the front, not after the cameras have shown them. And the gates control how fast people enter, because 80,000 people pushing through at once crush each other.</p>
+<p>Each piece maps onto the design. The sections and their speakers are <strong>edge servers</strong>, each holding the connections of tens of thousands of viewers. The amplifier hierarchy is the <strong>fan-out tree</strong>: a message is sent once to each edge, which delivers it locally. The announcer's selection is <strong>sampling</strong>: each viewer sees a readable subset of the chat. The screen's noise level is <strong>reaction aggregation</strong>: counts, not events. The stewards are <strong>moderation in the path</strong>. The gates are <strong>admission and reconnect control</strong>.</p>
+<p>The analogy breaks in one place that matters: in a stadium everyone hears the same PA. Online, each viewer can get a slightly different sample, plus messages meant only for them — replies, mentions, their own message appearing instantly. So the design has two delivery lanes: a broadcast lane that is the same for everyone on the stream, and a directed lane for messages addressed to one viewer.</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Architecture. On the write path, a viewer's message goes through an edge server to the ingest service for the stream, which checks rate limits and slow mode, runs fast moderation, assigns a sequence number and publishes. The stream node samples the broadcast lane and publishes through relays to every edge server with viewers of the stream. Each edge writes batched frames to its local connections. Accepted messages are also written to a chat log for replay and moderation. A reaction aggregator merges per-edge counts.">
+  <defs><marker id="cd18-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="8" y="30" width="96" height="44" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="56" y="50" text-anchor="middle" style="fill:var(--ink)">Sender</text>
+    <text x="56" y="66" text-anchor="middle" style="fill:var(--muted)">types a message</text>
+    <rect x="130" y="30" width="110" height="80" rx="4" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="185" y="50" text-anchor="middle" style="fill:var(--ink);font-weight:600">Ingest (stream)</text>
+    <text x="185" y="67" text-anchor="middle" style="fill:var(--muted)">rate limit, slow mode</text>
+    <text x="185" y="83" text-anchor="middle" style="fill:var(--muted)">fast moderation</text>
+    <text x="185" y="99" text-anchor="middle" style="fill:var(--muted)">seq = n + 1</text>
+    <line x1="104" y1="52" x2="128" y2="52" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="130" y="140" width="110" height="40" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="185" y="158" text-anchor="middle" style="fill:var(--ink)">Chat log</text>
+    <text x="185" y="173" text-anchor="middle" style="fill:var(--muted)">async, for replay</text>
+    <line x1="185" y1="110" x2="185" y2="138" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <rect x="268" y="30" width="96" height="80" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="316" y="52" text-anchor="middle" style="fill:var(--ink);font-weight:600">Stream node</text>
+    <text x="316" y="70" text-anchor="middle" style="fill:var(--muted)">sample broadcast</text>
+    <text x="316" y="86" text-anchor="middle" style="fill:var(--muted)">route directed</text>
+    <line x1="240" y1="70" x2="266" y2="70" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="392" y="20" width="70" height="36" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="427" y="43" text-anchor="middle" style="fill:var(--ink)">Relay 1</text>
+    <rect x="392" y="86" width="70" height="36" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="427" y="109" text-anchor="middle" style="fill:var(--ink)">Relay 2</text>
+    <line x1="364" y1="60" x2="390" y2="40" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <line x1="364" y1="80" x2="390" y2="100" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <rect x="490" y="8" width="66" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="523" y="27" text-anchor="middle" style="fill:var(--ink)">Edge A</text>
+    <rect x="490" y="44" width="66" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="523" y="63" text-anchor="middle" style="fill:var(--ink)">Edge B</text>
+    <rect x="490" y="80" width="66" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="523" y="99" text-anchor="middle" style="fill:var(--ink)">Edge C</text>
+    <rect x="490" y="116" width="66" height="28" rx="3" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="523" y="135" text-anchor="middle" style="fill:var(--ink)">Edge D</text>
+    <line x1="462" y1="34" x2="488" y2="22" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="462" y1="42" x2="488" y2="58" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="462" y1="100" x2="488" y2="94" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="462" y1="110" x2="488" y2="130" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="598" y="27" text-anchor="middle" style="fill:var(--muted)">100k</text>
+    <text x="598" y="63" text-anchor="middle" style="fill:var(--muted)">conns</text>
+    <text x="598" y="99" text-anchor="middle" style="fill:var(--muted)">each</text>
+    <rect x="268" y="200" width="200" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--s4)"/>
+    <text x="368" y="220" text-anchor="middle" style="fill:var(--ink)">Reaction aggregator</text>
+    <text x="368" y="238" text-anchor="middle" style="fill:var(--muted)">sum per-edge counts every 250 ms</text>
+    <path d="M523,144 L523,225 L470,225" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--s4);stroke-dasharray:4 3"/>
+    <text x="540" y="190" style="fill:var(--s4)">counts up</text>
+    <path d="M316,200 L316,112" marker-end="url(#cd18-arrow)" style="fill:none;stroke:var(--s4);stroke-dasharray:4 3"/>
+    <text x="250" y="160" style="fill:var(--s4)">totals down</text>
+    <text x="320" y="285" text-anchor="middle" style="fill:var(--ink-2)">publisher work ∝ number of relays; relay work ∝ edges; edge work ∝ its own viewers</text>
+  </g>
+</svg>
+<figcaption>The write path is narrow and strict (limits, moderation, a sequence number per stream); the read path is wide and cheap (a tree of sends, each edge delivering locally). Reactions travel the other way as counts and come back as totals.</figcaption>
+</figure>
+
+<h4>Two paths with opposite needs</h4>
+<p>The <strong>write path</strong> handles each accepted message once: authenticate the sender, apply their rate limit and the channel's rules, run moderation, assign a sequence number, publish. It must be strict and consistent but its volume is modest — thousands per second even for a huge stream. The <strong>read path</strong> multiplies each message by the audience: it must be cheap per delivery, tolerant of loss, and scale with the number of viewers. Every design decision below belongs to one of the two paths, and confusing them — durable, ordered, acknowledged delivery on the read path; best-effort checks on the write path — is where weak designs go wrong.</p>
+<p>A useful sentence to say early in the interview: <em>the write path is a per-stream sequencer with rules; the read path is a cache-like broadcast that is allowed to drop.</em> It tells the interviewer you know where correctness lives (accepting, rejecting and ordering messages, which happens once per message) and where scale lives (delivering, which happens millions of times per message), and it sets up every later trade-off — sampling, batching, at-most-once delivery — as a deliberate choice on the read path rather than a corner cut.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–13</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">13–19</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">19–26</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">26–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> (1) Viewers of a live stream see a chat panel that updates in real time. (2) Signed-in viewers can post messages; their own message appears instantly. (3) Viewers can send reactions (hearts, emotes) shown as a live aggregate. (4) Moderators and the streamer can delete messages, time out or ban users, enable slow mode, restrict chat to followers or subscribers. (5) Replies and mentions reach the person addressed. (6) Chat is saved and can be replayed in sync with the recording. Out of scope, said aloud: the video pipeline itself (cd4), private messages, and payment for paid messages (beyond treating them as must-deliver).</p>
+<p><strong>Non-functional.</strong> Low latency: a message should appear for viewers within about a second of being sent, roughly in step with the video (which itself runs several seconds behind real time). Massive fan-out: support single streams with millions of concurrent viewers and many thousands of streams at once. Availability over completeness: losing an occasional message on the read path is acceptable; the chat going dark is not. Safety: harmful content must be stopped before broad delivery wherever possible. Consistent order within a stream.</p>
+<p><strong>Clarifying questions.</strong> What is the largest single stream (viewers, chatters)? How many concurrent streams? Must every viewer see every message (a small Q&amp;A) or is sampling acceptable (a big event)? Are there paid or pinned messages that must never be dropped? How fast must moderation act, and is a short chat delay acceptable to the product? Global audience or one region?</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Assume the largest event has <strong>5 million concurrent viewers</strong>; across the platform there are <strong>20 million</strong> concurrent viewers at peak; on the big stream <strong>5% of viewers chat</strong>, each sending one message every <strong>30 seconds</strong>; a message is about <strong>150 bytes</strong> on the wire; each viewer taps a reaction every <strong>5 seconds</strong>.</p>
+<p><strong>Connections.</strong> 20 million concurrent connections platform-wide. LinkedIn reported holding on the order of 100,000 connections per frontend machine in its live-likes system; using that figure, the platform needs about <strong>200 edge servers</strong>, plus 50% headroom for failures and spikes: 300. The big stream alone spans 50 edges' worth of viewers, spread across many more edges because viewers of different streams share edges. Memory per idle connection (kernel socket buffers, a goroutine or actor, a little user state) is tens of kilobytes: 100,000 × 20 KB = 2 GB per edge, comfortable.</p>
+<p><strong>Message rate.</strong> Chatters: 5% × 5,000,000 = 250,000; each sends 1 per 30 s: 250,000 ÷ 30 ≈ <strong>8,300 messages per second</strong> into one stream — far beyond readability, which is around 5-10 per second for a human.</p>
+<p><strong>Naive fan-out.</strong> 8,300 messages × 5,000,000 viewers ≈ <strong>41.5 billion deliveries per second</strong>. At 150 bytes each that is about 6 TB/s. Impossible, and pointless.</p>
+<p><strong>Sampled fan-out.</strong> Cap what a viewer receives at <strong>10 messages per second</strong>: 5,000,000 × 10 = <strong>50 million deliveries per second</strong> for the stream. Bandwidth: 10 × 150 B = 1.5 KB/s per viewer; × 5 million = 7.5 GB/s (60 Gbit/s) total, before compression. Per edge holding 100,000 of these viewers: 1 million deliveries and about 150 MB/s (1.2 Gbit/s). <strong>Batching</strong> the messages into one frame every 200 ms turns 10 writes per second per connection into 5: <strong>500,000 socket writes per second</strong> per edge. That is the per-edge budget to design for.</p>
+<p><strong>Reactions.</strong> 5,000,000 viewers ÷ 5 s = <strong>1,000,000 reactions per second</strong> inbound. If edges count locally and send a summary every 250 ms, upstream traffic is (edges serving the stream) × 4 per second — a few hundred small messages per second. Outbound, one total every 500 ms per viewer: 10 million tiny updates per second, which ride in the same frames as chat.</p>
+<p><strong>Storage.</strong> Accepted messages for replay: 8,300 per second × 150 B ≈ 1.25 MB/s for the big stream; a three-hour event is about 13 GB. Platform-wide, perhaps 50,000 messages per second ≈ 650 GB per day. Easy for a partitioned log or wide-column store, written off the hot path.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+<tr><td>Edge servers</td><td>20M connections ÷ 100k, + headroom</td><td>~300</td></tr>
+<tr><td>Chat into the big stream</td><td>250k chatters ÷ 30 s</td><td>~8,300 msg/s</td></tr>
+<tr><td>Naive deliveries</td><td>8,300 × 5M</td><td>~41.5 billion/s</td></tr>
+<tr><td>Sampled deliveries</td><td>5M × 10/s</td><td>50 million/s</td></tr>
+<tr><td>Per-edge writes, batched</td><td>100k × 5 frames/s</td><td>500k/s, ~150 MB/s</td></tr>
+<tr><td>Reactions in</td><td>5M ÷ 5 s</td><td>1M/s → hundreds/s after edge counting</td></tr>
+<tr><td>Chat log</td><td>8,300 × 150 B × 3 h</td><td>~13 GB per event</td></tr>
+</table>
+
+<h4>3 · The API</h4>
+<pre>Connection (WebSocket, or SSE + HTTP POST):
+  GET wss://chat.example.com/v1/streams/{stream_id}?resume_from_seq=48211930
+  ← server frames, batched every ~200 ms:
+     {type: "batch", msgs: [{seq: 48211931, id, user: {id, name, badges}, text, ts}, …],
+      reactions: {"❤": 18422, "🔥": 9310}, viewers: 4920331}
+     {type: "delete", seq: 48211901}          {type: "mode", slow_mode_s: 10}
+  → client frames:
+     {type: "send", client_msg_id: "c-7f2…", text: "what a play"}
+     {type: "react", emote: "🔥"}
+
+Server replies to send:
+  {type: "ack", client_msg_id: "c-7f2…", seq: 48211977}
+  | {type: "rejected", client_msg_id, reason: "SLOW_MODE", retry_after_s: 7}
+
+Moderation (HTTP, moderators only):
+  POST /v1/streams/{id}/messages/{msg_id}:delete
+  POST /v1/streams/{id}/users/{user_id}:timeout   {seconds: 600}
+  PATCH /v1/streams/{id}/settings                  {slow_mode_s: 10, followers_only: true}</pre>
+<p>The <code>client_msg_id</code> lets the client show its own message instantly and match the server's ack, and makes a resend after a dropped connection idempotent. <code>resume_from_seq</code> lets a reconnecting client pick up from the last message it displayed. Rejections carry a reason and a retry hint so the client can show "slow mode: wait 7 s" instead of letting the user mash send.</p>
+
+<h4>4 · The data model</h4>
+<pre>In memory, on the stream's ingest/stream node:
+  stream_state  {stream_id, next_seq, slow_mode_s, followers_only, blocklist_version}
+  recent_ring   last ~1,000 broadcast messages (for resume and new joiners)
+  user_limits   token bucket per (stream, user)  — or in a shared store (cd12)
+
+In memory, on each edge:
+  subscriptions  stream_id → set of local connections
+  conn_state     connection → {user_id, stream_id, last_seq_sent}
+
+Shared, small, fast (replicated cache):
+  bans / timeouts   (stream_id, user_id) → until
+  registry          stream_id → set of edges with viewers   (for routing)
+  user_location     user_id → edge                          (for the directed lane)
+
+Durable, off the hot path:
+  chat_log   PARTITION BY (stream_id, hour) CLUSTER BY seq:
+             {seq, msg_id, user_id, text, ts, deleted_at, moderation_flags}</pre>
+<p>Almost everything on the read path is in memory and reconstructible: if an edge dies, its subscriptions die with its connections, and the clients re-create them by reconnecting. The only durable data is the chat log (for replay and moderation review) and moderation state (bans must survive restarts).</p>
+
+<h4>5 · High-level design and the path of one message</h4>
+<ol>
+<li><strong>Send.</strong> The viewer's client shows the message immediately (greyed until acknowledged) and sends it on its connection to its edge.</li>
+<li><strong>Ingest.</strong> The edge forwards it to the stream's ingest node — one node (or partition) owns each stream's write path, chosen by hashing the stream id. The node checks the sender's ban and timeout state, the per-user token bucket and slow mode, the channel's mode (followers only), and runs fast moderation filters. It assigns the next sequence number and acks the sender.</li>
+<li><strong>Publish.</strong> The stream node puts the message into the broadcast lane (subject to sampling, deep dive B) and, if it mentions or replies to someone, into the directed lane for those users. It appends it asynchronously to the chat log.</li>
+<li><strong>Fan out.</strong> The broadcast lane goes through relays to every edge in the stream's registry; directed messages go straight to the edge holding each addressed user.</li>
+<li><strong>Deliver.</strong> Each edge collects messages for 200 ms, builds one frame per stream (encoding it once), and writes the same bytes to every subscribed local connection, adding the few directed messages per connection.</li>
+</ol>
+<p>Viewer joins follow the reverse path: the client connects to an edge (any edge — the load balancer chooses), the edge adds the connection to its local subscription set and, if it is the edge's first viewer of the stream, registers itself in the stream's registry so messages start flowing to it; it then sends the last few dozen messages from the recent ring so the panel is not empty.</p>
+
+<h4>6 · Deep dive A: the fan-out topology</h4>
+<p><strong>Option 1: every edge receives everything.</strong> The simplest pub/sub broadcasts every message of every stream to every edge, and each edge drops what it has no viewers for. With 300 edges and 50,000 messages per second platform-wide, each edge processes 50,000 messages per second mostly to discard them, and the publisher sends 15 million per second. It wastes work proportional to edges × streams, and does not scale.</p>
+<p><strong>Option 2: route by subscription.</strong> Keep a <strong>registry</strong> of which edges have viewers for which stream. A message for stream S goes only to edges in S's registry entry. LinkedIn's live-likes system describes this shape: each frontend node keeps an in-memory table of which of its connections watch which video; it tells a <strong>dispatcher</strong> tier which videos it has viewers for; the subscription table lives in a key-value store any dispatcher can read; on publish, a dispatcher looks up the frontends interested in that video and sends only to them, and each frontend routes to its local connections. Twitch's chat describes a similar split between an Edge tier holding connections and a Pubsub tier that distributes messages across Edge nodes, which together "form a hierarchical message distribution system". The publisher's cost is now proportional to the number of edges that actually serve the stream.</p>
+<p><strong>Option 3: a tree for the biggest streams.</strong> A stream with viewers on 100 edges means 100 sends per message from one node. At 200 messages per second in the broadcast lane that is 20,000 sends per second — fine. But at the raw 8,300 per second it would be 830,000, and the stream node also does ingest. Insert <strong>relays</strong>: the stream node sends to 10 relays, each relay to 10 edges. Each node's fan-out is bounded (10), the tree's depth is log<sub>10</sub>(edges), and adding a level costs one more network hop — a millisecond or two. Discord's Manifold applies the same idea inside a cluster: group recipients by the node they live on and send one message per node, which then fans out locally.</p>
+<p><strong>Encode once, write many.</strong> At the edge, the expensive part is the per-connection write. Serialise each 200 ms batch for a stream <em>once</em> into its wire bytes (and compress once, if using compression), then write those same bytes to every connection subscribed to the stream. Per-connection work becomes a system call with a shared buffer, not JSON encoding. Directed messages are the exception, appended per connection. This is the difference between an edge that serves 100,000 viewers and one that serves 10,000.</p>
+<p><strong>Batching as a dial.</strong> A 200 ms batch window cuts socket writes from 10 to 5 per second per viewer at 10 messages per second, and to 5 regardless of how fast chat runs. Longer windows save more and add delay; at 500 ms the chat feels sluggish. 100-250 ms is the usual range, and it can adapt: send immediately when chat is quiet, batch when it is busy.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Comparison of fan-out work. Left: direct fan-out, the stream node sends each message to 5 million connections. Middle: per-edge fan-out, the stream node sends to 50 edges and each edge writes to 100,000 connections. Right: a tree, the stream node sends to 7 relays, each relay to about 7 edges, each edge to 100,000 connections. Work per node is shown under each layer.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="105" y="20" text-anchor="middle" style="fill:var(--crit);font-weight:600">Direct</text>
+    <text x="320" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Per-edge</text>
+    <text x="530" y="20" text-anchor="middle" style="fill:var(--good);font-weight:600">Tree</text>
+    <circle cx="105" cy="50" r="12" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <path d="M95,60 L20,200 L190,200 L115,60" style="fill:var(--surface-2);stroke:var(--crit);stroke-dasharray:3 2"/>
+    <text x="105" y="185" text-anchor="middle" style="fill:var(--ink)">5,000,000 sockets</text>
+    <text x="105" y="225" text-anchor="middle" style="fill:var(--crit)">one node: 5M writes</text>
+    <text x="105" y="241" text-anchor="middle" style="fill:var(--crit)">per message</text>
+    <circle cx="320" cy="50" r="12" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <rect x="240" y="100" width="22" height="18" rx="2" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <rect x="270" y="100" width="22" height="18" rx="2" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <rect x="300" y="100" width="22" height="18" rx="2" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="345" y="114" style="fill:var(--muted)">… ×50</text>
+    <line x1="314" y1="60" x2="251" y2="98" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="318" y1="62" x2="281" y2="98" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="320" y1="62" x2="311" y2="98" style="fill:none;stroke:var(--ink-2)"/>
+    <path d="M245,118 L232,170 L262,170 L257,118" style="fill:none;stroke:var(--good);stroke-dasharray:3 2"/>
+    <path d="M275,118 L266,170 L296,170 L287,118" style="fill:none;stroke:var(--good);stroke-dasharray:3 2"/>
+    <path d="M305,118 L300,170 L330,170 L317,118" style="fill:none;stroke:var(--good);stroke-dasharray:3 2"/>
+    <text x="320" y="190" text-anchor="middle" style="fill:var(--ink)">100k sockets per edge</text>
+    <text x="320" y="225" text-anchor="middle" style="fill:var(--ink-2)">root: 50 sends</text>
+    <text x="320" y="241" text-anchor="middle" style="fill:var(--ink-2)">edge: 100k writes (1 encode)</text>
+    <circle cx="530" cy="45" r="12" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <rect x="470" y="80" width="20" height="16" rx="2" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <rect x="520" y="80" width="20" height="16" rx="2" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <rect x="570" y="80" width="20" height="16" rx="2" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <line x1="524" y1="55" x2="481" y2="78" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="530" y1="57" x2="530" y2="78" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="536" y1="55" x2="579" y2="78" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="455" y="125" width="16" height="14" rx="2" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <rect x="477" y="125" width="16" height="14" rx="2" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <rect x="499" y="125" width="16" height="14" rx="2" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <line x1="476" y1="96" x2="463" y2="123" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="480" y1="96" x2="485" y2="123" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="484" y1="96" x2="507" y2="123" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="560" y="136" style="fill:var(--muted)">…</text>
+    <text x="530" y="170" text-anchor="middle" style="fill:var(--ink)">7 relays × 7 edges</text>
+    <text x="530" y="225" text-anchor="middle" style="fill:var(--good)">every node: ≤ 7 sends,</text>
+    <text x="530" y="241" text-anchor="middle" style="fill:var(--good)">edges: local writes only</text>
+  </g>
+</svg>
+<figcaption>Fan-out cost is about where the multiplication happens. A tree keeps each node's fan-out small and pushes the big multiplication to the edges, where one encoded frame is written to many local sockets.</figcaption>
+</figure>
+
+<h4>7 · Deep dive B: when chat is too fast to read</h4>
+<p><strong>Control what enters.</strong> Three limits apply on ingest. A <strong>per-user token bucket</strong> (cd12) — say one message per second with a burst of three — stops individuals flooding. <strong>Slow mode</strong>, set by the streamer, raises that to one message per N seconds for everyone. And a <strong>per-stream ingest cap</strong> bounds the worst case for one stream: beyond, say, 2,000 accepted messages per second, further messages are accepted for the sender (they see their own message) and the log, but are not eligible for the broadcast lane. Duplicate detection — the same text from one user within a short window, or the same link from many new accounts — rejects copy-paste spam before it costs anything downstream.</p>
+<p><strong>Sample what each viewer sees.</strong> Even after limits, a big stream's chat outruns readers. The stream node therefore builds a <strong>broadcast lane</strong> capped at a readable rate — say 10-20 messages per second — chosen from accepted messages. Random sampling is fair and simple; weighted sampling can favour subscribers, longer or non-duplicate messages, or messages a ranking model scores as higher quality, but keep a random component so no group dominates. Because the sample is chosen once at the stream node and fanned out, every viewer of the stream sees the same broadcast messages, which keeps conversations coherent ("did you see what X said?").</p>
+<p><strong>Never sample away what matters.</strong> A <strong>directed lane</strong> carries messages that must reach a specific viewer regardless of sampling: their own message (shown instantly by the client, confirmed by the ack), replies to them and mentions of them, moderator notices, and paid or highlighted messages, which the product sold as guaranteed visibility and which therefore go to everyone, bypassing the sample. The registry of user to edge routes directed messages straight to the right connection; the edge merges the lanes by sequence number.</p>
+<p><strong>Reactions: count, don't deliver.</strong> At a million reactions per second, each edge keeps a counter per (stream, emote) and every 250 ms sends its counts upstream, then resets. An aggregator merges counts from all edges and publishes the stream's totals (or the rate per emote) every 500 ms through the normal fan-out, where they ride in the same frame as chat. Clients turn the totals into floating hearts and bursts locally. Inbound traffic falls from a million events to a few hundred summaries per second; outbound is one small number set per viewer per half second. The lab shows the same reduction at small scale: 15,000 reactions become 60,000 summary deliveries instead of 45 million individual ones.</p>
+<table>
+<thead><tr><th>Mechanism</th><th>Where</th><th>What it bounds</th><th>Cost to the user</th></tr></thead>
+<tr><td>Per-user token bucket</td><td>Ingest</td><td>Flooding by one person</td><td>"You're sending too fast"</td></tr>
+<tr><td>Slow mode</td><td>Ingest, set by streamer</td><td>Total chatter rate</td><td>Wait N seconds between messages</td></tr>
+<tr><td>Per-stream cap</td><td>Ingest</td><td>Worst-case cost of one stream</td><td>Message logged but not broadcast</td></tr>
+<tr><td>Per-viewer sample</td><td>Stream node / edge</td><td>Deliveries and bandwidth</td><td>Sees a readable subset</td></tr>
+<tr><td>Reaction aggregation</td><td>Edge + aggregator</td><td>Event volume both ways</td><td>Sees totals, animated</td></tr>
+<tr><td>Batching</td><td>Edge</td><td>Socket writes</td><td>~200 ms extra delay</td></tr>
+</table>
+
+<h4>8 · Deep dive C: moderation, ordering and the hot stream</h4>
+<p><strong>Moderation in the path.</strong> Moderation has to happen at two speeds. <em>Synchronous</em>, on ingest, before fan-out, within a few milliseconds: is the user banned or timed out on this channel (a lookup in a replicated cache — Twitch's overview describes a "Clue" service that checks business rules such as whether a user is banned); does the text match the channel's blocklist or the platform's; does it contain a link when links are disallowed; does it violate the channel mode (followers only, subscribers only, emotes only). These are cheap and deterministic. <em>Asynchronous</em>, in parallel: a toxicity or spam classifier with a strict timeout. If it answers within budget (say 50 ms) and flags the message, the message is held for a moderator or dropped; if it answers late and flags, the system issues a <strong>retraction</strong>: a delete event with the message's sequence number that fans out like any message, and clients remove it from the panel. A streamer can also turn on a <strong>chat delay</strong> of a few seconds, which gives the asynchronous path time to act before anything is shown — trading immediacy for safety in channels that need it.</p>
+<p><strong>Ordering.</strong> Viewers on different edges, sampled differently, must still agree on order, or replies appear before the messages they answer. Give each stream exactly one <strong>sequencer</strong>: its ingest node stamps every accepted message with the next sequence number. Edges deliver in sequence order; clients insert by sequence number, so a message delayed by a slower relay path slots into place rather than appearing out of order. Gaps are expected — sampling creates them — so clients do not wait for missing numbers. Order across streams is never needed, which is what lets every stream have its own independent sequencer and makes the write path shard cleanly by stream id. On reconnect, the client sends its last sequence number; the edge fetches anything newer from the stream's recent ring (the last ~1,000 broadcast messages) and continues. SSE has this built in: each event can carry an id, and a reconnecting browser sends <code>Last-Event-ID</code>.</p>
+<p><strong>The hot stream.</strong> One stream's ingest is one node, by design (one sequencer). At 8,300 messages per second with cheap checks, one node copes; the per-stream cap protects it if chat explodes further. The fan-out is spread by the tree. What remains hot is <em>join and leave churn</em>: when a huge streamer goes live, millions of viewers connect within a minute, and when the event ends they all leave. Each join is a TLS handshake at an edge, a subscription update, possibly a registry update and a burst of recent messages. Spread joins across many edges, pre-provision capacity before scheduled events (autoscaling is far too slow), cap new handshakes per edge per second, and serve the initial burst of recent messages from the edge's own cache of the stream's recent ring rather than from the stream node.</p>
+<p><strong>Reconnect storms.</strong> If an edge holding 100,000 connections dies, its clients notice within seconds and reconnect. If they all do so immediately, 100,000 handshakes land on the other edges in the same second, CPU spikes on TLS, latency rises, health checks fail, another edge is removed from rotation, and its 100,000 clients join the storm. The defence is in the client: <strong>exponential backoff with random jitter</strong> (sc12) spreading reconnects over 5-30 seconds, plus a server hint ("reconnect after 12 s") on graceful shutdown, plus admission limits at each edge. Deploys drain edges gradually — stop routing new connections, then close existing ones a few thousand at a time.</p>
+
+<h4>9 · Bottlenecks, failure modes and trade-offs</h4>
+<p><strong>Edge CPU and bandwidth</strong> are the binding constraints on the read path; encode once, batch, compress per batch, and size edges by the 500,000 writes and 150 MB/s per edge worked out above. <strong>The registry</strong> must update quickly when an edge gains its first or loses its last viewer of a stream; if it lags, an edge misses messages for a few seconds (acceptable) or receives messages for a stream it no longer serves (wasteful but harmless). <strong>Relay or stream-node failure</strong> loses in-flight messages (at-most-once) and the edges resubscribe through the registry; the chat log retains what was accepted. <strong>Moderation cache staleness</strong> lets a just-banned user post for a second; make bans propagate as a pushed event, not only on cache expiry.</p>
+<p><strong>Trade-offs to close on.</strong> Completeness versus readability and cost (sampling, with a directed lane for what matters); latency versus efficiency (batch window); safety versus immediacy (synchronous checks, optional chat delay, retractions); durability versus speed (at-most-once live delivery, durable log off the path); and a single sequencer per stream (simple ordering) versus the load it concentrates (bounded by per-stream caps).</p>
+</section>
+
+<section data-field="deep">
+<h4>Why not deliver through a durable log?</h4>
+<p>It is tempting to put every message in Kafka and have edges consume it, getting durability and replay for free. The problem is how a log is read: consumers read partitions, not individual streams. If messages are partitioned by stream, an edge serving viewers of 500 different streams must consume up to 500 partitions' worth of traffic — or, with fewer partitions than streams, entire partitions mostly full of streams it does not serve. Every edge ends up reading a large fraction of all chat. LinkedIn's talk makes exactly this point: a log would give delivery guarantees, but every frontend would have to consume every live-video topic because any frontend might have a subscriber, which limits horizontal scaling and adds latency; they chose an in-memory routing path and accepted that events can be dropped, relying on monitoring. The usual answer is both: the log for durability and offline consumers (replay, moderation, analytics), an in-memory pub/sub with a registry for live delivery.</p>
+
+<h4>Connection-level economics</h4>
+<p>An edge's capacity is limited less by the number of idle connections (which modern event loops hold cheaply) than by the work per active second: TLS encryption of every frame, system calls per write, and memory copies. Encoding once removes serialisation; batching reduces system calls; compression per batch, shared across connections, reduces bandwidth — but WebSocket's per-message deflate extension usually keeps compression state per connection, which costs memory and CPU per viewer, so at very large scale teams often compress once at the application level instead or disable per-connection compression. Kernel tuning (socket buffer sizes, file descriptor limits) and spreading connections across CPU cores matter. These are the details behind "100,000 connections per machine": it is a budget, not a constant.</p>
+
+<h4>SSE versus WebSocket at scale</h4>
+<p>For live comments, most traffic is server-to-client. SSE (net11) runs over plain HTTP, so it passes through proxies, load balancers and HTTP/2 multiplexing without special handling, and resumption is built into the browser's EventSource via event ids and <code>Last-Event-ID</code>; clients send comments with ordinary POST requests, which gives the write path normal HTTP authentication, rate limiting and retries. WebSocket gives two-way messaging on one connection, which matters when clients send often (chat-heavy platforms) and allows protocols like IRC to be carried over it, as Twitch's Edge does alongside raw TCP. The fan-out architecture is identical; the choice is about client environment and send frequency.</p>
+
+<h4>Replay in sync with the recording</h4>
+<p>Chat replay alongside a recorded stream needs each message's time relative to the video, not the wall clock. Store the sequence number and the stream's media timestamp at the moment the message was accepted (the ingest node knows the stream's current position), apply deletions as tombstones so retracted messages are never replayed, and serve replay as static, cacheable chunks — for example one file per minute of video — because a recording is read by many people long after the live event.</p>
+
+<h4>Multi-region audiences</h4>
+<p>A global event has viewers on every continent. Keep the stream's sequencer in one region (usually near the broadcaster), and replicate the broadcast lane to relays in each region, which feed that region's edges. LinkedIn's talk describes the cross-data-centre version: subscriptions stay local to each data centre, and on publish the local dispatcher forwards the event to dispatchers in peer data centres, which do their own local lookups. A viewer in Sydney sees messages from a sender in London after two long hops — perhaps 200-300 ms — which is still well inside the video's own delay.</p>
+
+<h4>Small streams are a different product</h4>
+<p>Most streams are small: a few dozen to a few thousand viewers, where chat is slow enough to read in full and the community expects every message. The same system should behave differently there: no sampling below a threshold rate (deliver everything when the stream's accepted rate is under, say, 10 per second), no batching delay when the channel is quiet, and the streamer reading every message. Make sampling and batching adaptive to the stream's measured rate rather than global settings, so the design for the 5-million-viewer final does not degrade the experience of the 40-viewer stream.</p>
+
+<h4>Presence and viewer counts are aggregates too</h4>
+<p>"4,920,331 watching" is another fan-in problem: summing connection counts from hundreds of edges. Each edge reports its per-stream count every few seconds; an aggregator sums them; the total rides in chat frames. Twitch's overview names a separate "Room" service for viewer lists that aggregates membership across edges. Exact real-time viewer lists for millions are neither feasible nor useful; show an approximate count and, for small streams, the list.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real cases: Twitch chat and LinkedIn live likes</h4>
+<p><strong>Twitch</strong> described its chat system in a 2015 engineering overview as a highly scalable real-time distributed system written in Go, made of four parts. <strong>Edge</strong> receives and distributes messages between clients and backend services, and speaks the IRC protocol over both raw TCP and WebSockets — which is why third-party chat bots can connect with ordinary IRC libraries. <strong>Pubsub</strong> distributes messages internally across Edge nodes; together, Edge and Pubsub form a hierarchical message distribution system that performs massive fan-out. <strong>Clue</strong> analyses user actions and runs them through business logic — whether a user is banned, whether they are a subscriber — drawing on databases, internal APIs and caches. <strong>Room</strong> aggregates membership data across all edges to build each channel's viewer list. The overview states the chat service delivered over 10 billion messages a day at the time. Its structure is exactly this lesson's split: a connection tier, a fan-out tier, a synchronous rules check on the write path, and aggregated presence.</p>
+<p><strong>LinkedIn</strong>'s live-video interactions (Akhilesh Gupta's QCon London 2020 talk) streamed likes and comments to live viewers. Clients hold <strong>SSE</strong> connections; each connection is managed by a lightweight Akka actor, so a frontend machine held on the order of 100,000 connections. Each frontend keeps an in-memory table of which connections watch which live video; frontends subscribe to <strong>dispatchers</strong>, and the subscription table moved into a key-value store any dispatcher can read; a dispatcher publishing a like looks up the interested frontends and sends only to them, and across data centres the publishing dispatcher forwards the event to peer data centres' dispatchers, which fan out locally. The talk's arithmetic: 100 likes per second on a video with 10,000 viewers is a million likes per second delivered; dispatchers handled about 5,000 events per second each; end-to-end latency from publish to client send was about 75 ms at p90. And the deliberate choice: no Kafka, accepting at-most-once delivery for speed and horizontal scaling, with monitoring to detect loss.</p>
+
+<h4>Failure modes you will see</h4>
+<p><strong>Chat lag during a big moment.</strong> Symptom: messages arrive 10-30 seconds late at the peak of the event. Cause: edges saturated on write CPU or bandwidth, or a relay's outbound queue growing. Detection: per-edge send queue depth and the gap between a message's ingest time and its send time. Fix: lower the broadcast sample rate automatically when queues grow (conflate), widen the batch window, and pre-provision more edges for the next event.</p>
+<p><strong>Reconnect storm.</strong> Symptom: one edge crash is followed by several more over a minute. Cause: clients reconnecting without jitter. Detection: handshakes per second per edge. Fix: client backoff with jitter, handshake admission caps, graceful drain on deploys.</p>
+<p><strong>Harmful message shown widely.</strong> Symptom: a screenshot of a slur in a big stream's chat. Cause: the synchronous blocklist missed a variant and the classifier answered after fan-out. Mitigation: retraction within seconds; for high-risk events, a short chat delay so the classifier always runs first; regular updates to blocklists with variant matching.</p>
+<p><strong>Silent loss.</strong> Symptom: users report missing chat on one edge. Cause: the registry did not list that edge for the stream after a restart. Detection: compare, per stream, the sequence numbers each edge received against the stream node's count; alert on edges falling behind.</p>
+
+<h4>What to monitor</h4>
+<p>Concurrent connections and handshakes per second per edge; per-edge write rate, outbound bytes and send queue depth; ingest-to-delivery latency at p50/p99 per stream; accepted, rejected (by reason) and broadcast messages per second for the largest streams; registry update latency; relay queue depth; moderation latency and timeout rate, holds and retractions; reaction events in versus summaries out; and per-stream sequence gaps observed at edges.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> measure how much per-viewer sampling, batching and reaction aggregation remove from the work of fanning out a busy stream. Python 3.12 standard library, a few seconds.</p>
+<pre>"""Live chat fan-out: per-viewer sampling, batching into frames, and reaction aggregation."""
+import random, collections
+
+random.seed(1)
+VIEWERS, EDGES, SECONDS = 3_000, 3, 10
+CHAT_RATE = 400                     # messages/second accepted into the stream
+CAP = 10                            # most messages/second a viewer is shown
+FRAME_MS = 200                      # edge batches messages into one frame per 200 ms
+
+senders = random.sample(range(VIEWERS), 300)                     # 10% of viewers chat
+msgs, seq = [], 0
+for s in range(SECONDS):                                         # ingest assigns sequence numbers
+    for _ in range(CHAT_RATE):
+        seq += 1
+        msgs.append((seq, s + random.random(), random.choice(senders)))
+msgs.sort(key=lambda m: m[1])
+publisher_sends = len(msgs) * EDGES                              # one send per edge, not per viewer
+
+frames = deliveries = 0
+for v in range(VIEWERS):                                         # sampling at the edge
+    budget, per_frame = collections.Counter(), collections.Counter()
+    for sq, t, author in msgs:
+        sec = int(t)
+        if author == v or (budget[sec] &lt; CAP and random.random() &lt; CAP / CHAT_RATE * 1.2):
+            budget[sec] += author != v                           # own messages don't use budget
+            per_frame[int(t * 1000 // FRAME_MS)] += 1
+            deliveries += 1
+    frames += len(per_frame)
+naive = len(msgs) * VIEWERS
+print(f"messages accepted: {len(msgs):,}  ({CHAT_RATE}/s)")
+print(f"naive deliveries (every message to every viewer): {naive:,}")
+print(f"sampled deliveries: {deliveries:,}  ({deliveries / naive:.1%} of naive), "
+      f"avg {deliveries / VIEWERS / SECONDS:.1f} msg/s per viewer")
+print(f"socket writes with {FRAME_MS} ms frames: {frames:,} (vs {deliveries:,} unbatched)")
+print(f"publisher sends: {publisher_sends:,} (one per edge per message)")
+
+reacts = collections.Counter()                                   # reactions: count, don't deliver
+for v in range(VIEWERS):
+    for _ in range(SECONDS // 2):
+        reacts[(int(random.random() * SECONDS * 2), random.choice("❤🔥😂"))] += 1
+events_in = sum(reacts.values())
+windows_out = len({w for w, _ in reacts}) * VIEWERS
+print(f"reactions in: {events_in:,}; summaries out: {windows_out:,} "
+      f"(instead of {events_in * VIEWERS:,} individual deliveries)")</pre>
+<ol>
+<li>Expect about 2-3% of the naive deliveries, close to 10 messages per second per viewer, and under half as many socket writes once messages are batched into 200 ms frames.</li>
+<li>Double <code>CHAT_RATE</code>: naive deliveries double, sampled deliveries barely move. That flat line is the point of sampling.</li>
+<li>Set <code>FRAME_MS</code> to 50 and 1,000 and compare writes; think about what each does to perceived latency.</li>
+<li>Add a directed lane: pick 50 "mentioned" messages per second, each addressed to a random viewer, and make sure they bypass the budget. Count how many extra deliveries that costs.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Estimate it</b>
+<p>A product launch is streamed to 2 million concurrent viewers. 3% of them chat, one message every 20 seconds. Each edge holds 80,000 connections. Viewers see at most 8 messages per second; messages are 120 bytes; frames go out every 250 ms. Reactions: one every 4 seconds per viewer. Work out: chat rate, edges needed (with 50% headroom), per-edge writes and bandwidth, and reaction traffic before and after aggregation with 250 ms edge windows.</p>
+<details><summary>Answer</summary>
+<p>Chatters: 60,000; chat rate 60,000 ÷ 20 = <strong>3,000 messages per second</strong>. Edges: 2,000,000 ÷ 80,000 = 25, with headroom <strong>~38</strong>. Per edge: 80,000 viewers × 8 messages × 120 B = 76.8 MB/s (about 0.6 Gbit/s) before compression; frames every 250 ms means <strong>4 writes per viewer per second = 320,000 writes per second</strong> per edge. Reactions: 2,000,000 ÷ 4 = <strong>500,000 per second</strong> inbound; with each of 25 active edges sending a summary every 250 ms, upstream is 25 × 4 = <strong>100 summaries per second</strong>. Outbound reaction totals ride in the chat frames, so they add bytes but no extra writes.</p>
+</details>
+<b>Diagnose it</b>
+<p>During a live final, chat on one region's viewers lags 20 seconds behind other regions, while their video is fine. Edge CPU in that region is at 60%, but the relay feeding those edges shows a growing outbound queue. What is likely happening and what do you do?</p>
+<details><summary>Answer</summary>
+<p>The relay is the bottleneck, not the edges: it is receiving the stream's broadcast lane and cannot forward it to its edges as fast as it arrives — perhaps it feeds too many edges (more viewers in that region than planned put more edges under it), its network link is saturated, or it is forwarding the raw stream instead of the sampled lane. Immediately: reduce the broadcast lane's rate for the stream (lower the sample cap) so every relay's outbound rate drops, and add a relay so the overloaded relay's edges are split. Make queues bounded with conflation — when a relay's queue exceeds a threshold, drop the oldest broadcast messages rather than delivering them late, because late chat is worse than missing chat. Longer term: size relays by the edges they serve, alert on relay queue depth, and pre-provision the tree for scheduled events.</p>
+</details>
+</section>

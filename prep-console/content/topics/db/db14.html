@@ -1,0 +1,521 @@
+<!-- topic source for db/db14; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "db14",
+  "t": "Schema migrations without downtime: expand-contract, backfills and online index builds",
+  "tag": "Operations",
+  "sum": "How to change a live database schema while old and new code both run: which DDL locks or rewrites tables, the lock-queue trap and lock_timeout, the expand-contract pattern worked step by step, batched resumable backfills, CREATE INDEX CONCURRENTLY and NOT VALID constraints in PostgreSQL, online DDL and shadow-table tools such as GitHub's gh-ost in MySQL, and rollback plans.",
+  "prereq": [
+    [
+      "db9",
+      "Table and row lock modes; ACCESS EXCLUSIVE conflicts with everything; long transactions hold locks and snapshots."
+    ],
+    [
+      "db10",
+      "PostgreSQL rewrites rows as new versions; InnoDB online DDL and binlog replication; transactional DDL in PostgreSQL."
+    ],
+    [
+      "db13",
+      "Batch writes, keep transactions short, and make operations idempotent so they can be retried."
+    ],
+    [
+      "swe9",
+      "Deploys roll out gradually, so two versions of the application run at the same time."
+    ]
+  ],
+  "myths": [
+    [
+      "Adding a column is always instant.",
+      "In PostgreSQL 11 and later, adding a nullable column or one with a constant default is a metadata change. Adding a column with a volatile default such as random() or clock_timestamp(), or changing a column's type, rewrites the whole table under an ACCESS EXCLUSIVE lock. Know which operations rewrite before running them on a large table."
+    ],
+    [
+      "If a DDL statement is quick, it cannot cause an outage.",
+      "Even an instant ALTER TABLE needs a brief ACCESS EXCLUSIVE lock. If a long-running query holds a weaker lock on the table, the ALTER waits, and every new query on the table queues behind the waiting ALTER. A one-millisecond change can block all traffic for as long as the slowest running query. Always set a short lock_timeout and retry."
+    ],
+    [
+      "Renaming a column is a one-step migration.",
+      "The rename itself is instant, but application instances still running the old version will fail the moment the old name disappears. During a rolling deploy both versions run, so any change that breaks the old code needs the expand-contract sequence: add the new, make both work, switch, then remove the old."
+    ],
+    [
+      "CREATE INDEX CONCURRENTLY is always safe.",
+      "It avoids blocking writes, but it takes longer, scans the table twice, waits for all existing transactions to finish, cannot run inside a transaction block, and if it fails it leaves an INVALID index that still slows writes until it is dropped. It is the right tool, used with monitoring and cleanup."
+    ],
+    [
+      "Migrations should run automatically as part of every deploy.",
+      "Small additive migrations can. Long backfills, index builds on big tables and destructive changes should be separate, observable steps run with throttling and the ability to pause, because their runtime and impact depend on data size and production load, not on code."
+    ],
+    [
+      "Down migrations make every change reversible.",
+      "Dropping a column or rewriting values destroys information that a down migration cannot recreate. Real reversibility comes from the expand-contract sequence itself: until the contract step, the old structure still exists and is kept in sync, so rolling back the application is safe."
+    ]
+  ],
+  "recap": [
+    "Schema changes in production must keep two versions of application code working, because deploys are gradual and rollbacks happen.",
+    "Some DDL is metadata-only and instant, some scans the table, and some rewrites it; all need at least a brief lock, and ACCESS EXCLUSIVE blocks every read and write.",
+    "A DDL statement waiting for a lock blocks every later query on the table, so run DDL with a short lock_timeout and retry rather than letting it queue.",
+    "Expand-contract changes schemas in safe steps: add new structure, write to both, backfill, verify, switch reads, stop writing the old, then remove it.",
+    "Backfills run in small batches by primary key, each in its own short transaction, throttled and resumable, so they never hold long locks or lag replicas badly.",
+    "PostgreSQL builds indexes without blocking writes with CREATE INDEX CONCURRENTLY, and adds constraints cheaply with NOT VALID followed by VALIDATE CONSTRAINT.",
+    "MySQL relies on InnoDB online and instant DDL plus shadow-table tools; GitHub's gh-ost copies rows into a ghost table and replays changes from the binary log instead of triggers.",
+    "Every migration needs a plan for verification, throttling and rollback, and destructive steps should come last, after a waiting period."
+  ],
+  "glossary": [
+    [
+      "ACCESS EXCLUSIVE lock",
+      "PostgreSQL's strongest table lock, taken by most ALTER TABLE forms and DROP; it conflicts with every other lock, including plain SELECT."
+    ],
+    [
+      "Backfill",
+      "Populating a new column or table with values for existing rows, usually in batches."
+    ],
+    [
+      "Bridging view",
+      "A view that presents an old table or column name over the new structure so old code keeps working during a migration."
+    ],
+    [
+      "CREATE INDEX CONCURRENTLY",
+      "A PostgreSQL index build that does not block writes, at the cost of two table scans and waiting for existing transactions."
+    ],
+    [
+      "Cut-over",
+      "The moment a migration switches traffic from the old structure to the new one, such as a table rename."
+    ],
+    [
+      "Dual write",
+      "Writing every change to both the old and the new structure during a migration."
+    ],
+    [
+      "Expand-contract",
+      "A migration pattern that first adds new structure compatible with old code, then later removes the old structure once nothing uses it; also called parallel change."
+    ],
+    [
+      "Ghost table",
+      "A shadow copy of a table with the new schema, filled by an online migration tool and swapped in at cut-over."
+    ],
+    [
+      "Instant DDL",
+      "A schema change applied by updating metadata only, without touching rows."
+    ],
+    [
+      "INVALID index",
+      "A PostgreSQL index left behind by a failed concurrent build; it is maintained on writes but never used by queries."
+    ],
+    [
+      "Lock queue",
+      "The ordered list of sessions waiting for a lock; a waiting strong lock blocks later weaker requests too."
+    ],
+    [
+      "lock_timeout",
+      "A PostgreSQL setting that makes a statement fail if it waits longer than the given time for a lock."
+    ],
+    [
+      "NOT VALID constraint",
+      "A PostgreSQL constraint added without checking existing rows, enforced only for new writes until validated."
+    ],
+    [
+      "Online DDL",
+      "Schema changes that allow concurrent reads and writes for most of their duration."
+    ],
+    [
+      "Table rewrite",
+      "Rebuilding every row of a table into new storage, required by some type changes and defaults; it takes time proportional to table size."
+    ],
+    [
+      "Throttling",
+      "Slowing or pausing a migration when the database is under load or replicas lag."
+    ],
+    [
+      "Trigger",
+      "Code the database runs automatically on INSERT, UPDATE or DELETE of a table's rows."
+    ],
+    [
+      "VALIDATE CONSTRAINT",
+      "Checking existing rows against a NOT VALID constraint under a lock that allows normal reads and writes."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Why can't you just run ALTER TABLE during a deploy?",
+      "Two reasons. Many ALTER TABLE forms take an ACCESS EXCLUSIVE lock that blocks all reads and writes, and some rewrite the entire table, which on a large table means minutes or hours of blocking. And during a rolling deploy, old and new application versions run together, so a change that breaks the old version's queries (dropping or renaming a column) causes errors until every instance is updated."
+    ],
+    [
+      "E",
+      "What is the expand-contract pattern?",
+      "A way to make a breaking schema change in compatible steps. Expand: add the new column or table without removing anything, and make writes keep both in sync. Migrate: backfill existing data and switch reads to the new structure. Contract: once no code uses the old structure, remove it. At every step, both the current and the previous application version work."
+    ],
+    [
+      "E",
+      "How do you add an index to a large PostgreSQL table without blocking writes?",
+      "CREATE INDEX CONCURRENTLY, which builds the index while allowing inserts, updates and deletes. It cannot run inside a transaction, takes longer, and if it fails leaves an INVALID index you must drop and retry; check pg_index.indisvalid afterwards."
+    ],
+    [
+      "M",
+      "Walk through renaming users.email to users.email_address with zero downtime.",
+      "1) Add email_address (nullable, instant). 2) Deploy code that writes both columns and still reads email. 3) Backfill email_address from email in batches. 4) Verify no row differs. 5) Deploy code that reads email_address (still writing both). 6) Deploy code that stops writing email. 7) After a safe period, add NOT NULL and unique constraints on the new column (NOT VALID then VALIDATE, or concurrent unique index), then drop email. Each deploy is compatible with the one before it.",
+      "Follow-up: Could a database view or a trigger shorten this? — A trigger can keep the columns in sync for old writers instead of code changes, and a view can present the old name; both reduce deploys but add hidden logic to remove later."
+    ],
+    [
+      "M",
+      "What is the lock-queue problem with DDL in PostgreSQL, and how do you avoid it?",
+      "An ALTER TABLE needing ACCESS EXCLUSIVE must wait for any running query on the table, even a SELECT holding ACCESS SHARE. While it waits, it sits in the lock queue, and every new query on the table queues behind it, because granting their weaker locks would starve the ALTER. A slow report can therefore turn an instant DDL into a full outage. Set lock_timeout to a few seconds for migrations so the ALTER gives up instead of queuing, and retry with backoff; also check for long-running transactions before starting."
+    ],
+    [
+      "M",
+      "How should a backfill of 500 million rows be written?",
+      "In batches by primary key range (for example 5,000-20,000 rows), each in its own short transaction, recording progress so it can resume after interruption. Throttle between batches based on replica lag and database load, run it as a separate job rather than inside a deploy, make each batch idempotent (only update rows not yet backfilled), and keep new writes correct through dual writes or a trigger while it runs."
+    ],
+    [
+      "M",
+      "How do you add NOT NULL or a foreign key to a big existing PostgreSQL table without a long lock?",
+      "Add the check as a constraint marked NOT VALID, which is instant and enforces it for new rows; then run ALTER TABLE … VALIDATE CONSTRAINT, which scans existing rows under a SHARE UPDATE EXCLUSIVE lock that does not block reads or writes. For NOT NULL, a validated CHECK (col IS NOT NULL) lets PostgreSQL 12+ set the column NOT NULL without another scan; foreign keys support NOT VALID directly."
+    ],
+    [
+      "M",
+      "Which PostgreSQL ALTER TABLE operations rewrite the table?",
+      "Changing a column's type (except some binary-compatible changes such as increasing a varchar limit), adding a column with a volatile default, and some storage-changing operations. Adding a nullable column or one with a constant default (since PostgreSQL 11), dropping a column (it is only marked dropped) and renaming are metadata-only, though all still need a brief strong lock."
+    ],
+    [
+      "H",
+      "How does gh-ost perform an online migration and why did GitHub avoid triggers?",
+      "gh-ost creates a ghost table with the new schema, copies existing rows into it in throttled chunks, and captures ongoing changes by reading the MySQL binary log in row format, applying them to the ghost table; at cut-over it swaps the tables atomically. Trigger-based tools run extra statements inside every application transaction, adding overhead and lock contention, and they cannot be paused because removing triggers loses changes; GitHub reported near or complete lockdowns with them. Reading the binlog decouples the migration from application writes, so it can be throttled, paused and tested on replicas.",
+      "Follow-up: What can gh-ost not handle? — Its documentation lists foreign keys and triggers on the migrated table as unsupported, among other limitations, which is one reason some large MySQL users avoid foreign keys."
+    ],
+    [
+      "H",
+      "Change a column's type from int to bigint on a 2-billion-row PostgreSQL table without downtime.",
+      "ALTER COLUMN TYPE would rewrite the table under ACCESS EXCLUSIVE for hours. Instead: add a bigint column; keep it in sync with a trigger on insert and update; backfill in batches; build any needed indexes concurrently on it; verify; then in one short transaction with a lock_timeout, swap names (rename old to id_old, new to id), switch the primary key using a unique index built concurrently (ADD CONSTRAINT … PRIMARY KEY USING INDEX), and update dependent foreign keys and sequences. Drop the old column later. This is the Basecamp-style overflow fix done safely (db1)."
+    ],
+    [
+      "H",
+      "A migration added a NOT NULL column with a default to a 300 GB MySQL table during peak traffic and replicas fell an hour behind. Why, and what should have been done?",
+      "If the operation was not instant for that version or table, MySQL rebuilt the table: the primary completes it online, but the ALTER is replicated as one statement that each replica must execute serially, blocking its apply thread and producing replication lag as long as the rebuild. Use INSTANT where supported (MySQL 8.0 can add columns instantly), or run it with an online schema-change tool (gh-ost or pt-online-schema-change) that copies in throttled chunks with lag-aware throttling, and schedule large changes off peak."
+    ],
+    [
+      "H",
+      "How would you migrate an embeddings table to a new model's vectors (different dimension) for a live RAG service?",
+      "Treat it as expand-contract on data: add a new column or table for the new vectors (the dimension differs, so it is a new column), backfill embeddings in throttled batches (the model calls are the slow part, so it is a resumable job keyed by chunk id), write both embeddings for new chunks, build the new vector index concurrently, then shift query traffic gradually, comparing retrieval quality on an evaluation set before cutting over. Drop the old vectors and index only after a soak period. A query-time switch per tenant or by percentage makes rollback instant."
+    ]
+  ],
+  "refs": [
+    [
+      "post",
+      "GitHub — gh-ost: GitHub's online schema migration tool for MySQL (2016)",
+      "Why trigger-based online migrations caused lockdowns at GitHub, and how binlog-driven, throttled, testable migration works.",
+      "https://github.blog/news-insights/company-news/gh-ost-github-s-online-migration-tool-for-mysql/"
+    ],
+    [
+      "docs",
+      "gh-ost — Why triggerless",
+      "The detailed argument against trigger-based migrations.",
+      "https://raw.githubusercontent.com/github/gh-ost/master/doc/why-triggerless.md"
+    ],
+    [
+      "docs",
+      "gh-ost — Requirements and limitations",
+      "Including that foreign keys and triggers are not supported.",
+      "https://raw.githubusercontent.com/github/gh-ost/master/doc/requirements-and-limitations.md"
+    ],
+    [
+      "docs",
+      "PostgreSQL — CREATE INDEX (Building Indexes Concurrently)",
+      "How concurrent builds work, their cost and the INVALID index left by failures.",
+      "https://www.postgresql.org/docs/current/sql-createindex.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — ALTER TABLE",
+      "Which subcommands take which locks, which rewrite the table, NOT VALID and VALIDATE CONSTRAINT.",
+      "https://www.postgresql.org/docs/current/sql-altertable.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Explicit Locking",
+      "Table lock modes and their conflict table, the basis of the lock-queue problem.",
+      "https://www.postgresql.org/docs/current/explicit-locking.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>In August 2016, GitHub open-sourced a tool called gh-ost and explained why it had built it. GitHub ran on MySQL and changed its schema several times a day: new columns, new indexes, changed types, as product teams shipped features. A plain <code>ALTER TABLE</code> on a busy table was not an option: in default MySQL behaviour, many changes blocked the table, and even MySQL's own online DDL was online only on the server where it ran; replicated as a single statement, it made every replica stall while applying it. So GitHub, like most large MySQL users, had used pt-online-schema-change for years, a tool that builds a copy of the table with the new schema, copies rows across in chunks, keeps the copy in sync with database triggers, and swaps the tables at the end.</p>
+<p>As traffic grew, that approach broke down. GitHub's post describes the problems: the triggers ran inside every application transaction on the table, adding parsing overhead and competing for locks on two tables at once; under heavy write load they had seen near or complete lockdowns that made a table or the whole database inaccessible; removing the triggers at the end could stall for many seconds to a minute; and a migration could not truly be paused under load, because stopping the triggers would lose changes. Some migrations could only run at night or at weekends, and others consistently caused outages. gh-ost's answer was to drop triggers entirely and follow changes by reading MySQL's replication log instead, so the migration became a separate, throttleable, pausable, testable stream of work.</p>
+<p>The problem GitHub solved is universal. Every product changes its schema constantly, and in a system that must stay up, two constraints apply at once. The database must keep serving reads and writes while the structure changes, which means understanding exactly which operations lock or rewrite tables and for how long. And the application is deployed gradually, so for some minutes or hours the old version and the new version of the code run side by side against the same database, which means every intermediate state of the schema must work for both.</p>
+<p>This lesson teaches how to meet both constraints. It explains what different kinds of DDL actually do in PostgreSQL and MySQL, the lock-queue trap that turns an instant change into an outage, the expand-contract pattern that makes breaking changes safe, how to write backfills that can run for days without harm, online index and constraint builds, how shadow-table tools such as gh-ost work, and how to plan verification and rollback. The lab performs a complete expand-contract column split on 50,000 rows.</p>
+</section>
+
+<section data-field="primer">
+<h4>Renovating a shop that never closes</h4>
+<p>Think of a schema migration as renovating a shop that stays open twenty-four hours a day. You cannot close the doors while you move the counter. So you build the new counter next to the old one first, start serving customers at both, move the stock across in small loads during quiet moments, check that nothing is missing, then put up a sign directing everyone to the new counter, wait a while in case anyone still heads to the old one, and only then remove it. At no point is the shop unable to serve a customer, and at any point before the old counter is removed, you could go back.</p>
+<p>That is the <strong>expand-contract</strong> pattern, and the analogy captures its two essential properties. Changes are <em>additive first</em>: the new structure exists alongside the old before anything is removed. And there is a <em>period of compatibility</em>: for a while both structures are kept correct, so that both old and new staff (application versions) can work.</p>
+<p>The analogy breaks in one dangerous place. In a database, even putting up a sign can require briefly closing the door. Most schema changes need a moment of exclusive access to the table's definition, and if someone is in the middle of a long transaction, the change waits, and while it waits, it holds the door closed for everyone else who arrives. Managing that moment is half of the craft.</p>
+<h4>Two clocks</h4>
+<p>A migration runs on two clocks at once. The <strong>database clock</strong>: how long each step locks, scans or rewrites data, which depends on table size and load. The <strong>deploy clock</strong>: how long old and new application versions coexist, which depends on the rollout process and on how long you want to keep the ability to roll back. A safe plan lists each step with its effect on both clocks: what it locks and for how long, and which application versions must be running before and after it.</p>
+<h4>The compatibility rule</h4>
+<p>One rule summarises everything in this lesson: <strong>the schema must work with both the code currently deployed and the code about to be deployed</strong>. From it follow the practical guidelines. Additions are safe, because old code ignores what it does not know about (as long as it does not use <code>SELECT *</code> into fixed-position structures or <code>INSERT</code> without column lists). Removals are safe only after no running code uses the removed thing. Changes in meaning (a column that used to hold cents now holds dollars) are never safe in place; they are a new column with a new name. And constraints can only be tightened once all writers already obey them. Each section below is this rule applied to a specific kind of change, plus the database mechanics of doing it without long locks.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Expand-contract timeline: schema steps (add column, backfill, constraint, drop) interleaved with application deploys (write both, read new, stop writing old); old column removed only at the end">
+  <defs><marker id="db14-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="20" y1="125" x2="620" y2="125" marker-end="url(#db14-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="580" y="145" style="fill:var(--muted)">time</text>
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">schema</text>
+    <rect x="30" y="30" width="110" height="40" rx="5" style="fill:var(--good);fill-opacity:.12;stroke:var(--good)"/>
+    <text x="85" y="48" text-anchor="middle" style="fill:var(--ink)">1 add new</text>
+    <text x="85" y="63" text-anchor="middle" style="fill:var(--ink)">column (instant)</text>
+    <rect x="230" y="30" width="110" height="40" rx="5" style="fill:var(--s2);fill-opacity:.12;stroke:var(--s2)"/>
+    <text x="285" y="48" text-anchor="middle" style="fill:var(--ink)">3 backfill in</text>
+    <text x="285" y="63" text-anchor="middle" style="fill:var(--ink)">batches + verify</text>
+    <rect x="510" y="30" width="110" height="40" rx="5" style="fill:var(--crit);fill-opacity:.12;stroke:var(--crit)"/>
+    <text x="565" y="48" text-anchor="middle" style="fill:var(--ink)">7 constrain new,</text>
+    <text x="565" y="63" text-anchor="middle" style="fill:var(--ink)">drop old</text>
+    <text x="20" y="182" style="fill:var(--ink);font-weight:600">app</text>
+    <rect x="130" y="170" width="110" height="40" rx="5" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="185" y="188" text-anchor="middle" style="fill:var(--ink)">2 write both,</text>
+    <text x="185" y="203" text-anchor="middle" style="fill:var(--ink)">read old</text>
+    <rect x="330" y="170" width="110" height="40" rx="5" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="385" y="188" text-anchor="middle" style="fill:var(--ink)">4-5 read new,</text>
+    <text x="385" y="203" text-anchor="middle" style="fill:var(--ink)">write both</text>
+    <rect x="430" y="215" width="110" height="30" rx="5" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="485" y="235" text-anchor="middle" style="fill:var(--ink)">6 write new only</text>
+    <line x1="85" y1="70" x2="85" y2="120" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <line x1="285" y1="70" x2="285" y2="120" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <line x1="565" y1="70" x2="565" y2="120" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <line x1="185" y1="130" x2="185" y2="168" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <line x1="385" y1="130" x2="385" y2="168" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <text x="20" y="108" style="fill:var(--good)">← rollback safe anywhere before step 7 →</text>
+  </g>
+</svg>
+<figcaption>Schema steps (top) and application deploys (bottom) alternate, and each one is compatible with the state before it. Only the final step destroys anything, which is why it comes last and after a waiting period.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<h4>1. What DDL actually does</h4>
+<p>Schema changes fall into three cost classes, and knowing which class a statement belongs to is the first thing to check. <strong>Metadata-only</strong> changes update the catalog and touch no rows: in PostgreSQL, adding a nullable column, adding a column with a constant default (since version 11, the default is stored in the catalog and returned for old rows), dropping a column (it is marked dropped and its space reclaimed by later rewrites), renaming a column or table, and changing a column's default. <strong>Scanning</strong> changes read every row to check something but do not rewrite it: adding a CHECK or foreign key constraint that is validated immediately, or setting NOT NULL. <strong>Rewriting</strong> changes rebuild every row into new storage: changing a column's type (unless the change is binary-compatible, such as raising a varchar limit), adding a column whose default is volatile (such as <code>random()</code> or <code>clock_timestamp()</code>, since each row needs its own value), and commands such as <code>VACUUM FULL</code> or <code>CLUSTER</code>. A rewrite of a 500 GB table takes as long as writing 500 GB plus rebuilding every index, and in PostgreSQL holds an ACCESS EXCLUSIVE lock throughout.</p>
+<p>All of them also take a <strong>lock</strong>. PostgreSQL's ALTER TABLE documentation lists the lock level per subcommand: most forms take ACCESS EXCLUSIVE, which conflicts with every other lock mode including the ACCESS SHARE taken by plain SELECT (db9); a few take weaker locks (for example, VALIDATE CONSTRAINT takes SHARE UPDATE EXCLUSIVE, which allows normal reads and writes). For a metadata-only change, the ACCESS EXCLUSIVE lock is held for milliseconds. For a rewrite, it is held for the whole rewrite, which is an outage for that table.</p>
+<p>PostgreSQL has one major advantage here: <strong>transactional DDL</strong>. A migration that adds a column, creates a table and updates some rows can run in one transaction and either fully apply or fully roll back. (The exception is <code>CREATE INDEX CONCURRENTLY</code>, which cannot run inside a transaction block.) MySQL commits implicitly around most DDL, so a multi-statement migration that fails halfway leaves a partial state to clean up.</p>
+
+<h4>2. The lock queue: how a quick change causes an outage</h4>
+<p>The most common migration outage in PostgreSQL involves a change that should have taken a millisecond. Trace it. At 10:00:00, an analyst's report starts a 90-second <code>SELECT</code> on <code>orders</code>, holding ACCESS SHARE. At 10:00:05, a deploy runs <code>ALTER TABLE orders ADD COLUMN note text</code>, an instant metadata change that needs ACCESS EXCLUSIVE, which conflicts with the report's lock, so it waits. At 10:00:06, a customer's checkout runs <code>SELECT … FROM orders WHERE id = 42</code>, needing ACCESS SHARE. That does not conflict with the report, but PostgreSQL grants locks in queue order to prevent the ALTER from starving, so the checkout waits behind the ALTER. Every subsequent query on <code>orders</code> joins the queue. For the next 85 seconds, until the report finishes, nobody can read or write orders. Connection pools fill with waiting requests, and the outage spreads to everything that touches the pool.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Lock queue: a long SELECT holds ACCESS SHARE; ALTER TABLE waits for ACCESS EXCLUSIVE; every later SELECT and UPDATE queues behind the ALTER until the long query ends">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">Lock queue on table orders</text>
+    <rect x="20" y="35" width="150" height="40" rx="5" style="fill:var(--s3);fill-opacity:.12;stroke:var(--s3)"/>
+    <text x="30" y="52" style="fill:var(--ink)">report SELECT</text>
+    <text x="30" y="67" style="fill:var(--muted)">holds ACCESS SHARE, 90 s</text>
+    <rect x="190" y="35" width="150" height="40" rx="5" style="fill:var(--crit);fill-opacity:.12;stroke:var(--crit)"/>
+    <text x="200" y="52" style="fill:var(--ink)">ALTER TABLE</text>
+    <text x="200" y="67" style="fill:var(--crit)">waits for ACCESS EXCLUSIVE</text>
+    <rect x="360" y="35" width="80" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="370" y="58" style="fill:var(--ink)">SELECT</text>
+    <rect x="450" y="35" width="80" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="460" y="58" style="fill:var(--ink)">UPDATE</text>
+    <rect x="540" y="35" width="80" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="550" y="58" style="fill:var(--ink)">SELECT …</text>
+    <text x="360" y="95" style="fill:var(--crit)">all blocked behind the waiting ALTER</text>
+    <text x="20" y="130" style="fill:var(--ink)">Without lock_timeout: outage lasts as long as the report (85 s more).</text>
+    <text x="20" y="150" style="fill:var(--good)">With SET lock_timeout = '3s': the ALTER gives up after 3 s, the queue drains,</text>
+    <text x="20" y="168" style="fill:var(--good)">and the migration retries a few seconds later, ideally after checking for long transactions.</text>
+    <text x="20" y="200" style="fill:var(--muted)">The ALTER itself would have taken about a millisecond once granted.</text>
+  </g>
+</svg>
+<figcaption>A strong lock that is waiting is as harmful as one that is held, because the queue is first-come, first-served. The fix bounds the wait, not the change.</figcaption>
+</figure>
+<p>The fix is to never let DDL wait indefinitely. Run every migration statement with a short <code>lock_timeout</code> (for example <code>SET lock_timeout = '3s'</code>), so that if the lock is not granted quickly, the statement fails, the queue behind it drains immediately, and the migration tool retries after a pause, perhaps a few times with backoff. Before starting, check <code>pg_stat_activity</code> for long-running transactions on the table and wait for or cancel them. Many migration frameworks and linters (such as the strong_migrations gem for Rails or squawk for PostgreSQL migrations) set lock timeouts and flag dangerous operations automatically. The same principle applies in MySQL, where DDL waits for metadata locks held by open transactions; <code>lock_wait_timeout</code> bounds the wait.</p>
+
+<h4>3. Expand-contract, step by step</h4>
+<p>Take a breaking change: the <code>users</code> table stores a full name in <code>name</code>, and the product needs <code>first_name</code> and <code>last_name</code>. Dropping <code>name</code> breaks every running instance of the current code; adding the new columns without populating them breaks the new code's reads. The expand-contract sequence, which the lab performs on 50,000 rows:</p>
+<ol>
+<li><strong>Expand the schema.</strong> Add <code>first_name</code> and <code>last_name</code> as nullable columns: metadata-only, instant. Nothing reads them yet; the old code is unaffected.</li>
+<li><strong>Write both.</strong> Make every write also populate the new columns. Either deploy application code that writes both, or (as the lab does) add a trigger that derives the new columns whenever an old-style insert arrives, so instances that have not been redeployed still produce complete rows. The lab inserts "Ana Silva" through the old path and the trigger fills in ('Ana', 'Silva').</li>
+<li><strong>Backfill.</strong> Populate the new columns for existing rows in small batches (section 4). The lab processes 10 batches of 5,000 and confirms no rows are missing.</li>
+<li><strong>Verify.</strong> Compare old and new representations across all rows: the lab's check finds 0 mismatches. Never skip this; it catches parsing edge cases (names with no space, three-part names) before users do.</li>
+<li><strong>Switch reads.</strong> Deploy code that reads the new columns, still writing both, so a rollback to the previous version still finds <code>name</code> correct.</li>
+<li><strong>Stop writing the old.</strong> Deploy code that writes only the new columns. Remove the trigger.</li>
+<li><strong>Contract.</strong> After a waiting period long enough that no rollback to an old version is plausible, add constraints on the new columns (NOT NULL, section 6) and drop <code>name</code>.</li>
+</ol>
+<p>Every arrow in the sequence is backward compatible: at each step, the version of the code currently deployed and the version immediately before it both work. That is what makes rolling deploys and rollbacks safe. The cost is time and several deploys for what looks like one change, which is why teams reserve full expand-contract for breaking changes and apply purely additive changes in one step.</p>
+<p>The same pattern handles other breaking changes. <strong>Renaming a column</strong>: add the new column, write both, backfill, read new, stop writing old, drop old (or, in PostgreSQL, a view or generated column can bridge). <strong>Splitting a table</strong>: create the new table, dual-write, backfill, switch reads, stop writing the old columns. <strong>Changing a type</strong> (int to bigint, text to jsonb): add a column of the new type, sync with a trigger, backfill, swap. <strong>Making a column required</strong>: deploy code that always writes it, backfill nulls, then add the constraint.</p>
+
+<h4>4. Backfills that do not hurt</h4>
+<p>A backfill is a data migration over existing rows, and the naive version, <code>UPDATE users SET first_name = … WHERE first_name IS NULL</code> in one statement, is a production hazard on a large table. In PostgreSQL it holds row locks on every row it touches for the whole statement, writes a new version of every row (doubling the table's size until vacuum catches up, db10), generates a burst of WAL that replicas must replay (causing lag) and, if it fails at 90%, rolls back everything. In MySQL it holds locks and produces a single huge binlog event that replicas apply serially.</p>
+<p>A safe backfill is a <strong>batched, resumable job</strong>:</p>
+<ul>
+<li><strong>Batch by primary key range</strong>: process ids 1-5,000, then 5,001-10,000, and so on, each batch in its own short transaction. Keyset iteration on the primary key (db13) makes each batch's lookup an index range scan regardless of how far along the job is.</li>
+<li><strong>Make each batch idempotent</strong>: only touch rows that still need it (<code>AND first_name IS NULL</code>), so a batch that is retried or overlaps does no harm.</li>
+<li><strong>Record progress</strong>: store the last processed id, so the job can resume after a crash or a deliberate pause without starting over.</li>
+<li><strong>Throttle</strong>: sleep between batches, and slow down or pause when replica lag, CPU or latency exceed thresholds. A backfill that runs for a day at low impact is better than one that runs for an hour and degrades production.</li>
+<li><strong>Size batches by time</strong>: aim for each batch to take well under a second (typically 1,000 to 20,000 rows, depending on row size and indexes), so locks are short and progress steady.</li>
+<li><strong>Keep new writes correct</strong>: the dual write or trigger from step 2 ensures rows written during the backfill are already correct, so the backfill and live traffic never race on the same logical value.</li>
+</ul>
+<p>Backfills that call external services (computing embeddings with a model, geocoding addresses) follow the same rules with extra care for rate limits and cost: the job is resumable per row, results are written with the row's id as an idempotency key, and the slow external call happens outside the database transaction (db13).</p>
+
+<h4>5. Building indexes online</h4>
+<p>A plain <code>CREATE INDEX</code> in PostgreSQL takes a SHARE lock on the table, which allows reads but blocks all inserts, updates and deletes for the entire build, which can be hours on a large table. <code>CREATE INDEX CONCURRENTLY</code> builds the index while allowing writes. It works in phases: it registers the index in the catalog as not yet valid (so new writes begin maintaining it), waits for all transactions that might not know about the index to finish, scans the table to build the index, waits again, scans again to add rows changed during the first scan, and finally waits for transactions with older snapshots before marking the index valid for queries. The documentation is clear about the costs: more total work, two table scans, and waiting for existing transactions, so one long-running transaction can stall the build indefinitely.</p>
+<p>It also has a failure mode to plan for. If the build fails (a deadlock, a uniqueness violation for a unique index, a cancelled statement), the index is left behind marked <strong>INVALID</strong>: queries do not use it, but writes still maintain it, so it costs write performance until it is dropped. After every concurrent build, check <code>SELECT indexrelid::regclass, indisvalid FROM pg_index WHERE NOT indisvalid</code>, and drop and retry any invalid index (with <code>DROP INDEX CONCURRENTLY</code>). Because the command cannot run in a transaction block, migration frameworks that wrap each migration in a transaction need a per-migration opt-out. <code>REINDEX CONCURRENTLY</code> rebuilds an existing index the same way, and <code>DROP INDEX CONCURRENTLY</code> removes one without blocking.</p>
+<p>In MySQL, InnoDB has supported online index creation (allowing concurrent reads and writes for most of the build) since 5.6, and MySQL 8.0 added <code>ALGORITHM=INSTANT</code> for some column additions. The catch for replicated MySQL is the one GitHub described: an online ALTER is online on the primary, but replicas apply it as one statement, and on a replica with single-threaded apply for that table, replication stalls for the duration of the build.</p>
+
+<h4>6. Adding constraints without long locks</h4>
+<p>Adding a constraint to a populated table normally requires checking every existing row while holding a lock that blocks writes. PostgreSQL splits this into two steps. <code>ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID</code> adds the constraint instantly and enforces it for new and updated rows only. Then <code>ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_fk</code> scans existing rows to check them, holding only a SHARE UPDATE EXCLUSIVE lock, which allows normal reads and writes. CHECK constraints work the same way.</p>
+<p>NOT NULL used to require a full scan under ACCESS EXCLUSIVE. Since PostgreSQL 12, if a validated <code>CHECK (col IS NOT NULL)</code> constraint exists, <code>ALTER COLUMN … SET NOT NULL</code> uses it as proof and skips the scan; so the safe sequence is: add the CHECK as NOT VALID, validate it, set NOT NULL, drop the CHECK. Unique constraints are backed by unique indexes, so build the index concurrently first, then attach it with <code>ALTER TABLE … ADD CONSTRAINT … UNIQUE USING INDEX</code>, which takes only a brief lock. The same trick switches a primary key: build a unique index concurrently on the new key column and use <code>ADD CONSTRAINT … PRIMARY KEY USING INDEX</code>.</p>
+
+<h4>7. Shadow tables: how online schema-change tools work</h4>
+<p>When an engine cannot change a table online (or not without blocking replicas), tools rebuild the table alongside the original. All of them follow the same outline, which GitHub's post spells out: create a <strong>ghost table</strong> with the new schema; copy existing rows from the original into it in small, throttled chunks; meanwhile capture every change made to the original and apply it to the ghost; when the two are in sync, <strong>cut over</strong> by atomically renaming the original away and the ghost into its place.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="gh-ost: application writes to the original table; rows are copied in chunks to the ghost table; ongoing changes are read from the binary log and applied to the ghost table; at cut-over the tables are swapped">
+  <defs><marker id="db14-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="30" width="100" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="70" y="55" text-anchor="middle" style="fill:var(--ink)">application</text>
+    <line x1="120" y1="50" x2="178" y2="50" marker-end="url(#db14-g)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="180" y="25" width="130" height="50" rx="5" style="fill:var(--s1);fill-opacity:.12;stroke:var(--s1)"/>
+    <text x="245" y="47" text-anchor="middle" style="fill:var(--ink)">original table</text>
+    <text x="245" y="63" text-anchor="middle" style="fill:var(--muted)">old schema</text>
+    <rect x="180" y="140" width="130" height="50" rx="5" style="fill:var(--s4);fill-opacity:.12;stroke:var(--s4)"/>
+    <text x="245" y="162" text-anchor="middle" style="fill:var(--ink)">binary log</text>
+    <text x="245" y="178" text-anchor="middle" style="fill:var(--muted)">row-based events</text>
+    <line x1="245" y1="75" x2="245" y2="138" marker-end="url(#db14-g)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="380" y="85" width="90" height="50" rx="5" style="fill:var(--accent);fill-opacity:.12;stroke:var(--accent)"/>
+    <text x="425" y="107" text-anchor="middle" style="fill:var(--ink)">gh-ost</text>
+    <text x="425" y="123" text-anchor="middle" style="fill:var(--muted)">throttle/pause</text>
+    <line x1="310" y1="50" x2="380" y2="95" marker-end="url(#db14-g)" style="fill:none;stroke:var(--s2)"/>
+    <text x="318" y="66" style="fill:var(--s2)">copy rows</text>
+    <text x="318" y="80" style="fill:var(--s2)">in chunks</text>
+    <line x1="310" y1="165" x2="380" y2="125" marker-end="url(#db14-g)" style="fill:none;stroke:var(--s4)"/>
+    <text x="318" y="160" style="fill:var(--s4)">tail changes</text>
+    <rect x="520" y="85" width="105" height="50" rx="5" style="fill:var(--good);fill-opacity:.12;stroke:var(--good)"/>
+    <text x="572" y="107" text-anchor="middle" style="fill:var(--ink)">ghost table</text>
+    <text x="572" y="123" text-anchor="middle" style="fill:var(--muted)">new schema</text>
+    <line x1="470" y1="110" x2="518" y2="110" marker-end="url(#db14-g)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="20" y="215" style="fill:var(--ink-2)">Cut-over: rename original → _old and ghost → original in one atomic step; application writes never pass through triggers.</text>
+  </g>
+</svg>
+<figcaption>gh-ost reads ongoing changes from the binary log rather than from triggers inside application transactions, so the only extra load is one sequential writer that can be slowed or paused at any time.</figcaption>
+</figure>
+<p>The design question is how to capture changes. Trigger-based tools (pt-online-schema-change, Facebook's OSC, LHM) install triggers on the original table so every insert, update and delete is mirrored into the ghost table (or a change log) inside the same transaction. GitHub's experience with them was the reason for gh-ost: triggers add per-statement interpretation overhead, compete for locks on two tables inside application transactions, and cannot be paused, since disabling them loses changes; removing them at the end needed metadata locks that stalled for up to a minute on busy tables. gh-ost instead reads the binary log in row format (db10) and applies the changes itself, together with the row copy, as a single sequential writer. Because it controls all writes to the ghost table, it can throttle on load metrics or replica lag, pause completely (via a flag file or a command on its control socket), change chunk size while running, report progress, and test a full migration on a replica. GitHub described running continuous no-op migrations of every production table on dedicated replicas and comparing checksums of original and ghost tables, which is how they built trust in the tool. Its documented limitations include tables with foreign keys or triggers, a reminder that every online tool has preconditions to check.</p>
+<p>PostgreSQL users have fewer such tools because the engine handles more changes online itself, but the pattern exists (pg_repack rebuilds tables online to remove bloat; logical replication can migrate to a restructured copy) and is the fallback for rewrites such as type changes on huge tables.</p>
+
+<h4>8. A compatibility table for common changes</h4>
+<table>
+<thead><tr><th>Change</th><th>Safe in one step?</th><th>Safe procedure</th></tr></thead>
+<tr><td>Add nullable column / constant default</td><td>yes (with lock_timeout)</td><td>ALTER, instant in PostgreSQL 11+</td></tr>
+<tr><td>Add NOT NULL column</td><td>only with a default</td><td>add nullable, backfill, CHECK NOT VALID, validate, SET NOT NULL</td></tr>
+<tr><td>Add index</td><td>no (blocks writes)</td><td>CREATE INDEX CONCURRENTLY, check indisvalid</td></tr>
+<tr><td>Add foreign key / check</td><td>no (scans under lock)</td><td>ADD … NOT VALID, then VALIDATE CONSTRAINT</td></tr>
+<tr><td>Add unique constraint</td><td>no</td><td>unique index concurrently, then ADD CONSTRAINT … USING INDEX</td></tr>
+<tr><td>Rename column or table</td><td>no (breaks old code)</td><td>expand-contract, or a bridging view</td></tr>
+<tr><td>Change column type</td><td>no (rewrite)</td><td>new column, trigger, backfill, swap</td></tr>
+<tr><td>Drop column</td><td>only after no code reads it</td><td>stop reading, stop writing, wait, drop</td></tr>
+<tr><td>Drop table</td><td>only after no code uses it</td><td>revoke access first, wait, then drop</td></tr>
+</table>
+<p>Two habits make the table easier to follow. Ban <code>SELECT *</code> and column-less <code>INSERT</code> in application code, so adding columns can never break old code. And keep migrations and code changes in separate pull requests with the deploy order written down, so reviewers can check the compatibility rule step by step.</p>
+
+<h4>9. Partitioned tables make some migrations easier</h4>
+<p>Very large append-heavy tables (events, logs, LLM calls) are often partitioned by time (db10). Partitioning changes the migration picture in useful ways. A new column can be added to the parent and applies to all partitions. Indexes can be created per partition, concurrently, one partition at a time, and then attached to a parent index, so no single build has to cover the whole table. Data that needs a heavy rewrite can be migrated partition by partition, or left in old partitions behind a compatibility view while new partitions use the new structure. And retention becomes a metadata operation: detaching and dropping an old partition replaces a multi-hour DELETE and the vacuum work it would cause. Recent PostgreSQL versions can attach and detach partitions with lighter locks (<code>DETACH PARTITION … CONCURRENTLY</code>), which keeps even these steps online.</p>
+
+<h4>10. Planning, verification and rollback</h4>
+<p>A migration plan for a large or risky change should be written down and reviewed like code. For each step it states: the exact statement; its cost class (metadata, scan, rewrite) and lock level; the expected duration on production data size (measured on a copy, not guessed); the timeouts and throttles; how success is verified; and how to roll back. The application side lists which version must be deployed before and after each step.</p>
+<p>Verification is concrete: row counts, null counts and value comparisons between old and new columns (the lab's mismatch query), constraint validation, checksums of copied tables, query plans of the critical queries after an index change, and replication lag during and after. Rollback is mostly free with expand-contract up to the contract step: roll back the application and the old structure is still correct. The contract step is the only irreversible one, so it is separated in time (days or a release cycle later) and preceded by a check that nothing still reads the old structure, for example by logging queries that reference the old column, or by revoking access to it before dropping it so any hidden reader fails loudly while recovery is still trivial.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why PostgreSQL needs ACCESS EXCLUSIVE for metadata changes</h4>
+<p>It can seem excessive that adding a nullable column, which touches no data, needs the strongest lock. The reason is plan and catalog consistency. Every running query was planned against a particular definition of the table: its columns, their types, their positions. If the definition changed underneath a running statement, its plan and the tuple descriptors it is using could disagree with the catalog. ACCESS EXCLUSIVE guarantees no statement is using the table when its definition changes; afterwards, sessions invalidate their cached plans and catalog entries and re-plan. Some operations have been carefully relaxed (CREATE INDEX CONCURRENTLY, VALIDATE CONSTRAINT, ATTACH PARTITION with a lighter lock in recent versions, and some ALTER TABLE SET options) because the developers proved they cannot invalidate concurrent queries. That is also why the lock-queue problem is structural rather than a bug: correctness requires the brief exclusive moment, so the operational answer is to keep the wait for it short.</p>
+
+<h4>Fast defaults: how PostgreSQL 11 made ADD COLUMN DEFAULT instant</h4>
+<p>Before version 11, adding a column with a default rewrote the table to store the default in every row. Since 11, PostgreSQL stores a "missing value" for the column in the catalog (<code>pg_attribute.attmissingval</code>). Rows written before the column existed simply have fewer attributes in their tuple header; when such a row is read, the missing value is supplied. New and updated rows store the value physically. This only works when the default is the same for every existing row, which is why a constant default is instant and a volatile one such as <code>now()</code> evaluated per row, or <code>gen_random_uuid()</code>, still forces a rewrite. (A non-volatile function like <code>now()</code> evaluated once at ALTER time is treated as a constant.) MySQL 8.0's INSTANT algorithm uses a similar row-version idea for adding columns. Knowing the mechanism makes it easy to predict which defaults are cheap.</p>
+
+<h4>Migrations and replication</h4>
+<p>Schema changes interact with replication differently per engine. PostgreSQL's physical replication replays DDL as WAL records exactly as the primary performed it, including the full WAL of any rewrite, so a table rewrite produces a burst of WAL equal to the table's size plus indexes, and standbys must replay it; a concurrent index build similarly generates WAL proportional to the index. A standby running long queries may also delay applying the DDL because it conflicts with their locks, which can stall replication. PostgreSQL's logical replication does not replicate DDL at all: subscribers must be migrated separately and compatibly (add columns on the subscriber first, drop on the publisher first), which is itself an expand-contract discipline across clusters. MySQL replicates DDL as statements in the binlog, which replicas execute themselves, which is exactly why a long online ALTER on the primary becomes a long replication stall on replicas, and why gh-ost's approach of turning a migration into ordinary row writes keeps replicas flowing.</p>
+
+<h4>Online migrations at the data level</h4>
+<p>Some migrations are not schema changes at all but data moves: splitting a table across services, moving a tenant to another shard, re-keying data, switching storage engines. They use the same machinery at a larger scale: <strong>dual writes</strong> (or change-data-capture replication) from old to new, a <strong>backfill</strong> of historical data, <strong>shadow reads</strong> that query both and compare results without serving the new one, a gradual <strong>read cut-over</strong> by percentage or tenant, and a final <strong>write cut-over</strong>. Discord's MongoDB-to-Cassandra move (db11) and most sharding migrations (sc7) follow this script. The hard part is usually the write cut-over: making sure no write is lost or applied twice at the moment authority moves, which is solved with a brief write freeze, idempotent replays, or routing writes through a single log that both sides consume.</p>
+
+<h4>Testing migrations</h4>
+<p>Because migration risk depends on data size and production load, tests on a small development database catch syntax and logic errors but not duration or locking problems. Mature teams add three layers: static checks (linters that flag non-concurrent index builds, volatile defaults, type changes, missing lock timeouts and NOT NULL without the CHECK trick); rehearsals on a production-sized copy or a branch of production data (tools that create copy-on-write database clones make this cheap), measuring duration, WAL volume and locks; and canary execution in production with throttling and abort criteria. GitHub's practice of continuously migrating every table on test replicas and checksumming the result is the extreme version: it turns "will this tool corrupt data?" into a question answered by evidence every day.</p>
+</section>
+
+<section data-field="prod">
+<h4>GitHub's migration lessons</h4>
+<p>GitHub's account of moving from trigger-based migrations to gh-ost reads as a list of production failure modes. Trigger overhead on hot tables, invisible in testing, became lock contention under real write concurrency, to the point of near or complete lockdowns. Migrations that could not be paused under load turned traffic spikes during a migration into incidents. Removing triggers at the end stalled the table for seconds to a minute on metadata locks. Running migrations only off-peak slowed product development. The improvements gh-ost brought were operational rather than algorithmic: decoupling the migration's write load from application transactions, throttling on replica lag and load, pausing on demand, changing parameters mid-flight, reporting status over a socket, and continuous production-scale testing. Those properties (throttleable, pausable, observable, testable) are the checklist for any long-running migration job, whatever the database.</p>
+
+<h4>Typical migration incidents</h4>
+<p><strong>Lock-queue outages</strong> from DDL behind a long transaction, prevented by lock_timeout and pre-checks. <strong>Accidental rewrites</strong> from a type change or volatile default on a large table, prevented by knowing the cost classes and linting migrations. <strong>Blocking index builds</strong> from a forgotten <code>CONCURRENTLY</code>, which block writes for the whole build. <strong>Invalid indexes</strong> left by failed concurrent builds, slowing writes silently for months. <strong>Replica lag</strong> from large backfills or replicated ALTERs, which in turn causes stale reads (sc6) and can stall failover. <strong>Breaking old code</strong> with a destructive change during a rolling deploy, producing a spike of errors from instances not yet updated. <strong>Backfill bloat</strong> from updating every row of a large PostgreSQL table, doubling its size and swamping autovacuum. Each has a standard prevention from this lesson, which is why many teams encode them in a migration linter and a written checklist.</p>
+
+<h4>Operating migrations</h4>
+<p>Practical rules that keep migrations boring: separate schema changes from code deploys, so each can be rolled back independently; keep migrations small and frequent rather than large and rare; run long operations (backfills, index builds on large tables) as observable jobs with progress metrics, not inside the deploy pipeline; set <code>lock_timeout</code> and <code>statement_timeout</code> for the migration role and retry on lock timeouts; check for long transactions and replication lag before starting; watch error rates, latency, locks (<code>pg_locks</code>, <code>pg_stat_activity</code> wait events) and replica lag during; and verify after. For managed databases, read the provider's notes on which operations trigger instance-level work (some parameter or storage changes reboot instances).</p>
+
+<h4>Migrations in AI systems</h4>
+<p>AI products add migration types that are data-heavy and slow. Re-embedding a corpus when changing embedding models is a backfill whose unit cost is a model call: run it as a resumable job keyed by chunk id, throttled by both database load and the embedding API's rate limits and budget, writing to a new vector column or table (the dimension often changes), with a new vector index built concurrently and traffic shifted gradually after offline retrieval evaluation (db15). Changing the structure of logged LLM calls or conversation messages (adding token accounting, splitting content into parts for multimodal messages) follows expand-contract on huge append-only tables, where time partitioning helps: new partitions get the new structure and old partitions can be backfilled lazily or left as they are behind a compatibility view. And feature tables used for both training and serving need migrations that keep point-in-time correctness: a backfilled feature must be computed as of each historical timestamp, not from today's data, or models trained on it will learn from the future.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> perform a complete expand-contract migration on a 50,000-row SQLite table: replace <code>name</code> with <code>first_name</code> and <code>last_name</code> while old-style writes keep working, backfilling in batches, verifying, and finally contracting. Python 3.12 standard library (SQLite 3.35+ for <code>DROP COLUMN</code>). Save as <code>db14.py</code>.</p>
+<pre>"""Expand-contract: replace users.name with first_name/last_name while 'old' and 'new' app code both run."""
+import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+db.executemany("INSERT INTO users (name) VALUES (?)", [(f"First{i} Last{i}",) for i in range(50_000)])
+
+# Step 1 EXPAND: add nullable columns (cheap, no rewrite) and keep them in sync for old writers
+db.executescript("""
+ALTER TABLE users ADD COLUMN first_name TEXT;
+ALTER TABLE users ADD COLUMN last_name TEXT;
+CREATE TRIGGER sync_ins AFTER INSERT ON users WHEN NEW.first_name IS NULL BEGIN
+  UPDATE users SET first_name = substr(NEW.name, 1, instr(NEW.name, ' ') - 1),
+                   last_name  = substr(NEW.name, instr(NEW.name, ' ') + 1) WHERE id = NEW.id;
+END;
+""")
+print("expand: columns added, old writers still work -&gt;", end=" ")
+db.execute("INSERT INTO users (name) VALUES ('Ana Silva')")           # old code path
+print(db.execute("SELECT first_name, last_name FROM users WHERE name = 'Ana Silva'").fetchone())
+
+# Step 2 BACKFILL in small batches by primary key range (short transactions, resumable)
+BATCH, last_id, batches = 5_000, 0, 0
+while True:
+    with db:                                                       # one short transaction per batch
+        ids = db.execute("SELECT id FROM users WHERE id &gt; ? AND first_name IS NULL ORDER BY id LIMIT ?",
+                         (last_id, BATCH)).fetchall()
+        if not ids:
+            break
+        lo, hi = ids[0][0], ids[-1][0]
+        db.execute("""UPDATE users SET first_name = substr(name, 1, instr(name, ' ') - 1),
+                                       last_name  = substr(name, instr(name, ' ') + 1)
+                      WHERE id BETWEEN ? AND ? AND first_name IS NULL""", (lo, hi))
+        last_id, batches = hi, batches + 1
+missing = db.execute("SELECT count(*) FROM users WHERE first_name IS NULL").fetchone()[0]
+print(f"backfill: {batches} batches of &lt;= {BATCH}, rows still missing: {missing}")
+
+# Step 3 verify before switching reads
+bad = db.execute("SELECT count(*) FROM users WHERE first_name || ' ' || last_name &lt;&gt; name").fetchone()[0]
+print("verify: mismatches between old and new columns:", bad)
+
+# Step 4 new code writes both (old column still read by any old instances still running)
+db.execute("INSERT INTO users (name, first_name, last_name) VALUES ('Raj Rao', 'Raj', 'Rao')")
+
+# Step 5 CONTRACT after every reader of 'name' is gone: drop trigger, then the old column
+db.executescript("DROP TRIGGER sync_ins; ALTER TABLE users DROP COLUMN name;")
+print("contract: columns now", [r[1] for r in db.execute("PRAGMA table_info(users)")])</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li>After the expand step, an insert using only the old <code>name</code> column still produces complete rows: the trigger fills <code>('Ana', 'Silva')</code>. This is how instances not yet redeployed stay correct.</li>
+<li>The backfill runs 10 batches of at most 5,000 rows, each in its own transaction, and leaves 0 rows missing. Each batch is idempotent (<code>first_name IS NULL</code>), so rerunning the loop is harmless.</li>
+<li>Verification finds 0 mismatches between old and new representations.</li>
+<li>Only after reads and writes have moved to the new columns are the trigger and the old column dropped.</li>
+</ol>
+<p><strong>Try next.</strong> The trigger only covers inserts: add an <code>AFTER UPDATE OF name</code> trigger, then simulate an old instance renaming a user mid-backfill, and confirm the new columns follow. Add a name with no space ("Cher") before the backfill and see the verification step catch the parsing bug. Kill the script during the backfill loop (raise an exception after 3 batches), restart from the recorded <code>last_id</code>, and confirm it resumes without redoing or skipping rows. On PostgreSQL, the equivalent steps would add <code>SET lock_timeout = '3s'</code> before each ALTER and use <code>CREATE INDEX CONCURRENTLY</code> for any new index.</p>
+</section>
+
+<section data-field="drill">
+<b>Plan: making orders.customer_id a validated foreign key and switching it to bigint</b>
+<p>PostgreSQL 16, <code>orders</code> has 1.2 billion rows (700 GB), <code>customer_id integer</code> with no foreign key and no index, and some orphan rows from an old bug. Customer ids are at 1.8 billion and growing. Traffic is 3,000 writes per second, and the app is deployed with rolling updates. Write the migration plan: steps, locks, durations to measure, verification and rollback.</p>
+<details><summary>Answer</summary>
+<p><strong>Goal decomposition.</strong> Two changes: widen to bigint (a rewrite if done with ALTER TYPE, so use expand-contract) and add a validated foreign key (NOT VALID then VALIDATE). Do the widening first, because the constraint belongs on the final column, and because the id space is the urgent risk (db1).</p>
+<p><strong>Steps.</strong> 1) <code>ALTER TABLE orders ADD COLUMN customer_id_new bigint</code>, instant, with <code>lock_timeout = '3s'</code> and retries. 2) Trigger on insert and update setting <code>customer_id_new = customer_id</code> when not supplied; deploy code that writes both. 3) Backfill by primary key in batches of about 10,000 rows, each well under a second, throttled on replica lag (target under 5 s) and write latency; at roughly 1.2 billion rows this is days, so run it as a resumable job and expect table bloat that autovacuum must absorb (tune it for this table first). 4) Verify: <code>count(*) WHERE customer_id_new IS DISTINCT FROM customer_id</code> by ranges. 5) <code>CREATE INDEX CONCURRENTLY</code> on <code>customer_id_new</code> (needed anyway for the foreign key's delete checks, db1); check <code>indisvalid</code>. 6) Clean orphans: find them with an anti-join in batches and decide with the business whether to fix, archive or delete. 7) <code>ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id_new) REFERENCES customers (id) NOT VALID</code> (instant), then <code>VALIDATE CONSTRAINT</code> (full scan under SHARE UPDATE EXCLUSIVE, which allows reads and writes; measure duration on a copy). 8) Deploy code reading <code>customer_id_new</code>. 9) In one short transaction with lock_timeout: rename <code>customer_id</code> to <code>customer_id_old</code> and <code>customer_id_new</code> to <code>customer_id</code>, adjust the trigger; deploy code that writes only the new column. 10) After a waiting period, drop the trigger and <code>customer_id_old</code>.</p>
+<p><strong>Also.</strong> <code>customers.id</code> must be bigint too, with its own expand-contract if it is integer, done first. <strong>Rollback:</strong> before step 9, roll back the app; the old column is still authoritative. After step 9 and before 10, the rename can be reversed in one transaction. <strong>Verification throughout:</strong> replica lag, autovacuum progress and bloat on <code>orders</code>, error rates per deploy, and the plan of the main <code>orders</code> queries after the swap.</p>
+</details>
+</section>

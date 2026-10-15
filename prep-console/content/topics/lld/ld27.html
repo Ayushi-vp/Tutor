@@ -1,0 +1,759 @@
+<!-- topic source for lld/ld27; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld27",
+  "t": "An in-process pub-sub event bus",
+  "tag": "Concurrency",
+  "sum": "Decouple components inside one process: dot-separated topics with '*' and '#' wildcards matched by a trie, synchronous and asynchronous subscribers, FIFO order per subscriber, bounded queues with block, drop-newest and drop-oldest back-pressure, error isolation with dead letters, and an unsubscribe that is safe while other threads are publishing — tested with a reference matcher, ordering checks and a churn stress test.",
+  "prereq": [
+    ["swe3", "The observer pattern: subjects notify registered observers without knowing what they do."],
+    ["sc10", "Pub/sub between services: publishers send to topics, subscribers receive what matches, decoupled in time and identity."],
+    ["ld16", "A bounded blocking queue makes producers wait when full and consumers wait when empty."],
+    ["al15", "A trie stores strings by shared prefixes; walking it costs time proportional to the key, not the number of keys."],
+    ["os6", "Deadlock needs mutual exclusion, hold-and-wait, no preemption and a circular wait; avoid it by never calling unknown code while holding a lock."],
+    ["py9", "Threads share memory; queue.Queue is a thread-safe FIFO with put and get timeouts."]
+  ],
+  "myths": [
+    ["Iterating the subscriber list while publishing is fine if you hold a lock.", "Holding the bus lock while calling handlers means a slow handler blocks every other publisher and subscriber, and a handler that subscribes, unsubscribes or publishes deadlocks on the lock it is already inside. Take a snapshot of the matching subscribers under the lock, release it, then call handlers. The snapshot is what makes unsubscribe-while-publishing safe."],
+    ["Asynchronous delivery means events can arrive in any order.", "Async delivery with one queue and one worker per subscriber keeps each subscriber's events in the order they were published (per publisher). Order is lost only across subscribers, or when one subscriber is served by several workers. Decide which order matters and design for it."],
+    ["An unbounded queue avoids back-pressure problems.", "It hides them until memory runs out. A slow subscriber with an unbounded queue grows without limit while the producer never notices. Bounded queues force a decision — block the producer, drop the new event, or drop the oldest — and the right choice depends on whether events are commands that must not be lost or telemetry where the latest value is what matters."],
+    ["One bad handler is the handler's problem.", "Without isolation, an exception in a synchronous handler propagates into the publisher and stops delivery to every later subscriber, so one buggy listener breaks unrelated features. Catch per handler, record the failure (a dead-letter list or a log), and keep delivering."],
+    ["Once unsubscribe returns, the handler cannot be called — obviously.", "Not without care. Another thread may already have taken a snapshot that includes the subscription and be about to call it. The bus must re-check an active flag under a per-subscription lock right before calling, and unsubscribe must take that lock, so it waits for any in-flight call and guarantees nothing starts afterwards."]
+  ],
+  "recap": [
+    "An in-process event bus lets components publish events to named topics and subscribe to patterns without knowing about each other.",
+    "Topics are dot-separated words; '*' matches exactly one word and '#' matches zero or more, as in AMQP topic exchanges.",
+    "A trie keyed by word, with '*' and '#' children, finds matching subscriptions in time proportional to the topic's length and the wildcards present, not the number of subscriptions.",
+    "Publish takes a snapshot of matching subscriptions under the bus lock and calls handlers without it.",
+    "Synchronous subscribers run in the publisher's thread in subscription order; asynchronous ones each have a bounded queue and a worker thread.",
+    "One worker per async subscriber keeps each subscriber's events in publish order.",
+    "When a queue is full, the policy decides: block the publisher up to a timeout, drop the new event, or drop the oldest queued event.",
+    "Handler exceptions are caught per subscriber and recorded as dead letters, so other subscribers still receive the event.",
+    "Unsubscribe removes the subscription, then takes its call lock to wait for an in-flight call and mark it inactive; every delivery re-checks the flag under that lock.",
+    "A re-entrant call lock lets a handler unsubscribe itself; close() stops workers after draining or dropping their queues."
+  ],
+  "glossary": [
+    ["Back-pressure", "A signal from a slow consumer to a fast producer to slow down, or a policy for what happens when the consumer cannot keep up."],
+    ["Dead letter", "A record of an event that could not be delivered or processed, kept for inspection instead of being lost silently."],
+    ["Drop-oldest / drop-newest", "Overflow policies that discard the oldest queued event or the incoming event when a bounded queue is full."],
+    ["Event bus", "An object through which parts of a program publish events and receive the events they subscribed to."],
+    ["FIFO", "First in, first out: events leave a queue in the order they entered."],
+    ["Handler", "The function a subscriber registers, called with the topic and the event."],
+    ["Re-entrant lock", "A lock the same thread can acquire again while already holding it, released only when every acquisition is released."],
+    ["Snapshot", "A copy of the current set of matching subscribers taken under a lock, used after the lock is released."],
+    ["Subscription", "A registration of a handler for a topic pattern, with its delivery mode, queue and state."],
+    ["Topic", "A dot-separated name an event is published under, such as orders.eu.created."],
+    ["Trie", "A tree where each edge is one word of the key, so keys with common prefixes share a path."],
+    ["Wildcard", "A pattern word that matches other words: '*' exactly one, '#' zero or more."]
+  ],
+  "qa": [
+    ["E", "Why use an event bus instead of calling functions directly?", "It decouples publishers from subscribers: the order service publishes orders.created without knowing that email, analytics and inventory listen, and new listeners can be added without touching it. The costs are indirection (harder to trace who reacts to what), weaker guarantees than a direct call (no return value, possible asynchrony), and the need to handle errors and slow listeners in the bus."],
+    ["E", "What do '*' and '#' mean in topic patterns?", "Following AMQP topic exchanges: '*' matches exactly one word and '#' matches zero or more words. orders.*.created matches orders.eu.created but not orders.eu.vip.created; orders.#.created matches both and also orders.created; lazy.# matches lazy itself."],
+    ["E", "Synchronous or asynchronous delivery — what is the difference?", "Synchronous subscribers run in the publisher's thread before publish returns, so the publisher sees their latency and they run in subscription order. Asynchronous subscribers get the event through a queue and run on their own thread, so publish returns quickly, but delivery happens later, the publisher cannot know whether it succeeded, and a slow subscriber needs a back-pressure policy."],
+    ["M", "How do you match a topic against thousands of patterns efficiently?", "Store patterns in a trie keyed by word, where '*' and '#' are ordinary child keys. To match topic words w0…wn, walk from the root: at each node, follow the child equal to the next word and the '*' child (each consuming one word), and the '#' child consuming any number of words including zero. Collect subscriptions at nodes reached exactly when the topic is used up. Cost depends on the topic length and the wildcards present, not on how many patterns exist.", "Follow-up: What is the worst case? — Many '#' wildcards in one pattern can make the walk explore many splits; real systems cap the number of '#' per pattern or cache match results per topic."],
+    ["M", "How is unsubscribe made safe while other threads are publishing?", "Publish snapshots the matching subscriptions under the bus lock and releases it, so unsubscribe can always proceed. Each subscription has an active flag and a call lock; the bus calls a handler only while holding that lock and after checking the flag. Unsubscribe removes the subscription from the trie, then takes the call lock (waiting for any in-flight call) and clears the flag. Any snapshot that still holds the subscription will find it inactive."],
+    ["M", "What ordering does the bus guarantee?", "For each subscriber, events from one publisher thread arrive in the order that thread published them: synchronous delivery happens in the publisher's thread in sequence, and each asynchronous subscriber has one FIFO queue and one worker. There is no global order across publishers (two threads publishing at once interleave arbitrarily), and no order across subscribers."],
+    ["M", "Compare the three back-pressure policies.", "Block makes the publisher wait for room (with a timeout, then an error): nothing is lost, but a slow subscriber slows every publisher — right for commands that must be processed. Drop-newest discards the incoming event when full: the subscriber keeps the backlog it has. Drop-oldest discards the oldest queued event: the subscriber always works on the most recent data — right for telemetry, prices or UI updates where stale values are worthless."],
+    ["M", "What happens when a handler raises?", "The bus catches it for that subscriber only, records a dead letter (topic, event, subscription id, error), and continues with the next subscriber, so one bug cannot stop unrelated listeners. The dead letters can be logged, alerted on, or retried. Exceptions are not propagated to the publisher, which would otherwise have to know about every subscriber's failures."],
+    ["H", "How do you avoid deadlocks in an event bus?", "Never call handlers while holding the bus lock (snapshot, then release). Make the per-subscription lock re-entrant so a handler can unsubscribe itself. Be aware of the remaining cycle: if handler A, while running, unsubscribes B in another thread while B's handler is running and unsubscribes A, each waits for the other's call lock. Document that unsubscribing other subscriptions from inside a handler can block, or defer such unsubscribes to after the handler returns.", "Follow-up: Why not skip the call lock and accept a late call? — Then a component that unsubscribes and frees its resources can still be called, using freed state; the guarantee is what makes unsubscribe safe to use in shutdown code."],
+    ["H", "A synchronous handler publishes another event. What can go wrong?", "Recursion: the nested publish runs its subscribers immediately, inside the outer handler, so events are processed depth-first rather than in publish order, and a cycle (A's handler publishes B, B's publishes A) recurses until the stack overflows. Options: forbid publishing from sync handlers, detect re-entrancy and queue nested events until the outer publish finishes, or make the subscribers involved asynchronous."],
+    ["H", "How would this design change for events between processes?", "Delivery can no longer be a function call: events must be serialised and sent through a broker (Kafka, RabbitMQ, a cloud pub/sub). That adds durability choices (at-most-once versus at-least-once), consumer acknowledgements, redelivery and therefore idempotent handlers, persistent queues instead of in-memory ones, and partitioning for ordering (per key rather than per subscriber). The in-process bus's ideas — topic patterns, per-subscriber ordering, back-pressure policies, dead letters — map directly onto broker features."],
+    ["H", "When should events not go through a bus at all?", "When the caller needs the result or must know the action happened (a payment authorisation), when ordering across components matters (a bus does not order events across subscribers), or when the indirection hides important control flow from readers of the code. A direct call or an explicit workflow is clearer for those; the bus fits notifications and fan-out to independent listeners."]
+  ],
+  "refs": [
+    ["docs", "RabbitMQ tutorial: topics", "The topic exchange's routing rules: dot-delimited words, '*' for exactly one word, '#' for zero or more, with worked examples (*.orange.*, *.*.rabbit, lazy.#).", "https://www.rabbitmq.com/tutorials/tutorial-five-python"],
+    ["docs", "Python queue: a synchronized queue class", "queue.Queue with maxsize, blocking put and get with timeouts, and the Full and Empty exceptions.", "https://docs.python.org/3/library/queue.html"],
+    ["docs", "Python threading: RLock", "A re-entrant lock the owning thread may acquire repeatedly — what lets a handler unsubscribe itself.", "https://docs.python.org/3/library/threading.html#rlock-objects"],
+    ["docs", "Observer pattern", "The pattern an event bus generalises: subjects notifying registered observers without depending on them.", "https://en.wikipedia.org/wiki/Observer_pattern"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A desktop trading application has a dozen components that care about prices: the chart, the order ticket, the risk panel, an alerting module, a log. At first the price feed calls each of them directly. Every new feature means editing the feed. Then someone adds an event bus — components subscribe to <code>prices.*</code>, the feed publishes — and it works until the market opens. The risk panel's handler takes 200 milliseconds per update, and because handlers run inside the feed's thread, prices on the chart freeze. A plug-in's handler throws an exception on a malformed symbol, and every subscriber after it in the list stops receiving prices. Closing a window unsubscribes its chart while the feed is mid-publish, and the closed chart's handler is called once more on freed state and crashes the app.</p>
+<p>The in-process event bus is a standard machine-coding round because it compresses several classic problems into one small class: pattern matching (topics with wildcards), concurrency (multiple publishers, asynchronous subscribers), flow control (what to do when a subscriber falls behind), fault isolation (one bad listener must not break the others), and the subtle lifecycle question every observer system faces — what exactly does "unsubscribed" guarantee when other threads are publishing at the same moment?</p>
+<p>This lesson builds the bus in stages: requirements and entities; a naive list of callbacks and its failures; topic matching with AMQP-style wildcards, first by recursion and then with a trie; publishing from a snapshot without holding the lock; synchronous and asynchronous subscribers with per-subscriber ordering; bounded queues with block, drop-newest and drop-oldest policies; error isolation with dead letters; and an unsubscribe that, once it returns, guarantees the handler will never be called again — even with three threads publishing. The full solution is a runnable Python 3.12 file with nine tests, including the RabbitMQ tutorial's routing examples, a trie checked against a reference matcher on 500 random topics, ordering across four publishers, and a churn test with eight publishers and four threads subscribing and unsubscribing continuously.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: an office's internal mail room</h4>
+<p>Departments in a large office send memos labelled with a subject line like <em>orders.europe.created</em>. Staff register interests with the mail room: "send me anything about <em>orders.europe.*</em>" or "everything under <em>orders.#</em>". The mail room keeps a directory of interests organised by subject words, so it can find everyone interested in a memo without reading the whole list. Some staff want memos handed to them immediately, while the sender waits at the desk (synchronous); others have an in-tray that a clerk fills and they work through at their own pace (asynchronous). In-trays have limited room: when one is full, the mail room either makes the sender wait, throws away the new memo, or throws away the oldest memo in the tray, depending on what that recipient asked for. If a recipient refuses a memo angrily, the mail room notes it in a log and carries on delivering to everyone else. And when someone cancels their interest, the mail room promises: once the cancellation is confirmed, nothing more will reach them — not even a memo that was already on its way down the corridor.</p>
+<p>The directory organised by subject words is the <strong>trie</strong>; "<em>*</em>" and "<em>#</em>" are the <strong>wildcards</strong>; handing over while the sender waits is <strong>synchronous delivery</strong>; the in-tray is a <strong>bounded queue</strong> with a worker; the three full-tray rules are <strong>back-pressure policies</strong>; the log of refusals is the <strong>dead-letter</strong> list; the cancellation promise is <strong>safe unsubscribe</strong>.</p>
+<p>The analogy breaks in one important place. In a real office the person delivering a memo cannot be in two places at once. In a program, a publisher in one thread can be calling a handler at the very moment another thread cancels it. Making the cancellation promise true is where the locking design earns its keep.</p>
+
+<figure>
+<svg viewBox="0 0 640 290" width="100%" role="img" aria-label="Event bus flow. A publisher calls publish with topic orders.eu.created. Under the bus lock, the trie is matched and a snapshot of matching subscriptions is taken; the lock is released. Synchronous subscribers are called in the publisher's thread, each under its own call lock and after checking it is still active; exceptions go to dead letters. Asynchronous subscribers receive the event in their bounded queue, with a policy for when it is full, and their worker thread calls the handler in FIFO order.">
+  <defs><marker id="ld27-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="20" width="130" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="75" y="40" text-anchor="middle" style="fill:var(--ink)">publisher thread</text>
+    <text x="75" y="58" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">orders.eu.created</text>
+    <rect x="170" y="14" width="180" height="62" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="260" y="34" text-anchor="middle" style="fill:var(--ink);font-weight:600">under bus lock</text>
+    <text x="260" y="52" text-anchor="middle" style="fill:var(--muted)">trie.match → snapshot</text>
+    <text x="260" y="68" text-anchor="middle" style="fill:var(--muted)">then release</text>
+    <line x1="140" y1="45" x2="168" y2="45" marker-end="url(#ld27-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="380" y="10" width="250" height="84" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="505" y="30" text-anchor="middle" style="fill:var(--ink);font-weight:600">sync subscribers (publisher's thread)</text>
+    <text x="392" y="50" style="fill:var(--muted)">for each, in subscription order:</text>
+    <text x="392" y="68" style="fill:var(--muted)">take call lock · active? · call</text>
+    <text x="392" y="86" style="fill:var(--crit)">exception → dead letter, continue</text>
+    <line x1="350" y1="40" x2="378" y2="40" marker-end="url(#ld27-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="380" y="120" width="250" height="78" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="505" y="140" text-anchor="middle" style="fill:var(--ink);font-weight:600">async subscriber</text>
+    <rect x="392" y="150" width="20" height="18" style="fill:var(--s3)"/>
+    <rect x="414" y="150" width="20" height="18" style="fill:var(--s3)"/>
+    <rect x="436" y="150" width="20" height="18" style="fill:var(--s3)"/>
+    <rect x="458" y="150" width="20" height="18" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 2"/>
+    <text x="490" y="164" style="fill:var(--muted)">bounded queue</text>
+    <text x="392" y="188" style="fill:var(--muted)">full → block · drop newest · drop oldest</text>
+    <line x1="300" y1="78" x2="390" y2="150" marker-end="url(#ld27-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="380" y="220" width="250" height="56" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="505" y="240" text-anchor="middle" style="fill:var(--ink)">worker thread (one per subscriber)</text>
+    <text x="505" y="258" text-anchor="middle" style="fill:var(--muted)">FIFO · call lock · active? · call</text>
+    <line x1="505" y1="198" x2="505" y2="218" marker-end="url(#ld27-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="10" y="150" width="330" height="110" rx="4" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="175" y="170" text-anchor="middle" style="fill:var(--ink);font-weight:600">unsubscribe(sub)</text>
+    <text x="24" y="192" style="fill:var(--muted)">1. under bus lock: remove from table and trie</text>
+    <text x="24" y="212" style="fill:var(--muted)">2. take sub's call lock (waits for in-flight call)</text>
+    <text x="24" y="232" style="fill:var(--muted)">3. active = False · drop queue · stop worker</text>
+    <text x="24" y="252" style="fill:var(--good)">→ handler never called again</text>
+  </g>
+</svg>
+<figcaption>The bus lock is held only to read or change the routing table; handlers always run without it. The per-subscription call lock is what turns "unsubscribed" into a guarantee: every call checks the active flag under it, and unsubscribe flips the flag under it.</figcaption>
+</figure>
+
+<h4>Inside one process, not between services</h4>
+<p>This round is about the bus <em>inside</em> a program — a desktop application, a game engine, a single backend service whose modules should not import each other. Everything lives in one memory space, so delivery is a function call or a queue put, events are ordinary objects, and nothing survives a restart. Keeping that scope clear early in the interview avoids a detour into brokers, persistence and network failures, which belong to a different question (sc10). The in-process version still has all the hard parts that make concurrency rounds interesting: shared mutable routing state, callbacks into unknown code, and threads that start and stop while events are in flight.</p>
+
+<h4>What the round expects</h4>
+<p><code>subscribe(pattern, handler, …)</code> returning a handle, <code>unsubscribe(handle)</code>, <code>publish(topic, event)</code>, and <code>close()</code>; wildcard matching with a clear definition; synchronous and asynchronous modes; a stated ordering guarantee; a back-pressure policy for bounded queues; error isolation; thread safety, including unsubscribe during publish; and tests that exercise concurrency rather than only single-threaded calls.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Entities &amp; API</span></div><div class="ck"><span class="ck-m">10–14</span><span class="ck-t">Naive list</span></div><div class="ck"><span class="ck-m">14–24</span><span class="ck-t">Wildcards &amp; trie</span></div><div class="ck"><span class="ck-m">24–36</span><span class="ck-t">Async, pressure, unsubscribe</span></div><div class="ck"><span class="ck-m">36–45</span><span class="ck-t">Tests &amp; extensions</span></div></div>
+
+<h4>1 · Clarify the requirements</h4>
+<p>Ask: what do topics look like, and which wildcard syntax? Must <code>publish</code> wait for handlers, or return immediately? What ordering is required — per subscriber, per publisher, global? What should happen when a subscriber cannot keep up? What happens when a handler throws? Can handlers subscribe, unsubscribe or publish from inside a callback? What exactly does unsubscribe guarantee? How is the bus shut down? Agreed: dot-separated topics with AMQP (Advanced Message Queuing Protocol, the standard RabbitMQ implements) semantics ('*' one word, '#' zero or more); per-subscription choice of synchronous or asynchronous delivery; FIFO per subscriber per publisher; bounded async queues with a per-subscription overflow policy; handler errors isolated and recorded; handlers may unsubscribe themselves; after <code>unsubscribe</code> returns, the handler is never called again; <code>close(drain)</code> delivers or drops what is queued.</p>
+
+<h4>2 · Entities and the interface</h4>
+<pre>bus = EventBus()
+sub = bus.subscribe("orders.*.created", handler, asynchronous=False,
+                    maxsize=1000, overflow=Overflow.BLOCK, block_timeout=1.0)
+bus.publish("orders.eu.created", event) -&gt; int        # number of subscribers that accepted it
+bus.unsubscribe(sub)
+bus.close(drain=True)
+bus.dead_letters -&gt; [(topic, event, sub_id, error)]
+
+Subscription: id, pattern, handler, asynchronous, overflow, maxsize, active, call_lock (RLock),
+              q (queue.Queue) and worker (Thread) when asynchronous, delivered, dropped
+TopicTrie:    add(words, sub), remove(words, sub_id), match(words) -&gt; {id: sub}</pre>
+<p>The handle returned by <code>subscribe</code> is the subscription itself, so unsubscribing needs no lookup by handler (handlers are often lambdas with no identity worth comparing). <code>publish</code> returns how many subscribers accepted the event, which makes dropped events visible to callers and tests.</p>
+
+<h4>3 · Stage one: a list of callbacks</h4>
+<pre>class NaiveBus:
+    def __init__(self): self.subs, self.lock = [], threading.Lock()
+    def subscribe(self, topic, h):
+        with self.lock: self.subs.append((topic, h))
+    def publish(self, topic, e):
+        with self.lock:
+            for t, h in self.subs:
+                if t == topic: h(topic, e)       # handler runs under the lock</pre>
+<p>Every failure from the opening story is here. Handlers run under the bus lock: a slow handler blocks every publisher and every subscribe call, and a handler that subscribes or publishes deadlocks immediately (the lock is not re-entrant). An exception in one handler propagates out of <code>publish</code> and skips the rest. There is no wildcard matching and no way to deliver asynchronously. And if <code>subscribe</code> did not take the lock, appending to the list during iteration in another thread would be a data race. The fixes below address each.</p>
+
+<h4>4 · Stage two: topics and wildcards</h4>
+<p><strong>The rules.</strong> Following RabbitMQ's topic exchange, a topic is a list of words separated by dots; in a subscription pattern, <code>*</code> stands for exactly one word and <code>#</code> for zero or more words. Using the RabbitMQ tutorial's examples, which the first test replays exactly: <code>*.orange.*</code> matches <code>quick.orange.rabbit</code> and <code>lazy.orange.elephant</code> but not <code>orange</code> or <code>quick.orange.new.rabbit</code>; <code>*.*.rabbit</code> matches <code>quick.orange.rabbit</code>; <code>lazy.#</code> matches <code>lazy.brown.fox</code>, <code>lazy.orange.new.rabbit</code> and plain <code>lazy</code> (zero words). <code>lazy.pink.rabbit</code> matches two of one queue's patterns but is delivered to it once. Validation rejects empty words (<code>a..b</code>), wildcards inside words (<code>a.b*</code>), and wildcards in published topics.</p>
+<p><strong>A reference matcher.</strong> The rules are easiest to state as recursion over word lists: an empty pattern matches only an empty topic; a pattern starting with <code>#</code> matches if the rest of the pattern matches the topic with any number (0 to all) of leading words removed; otherwise the first pattern word must be <code>*</code> or equal to the first topic word, and the rest must match the rest. This takes ten lines, is obviously correct, and becomes the test oracle.</p>
+<p><strong>The trie.</strong> Checking every subscription's pattern on every publish costs O(subscriptions × topic length). A trie shares work between patterns: each node's children are keyed by word, with <code>*</code> and <code>#</code> as ordinary keys, and subscriptions sit at the node where their pattern ends. To match topic words w<sub>0</sub>…w<sub>n−1</sub>, walk from the root with an index i: if the node has a <code>#</code> child, recurse into it for every j from i to n (the <code>#</code> consumes w<sub>i</sub>…w<sub>j−1</sub>, possibly nothing); if i = n, collect the node's subscriptions; otherwise recurse into the child for w<sub>i</sub> and the <code>*</code> child with i + 1. Matching <code>orders.eu.created</code> against the patterns <code>orders.*.created</code>, <code>orders.#</code> and <code>#.created</code>: from the root, the <code>orders</code> branch leads to a <code>*</code> node (consuming "eu") and then a <code>created</code> node where the first subscription sits; its <code>#</code> child, entered with i = 1, absorbs "eu.created"; and the root's <code>#</code> child, entered with j = 2, leaves "created" to match its <code>created</code> child. Results are collected in a dictionary by subscription id, so a subscription reachable two ways is delivered once. <code>remove</code> prunes nodes left with no subscriptions and no children, which the stress test checks (after heavy churn, the trie is empty). The second test compares the trie with the reference matcher on 300 random patterns and 500 random topics.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="A topic trie holding three patterns: orders.*.created, orders.#, and #.created. The root has children orders and hash. orders has children star and hash; star has child created holding subscription 1; the hash under orders holds subscription 2; the root's hash has child created holding subscription 3. Matching orders.eu.created reaches all three.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <circle cx="320" cy="30" r="16" style="fill:var(--surface-2);stroke:var(--ink-2)"/>
+    <text x="320" y="34" text-anchor="middle" style="fill:var(--ink)">root</text>
+    <rect x="160" y="74" width="80" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="200" y="91" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">orders</text>
+    <rect x="440" y="74" width="60" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="470" y="91" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">#</text>
+    <line x1="308" y1="42" x2="210" y2="72" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="332" y1="42" x2="460" y2="72" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="90" y="130" width="60" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="120" y="147" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">*</text>
+    <rect x="240" y="130" width="70" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="275" y="147" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">#  [s2]</text>
+    <line x1="190" y1="100" x2="125" y2="128" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="210" y1="100" x2="270" y2="128" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="70" y="186" width="110" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="125" y="203" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">created [s1]</text>
+    <line x1="120" y1="156" x2="122" y2="184" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="420" y="130" width="110" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="475" y="147" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">created [s3]</text>
+    <line x1="470" y1="100" x2="473" y2="128" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="560" y="40" style="fill:var(--ink)">s1: orders.*.created</text>
+    <text x="560" y="58" style="fill:var(--ink)">s2: orders.#</text>
+    <text x="560" y="76" style="fill:var(--ink)">s3: #.created</text>
+    <text x="330" y="200" style="fill:var(--muted)">topic orders.eu.created:</text>
+    <text x="330" y="218" style="fill:var(--muted)">'*' eats "eu"; '#' eats "eu.created" or "orders.eu"</text>
+  </g>
+</svg>
+<figcaption>Wildcards are just children with special keys, so patterns that share a prefix share a path. A '#' node is entered once for every possible number of words it could absorb, including none — which is why orders.# also matches the bare topic orders.</figcaption>
+</figure>
+
+<h4>5 · Stage three: publish from a snapshot</h4>
+<p><code>publish</code> validates the topic, takes the bus lock just long enough to run <code>trie.match</code> and copy the result (sorted by subscription id, so synchronous handlers run in subscription order), releases the lock, and only then delivers. Holding the bus lock only for the routing lookup means slow handlers never block other publishers or subscribe calls, and handlers can call <code>subscribe</code>, <code>unsubscribe</code> or <code>publish</code> without deadlocking on the bus lock. The price is that the snapshot can be stale: a subscription removed a microsecond after the snapshot is still in the list. Stage six turns that staleness into a non-issue.</p>
+
+<h4>6 · Stage four: synchronous and asynchronous delivery</h4>
+<p><strong>Synchronous</strong> subscribers are called in the publisher's thread, one after another. Each call happens inside a <code>try</code>: an exception is recorded in <code>dead_letters</code> as (topic, event, subscription id, "ZeroDivisionError: division by zero") and delivery continues with the next subscriber. The test subscribes three handlers to <code>x</code>, the middle one dividing by zero: the first and third receive both events in order, and two dead letters are recorded.</p>
+<p><strong>Asynchronous</strong> subscribers each get a <code>queue.Queue(maxsize)</code> and a dedicated daemon worker thread that loops: take the next item, call the handler (with the same error isolation), repeat until a stop sentinel arrives. One queue and one worker per subscriber is what gives FIFO order: events from one publisher enter the queue in publish order and leave it in the same order. The test runs four publisher threads each publishing 1,000 numbered events to <code>seq.pN</code> and checks that, for each publisher, the subscriber received 0…999 in order — while the four streams interleave arbitrarily, as expected.</p>
+
+<h4>7 · Stage five: back-pressure</h4>
+<p>A bounded queue fills when the subscriber is slower than the publishers. Three policies, chosen per subscription:</p>
+<table>
+<thead><tr><th>Policy</th><th>When full</th><th>Loses events?</th><th>Publisher affected?</th><th>Use for</th></tr></thead>
+<tr><td>BLOCK</td><td>publisher waits up to a timeout, then <code>BackPressure</code></td><td>No (error instead)</td><td>Yes, slowed or failed</td><td>Commands that must be handled</td></tr>
+<tr><td>DROP_NEWEST</td><td>incoming event discarded</td><td>Yes, newest</td><td>No</td><td>Work where the backlog matters more</td></tr>
+<tr><td>DROP_OLDEST</td><td>oldest queued event discarded, new one enqueued</td><td>Yes, oldest</td><td>No</td><td>Prices, telemetry, UI state</td></tr>
+</table>
+<p>The test blocks three consumers behind a gate and publishes ten events to each kind. Drop-newest and drop-oldest each record at least six drops (the queue holds three, one may be in the worker's hands); after the gate opens, the drop-oldest subscriber's last three events are 7, 8, 9 — the newest survived. The blocking subscriber, with a queue of two, accepts event 0 (taken by the worker), then 1 and 2 (queued); publishing 3 waits 50 ms and raises <code>BackPressure: subscriber … is 2 events behind</code>. Each subscription counts its drops, so monitoring can see which consumers are falling behind.</p>
+
+<h4>8 · Stage six: unsubscribe while publishing</h4>
+<p><strong>The race.</strong> Thread P takes a snapshot containing subscription S and is about to call S's handler. Thread U calls <code>unsubscribe(S)</code>, removes it from the trie, returns — and the component that owned S frees its resources. Then P calls the handler on freed state. A guarantee is needed: <em>once unsubscribe returns, the handler is not running and will never be called again.</em></p>
+<p><strong>The mechanism.</strong> Each subscription has an <code>active</code> flag and a <code>call_lock</code>. Every delivery — synchronous in the publisher's thread, or asynchronous in the worker — takes the call lock, checks <code>active</code>, and only then calls the handler, releasing the lock after it returns. <code>unsubscribe</code> first removes the subscription from the table and trie under the bus lock (no new snapshots will include it), then takes the call lock — which waits for any in-flight call to finish — and sets <code>active = False</code>. Any stale snapshot that still holds S now finds it inactive and skips it. For an asynchronous subscriber, unsubscribe also discards its queued events and stops its worker. The test runs three publisher threads hammering one subscriber, unsubscribes it, then sets a flag; the handler records any call that sees the flag. Run for both delivery modes, it records none.</p>
+<p><strong>Unsubscribing yourself.</strong> A handler that unsubscribes its own subscription — "handle the first event only" — already holds the call lock. With a plain lock that would deadlock; the call lock is a re-entrant <code>RLock</code>, so the same thread acquires it again, sets the flag, and the current call simply finishes. For an asynchronous subscriber, the worker cannot join itself, so <code>_drain_and_stop</code> skips the join when called from the worker thread; the worker exits after the current call. The test checks both modes deliver exactly one event.</p>
+<p><strong>The remaining hazard.</strong> If handler A, running in one thread, unsubscribes B while B's handler, running in another, unsubscribes A, each waits for the other's call lock: a deadlock (os6's circular wait). It is rare and worth stating; the remedy is to avoid unsubscribing <em>other</em> subscriptions from inside handlers, or to defer it until the handler returns.</p>
+
+<h4>9 · Stage seven: shutdown and the stress test</h4>
+<p><code>close(drain=True)</code> marks the bus closed (new publishes and subscribes fail), then for every asynchronous subscriber enqueues a stop sentinel behind its pending events and joins its worker, so everything already accepted is delivered; <code>close(drain=False)</code> discards pending events first. The churn test runs eight publishers sending 2,000 events each to random topics while four threads repeatedly subscribe a random pattern in a random mode with drop-newest queues, sleep a fraction of a millisecond, and unsubscribe. It requires no exceptions anywhere and, at the end, an empty subscription table and an empty trie — proving <code>remove</code> prunes correctly under concurrency.</p>
+
+<h4>10 · The full solution</h4>
+<p>Nine tests in about a second, stable across repeated runs. Python 3.12, standard library only.</p>
+<pre>"""An in-process pub-sub event bus: dot-separated topics with AMQP-style wildcards ('*' = exactly one
+word, '#' = zero or more) matched through a trie, synchronous and asynchronous subscribers, FIFO
+order per subscriber, bounded queues with back-pressure policies, error isolation with a dead-letter
+record, and unsubscribe that is safe while publishing (once it returns, the handler is never called
+again). Python 3.12, standard library only.  Run: python event_bus.py"""
+from __future__ import annotations
+
+import itertools
+import queue
+import random
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable
+
+Handler = Callable[[str, Any], None]
+
+
+class Overflow(Enum):
+    BLOCK = "block"                 # publisher waits up to a timeout, then BackPressure
+    DROP_NEWEST = "drop_newest"     # discard the event being published
+    DROP_OLDEST = "drop_oldest"     # discard the oldest queued event to make room
+
+
+class BackPressure(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- topic matching
+def _valid(pattern: str, allow_wildcards: bool) -&gt; list[str]:
+    words = pattern.split(".")
+    if not pattern or any(w == "" for w in words):
+        raise ValueError(f"bad topic {pattern!r}: empty word")
+    if not allow_wildcards and any(w in ("*", "#") for w in words):
+        raise ValueError(f"wildcards are not allowed in published topics: {pattern!r}")
+    if any(("*" in w or "#" in w) and w not in ("*", "#") for w in words):
+        raise ValueError(f"a wildcard must be a whole word: {pattern!r}")
+    return words
+
+
+class _TrieNode:
+    __slots__ = ("children", "subs")
+
+    def __init__(self) -&gt; None:
+        self.children: dict[str, _TrieNode] = {}
+        self.subs: dict[int, "Subscription"] = {}
+
+
+class TopicTrie:
+    def __init__(self) -&gt; None:
+        self.root = _TrieNode()
+
+    def add(self, words: list[str], sub: "Subscription") -&gt; None:
+        node = self.root
+        for w in words:
+            node = node.children.setdefault(w, _TrieNode())
+        node.subs[sub.id] = sub
+
+    def remove(self, words: list[str], sub_id: int) -&gt; None:
+        path, node = [], self.root
+        for w in words:
+            path.append((node, w))
+            node = node.children[w]
+        node.subs.pop(sub_id, None)
+        for parent, w in reversed(path):                    # prune empty branches
+            child = parent.children[w]
+            if child.subs or child.children:
+                break
+            del parent.children[w]
+
+    def match(self, words: list[str]) -&gt; dict[int, "Subscription"]:
+        found: dict[int, Subscription] = {}
+
+        def walk(node: _TrieNode, i: int) -&gt; None:
+            hash_child = node.children.get("#")
+            if hash_child is not None:                       # '#' consumes words i..j for every j &gt;= i
+                for j in range(i, len(words) + 1):
+                    walk(hash_child, j)
+            if i == len(words):
+                found.update(node.subs)
+                return
+            for key in (words[i], "*"):
+                child = node.children.get(key)
+                if child is not None:
+                    walk(child, i + 1)
+        walk(self.root, 0)
+        return found                                         # a subscription matched twice is delivered once
+
+
+def reference_match(pattern: list[str], topic: list[str]) -&gt; bool:
+    """Reference matcher for tests: the rules written as plain recursion, obviously correct."""
+    if not pattern:
+        return not topic
+    if pattern[0] == "#":
+        return any(reference_match(pattern[1:], topic[i:]) for i in range(len(topic) + 1))
+    if not topic:
+        return False
+    return pattern[0] in ("*", topic[0]) and reference_match(pattern[1:], topic[1:])
+
+
+# ---------------------------------------------------------------- subscriptions
+@dataclass(eq=False)
+class Subscription:
+    id: int
+    pattern: str
+    handler: Handler
+    asynchronous: bool
+    overflow: Overflow
+    maxsize: int
+    block_timeout: float
+    active: bool = True
+    call_lock: threading.RLock = field(default_factory=threading.RLock)   # held while the handler runs
+    q: queue.Queue | None = None
+    worker: threading.Thread | None = None
+    delivered: int = 0
+    dropped: int = 0
+
+
+_STOP = object()
+
+
+class EventBus:
+    def __init__(self) -&gt; None:
+        self._lock = threading.Lock()              # protects the trie and the subscription table
+        self._trie = TopicTrie()
+        self._subs: dict[int, Subscription] = {}
+        self._ids = itertools.count(1)
+        self.dead_letters: list[tuple[str, Any, int, str]] = []   # (topic, event, sub id, error)
+        self._dl_lock = threading.Lock()
+        self._closed = False
+
+    # ---- subscribe / unsubscribe
+    def subscribe(self, pattern: str, handler: Handler, *, asynchronous: bool = False,
+                  maxsize: int = 1000, overflow: Overflow = Overflow.BLOCK,
+                  block_timeout: float = 1.0) -&gt; Subscription:
+        words = _valid(pattern, allow_wildcards=True)
+        sub = Subscription(next(self._ids), pattern, handler, asynchronous, overflow, maxsize, block_timeout)
+        if asynchronous:
+            sub.q = queue.Queue(maxsize=maxsize)
+            sub.worker = threading.Thread(target=self._run_worker, args=(sub,), daemon=True,
+                                          name=f"bus-sub-{sub.id}")
+            sub.worker.start()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("bus is closed")
+            self._trie.add(words, sub)
+            self._subs[sub.id] = sub
+        return sub
+
+    def unsubscribe(self, sub: Subscription) -&gt; None:
+        """After this returns, the handler is not running and will never be called again
+        (unless called from inside the handler itself, where the current call simply finishes)."""
+        with self._lock:
+            if self._subs.pop(sub.id, None) is None:
+                return
+            self._trie.remove(sub.pattern.split("."), sub.id)
+        with sub.call_lock:                         # waits for an in-flight call in another thread
+            sub.active = False
+        if sub.asynchronous:
+            self._drain_and_stop(sub)
+
+    # ---- publish
+    def publish(self, topic: str, event: Any) -&gt; int:
+        """Deliver to every matching subscription. Returns how many accepted the event."""
+        words = _valid(topic, allow_wildcards=False)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("bus is closed")
+            targets = sorted(self._trie.match(words).values(), key=lambda s: s.id)   # snapshot
+        accepted = 0
+        for sub in targets:                         # the lock is NOT held while handlers run
+            if sub.asynchronous:
+                accepted += self._enqueue(sub, topic, event)
+            else:
+                accepted += self._call(sub, topic, event)
+        return accepted
+
+    def _enqueue(self, sub: Subscription, topic: str, event: Any) -&gt; int:
+        if not sub.active:
+            return 0
+        item = (topic, event)
+        if sub.overflow is Overflow.BLOCK:
+            try:
+                sub.q.put(item, timeout=sub.block_timeout)
+                return 1
+            except queue.Full:
+                raise BackPressure(f"subscriber {sub.id} ({sub.pattern}) is {sub.maxsize} events behind")
+        try:
+            sub.q.put_nowait(item)
+            return 1
+        except queue.Full:
+            if sub.overflow is Overflow.DROP_NEWEST:
+                sub.dropped += 1
+                return 0
+            while True:                             # DROP_OLDEST: make room, retry
+                try:
+                    sub.q.get_nowait()
+                    sub.dropped += 1
+                except queue.Empty:
+                    pass
+                try:
+                    sub.q.put_nowait(item)
+                    return 1
+                except queue.Full:
+                    continue
+
+    def _call(self, sub: Subscription, topic: str, event: Any) -&gt; int:
+        with sub.call_lock:
+            if not sub.active:                       # unsubscribed after the snapshot was taken
+                return 0
+            try:
+                sub.handler(topic, event)
+                sub.delivered += 1
+            except Exception as e:                   # isolate: one bad handler cannot hurt others
+                with self._dl_lock:
+                    self.dead_letters.append((topic, event, sub.id, f"{type(e).__name__}: {e}"))
+            return 1
+
+    def _run_worker(self, sub: Subscription) -&gt; None:
+        while True:
+            item = sub.q.get()
+            if item is _STOP:
+                return
+            self._call(sub, *item)
+
+    def _drain_and_stop(self, sub: Subscription, deliver: bool = False) -&gt; None:
+        if not deliver:                              # discard what is queued
+            while True:
+                try:
+                    sub.q.get_nowait()
+                except queue.Empty:
+                    break
+        sub.q.put(_STOP)
+        if threading.current_thread() is not sub.worker:
+            sub.worker.join()
+
+    def close(self, drain: bool = True) -&gt; None:
+        """Stop accepting events; deliver (or drop) what async subscribers still have queued."""
+        with self._lock:
+            self._closed = True
+            subs = list(self._subs.values())
+        for sub in subs:
+            if sub.asynchronous:
+                self._drain_and_stop(sub, deliver=drain)
+
+
+# ---------------------------------------------------------------- tests
+def collector():
+    got, lock = [], threading.Lock()
+
+    def handler(topic, event):
+        with lock:
+            got.append((topic, event))
+    return got, handler
+
+
+def test_wildcards_follow_amqp_rules() -&gt; None:
+    bus, results = EventBus(), {}
+    for p in ["*.orange.*", "*.*.rabbit", "lazy.#", "#", "orders.#.created", "a.b"]:
+        got, h = collector()
+        bus.subscribe(p, h)
+        results[p] = got
+    for t in ["quick.orange.rabbit", "lazy.orange.elephant", "quick.orange.fox", "lazy.brown.fox",
+              "lazy.pink.rabbit", "quick.brown.fox", "orange", "quick.orange.new.rabbit",
+              "lazy.orange.new.rabbit", "lazy", "orders.created", "orders.eu.vip.created", "a.b"]:
+        bus.publish(t, None)
+    topics = {p: [t for t, _ in g] for p, g in results.items()}
+    assert topics["*.orange.*"] == ["quick.orange.rabbit", "lazy.orange.elephant", "quick.orange.fox"]
+    assert topics["*.*.rabbit"] == ["quick.orange.rabbit", "lazy.pink.rabbit"]
+    assert topics["lazy.#"] == ["lazy.orange.elephant", "lazy.brown.fox", "lazy.pink.rabbit",
+                                "lazy.orange.new.rabbit", "lazy"]          # '#' matches zero words too
+    assert len(topics["#"]) == 13
+    assert topics["orders.#.created"] == ["orders.created", "orders.eu.vip.created"]
+    assert topics["a.b"] == ["a.b"]
+
+
+def test_trie_agrees_with_reference_matcher() -&gt; None:
+    rng = random.Random(5)
+    vocab = ["a", "b", "c"]
+    patterns = {".".join(rng.choice(vocab + ["*", "#"]) for _ in range(rng.randint(1, 4))) for _ in range(300)}
+    trie, subs = TopicTrie(), {}
+    for i, p in enumerate(sorted(patterns), 1):
+        s = Subscription(i, p, lambda t, e: None, False, Overflow.BLOCK, 1, 1.0)
+        trie.add(p.split("."), s)
+        subs[i] = p
+    for _ in range(500):
+        topic = ".".join(rng.choice(vocab) for _ in range(rng.randint(1, 5)))
+        expected = {i for i, p in subs.items() if reference_match(p.split("."), topic.split("."))}
+        assert set(trie.match(topic.split("."))) == expected, topic
+
+
+def test_sync_order_and_error_isolation() -&gt; None:
+    bus, order = EventBus(), []
+    bus.subscribe("x", lambda t, e: order.append(("first", e)))
+    bus.subscribe("x", lambda t, e: 1 / 0)
+    bus.subscribe("x", lambda t, e: order.append(("third", e)))
+    assert bus.publish("x", 1) == 3 and bus.publish("x", 2) == 3
+    assert order == [("first", 1), ("third", 1), ("first", 2), ("third", 2)]
+    assert [d[3] for d in bus.dead_letters] == ["ZeroDivisionError: division by zero"] * 2
+
+
+def test_async_preserves_per_subscriber_order_per_publisher() -&gt; None:
+    bus = EventBus()
+    got, h = collector()
+    bus.subscribe("seq.#", h, asynchronous=True, maxsize=10_000)
+
+    def publisher(p: int) -&gt; None:
+        for i in range(1000):
+            bus.publish(f"seq.p{p}", i)
+    ts = [threading.Thread(target=publisher, args=(p,)) for p in range(4)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    bus.close(drain=True)
+    assert len(got) == 4000
+    for p in range(4):
+        assert [e for t, e in got if t == f"seq.p{p}"] == list(range(1000))   # FIFO per publisher
+
+
+def test_back_pressure_policies() -&gt; None:
+    gate = threading.Event()
+
+    def slow(t, e):
+        gate.wait()                                  # consumer stuck until the gate opens
+    bus = EventBus()
+    newest = bus.subscribe("n", slow, asynchronous=True, maxsize=3, overflow=Overflow.DROP_NEWEST)
+    oldest_got: list[int] = []
+    oldest = bus.subscribe("o", lambda t, e: (gate.wait(), oldest_got.append(e)), asynchronous=True,
+                           maxsize=3, overflow=Overflow.DROP_OLDEST)
+    blocking = bus.subscribe("b", slow, asynchronous=True, maxsize=2, overflow=Overflow.BLOCK, block_timeout=0.05)
+    for i in range(10):
+        bus.publish("n", i)
+        bus.publish("o", i)
+    assert newest.dropped &gt;= 6 and oldest.dropped &gt;= 6
+    bus.publish("b", 0); time.sleep(0.05); bus.publish("b", 1); bus.publish("b", 2)   # worker holds 0; queue 1,2
+    try:
+        bus.publish("b", 3)
+    except BackPressure as e:
+        assert "2 events behind" in str(e)
+    else:
+        raise AssertionError("no back-pressure")
+    gate.set()
+    bus.close(drain=True)
+    assert oldest_got[-3:] == [7, 8, 9]              # the newest events survived
+
+
+def test_unsubscribe_inside_own_handler() -&gt; None:
+    bus, calls = EventBus(), []
+    sub = None
+
+    def once(t, e):
+        calls.append(e)
+        bus.unsubscribe(sub)                          # re-entrant: allowed, no deadlock
+    sub = bus.subscribe("x", once)
+    bus.publish("x", 1); bus.publish("x", 2)
+    assert calls == [1]
+    asub = None
+
+    def aonce(t, e):
+        calls.append(("a", e))
+        bus.unsubscribe(asub)
+    asub = bus.subscribe("y", aonce, asynchronous=True)
+    bus.publish("y", 1); bus.publish("y", 2)
+    asub.worker.join(timeout=2)
+    assert calls == [1, ("a", 1)] and not asub.worker.is_alive()
+
+
+def test_no_call_after_unsubscribe_returns() -&gt; None:
+    for asynchronous in (False, True):
+        bus, done, violations = EventBus(), threading.Event(), []
+        sub = None
+
+        def h(t, e):
+            if done.is_set():
+                violations.append(e)
+            time.sleep(0.0005)
+        sub = bus.subscribe("t", h, asynchronous=asynchronous, maxsize=100_000)
+        stop = threading.Event()
+
+        def publisher() -&gt; None:
+            i = 0
+            while not stop.is_set():
+                bus.publish("t", i)
+                i += 1
+        ps = [threading.Thread(target=publisher) for _ in range(3)]
+        for p in ps: p.start()
+        time.sleep(0.05)
+        bus.unsubscribe(sub)
+        done.set()                                     # anything after this is a violation
+        time.sleep(0.05)
+        stop.set()
+        for p in ps: p.join()
+        assert violations == [], (asynchronous, violations[:3])
+
+
+def test_stress_churn() -&gt; None:
+    bus, errors, stop = EventBus(), [], threading.Event()
+    totals = [0]
+    lock = threading.Lock()
+
+    def h(t, e):
+        with lock:
+            totals[0] += 1
+
+    def churn(seed: int) -&gt; None:
+        rng = random.Random(seed)
+        try:
+            while not stop.is_set():
+                s = bus.subscribe(rng.choice(["s.*", "s.#", "#", "s.a"]), h,
+                                  asynchronous=rng.random() &lt; 0.5, overflow=Overflow.DROP_NEWEST, maxsize=50)
+                time.sleep(rng.random() / 1000)
+                bus.unsubscribe(s)
+        except Exception as e:      # pragma: no cover
+            errors.append(e)
+
+    def pub(seed: int) -&gt; None:
+        rng = random.Random(seed)
+        try:
+            for i in range(2000):
+                bus.publish(rng.choice(["s.a", "s.b", "t"]), i)
+        except Exception as e:      # pragma: no cover
+            errors.append(e)
+    cs = [threading.Thread(target=churn, args=(s,)) for s in range(4)]
+    ps = [threading.Thread(target=pub, args=(s,)) for s in range(8)]
+    for t in cs + ps: t.start()
+    for t in ps: t.join()
+    stop.set()
+    for t in cs: t.join()
+    assert not errors and bus._subs == {} and bus._trie.root.children == {}   # everything pruned
+
+
+def test_rejects_bad_topics() -&gt; None:
+    bus = EventBus()
+    for bad in ["", "a..b", "a.b*", "a.#x"]:
+        try:
+            bus.subscribe(bad, lambda t, e: None)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+    try:
+        bus.publish("a.*", 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("published to a wildcard")
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
+    for t in tests:
+        t()
+        print("ok ", t.__name__)
+    print(f"{len(tests)} tests passed")</pre>
+
+<h4>11 · Edge cases</h4>
+<p><strong>The same handler subscribed twice</strong> gets two subscriptions and two deliveries; the handle, not the function, identifies a subscription. <strong>Overlapping patterns on one subscription</strong> cannot happen (one pattern per subscription), but one subscriber with two subscriptions matching the same topic receives the event twice — by design. <strong>Unsubscribe twice</strong>: the second call finds nothing and returns. <strong>Publish after close</strong>: raises. <strong>A handler that blocks forever</strong>: a synchronous one blocks its publisher; an asynchronous one blocks only its own queue, which then applies its overflow policy — and <code>unsubscribe</code> on it would wait forever for the call lock, so long-running handlers need their own timeouts. <strong>Events mutated by handlers</strong>: all subscribers receive the same object; pass immutable events (frozen dataclasses) or copies.</p>
+
+<h4>12 · Extensions the interviewer will ask for</h4>
+<p><strong>Priorities</strong>: order synchronous subscribers by a priority field rather than subscription order. <strong>Filters</strong>: a predicate on the event in addition to the topic pattern. <strong>Re-entrant publish</strong>: queue events published from inside synchronous handlers and deliver them after the outer publish, giving breadth-first order and preventing unbounded recursion. <strong>Retry and dead-letter replay</strong>: retry failed deliveries a few times with backoff before recording a dead letter, and offer a way to replay dead letters after a fix. <strong>A shared worker pool</strong> instead of a thread per async subscriber, keeping per-subscriber order by never running two events of one subscriber at once (a per-subscriber "busy" flag and pending queue). <strong>asyncio</strong>: the same design with <code>asyncio.Queue</code> and tasks; cancellation replaces the stop sentinel. <strong>Match caching</strong>: memoise <code>trie.match</code> results per topic, invalidated on subscribe and unsubscribe, when the set of topics is small and publishes are frequent.</p>
+
+<h4>13 · Complexity</h4>
+<p>Subscribe and unsubscribe: O(p) trie work for a pattern of p words, plus thread start or join for asynchronous subscriptions. Publish: matching costs O(t) per path for a topic of t words, multiplied by the branching from '*' children and the up-to-t+1 splits at each '#' node — in practice small, and independent of the total number of subscriptions — plus O(k log k) to sort k matches, plus delivery. Synchronous delivery cost is the sum of handler times; asynchronous delivery is O(1) per subscriber (a queue put). Memory: O(total pattern words) for the trie, O(maxsize) per asynchronous queue, one thread per asynchronous subscriber.</p>
+</section>
+
+<section data-field="deep">
+<h4>The two locks, and why there are two</h4>
+<p>One lock protects the routing table (the trie and the subscription map); another, per subscription, protects the act of calling its handler. They solve different problems with different contention profiles. The bus lock is held for microseconds — a trie walk or an insert — and serialises routing changes so the trie is never seen half-modified. The call lock is held for as long as a handler runs, but only contends with unsubscribe and with other deliveries to the same subscription, so a slow handler slows only itself. Combining them into one lock would bring back the naive bus's problems; dropping the call lock would break the unsubscribe guarantee. This "global lock for structure, per-object lock for use" split appears in connection pools, caches and schedulers too.</p>
+
+<h4>Copy-on-write as an alternative to snapshots</h4>
+<p>Instead of copying matches under a lock on every publish, a bus can keep its routing table immutable: subscribe and unsubscribe build a new table (a copy with the change) and swap a single reference to it; publish reads the current reference without any lock. Reads become lock-free and cheap; writes cost a copy of the table, which is fine when subscriptions change rarely and publishes are frequent — the common case for an event bus. In Python, swapping one attribute is atomic, so readers always see either the old or the new table. Many observer implementations in UI frameworks work exactly this way.</p>
+
+<h4>Ordering guarantees are a product decision</h4>
+<p>"In order" has several meanings. Per subscriber, per publisher (this bus): each listener sees each producer's events in sequence. Per key: all events about order 4471 arrive in sequence, even from different producers — which needs routing by key to a single queue, the way Kafka partitions work. Global total order: every subscriber sees all events in the same order — which needs a single sequencer and costs throughput (cd15 built one for an exchange). Stronger orders cost more concurrency. Ask which one the consumers actually need; most need per-key order at most.</p>
+
+<h4>Back-pressure propagates, or it does not</h4>
+<p>Blocking publishers propagates back-pressure upstream: if the slow consumer matters, the whole pipeline slows to its pace, which is correct for work that must be done and dangerous when the publisher is something that cannot slow down (a UI thread, a network reader that must keep up with a socket). Dropping policies stop propagation and lose data instead. A middle ground is to give critical and non-critical subscribers different policies — the risk engine blocks, the chart drops oldest — so one slow, unimportant listener can never stall the feed. Recording drops per subscriber turns invisible data loss into a metric.</p>
+
+<h4>Lifetimes: who keeps whom alive</h4>
+<p>A subscription holds a reference to its handler, and a handler that is a bound method or a closure holds a reference to its owner. So a component that subscribes and never unsubscribes is kept alive by the bus forever — a memory leak that also keeps receiving events. Three remedies are common. Tie the subscription to the component's lifecycle explicitly (unsubscribe in dispose, or return the subscription from a context manager). Hold handlers through weak references, so a garbage-collected owner silently drops out — convenient, but surprising when a lambda subscriber disappears immediately because nothing else referenced it. Or scope subscriptions to a parent object that unsubscribes all its children at once. Whichever you choose, the bus should expose a count of live subscriptions so leaks are visible.</p>
+
+<h4>In-process bus versus a message broker</h4>
+<p>An in-process bus is fast (a function call or a queue put), simple and needs no infrastructure, but its events vanish if the process dies, it cannot cross processes, and its back-pressure is limited to one machine's memory. A broker — RabbitMQ, Kafka, a cloud pub/sub service — adds durable storage, delivery across processes and machines, acknowledgements and redelivery, consumer groups and retention, at the cost of latency, operations and at-least-once semantics that make handlers idempotent. Many systems use both: an in-process bus inside each service for decoupling modules, and a broker between services. The concepts transfer directly; RabbitMQ's topic exchange is where the wildcard rules in this lesson come from.</p>
+</section>
+
+<section data-field="prod">
+<h4>How event buses fail in production</h4>
+<p><strong>Frozen UI or stalled feed.</strong> Symptom: everything stops while one listener works. Cause: a slow synchronous handler on a thread that must not block, or a BLOCK policy on a slow asynchronous subscriber. Detection: handler duration histograms per subscription; time publishers spend blocked. Fix: make slow subscribers asynchronous with an appropriate overflow policy.</p>
+<p><strong>Silent loss.</strong> Symptom: a listener misses events intermittently. Cause: drop policies under load, with nobody watching the drop counters. Detection: export <code>dropped</code> per subscription and alert on it. Fix: larger queues, faster handlers, or a policy that matches the event's importance.</p>
+<p><strong>Crashes after closing a component.</strong> Symptom: rare errors in handlers referencing closed resources. Cause: unsubscribe that does not wait for in-flight calls, so a handler runs after its owner shut down. Fix: the call-lock guarantee.</p>
+<p><strong>Memory growth.</strong> Symptom: process memory rises steadily. Cause: unbounded queues behind a slow subscriber, or subscriptions never unsubscribed (components that subscribe on creation and forget to unsubscribe on disposal, keeping themselves alive through the handler closure). Detection: queue depths and subscription counts over time. Fix: bounded queues, and tying subscription lifetime to component lifetime (context managers, weak references).</p>
+<p><strong>Event storms.</strong> Symptom: CPU spikes as handlers publish events that trigger other handlers. Cause: cycles in event chains. Detection: events published per second by topic; recursion depth. Fix: break cycles, deduplicate, or queue nested publishes.</p>
+
+<p><strong>Thread explosion.</strong> Symptom: thousands of threads in a process that should have dozens. Cause: one worker thread per asynchronous subscriber, with subscribers created per request or per object. Fix: a shared worker pool that preserves per-subscriber order (only one event per subscriber in flight at a time), or limit asynchronous subscriptions to long-lived components.</p>
+
+<h4>What to measure</h4>
+<p>Events published per topic; deliveries, drops and dead letters per subscription; handler latency percentiles per subscription; queue depth per asynchronous subscriber; time publishers spend blocked by back-pressure; and the number of live subscriptions and worker threads.</p>
+
+<p>Tracing helps too: attach a correlation id to each published event and log it on delivery, so a single user action can be followed through every handler it triggered — the in-process equivalent of distributed tracing, and the fastest way to answer "who reacted to this, and in what order?".</p>
+
+<h4>Knobs</h4>
+<p>Delivery mode per subscription; queue size and overflow policy per subscription; block timeout; whether nested publishes are delivered immediately or queued; whether failed deliveries are retried before becoming dead letters; and, at scale, a shared worker pool size instead of a thread per subscriber.</p>
+
+<h4>The real references</h4>
+<p>The wildcard semantics come from RabbitMQ's topic exchange, whose tutorial defines routing keys as dot-delimited words (up to 255 bytes), with <code>*</code> substituting for exactly one word and <code>#</code> for zero or more, and walks through the examples the first test replays — including that a message matching two of a queue's bindings is delivered to it once, and that <code>lazy.#</code> matches a four-word key. Python's standard library supplies the rest: <code>queue.Queue</code> provides the bounded FIFO with blocking puts and timeouts used for asynchronous subscribers, and <code>threading.RLock</code> the re-entrant call lock that lets a handler unsubscribe itself.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then break it, measure it and extend it. Python 3.12, standard library only. The concurrency tests are probabilistic by nature — a race may not show up on every run — so when you break something, run the relevant test in a loop (ten or twenty times) before concluding it still passes.</p>
+<ol>
+<li>Save the full solution as <code>event_bus.py</code> and run it a few times. Nine tests pass in about a second on every run.</li>
+<li><strong>Break the snapshot.</strong> Move the handler calls inside <code>with self._lock</code> in <code>publish</code>. Which test hangs, and why? (Hint: a handler that unsubscribes.)</li>
+<li><strong>Break the guarantee.</strong> Remove the <code>with sub.call_lock</code> from <code>unsubscribe</code>, or the <code>active</code> check from <code>_call</code>. Run <code>test_no_call_after_unsubscribe_returns</code> ten times and count failures.</li>
+<li><strong>Break the order.</strong> Give an asynchronous subscriber two worker threads reading the same queue. Which test fails, and how often?</li>
+<li><strong>Measure.</strong> Subscribe 10,000 patterns built from a 20-word vocabulary and publish 100,000 random topics; time matching with the trie and with the reference matcher looping over all patterns.</li>
+<li><strong>Extend it: queued nested publishes.</strong> Make a <code>publish</code> called from inside a synchronous handler queue its event and deliver it after the outer publish finishes. Write a test where A's handler publishes B, and check that all A subscribers run before any B subscriber.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Design it</b>
+<p>A trading terminal publishes price ticks at up to 5,000 per second on topics like <code>prices.NASDAQ.AAPL</code>. Subscribers: a chart (needs the latest price, redraws at 30 frames per second), a risk engine (must see every tick for its positions, takes 0.1 ms per tick), an audit log (must not lose anything, writes in batches), and third-party plug-ins of unknown quality. Choose patterns, delivery modes and overflow policies.</p>
+<details><summary>Answer</summary>
+<p>Chart: <code>prices.*.*</code> filtered to visible symbols, asynchronous with a tiny queue and DROP_OLDEST (it only needs the latest value; stale ticks are worthless) — or better, conflate to latest-per-symbol. Risk engine: subscribe only to its symbols (<code>prices.NASDAQ.AAPL</code> etc.), asynchronous with a large queue and BLOCK: 5,000 ticks at 0.1 ms is 0.5 s of work per second, so it keeps up, and if it ever cannot, slowing the feed is safer than missing ticks. Audit log: <code>prices.#</code>, asynchronous, large queue, BLOCK with an alert on queue depth, batch writes in the handler. Plug-ins: asynchronous only (never synchronous on the feed thread), modest queues with DROP_NEWEST, error isolation, and per-plug-in drop and dead-letter metrics so a bad plug-in is visible without hurting anyone else.</p>
+</details>
+<b>Diagnose it</b>
+<p>After adding a "close tab" feature, a desktop app occasionally crashes with an error inside a chart handler that references a disposed canvas. The chart unsubscribes in its <code>dispose()</code> method before freeing the canvas. Prices are published from a background thread. What is happening and how do you fix it?</p>
+<details><summary>Answer</summary>
+<p>The publisher thread took a snapshot including the chart's subscription, then <code>dispose()</code> unsubscribed and freed the canvas, then the publisher called the handler from its stale snapshot — or the handler was mid-call when the canvas was freed. The bus's unsubscribe does not guarantee "no more calls". Fix in the bus: an active flag checked under a per-subscription call lock before each call, and unsubscribe that takes the call lock (waiting for an in-flight call) before returning. Then <code>dispose()</code> can safely free the canvas after unsubscribe returns. Alternatively, the handler can marshal to the UI thread and check a disposed flag there, but the bus-level guarantee fixes every subscriber at once.</p>
+</details>
+</section>

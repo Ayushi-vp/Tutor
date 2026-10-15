@@ -1,0 +1,646 @@
+<!-- topic source for lld/ld23; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld23",
+  "t": "A semantic cache for LLM responses",
+  "tag": "AI systems",
+  "sum": "Reuse answers to questions that mean the same thing: a deterministic toy embedder, an exact-key fast path, a cosine threshold, TTL and LRU eviction, per-tenant namespaces, partitioning by model and parameters, and hit and false-hit metrics — with a threshold sweep that shows why no threshold separates paraphrases from near-misses.",
+  "prereq": [
+    ["ae9", "Caching for LLM apps: provider prompt caches reuse a prefix, response caches reuse whole answers, semantic caches match by meaning and risk false hits."],
+    ["ld1", "An LRU cache evicts the least recently used entry; an ordered dict moved-to-end on access gives O(1) recency."],
+    ["ld12", "A key-value store with TTL expires entries lazily on read and actively in a sweep."],
+    ["mc22", "Dense retrieval: embed text into vectors and rank by cosine similarity; top-k by brute force is a dot product per item."],
+    ["ld3", "A vector index answers nearest-neighbour queries; approximate indexes trade recall for speed."],
+    ["au9", "Multi-tenancy: every lookup must be scoped by tenant, or one customer's data leaks into another's results."]
+  ],
+  "myths": [
+    ["A semantic cache is a normal cache with fuzzier keys, so it is safe wherever a cache is.", "A normal cache returns the stored answer only for the identical request. A semantic cache returns an answer written for a different question that looks similar. When the questions differ in a way the embedding does not capture — a negation, a number, a date, a name — it confidently returns the wrong answer. It is an approximation with a measurable error rate, and belongs only where that error is acceptable."],
+    ["There is a threshold that separates paraphrases from different questions.", "In this lesson's labelled pairs, the paraphrase 'What is your refund policy?' / 'What's your refund policy?' scores 0.787, while 'capital of Australia' / 'capital of Austria' scores 0.829. Any threshold that accepts the first accepts the second. Real embedders shift the numbers but not the overlap: the threshold trades hit rate against false hits; it does not eliminate either."],
+    ["Caching by prompt alone is enough.", "The same prompt to a different model, with a different temperature, system prompt, tool set or retrieved context, can deserve a different answer. The cache must be partitioned by everything that changes the response — model, parameters, prompt template version, and the user's or tenant's data."],
+    ["Semantic caching saves the model call, so it is always faster.", "Every lookup pays for an embedding (a network call to an embedding model, or local inference) and a vector search. On a miss you pay that and the model call. With a low hit rate, a semantic cache adds latency and cost. Put the cheap exact-match lookup first and measure the hit rate before assuming a win."],
+    ["Shared caching across customers is fine for public questions.", "Responses often contain tenant data — names, prices, policies, internal codes — even when the question looks generic. A cache shared across tenants can return one customer's answer to another. Namespace by tenant by default, and share only content you have proven is tenant-independent."]
+  ],
+  "recap": [
+    "A semantic cache returns a stored response when a new prompt's embedding is similar enough to a cached prompt's, trading correctness risk for saved model calls.",
+    "Look up an exact key first (a hash of the normalised prompt): it is cheap, and an exact hit can never be a false hit.",
+    "Normalise conservatively for exact keys — case and whitespace — because aggressive normalisation turns different questions into the same key.",
+    "Semantic matching compares unit-length embeddings by dot product (cosine similarity) and accepts the best match above a threshold.",
+    "Partition the cache by tenant and by everything that changes the answer: model, parameters, template version.",
+    "Entries expire after a TTL so stale answers age out, and an LRU bound keeps each namespace's memory fixed.",
+    "Track exact hits, semantic hits, misses and false hits; false hits come from feedback or sampled judging, and a reported false hit removes the entry.",
+    "A threshold sweep on labelled pairs shows the trade-off: lower thresholds raise hit rate and false hits together.",
+    "Embedding happens outside the lock, because it is the slow step; the lock protects only the dictionary operations.",
+    "Brute-force search is O(n·d) per namespace; beyond tens of thousands of entries, use an approximate nearest-neighbour index."
+  ],
+  "glossary": [
+    ["Cosine similarity", "The cosine of the angle between two vectors; for unit-length vectors it equals their dot product, 1 for identical directions."],
+    ["Embedding", "A vector of numbers representing a piece of text, such that similar texts tend to have nearby vectors."],
+    ["Exact-key fast path", "Looking up a hash of the normalised prompt before doing any embedding or similarity search."],
+    ["False hit", "A semantic cache hit whose stored answer is wrong for the new question."],
+    ["Feature hashing", "Mapping features (words, character n-grams) to vector positions with a hash function instead of a vocabulary."],
+    ["Hit rate", "The fraction of lookups answered from the cache."],
+    ["LRU", "Least recently used: the eviction policy that removes the entry not accessed for the longest time."],
+    ["Namespace", "A separate partition of the cache — here per tenant and per model-and-parameters — that lookups never cross."],
+    ["Normalisation", "Transforming a prompt (lower-casing, collapsing whitespace) so trivially different strings share an exact key."],
+    ["Partition key", "The part of the cache key capturing everything besides the prompt that affects the answer: model, temperature, template version."],
+    ["Threshold", "The minimum similarity at which a semantic match counts as a hit."],
+    ["TTL", "Time to live: how long an entry may be served before it expires."]
+  ],
+  "qa": [
+    ["E", "What is a semantic cache and when is it worth using?", "A cache that matches new prompts to stored ones by embedding similarity, so paraphrases reuse an answer. It is worth it when many users ask the same few things in different words (support FAQs, product questions), answers do not depend on per-user data, and occasional wrong reuse is tolerable. It is not worth it for personalised, time-sensitive or precise questions."],
+    ["E", "Why check an exact key before the semantic search?", "It is far cheaper — a hash and a dictionary lookup, no embedding call, no vector scan — and an exact hit cannot be a false hit. Many repeated prompts are identical (retries, popular questions, programmatic callers), so the fast path often carries a large share of hits."],
+    ["E", "What should be part of the cache key besides the prompt?", "Everything that changes the right answer: the tenant, the model, sampling parameters such as temperature, the system prompt or template version, the tool set, and any retrieved context or user data the prompt depends on. In the solution these form the namespace, so lookups never cross them."],
+    ["M", "How do you choose the similarity threshold?", "Empirically, per embedder and per domain. Collect labelled pairs — paraphrases and near-misses (negations, different numbers, different entities) — and sweep thresholds, recording hits on same-intent pairs and false hits. Pick the threshold where the false-hit rate is acceptable for the product, knowing hit rate falls with it. In this lesson's sweep, 0.9 has no false hits but catches only 2 of 6 paraphrases; 0.8 catches 5 but has 3 false hits.", "Follow-up: Can you avoid the trade-off? — Partly: add a verification step for borderline matches (a cheap model or rules checking numbers and entities match), or cache only templated, high-frequency questions."],
+    ["M", "How do you measure false hits in production?", "They are invisible at lookup time, so collect them afterwards: user feedback (thumbs down, 'that's not what I asked'), a sampled LLM judge comparing the new question with the matched question and answer, and shadow mode — call the model anyway for a sample of semantic hits and compare. Report false hits as a rate of semantic hits, and remove entries reported wrong."],
+    ["M", "How do TTL and LRU work together here?", "TTL bounds staleness: an answer about prices or policies should not be served after it may have changed. LRU bounds memory: each namespace keeps at most N entries, evicting the least recently used. Expired entries are removed lazily when encountered and before LRU eviction on insert, so the size bound is spent on live entries."],
+    ["M", "Why is embedding done outside the lock?", "Embedding is the slow step — a network call or model inference, milliseconds to tens of milliseconds — while dictionary operations take microseconds. Holding the lock during embedding would serialise every lookup behind one embedding call. The solution embeds first, then takes the lock only to scan and update. The cost is that the cache may change between the two steps, which is harmless here."],
+    ["M", "What breaks if you normalise prompts aggressively?", "Different questions collapse to one exact key, and exact hits are trusted completely. Removing digits makes 'refund order 1234' match 'refund order 5678'; removing stop words makes 'cancel my order' match 'do not cancel my order' after dropping 'do' and 'not'. Normalise only what cannot change meaning — case and whitespace — and leave fuzziness to the semantic path, where it is measured."],
+    ["H", "A tenant reports another company's internal discount code appeared in their chatbot. What went wrong and how do you fix it?", "The cache was shared across tenants: one tenant's question and answer were stored without a tenant scope, and a semantically similar question from another tenant matched it. Fix immediately by invalidating the shared cache and adding the tenant to every key and namespace, so lookups cannot cross tenants even on exact matches. Then audit what was served across tenants, treat it as a data incident, and add a test that a lookup from tenant B never returns tenant A's entry.", "Follow-up: Is there anything safe to share across tenants? — Answers generated only from public data with no tenant context; if you share them, put them in an explicit 'public' namespace, never by default."],
+    ["H", "How does this design scale to millions of entries?", "The brute-force scan is O(n·d) per lookup per namespace: at 100,000 entries and 768 dimensions that is about 77 million multiply-adds, tens of milliseconds even vectorised. Replace the scan with an approximate nearest-neighbour index per namespace (HNSW or IVF, ld3), keep the exact-key dictionary in a shared store like Redis, store vectors in a vector database or Redis with a search index, and shard namespaces across nodes. Eviction and TTL become store features rather than in-process logic.", "Follow-up: Does approximate search change false-hit behaviour? — It can only miss neighbours, not invent them, so it lowers hit rate slightly but does not add false hits beyond what the threshold allows."],
+    ["H", "Would you cache responses for RAG questions?", "Carefully. The answer depends on the retrieved documents, which change, and on which documents the user may see. Include the document set's version (or the ids and versions of retrieved chunks) in the partition key, scope by tenant and permission group, and keep TTLs short. Often it is better to cache the retrieval step or embeddings and leave generation uncached."],
+    ["H", "When would you not build a semantic cache at all?", "When the hit rate would be low (diverse, long, personalised prompts), when false hits are costly (medical, legal, financial specifics, anything with numbers), when answers are cheap relative to embedding plus search, or when the provider's prompt caching already captures the reuse (repeated long prefixes, which prompt caching makes cheap without any correctness risk). Measure the exact-match hit rate first; if it is already high, the semantic layer adds little."]
+  ],
+  "refs": [
+    ["code", "GPTCache (Zilliz)", "An open-source semantic cache for LLMs with pluggable embedding generators, cache storage, vector stores, LRU/FIFO eviction and similarity evaluators; its README warns about false positives and false negatives.", "https://github.com/zilliztech/GPTCache"],
+    ["docs", "RedisVL: semantic caching for LLMs", "SemanticCache with a cosine distance_threshold, TTL that is refreshed on hits, and filterable fields to scope entries by user or account.", "https://docs.redisvl.com/en/latest/user_guide/03_llmcache.html"],
+    ["docs", "Feature hashing", "The hashing trick used by the toy embedder: features mapped to vector positions by a hash, with a sign hash to reduce collision bias.", "https://en.wikipedia.org/wiki/Feature_hashing"],
+    ["docs", "Python collections.OrderedDict", "move_to_end and popitem(last=False), the two operations behind O(1) LRU.", "https://docs.python.org/3/library/collections.html#collections.OrderedDict"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A customer-support assistant answers 2 million questions a month, and the finance team notices that a third of them are some version of "how do I reset my password", "where is my order" or "what is your refund policy". Each costs a model call: a few cents and two seconds. Someone proposes a cache. An exact-match cache helps a little — the identical string "How do I reset my password?" comes up often — but "how can I reset my password", "reset password how", and "I forgot my password" all miss. So the team adds a semantic cache: embed each question, and if a stored question is close enough, return its answer. The hit rate jumps. Two weeks later, a customer who wrote "do not cancel my order" receives "Your order has been cancelled — you'll get a refund in 5 days", because the cache matched it to "cancel my order". Another customer, of a different company using the same platform, receives an answer that mentions a competitor's internal discount code.</p>
+<p>A semantic cache is one of the most common optimisations proposed for LLM applications and one of the most commonly misbuilt. The mechanism is simple: an embedding, a similarity threshold, a dictionary. The design decisions are what an interviewer probes. Where does the exact match go? What must be in the key besides the question? How do you pick the threshold, and what is the error rate it implies? How do entries expire, and what bounds memory? How do you keep tenants apart? How do you even know when the cache gave a wrong answer? And when is a semantic cache simply the wrong tool?</p>
+<p>This lesson builds one in the order a machine-coding round flows: requirements, the entities, a naive version, then in stages an exact-key fast path, semantic matching with a deterministic toy embedder (so tests are reproducible), partitioning by tenant, model and parameters, TTL and LRU eviction, metrics including false hits, and a threshold sweep over labelled pairs that makes the core trade-off concrete. The full solution is a runnable Python 3.12 file with nine tests including a concurrent stress test. The sweep is the lesson's centre: with this embedder, the paraphrase "What is your refund policy?" / "What's your refund policy?" scores 0.787 while "capital of Australia" / "capital of Austria" scores 0.829 — no threshold separates them.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: a help desk with a binder of past answers</h4>
+<p>A help desk keeps a binder of questions it has answered, each with the answer written out. When a new question arrives, the clerk first checks the index for that exact question — if it is there, copy the answer. If not, the clerk skims the binder for a question that "sounds the same" and, if one is close enough, copies that answer instead of researching from scratch. The binder has a separate section for each client company, so one company's answers are never given to another. Each page has a "valid until" date, after which it is torn out. And the binder has a fixed number of pages: when it is full, the page nobody has looked at for the longest is removed.</p>
+<p>The exact index is the <strong>exact-key fast path</strong>. "Sounds the same" is <strong>embedding similarity above a threshold</strong>. The sections are <strong>namespaces</strong> by tenant (and, in practice, by model and settings, since a different expert might answer differently). "Valid until" is the <strong>TTL</strong>. Removing the least-read page is <strong>LRU eviction</strong>.</p>
+<p>The analogy breaks exactly where the danger is. A human clerk reading "do not cancel my order" notices the "not". An embedding compresses a sentence into a few hundred numbers, and small words that flip the meaning can barely move it. The clerk's "sounds the same" is judgement; the cache's is a number compared with a threshold, and the number is wrong sometimes. The design must assume that and measure it.</p>
+
+<h4>Where it sits in an LLM application</h4>
+<p>A request to an LLM application passes several places where reuse is possible, and the semantic cache is only one. Before the model call, the provider's prompt cache can make a repeated long prefix cheap without changing the answer. An exact response cache can return a stored answer for a byte-identical request. The semantic cache sits after those, catching paraphrases. After it comes the model call, and the result flows back to be stored. Placing the semantic layer last among the caches means it handles only what the safe layers could not, which keeps its error rate confined to the traffic that needs it.</p>
+
+<h4>What the round expects</h4>
+<p>A class with <code>get</code> and <code>put</code>; an exact fast path; cosine similarity over unit vectors with a threshold; namespaces that include the tenant and everything that changes the answer; TTL with an injected clock; an LRU bound per namespace; thread safety with the slow embedding call outside the lock; metrics including false hits; a deterministic embedder for tests; and — the part that distinguishes strong candidates — a clear statement of the false-hit risk, how to measure it and how the threshold trades it against hit rate.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Lookup flow. A request with tenant, model, parameters and prompt selects a namespace. Step one hashes the normalised prompt and checks the exact dictionary; a live entry is an exact hit. Otherwise step two embeds the prompt outside the lock and scans the namespace's entries for the best cosine similarity; at or above the threshold it is a semantic hit, below it is a miss, which calls the model and stores the result. Expired entries are dropped when met, and inserts evict least recently used entries.">
+  <defs><marker id="ld23-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="20" width="150" height="58" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="85" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">request</text>
+    <text x="85" y="56" text-anchor="middle" style="fill:var(--muted)">tenant · model · params</text>
+    <text x="85" y="71" text-anchor="middle" style="fill:var(--muted)">prompt</text>
+    <rect x="190" y="20" width="160" height="58" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="270" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">namespace</text>
+    <text x="270" y="56" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">(tenant, model+params)</text>
+    <text x="270" y="71" text-anchor="middle" style="fill:var(--muted)">never crossed</text>
+    <line x1="160" y1="49" x2="188" y2="49" marker-end="url(#ld23-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="380" y="20" width="250" height="58" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="505" y="40" text-anchor="middle" style="fill:var(--ink);font-weight:600">① exact: sha256(normalise(prompt))</text>
+    <text x="505" y="58" text-anchor="middle" style="fill:var(--good)">live entry → exact hit (never false)</text>
+    <text x="505" y="72" text-anchor="middle" style="fill:var(--muted)">microseconds, no embedding</text>
+    <line x1="350" y1="49" x2="378" y2="49" marker-end="url(#ld23-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="380" y="110" width="250" height="58" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="505" y="130" text-anchor="middle" style="fill:var(--ink);font-weight:600">② embed (outside the lock)</text>
+    <text x="505" y="148" text-anchor="middle" style="fill:var(--muted)">scan namespace: best cosine</text>
+    <text x="505" y="162" text-anchor="middle" style="fill:var(--muted)">skip and drop expired entries</text>
+    <line x1="505" y1="78" x2="505" y2="108" marker-end="url(#ld23-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="512" y="98" style="fill:var(--muted)">no exact</text>
+    <rect x="380" y="200" width="118" height="54" rx="4" style="fill:var(--surface-2);stroke:var(--s4)"/>
+    <text x="439" y="220" text-anchor="middle" style="fill:var(--ink)">≥ threshold</text>
+    <text x="439" y="238" text-anchor="middle" style="fill:var(--s4)">semantic hit</text>
+    <text x="439" y="250" text-anchor="middle" style="fill:var(--crit)">may be false</text>
+    <rect x="512" y="200" width="118" height="54" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="571" y="220" text-anchor="middle" style="fill:var(--ink)">&lt; threshold</text>
+    <text x="571" y="238" text-anchor="middle" style="fill:var(--muted)">miss → call model</text>
+    <text x="571" y="250" text-anchor="middle" style="fill:var(--muted)">put(); LRU evict</text>
+    <line x1="470" y1="168" x2="445" y2="198" marker-end="url(#ld23-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="540" y1="168" x2="565" y2="198" marker-end="url(#ld23-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="10" y="130" width="330" height="110" rx="4" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="175" y="150" text-anchor="middle" style="fill:var(--ink);font-weight:600">metrics</text>
+    <text x="30" y="172" style="fill:var(--muted)">exact hits · semantic hits · misses</text>
+    <text x="30" y="192" style="fill:var(--muted)">false hits (from feedback / judge)</text>
+    <text x="30" y="212" style="fill:var(--muted)">evictions · expirations</text>
+    <text x="30" y="232" style="fill:var(--crit)">false-hit rate = false / semantic hits</text>
+  </g>
+</svg>
+<figcaption>The cheap, always-correct step runs first; the expensive, sometimes-wrong step runs only if it fails. Nothing ever crosses a namespace, which is what keeps tenants and models apart. The only metric that tells you whether the cache is safe — false hits — has to be collected after the fact.</figcaption>
+</figure>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Entities &amp; API</span></div><div class="ck"><span class="ck-m">10–14</span><span class="ck-t">Naive version</span></div><div class="ck"><span class="ck-m">14–30</span><span class="ck-t">Exact, semantic, namespaces</span></div><div class="ck"><span class="ck-m">30–38</span><span class="ck-t">TTL, LRU, metrics, sweep</span></div><div class="ck"><span class="ck-m">38–45</span><span class="ck-t">Scale &amp; extensions</span></div></div>
+
+<h4>1 · Clarify the requirements</h4>
+<p>Ask: what traffic is this for — repeated FAQ-like questions, or long personalised prompts? Is the deployment multi-tenant? Which model and parameters vary between requests? How stale may an answer be? How large may the cache grow? What is the cost of a wrong answer (a support FAQ versus a refund decision)? Is there an embedding model available, and what does it cost per call? Is the cache in-process or shared between servers?</p>
+<p>A typical agreed scope: an in-process cache (a shared store is an extension); <code>get(tenant, prompt, model, **params)</code> and <code>put(...)</code>; exact-match fast path; semantic match by cosine similarity over embeddings with a configurable threshold; per-tenant isolation and partitioning by model and parameters; TTL; an LRU size bound per namespace; metrics for exact hits, semantic hits, misses, false hits, evictions and expirations; thread-safe; and a deterministic embedder for tests. Non-functional: a lookup should cost one embedding plus a scan; exact hits should cost microseconds.</p>
+
+<h4>2 · Entities and the interface</h4>
+<pre>embed(text) -&gt; Vector                       # unit-length; ToyEmbedder in tests, a real model in prod
+SemanticCache(embed, threshold, ttl_s, max_entries, clock)
+  .get(tenant, prompt, model, **params) -&gt; Lookup(response, kind, similarity, matched_prompt)
+  .put(tenant, prompt, response, model, **params)
+  .report_false_hit(tenant, matched_prompt, model, **params)
+  .invalidate_tenant(tenant) -&gt; int
+  .metrics -&gt; Metrics(exact_hits, semantic_hits, misses, false_hits, evictions, expirations)</pre>
+<p>Internally: a dict from <strong>namespace</strong> — the pair (tenant, partition key) — to an <code>OrderedDict</code> mapping exact key to <strong>Entry</strong> (prompt, response, vector, expiry, hit count). The <code>OrderedDict</code> doubles as the LRU list: <code>move_to_end</code> on access, <code>popitem(last=False)</code> to evict, both O(1) — the same trick as ld1's honest ten-line LRU. One lock protects the structure; the embedder is injected so tests can use a deterministic one, and the clock is injected so TTL tests do not sleep.</p>
+
+<h4>3 · Stage one: the naive version</h4>
+<pre>cache = []                                  # list of (vector, prompt, response)
+def get(prompt):
+    v = embed(prompt)
+    best = max(cache, key=lambda e: cosine(v, e[0]), default=None)
+    if best and cosine(v, best[0]) &gt; 0.8:
+        return best[2]
+def put(prompt, response):
+    cache.append((embed(prompt), prompt, response))</pre>
+<p>It works in a demo and has every production problem. It embeds even identical repeats. It shares answers across tenants and across models. It never expires anything, so last quarter's price is served forever. It grows without bound. It has no metrics, so nobody knows the hit rate or how often it is wrong. Its threshold of 0.8 was chosen by feel. It is not thread-safe. And it re-embeds on every put even when the prompt is already cached. The stages fix these in order of risk.</p>
+
+<h4>4 · Stage two: the exact-key fast path</h4>
+<p>Before any embedding, hash the <strong>normalised</strong> prompt and look it up. Normalisation is deliberately conservative: lower-case and collapse whitespace, nothing else. <code>"  what IS your   refund policy?"</code> and <code>"What is your refund policy?"</code> share a key. Stripping punctuation, digits or stop words would make more strings collide, but an exact hit is trusted completely — it skips the similarity check — so every normalisation step must be one that can never change meaning. Removing digits would merge "refund order 1234" with "refund order 5678"; removing stop words would merge "cancel" with "do not cancel". Fuzziness belongs in the semantic step, where it is measured.</p>
+<p>The fast path is cheap (a SHA-256 of a short string and a dict lookup, microseconds), it avoids the embedding call entirely, and it can never be a false hit. In real traffic a large share of repeats are byte-identical — retries, programmatic callers, popular canned questions — so it often carries a substantial fraction of all hits by itself.</p>
+
+<h4>5 · Stage three: semantic matching</h4>
+<p><strong>The embedder.</strong> Tests need an embedder that is deterministic and free. The solution's <code>ToyEmbedder</code> uses <strong>feature hashing</strong>: each word (weight 1) and each character trigram of each word (weight 0.5, so spelling variants overlap) is hashed with BLAKE2 — not Python's built-in <code>hash()</code>, which is randomised per process — into one of 512 positions, with the hash's top bit choosing the sign so collisions tend to cancel rather than accumulate; the vector is then scaled to unit length. It captures word overlap and typos, not meaning, which is precisely what makes it a good teacher: it fails the same way real embedders sometimes do, only more visibly.</p>
+<p><strong>Cosine similarity.</strong> For unit-length vectors, cosine similarity is just the dot product: 1.0 for identical direction, around 0 for unrelated. The lookup embeds the prompt (outside the lock, see below), scans the namespace, keeps the best similarity, and returns a semantic hit if it is at least the threshold. Worked from the solution's labelled pairs: "How can I reset my password?" against the cached "How do I reset my password?" scores <strong>0.863</strong>; the typo "how do i reset my pasword" scores <strong>0.882</strong> (trigrams rescue the misspelling); "How do I change my email address?" scores <strong>0.508</strong>. At a threshold of 0.85 the first two hit and the third misses.</p>
+<p><strong>Embedding outside the lock.</strong> Embedding is the slow step — in production a network call to an embedding model, several milliseconds. If <code>get</code> held the lock while embedding, every concurrent lookup would queue behind it. So <code>get</code> checks the exact key under the lock, releases it, embeds, then re-acquires the lock to scan. The cache may change in between (an entry may be added or evicted); for a cache that is harmless — at worst a lookup misses an entry added a millisecond earlier.</p>
+
+<h4>6 · Stage four: namespaces — tenants, models, parameters</h4>
+<p>A response depends on more than the prompt. The namespace is the pair (tenant, partition key), where the partition key is the model plus a sorted JSON of the parameters that change the answer: <code>"small-model" + '{"temperature": 0}'</code>. Lookups and inserts touch only their own namespace, so a different model, a different temperature, or a different tenant can never be served another's answer — not even on an exact match. The test <code>test_tenants_are_isolated</code> stores "What is our discount code?" with the answer "ACME-SECRET-20" for tenant acme and checks that tenant globex, asking the identical question, misses. In a real system the partition key also includes the system prompt or template version (a new prompt template makes old answers stale), the tool set, and for retrieval-augmented answers, the version of the documents retrieved.</p>
+<p><code>invalidate_tenant</code> drops every namespace for a tenant at once — what you call when a tenant updates its policies, or on an incident.</p>
+
+<h4>7 · Stage five: TTL and LRU</h4>
+<p><strong>TTL.</strong> Each entry stores <code>expires_at = clock() + ttl_s</code>. Expiry is enforced lazily: <code>_alive</code> checks an entry whenever a lookup meets it, and deletes it if expired. Inserts also sweep the namespace for expired entries before LRU eviction, so the size bound is spent on live entries. The test sets a 60-second TTL with a fake clock: at 59.9 seconds the entry hits; at exactly 60.0 it is gone and an expiration is counted.</p>
+<p><strong>LRU.</strong> Each namespace holds at most <code>max_entries</code>. Every hit moves the entry to the end of the <code>OrderedDict</code>; when an insert makes the namespace too large, <code>popitem(last=False)</code> removes the front — the least recently used. The test inserts alpha, beta, gamma into a namespace of three, reads alpha (making it most recent), inserts delta, and checks that beta — not alpha — was evicted. A per-namespace bound also stops one tenant's traffic from evicting another's entries, a fairness property worth stating.</p>
+
+<h4>8 · Stage six: metrics, false hits and the threshold sweep</h4>
+<p><strong>What to count.</strong> Exact hits, semantic hits and misses give the hit rate. Evictions and expirations show whether the size and TTL are right. And <strong>false hits</strong> — semantic hits whose answer was wrong — are the only measure of whether the cache is safe. They cannot be detected at lookup time (if the cache could tell, it would not have returned the answer), so they arrive later: a user's thumbs-down, a support escalation, a sampled LLM judge comparing the new question with the matched question and answer, or shadow traffic that calls the model anyway for a sample of semantic hits and compares. <code>report_false_hit</code> counts the event and removes the offending entry so it cannot mislead again. The test shows the canonical failure: with a threshold of 0.7, "Do not cancel my order" matches "Cancel my order" (similarity 0.811) and returns "Your order is cancelled."</p>
+<p><strong>The sweep.</strong> The solution labels twelve pairs: six with the same intent (paraphrases, a typo, extra punctuation) and six near-misses (a negation, Sunday versus Saturday, two order numbers, Australia versus Austria, French versus German, and an unrelated question). Their similarities under the toy embedder:</p>
+<table>
+<thead><tr><th>Pair</th><th>Same intent?</th><th>Cosine</th></tr></thead>
+<tr><td>"How do I reset my password?" / "how do i reset my password"</td><td>yes</td><td>1.000 (exact)</td></tr>
+<tr><td>"Where is my order?" / "where is my order??"</td><td>yes</td><td>1.000</td></tr>
+<tr><td>"how do i reset my pasword" / "How do I reset my password?"</td><td>yes</td><td>0.882</td></tr>
+<tr><td>"How can I reset my password?" / "How do I reset my password?"</td><td>yes</td><td>0.863</td></tr>
+<tr><td>"Cancel my order" / "Please cancel my order"</td><td>yes</td><td>0.845</td></tr>
+<tr><td>"What is the capital of Australia?" / "…of Austria?"</td><td><strong>no</strong></td><td>0.829</td></tr>
+<tr><td>"Cancel my order" / "Do not cancel my order"</td><td><strong>no</strong></td><td>0.811</td></tr>
+<tr><td>"Is the store open on Sunday?" / "…on Saturday?"</td><td><strong>no</strong></td><td>0.809</td></tr>
+<tr><td>"What is your refund policy?" / "What's your refund policy?"</td><td>yes</td><td>0.787</td></tr>
+<tr><td>"Translate 'hello' to French" / "…to German"</td><td><strong>no</strong></td><td>0.781</td></tr>
+<tr><td>"Refund for order 1234" / "Refund for order 5678"</td><td><strong>no</strong></td><td>0.778</td></tr>
+<tr><td>"How do I reset my password?" / "How do I change my email address?"</td><td><strong>no</strong></td><td>0.508</td></tr>
+</table>
+<p>Sweeping the threshold: at 0.70, all 6 paraphrases hit but so do 5 of the 6 near-misses; at 0.80, 5 paraphrases and 3 false hits; at 0.90, no false hits but only the 2 exact-equivalent pairs hit. The sorted column shows why: the near-misses (0.778-0.829) sit <em>between</em> the paraphrases (0.787-1.0). A real embedding model moves the numbers — it would score "What's" versus "What is" higher — but near-misses that differ by one entity, number or negation remain close in any embedding that represents topic, because they <em>are</em> about the same topic. The threshold is a dial between hit rate and false hits, chosen per product from a sweep like this on real, labelled traffic.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Number line of cosine similarity from 0.75 to 1.0. Same-intent pairs are green dots at 0.787, 0.845, 0.863, 0.882, 1.0 and 1.0. Different-intent pairs are red crosses at 0.778, 0.781, 0.809, 0.811 and 0.829, plus one at 0.508 off the scale. Threshold lines at 0.80 and 0.90 show that 0.80 lets in three red crosses while 0.90 excludes all red but also four green dots.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="40" y1="120" x2="600" y2="120" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="40" y="142" text-anchor="middle" style="fill:var(--muted)">0.75</text>
+    <text x="152" y="142" text-anchor="middle" style="fill:var(--muted)">0.80</text>
+    <text x="264" y="142" text-anchor="middle" style="fill:var(--muted)">0.85</text>
+    <text x="376" y="142" text-anchor="middle" style="fill:var(--muted)">0.90</text>
+    <text x="488" y="142" text-anchor="middle" style="fill:var(--muted)">0.95</text>
+    <text x="600" y="142" text-anchor="middle" style="fill:var(--muted)">1.00</text>
+    <circle cx="125" cy="100" r="6" style="fill:var(--good)"/>
+    <circle cx="257" cy="100" r="6" style="fill:var(--good)"/>
+    <circle cx="297" cy="100" r="6" style="fill:var(--good)"/>
+    <circle cx="337" cy="100" r="6" style="fill:var(--good)"/>
+    <circle cx="600" cy="100" r="6" style="fill:var(--good)"/>
+    <circle cx="600" cy="84" r="6" style="fill:var(--good)"/>
+    <text x="102" y="78" text-anchor="middle" style="fill:var(--good)">What's / What is</text>
+    <text x="62" y="158" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="69" y="172" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="173" y="158" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="178" y="174" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="217" y="158" text-anchor="middle" style="fill:var(--crit);font-weight:700">✕</text>
+    <text x="220" y="190" text-anchor="middle" style="fill:var(--crit)">Austria / Australia</text>
+    <text x="150" y="206" text-anchor="middle" style="fill:var(--crit)">do not cancel · Sunday/Saturday</text>
+    <text x="60" y="206" text-anchor="middle" style="fill:var(--crit)">1234/5678</text>
+    <line x1="152" y1="40" x2="152" y2="130" style="fill:none;stroke:var(--accent);stroke-dasharray:4 3"/>
+    <text x="152" y="34" text-anchor="middle" style="fill:var(--accent)">0.80: 5 hits, 3 false</text>
+    <line x1="376" y1="40" x2="376" y2="130" style="fill:none;stroke:var(--accent);stroke-dasharray:4 3"/>
+    <text x="376" y="34" text-anchor="middle" style="fill:var(--accent)">0.90: 2 hits, 0 false</text>
+    <text x="520" y="200" style="fill:var(--muted)">(unrelated: 0.508)</text>
+  </g>
+</svg>
+<figcaption>Green dots are same-intent pairs, red crosses different-intent pairs. They interleave: a threshold anywhere in the band admits some red or rejects some green. Moving the dial changes the mix; only a better embedder, a verification step, or a narrower use case changes the overlap.</figcaption>
+</figure>
+
+<h4>9 · The full solution</h4>
+<p>Running the file prints the sweep and the similarity of every labelled pair, then nine tests: the exact fast path, semantic hit and miss, tenant isolation and invalidation, partitioning by model and parameters, TTL with a fake clock, LRU order, false-hit feedback, the monotone sweep, and eight threads doing 1,600 concurrent gets and puts across three tenants. Python 3.12, standard library only.</p>
+<pre>"""A semantic cache for LLM responses: a deterministic toy embedder, an exact-key fast path, a
+cosine-similarity threshold, TTL and LRU eviction, per-tenant namespaces, partitioning by model
+and parameters, and hit / false-hit metrics with a threshold sweep.
+Python 3.12, standard library only.  Run: python semantic_cache.py"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Callable
+
+Vector = list[float]
+
+
+# ---------------------------------------------------------------- a deterministic toy embedder
+class ToyEmbedder:
+    """Feature hashing of words and character trigrams into `dim` buckets, L2-normalised.
+    Deterministic across runs and machines (blake2b, not Python's salted hash()). It captures
+    word overlap and spelling variants, NOT meaning: 'cancel my order' and 'do not cancel my
+    order' look very similar to it, which is exactly the false-hit risk a real cache must face."""
+
+    def __init__(self, dim: int = 512) -&gt; None:
+        self.dim = dim
+
+    def _features(self, text: str) -&gt; list[tuple[str, float]]:
+        words = re.findall(r"[a-z0-9']+", text.lower())
+        feats = [(f"w:{w}", 1.0) for w in words]
+        for w in words:
+            padded = f"#{w}#"
+            feats += [(f"c:{padded[i:i + 3]}", 0.5) for i in range(len(padded) - 2)]
+        return feats
+
+    def __call__(self, text: str) -&gt; Vector:
+        v = [0.0] * self.dim
+        for feat, weight in self._features(text):
+            h = int.from_bytes(hashlib.blake2b(feat.encode(), digest_size=8).digest(), "big")
+            v[h % self.dim] += weight if (h &gt;&gt; 63) &amp; 1 else -weight     # signed hashing
+        norm = math.sqrt(sum(x * x for x in v)) or 1.0
+        return [x / norm for x in v]
+
+
+def cosine(a: Vector, b: Vector) -&gt; float:          # both unit length: dot product = cosine
+    return sum(x * y for x, y in zip(a, b))
+
+
+def normalise(prompt: str) -&gt; str:
+    """Conservative normalisation for the exact key: case and whitespace only."""
+    return " ".join(prompt.lower().split())
+
+
+# ---------------------------------------------------------------- the cache
+@dataclass
+class Entry:
+    prompt: str
+    response: str
+    vector: Vector
+    expires_at: float
+    hits: int = 0
+
+
+@dataclass
+class Lookup:
+    response: str | None
+    kind: str                       # "exact" | "semantic" | "miss"
+    similarity: float = 0.0
+    matched_prompt: str | None = None
+
+
+@dataclass
+class Metrics:
+    exact_hits: int = 0
+    semantic_hits: int = 0
+    misses: int = 0
+    false_hits: int = 0             # semantic hits later reported wrong
+    evictions: int = 0
+    expirations: int = 0
+
+    @property
+    def hit_rate(self) -&gt; float:
+        total = self.exact_hits + self.semantic_hits + self.misses
+        return (self.exact_hits + self.semantic_hits) / total if total else 0.0
+
+
+class SemanticCache:
+    def __init__(self, embed: Callable[[str], Vector], threshold: float = 0.9, ttl_s: float = 3600.0,
+                 max_entries: int = 1000, clock: Callable[[], float] = time.monotonic) -&gt; None:
+        if not 0.0 &lt; threshold &lt;= 1.0:
+            raise ValueError("threshold must be in (0, 1]")
+        self.embed, self.threshold, self.ttl_s = embed, threshold, ttl_s
+        self.max_entries, self.clock = max_entries, clock
+        # namespace = (tenant, partition); partition = model + parameters that change the answer
+        self._spaces: dict[tuple[str, str], OrderedDict[str, Entry]] = {}
+        self._lock = threading.Lock()
+        self.metrics = Metrics()
+
+    @staticmethod
+    def partition(model: str, **params: object) -&gt; str:
+        return model + json.dumps(params, sort_keys=True)
+
+    @staticmethod
+    def _key(prompt: str) -&gt; str:
+        return hashlib.sha256(normalise(prompt).encode()).hexdigest()
+
+    def get(self, tenant: str, prompt: str, model: str, **params: object) -&gt; Lookup:
+        ns, key = (tenant, self.partition(model, **params)), self._key(prompt)
+        vec = None
+        with self._lock:
+            space = self._spaces.get(ns)
+            if space is not None:
+                e = space.get(key)
+                if e is not None and self._alive(space, key, e):            # 1. exact fast path
+                    space.move_to_end(key)
+                    e.hits += 1
+                    self.metrics.exact_hits += 1
+                    return Lookup(e.response, "exact", 1.0, e.prompt)
+        vec = self.embed(prompt)                    # embed outside the lock: it is the slow part
+        with self._lock:
+            space = self._spaces.get(ns)
+            best_key, best_sim = None, -1.0
+            if space is not None:
+                for k, e in list(space.items()):                            # 2. semantic scan
+                    if not self._alive(space, k, e):
+                        continue
+                    sim = cosine(vec, e.vector)
+                    if sim &gt; best_sim:
+                        best_key, best_sim = k, sim
+            if best_key is not None and best_sim &gt;= self.threshold:
+                e = space[best_key]
+                space.move_to_end(best_key)
+                e.hits += 1
+                self.metrics.semantic_hits += 1
+                return Lookup(e.response, "semantic", best_sim, e.prompt)
+            self.metrics.misses += 1
+            return Lookup(None, "miss", max(best_sim, 0.0))
+
+    def put(self, tenant: str, prompt: str, response: str, model: str, **params: object) -&gt; None:
+        ns, key = (tenant, self.partition(model, **params)), self._key(prompt)
+        vec = self.embed(prompt)
+        with self._lock:
+            space = self._spaces.setdefault(ns, OrderedDict())
+            space[key] = Entry(prompt, response, vec, self.clock() + self.ttl_s)
+            space.move_to_end(key)
+            self._evict(space)
+
+    def report_false_hit(self, tenant: str, matched_prompt: str, model: str, **params: object) -&gt; None:
+        """Feedback (a user said the answer was wrong, or a judge disagreed): count it and drop the entry."""
+        ns = (tenant, self.partition(model, **params))
+        with self._lock:
+            self.metrics.false_hits += 1
+            space = self._spaces.get(ns)
+            if space is not None:
+                space.pop(self._key(matched_prompt), None)
+
+    def invalidate_tenant(self, tenant: str) -&gt; int:
+        with self._lock:
+            doomed = [ns for ns in self._spaces if ns[0] == tenant]
+            n = sum(len(self._spaces[ns]) for ns in doomed)
+            for ns in doomed:
+                del self._spaces[ns]
+            return n
+
+    def size(self, tenant: str | None = None) -&gt; int:
+        with self._lock:
+            return sum(len(s) for ns, s in self._spaces.items() if tenant is None or ns[0] == tenant)
+
+    # ---- internals (lock held)
+    def _alive(self, space: OrderedDict, key: str, e: Entry) -&gt; bool:
+        if e.expires_at &lt;= self.clock():
+            del space[key]
+            self.metrics.expirations += 1
+            return False
+        return True
+
+    def _evict(self, space: OrderedDict) -&gt; None:
+        now = self.clock()
+        for k in [k for k, e in space.items() if e.expires_at &lt;= now]:      # expired first
+            del space[k]
+            self.metrics.expirations += 1
+        while len(space) &gt; self.max_entries:                               # then least recently used
+            space.popitem(last=False)
+            self.metrics.evictions += 1
+
+
+# ---------------------------------------------------------------- tests
+class FakeClock:
+    def __init__(self) -&gt; None:
+        self.t = 0.0
+
+    def __call__(self) -&gt; float:
+        return self.t
+
+
+EMB = ToyEmbedder()
+
+# (query, cached prompt, same intent?) — labelled pairs for the threshold sweep
+PAIRS = [
+    ("How do I reset my password?", "how do i reset my password", True),
+    ("How can I reset my password?", "How do I reset my password?", True),
+    ("how do i reset my pasword", "How do I reset my password?", True),
+    ("What is your refund policy?", "What's your refund policy?", True),
+    ("Where is my order?", "where is my order??", True),
+    ("Cancel my order", "Please cancel my order", True),
+    ("Cancel my order", "Do not cancel my order", False),
+    ("Is the store open on Sunday?", "Is the store open on Saturday?", False),
+    ("Refund for order 1234", "Refund for order 5678", False),
+    ("What is the capital of Australia?", "What is the capital of Austria?", False),
+    ("How do I reset my password?", "How do I change my email address?", False),
+    ("Translate 'hello' to French", "Translate 'hello' to German", False),
+]
+
+
+def test_exact_fast_path_ignores_case_and_spacing() -&gt; None:
+    c = SemanticCache(EMB)
+    c.put("acme", "What is your refund policy?", "30 days.", "m1")
+    r = c.get("acme", "  what IS your   refund policy?", "m1")
+    assert (r.kind, r.response, r.similarity) == ("exact", "30 days.", 1.0)
+
+
+def test_semantic_hit_and_miss() -&gt; None:
+    c = SemanticCache(EMB, threshold=0.85)
+    c.put("acme", "How do I reset my password?", "Use the reset link.", "m1")
+    hit = c.get("acme", "How can I reset my password?", "m1")
+    miss = c.get("acme", "How do I change my email address?", "m1")
+    assert hit.kind == "semantic" and hit.response == "Use the reset link." and hit.similarity &gt;= 0.85
+    assert miss.kind == "miss" and miss.response is None
+    assert (c.metrics.semantic_hits, c.metrics.misses) == (1, 1)
+
+
+def test_tenants_are_isolated() -&gt; None:
+    c = SemanticCache(EMB)
+    c.put("acme", "What is our discount code?", "ACME-SECRET-20", "m1")
+    assert c.get("globex", "What is our discount code?", "m1").kind == "miss"   # not even exact
+    assert c.get("acme", "What is our discount code?", "m1").kind == "exact"
+    assert c.invalidate_tenant("acme") == 1 and c.size() == 0
+
+
+def test_model_and_parameters_partition_the_cache() -&gt; None:
+    c = SemanticCache(EMB)
+    c.put("acme", "Summarise this policy", "Short summary", "small-model", temperature=0)
+    assert c.get("acme", "Summarise this policy", "large-model", temperature=0).kind == "miss"
+    assert c.get("acme", "Summarise this policy", "small-model", temperature=0.7).kind == "miss"
+    assert c.get("acme", "Summarise this policy", "small-model", temperature=0).kind == "exact"
+
+
+def test_ttl_expiry() -&gt; None:
+    clock = FakeClock()
+    c = SemanticCache(EMB, ttl_s=60, clock=clock)
+    c.put("acme", "Opening hours?", "9 to 5", "m1")
+    clock.t = 59.9
+    assert c.get("acme", "Opening hours?", "m1").kind == "exact"
+    clock.t = 60.0
+    assert c.get("acme", "Opening hours?", "m1").kind == "miss" and c.metrics.expirations == 1
+    assert c.size() == 0
+
+
+def test_lru_eviction_respects_recency() -&gt; None:
+    c = SemanticCache(EMB, max_entries=3, threshold=0.99)
+    for p in ["alpha question", "beta question", "gamma question"]:
+        c.put("t", p, p.upper(), "m1")
+    c.get("t", "alpha question", "m1")                    # alpha is now most recent
+    c.put("t", "delta question", "DELTA", "m1")           # evicts beta, the least recent
+    assert c.get("t", "beta question", "m1").kind == "miss"
+    assert all(c.get("t", p, "m1").kind == "exact" for p in ["alpha question", "gamma question", "delta question"])
+    assert c.metrics.evictions == 1 and c.size("t") == 3
+
+
+def test_false_hit_feedback_drops_the_entry() -&gt; None:
+    c = SemanticCache(EMB, threshold=0.7)
+    c.put("t", "Cancel my order", "Your order is cancelled.", "m1")
+    r = c.get("t", "Do not cancel my order", "m1")
+    assert r.kind == "semantic"                           # the toy embedder cannot see negation
+    c.report_false_hit("t", r.matched_prompt, "m1")
+    assert c.metrics.false_hits == 1 and c.get("t", "Do not cancel my order", "m1").kind == "miss"
+
+
+def sweep(thresholds: list[float]) -&gt; list[tuple[float, int, int, int]]:
+    """For each threshold: (threshold, true hits, false hits, missed same-intent pairs)."""
+    rows = []
+    for th in thresholds:
+        tp = fp = fn = 0
+        for query, cached, same in PAIRS:
+            sim = cosine(EMB(query), EMB(cached))
+            if normalise(query) == normalise(cached):
+                sim = 1.0
+            if sim &gt;= th:
+                tp += same
+                fp += not same
+            else:
+                fn += same
+        rows.append((th, tp, fp, fn))
+    return rows
+
+
+def test_threshold_sweep_trades_hits_for_false_hits() -&gt; None:
+    rows = sweep([0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
+    tps, fps = [r[1] for r in rows], [r[2] for r in rows]
+    assert tps == sorted(tps, reverse=True) and fps == sorted(fps, reverse=True)   # both fall as threshold rises
+    assert fps[0] &gt; 0 and fps[-1] == 0                                         # low threshold: false hits
+    assert tps[-1] &gt;= 1                                                         # high: still some hits
+
+
+def test_concurrent_gets_and_puts() -&gt; None:
+    c, errors = SemanticCache(EMB, max_entries=50), []
+
+    def worker(k: int) -&gt; None:
+        try:
+            for i in range(200):
+                p = f"question {i % 80} from worker {k % 2}"
+                if c.get(f"tenant{k % 3}", p, "m1").kind == "miss":
+                    c.put(f"tenant{k % 3}", p, f"answer {i % 80}", "m1")
+        except Exception as e:      # pragma: no cover
+            errors.append(e)
+    ts = [threading.Thread(target=worker, args=(k,)) for k in range(8)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    m = c.metrics
+    assert not errors and m.exact_hits + m.semantic_hits + m.misses == 1600
+    assert all(c.size(f"tenant{k}") &lt;= 50 for k in range(3))
+
+
+if __name__ == "__main__":
+    for th, tp, fp, fn in sweep([0.5, 0.6, 0.7, 0.8, 0.9, 0.95]):
+        print(f"threshold {th:.2f}: hits on same-intent pairs {tp}/6, false hits {fp}/6, missed {fn}")
+    for q, cp, same in PAIRS:
+        print(f"  {cosine(EMB(q), EMB(cp)):.3f}  {'same ' if same else 'DIFF '} {q!r} vs {cp!r}")
+    tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
+    for t in tests:
+        t()
+        print("ok ", t.__name__)
+    print(f"{len(tests)} tests passed")</pre>
+
+<h4>10 · Edge cases</h4>
+<p><strong>Empty or whitespace prompt</strong>: the embedder returns a zero vector scaled by 1, similarity 0 to everything; reject it at the API. <strong>Two entries tie for best similarity</strong>: the first scanned wins; deterministic but arbitrary — prefer the most recent or the most hit. <strong>Updating an answer</strong>: <code>put</code> with the same normalised prompt overwrites the entry and resets its TTL. <strong>Threshold of exactly 1.0</strong>: semantic matching degenerates to vector equality — useful as an off switch. <strong>Responses that should never be cached</strong>: errors, refusals, answers containing user-specific data, and streamed responses that were cut off; the caller decides, and the cache should expose a way to skip storage. <strong>Embedding failures</strong>: if the embedding call fails, fall through to the model rather than failing the request — the cache is an optimisation, never a dependency.</p>
+
+<h4>11 · Extensions the interviewer will ask for</h4>
+<p><strong>A verification step</strong> for borderline matches (say 0.80-0.90): a rule check that numbers, dates and named entities in both prompts match, or a small model asked "do these two questions have the same answer?". <strong>Shared storage</strong>: Redis or a vector database holding vectors and responses, with TTL and per-tenant filters as store features — RedisVL's <code>SemanticCache</code>, for example, stores prompt-response pairs with a cosine distance threshold, an optional TTL refreshed on hits, and filterable fields to scope entries by user or account. <strong>An ANN (approximate nearest-neighbour) index</strong> per namespace once entries exceed tens of thousands (ld3). <strong>Adaptive thresholds</strong> per namespace, tuned from that namespace's false-hit feedback. <strong>Caching at a different level</strong>: cache retrieval results or tool outputs instead of final answers, where staleness and personalisation are easier to reason about. <strong>Warming</strong>: pre-populate with curated FAQ (frequently asked question) pairs reviewed by a human, which makes the cache's answers trustworthy by construction.</p>
+
+<h4>12 · Complexity</h4>
+<p>Exact lookup: O(p) to normalise and hash a prompt of length p, O(1) dictionary access. Semantic lookup: one embedding call plus O(n·d) to scan n entries of dimension d — 512 here, 768-3,072 for real models; at 10,000 entries of 768 dimensions that is 7.7 million multiply-adds, a few milliseconds in vectorised code and much more in pure Python. Insert: one embedding, O(1) dictionary work, plus an O(n) expired-entry sweep (amortisable by sweeping only occasionally). Memory: O(n·d) floats per namespace — 10,000 entries × 768 dimensions × 4 bytes ≈ 31 MB as float32, or roughly double that as Python floats in lists.</p>
+</section>
+
+<section data-field="deep">
+<h4>Semantic caching versus prompt caching</h4>
+<p>Two different features share the word "cache". Provider <strong>prompt caching</strong> reuses the computation for an identical prefix of a request — a long system prompt, a document, conversation history — so repeated prefixes are processed far more cheaply and quickly, while the model still generates a fresh answer. It has no correctness risk: the answer is computed for this exact request. A <strong>semantic cache</strong> skips the model entirely and returns an answer generated for a different request. The first is almost always worth turning on; the second is a product decision with an error rate. In interviews, propose prompt caching first for long shared prefixes, an exact response cache second, and a semantic cache only for high-repeat, low-risk traffic.</p>
+
+<h4>Why embeddings confuse near-misses</h4>
+<p>Embedding models are trained so that texts about the same thing land close together. "What is the capital of Australia?" and "What is the capital of Austria?" are about the same thing — a capital city question with a similar country name — so they <em>should</em> be close by the model's training objective, even though their answers differ completely. Negation is similar: "cancel" and "do not cancel" share their topic, and a single function word moves a sentence embedding only a little. This is not a bug in a particular model; it is a mismatch between what similarity measures (topic, phrasing) and what a cache needs (same answer). Cross-encoders or small models that compare two questions directly are better at "same answer?" but cost a model call per comparison, which is why they appear only as verification for borderline matches.</p>
+
+<h4>Hit rate is distribution-dependent</h4>
+<p>The value of a semantic cache depends on how concentrated traffic is. If a few hundred intents cover most questions (a narrow support bot), hit rates can be high. If prompts are long, contain user data, or include conversation history (a general assistant), almost nothing repeats closely enough, and the cache mostly adds an embedding call per request. Before building one, measure on logged traffic: embed a sample, cluster or nearest-neighbour it at candidate thresholds, and estimate the hit rate and the false-hit rate from a labelled subset. That analysis is often enough to decide not to build it.</p>
+
+<h4>Caching multi-turn conversations</h4>
+<p>In a chat, the meaning of "and how much does it cost?" depends on the previous turns. Caching on the last message alone would answer with whatever "how much does it cost" meant in another conversation. Options: cache only first turns (often the bulk of FAQ-like traffic); embed a condensed version of the conversation (a rewritten standalone question, at the cost of a model call to rewrite); or include a hash of the relevant context in the partition key, which makes hits rare. This is one more reason semantic caches suit narrow, first-turn traffic.</p>
+
+<h4>Choosing and changing the embedder</h4>
+<p>The embedder determines everything the threshold means. A threshold tuned at 0.9 for one model is meaningless for another, because each model spreads its vectors differently; some place unrelated sentences around 0.2, others around 0.6. So the embedder's name and version belong in the partition key, and changing it means a new namespace (or re-embedding every entry) and a new sweep. Smaller embedding models are cheaper and faster per lookup, which matters because every miss pays for an embedding; larger ones separate near-misses somewhat better. The pragmatic choice is the cheapest model whose sweep on your labelled pairs gives an acceptable false-hit rate at a useful hit rate — measured, not assumed from a leaderboard.</p>
+
+<h4>Security and privacy</h4>
+<p>A cache is a store of past outputs, so it inherits every data-protection obligation of those outputs: tenant isolation (a cross-tenant leak through a cache is a data breach), deletion requests (a user's data must be removable from cached answers), and poisoning — if users can influence what is stored (by asking crafted questions whose answers are then served to others), an attacker can plant content. Scope by tenant and, where answers contain user data, by user; store only responses from trusted generations; and keep an audit trail of what was served from cache.</p>
+</section>
+
+<section data-field="prod">
+<h4>How semantic caches fail in production</h4>
+<p><strong>Confident wrong answers.</strong> Symptom: complaints that the assistant answered a different question, clustered around negations, numbers or named entities. Cause: threshold too low for the embedder and domain. Detection: false-hit rate from feedback and sampled judging, broken down by similarity band. Fix: raise the threshold, add verification in the borderline band, or exclude intents with numbers and entities.</p>
+<p><strong>Cross-tenant leaks.</strong> Symptom: one customer sees another's data. Cause: missing tenant scope on some code path (often a background warm-up job that stored without a tenant). Fix: make tenant a required argument with no default, test isolation, and alert on any namespace without a tenant.</p>
+<p><strong>Stale answers after a change.</strong> Symptom: the bot quotes last month's price. Cause: TTL too long, or no invalidation when the source changed. Fix: shorter TTLs for volatile intents, and invalidation (per tenant or per document) wired to content updates.</p>
+<p><strong>Cache that costs more than it saves.</strong> Symptom: latency and spend rose after launch. Cause: low hit rate, so most requests pay for an embedding and a search on top of the model call. Detection: hit rate and added latency per request. Fix: keep the exact cache, drop or narrow the semantic layer.</p>
+<p><strong>Embedder upgrade, silent drift.</strong> Symptom: false hits jump after an infrastructure change nobody connected to the cache. Cause: the embedding model was upgraded and old vectors were compared with new ones at the old threshold. Fix: embedder version in the partition key and a fresh sweep before switching.</p>
+<p><strong>Model upgrade, old answers.</strong> Symptom: after switching models, answers are inconsistent in style or quality. Cause: model not in the partition key, so the new model's traffic is served the old model's answers. Fix: include the model and prompt template version in the namespace.</p>
+
+<h4>What to measure</h4>
+<p>Exact, semantic and overall hit rates per tenant and per intent; false-hit rate overall and by similarity band; latency added by embedding and search on misses; cost saved (hits × model cost) minus cost added (lookups × embedding cost); evictions and expirations; namespace sizes; and the similarity distribution of hits, which shifts when traffic or the embedder changes.</p>
+
+<h4>Knobs</h4>
+<p>Threshold (per namespace if possible); TTL (per intent class: short for prices and stock, long for how-to answers); max entries per namespace; which requests are eligible (first turn only, no user data, no tools); verification band; and whether semantic matching is on at all for a given tenant.</p>
+
+<h4>The real references</h4>
+<p>GPTCache, an open-source semantic cache from Zilliz, structures the problem into the same modules as this solution — an embedding generator, cache storage, a vector store, a cache manager with eviction policies such as LRU and FIFO, and a similarity evaluator — and its README states the core risk directly: a semantic cache can produce false positives on hits and false negatives on misses, with hit ratio, latency and recall as the metrics to tune. RedisVL's <code>SemanticCache</code> shows the production shape: a threshold expressed as cosine <em>distance</em> (0 identical, 2 opposite, so a distance threshold of 0.1 corresponds to a similarity of 0.9), optional TTL refreshed on every hit, and filterable fields to scope entries by user or account — the namespaces of this lesson.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then break it, measure it and extend it. Python 3.12, standard library only. Keep the sweep's printed table next to you: every change below should be judged by how it moves the hits and false hits in that table, not by whether one example looks right.</p>
+<ol>
+<li>Save the full solution as <code>semantic_cache.py</code> and run it. It prints the sweep and the twelve similarities, then nine tests pass.</li>
+<li><strong>Break isolation.</strong> Change the namespace to <code>(self.partition(model, **params),)</code>, dropping the tenant. Which test fails? Write down what a customer would have seen.</li>
+<li><strong>Break normalisation.</strong> Make <code>normalise</code> also strip digits and the words "not" and "do". Re-run the sweep with the exact path in mind: which near-misses now become exact hits that skip the threshold entirely?</li>
+<li><strong>Measure the scan.</strong> Insert 20,000 random prompts into one namespace and time <code>get</code> for a miss. Then double the entries. Estimate the per-lookup cost at 500,000 entries and decide when you would switch to an ANN index.</li>
+<li><strong>Extend it: verification.</strong> For semantic hits between 0.75 and 0.9, require that the sets of numbers and capitalised words in both prompts are equal. Re-run the sweep: how many false hits remain at 0.75, and how many true hits did you lose?</li>
+<li><strong>Extend it: adaptive threshold.</strong> Keep a false-hit rate per namespace and raise that namespace's threshold by 0.02 each time the rate exceeds 2% over the last 100 semantic hits.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Decide it</b>
+<p>Three teams ask for a semantic cache: (a) a public FAQ bot for a bank's opening hours, branch locations and card replacement process; (b) a coding assistant inside an IDE whose prompts include the open file; (c) a multi-tenant HR assistant answering policy questions from each company's handbook. For each: build it or not, and with what key, TTL and threshold policy?</p>
+<details><summary>Answer</summary>
+<p><strong>(a) Yes.</strong> Narrow, repetitive, mostly public answers. Namespace by model and template version; exact path first; threshold from a sweep on labelled logs, likely conservative, with verification for numbers (branch numbers, dates); TTL hours to a day, with invalidation when opening hours change; exclude anything mentioning the user's account. <strong>(b) No semantic cache.</strong> Prompts contain the file, so nearly every prompt is unique, and a wrong reused completion is costly. Use provider prompt caching for the shared prefix (system prompt, repository context) and perhaps an exact cache for identical requests. <strong>(c) Yes, with care.</strong> Namespace by tenant (mandatory), handbook version and model; TTL tied to handbook updates (invalidate the tenant's namespace on upload); threshold conservative because policies differ by small details (number of leave days); verification on numbers; never cache answers that used employee-specific data.</p>
+</details>
+<b>Diagnose it</b>
+<p>After a semantic cache launched, overall hit rate is 41% and the team is happy, but CSAT (customer satisfaction score) for cached answers is 12 points lower than for uncached ones. Exact hits are 30% of all lookups, semantic hits 11%. What do you look at, and what do you change?</p>
+<details><summary>Answer</summary>
+<p>Split CSAT by hit type: exact hits cannot be false, so if they are fine, the drop comes from the 11% semantic hits — meaning a substantial fraction of semantic hits are wrong. Plot satisfaction (or sampled judge verdicts) by similarity band: false hits usually concentrate just above the threshold. Inspect low-rated semantic hits for patterns (numbers, negations, entities, multi-turn follow-ups). Then: raise the threshold until the borderline band is gone, or add verification in that band; exclude follow-up turns and intents with numbers; and keep reporting false hits to remove bad entries. Expect hit rate to drop a few points — mostly semantic hits that were doing harm — while the exact path keeps most of the savings.</p>
+</details>
+</section>

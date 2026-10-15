@@ -1,8 +1,10 @@
 import { useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { Collapsible } from "../components/Card";
+import { CodeBlock } from "../components/Viz";
 import { StatusButtons } from "../components/Status";
-import { DSA, PATTERNS, PAT_NAME, type Level } from "../content";
+import { DSA, ITEM_INDEX, PATTERNS, PAT_NAME, type Level } from "../content";
+import { lessonPath } from "../lesson";
 import { useProgress } from "../store";
 import { DIFF_CLS, DIFF_NAME, matches } from "../util";
 
@@ -27,7 +29,7 @@ export function Dsa() {
     <div className="wrap">
       <div className="eyebrow">Drill · algorithms</div>
       <h1 className="page-h">Patterns first, then problems</h1>
-      <p className="lede">Problems are grouped by the pattern that unlocks them, because that is how they are recognised under time pressure. Learn the twenty-one patterns and most of the list becomes recall rather than invention.</p>
+      <p className="lede">Problems are grouped by the pattern that unlocks them, because that is how they are recognised under time pressure. Learn the {PATTERNS.length} patterns and most of the list becomes recall rather than invention. Each one has a full lesson in DSA patterns.</p>
       <div className="grid g4" style={{ margin: "20px 0" }}>
         <div className="stat lead"><span className="k">Solved</span><span className="v">{g.d}<small>/{g.n}</small></span><span className="d">{g.p}% of the list</span></div>
         {(["E", "M", "H"] as Level[]).map(d => (
@@ -36,7 +38,7 @@ export function Dsa() {
         ))}
       </div>
 
-      <h2 className="sec-h">The twenty-one patterns</h2>
+      <h2 className="sec-h">The {PATTERNS.length} patterns</h2>
       <p className="sec-s">Each one: when it applies, the template to write from memory, and the mistake that costs the offer.</p>
       {PATTERNS.map((p, i) => {
         const n = DSA.filter(x => x.p === p.k).length;
@@ -44,8 +46,9 @@ export function Dsa() {
           <Collapsible key={p.k} id={`pat-${p.k}`} openId={params.get("open")} n={String(i + 1).padStart(2, "0")} title={p.n} sub={p.when}
             meta={<><span className="tag">{n} problems</span><span className="chip">{p.cx}</span></>}>
             <div className="prose">
-              <h4>Template</h4><pre>{p.tpl}</pre>
+              <h4>Template</h4><CodeBlock code={p.tpl} />
               <div className="callout warnc"><b>What goes wrong</b>{p.trap}</div>
+              {p.learn && ITEM_INDEX[p.learn] && <Link className="btn ghost" to={lessonPath(p.learn)}>Read the full lesson</Link>}
               <button className="btn ghost" type="button" onClick={() => { setPat(p.k); tableRef.current?.scrollIntoView({ behavior: "smooth" }); }}>
                 Show the {n} problems</button>
             </div>

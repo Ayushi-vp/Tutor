@@ -1,0 +1,483 @@
+<!-- topic source for infra/in13; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "in13",
+  "t": "Design a container orchestrator (a mini Kubernetes)",
+  "tag": "Cluster management",
+  "sum": "Designing the control plane: declarative desired state and reconciliation loops, a scheduler's filter-then-score pass worked on four nodes, bin-packing versus spreading, node heartbeats and failure detection, leader election, and why running workloads survive a control-plane outage.",
+  "prereq": [
+    ["in8", "etcd and ZooKeeper keep small, critical state consistent with Raft or ZAB; leases and watches let clients elect leaders and react to changes."],
+    ["sc15", "Kubernetes runs containers as pods, describes them in objects such as Deployments, and autoscales; requests and limits declare what a container needs."],
+    ["os13", "A container is a process in its own namespaces with cgroup limits; the kernel enforces CPU and memory caps on the node."],
+    ["in5", "A distributed job scheduler stores jobs durably, hands them to workers with leases, and must cope with workers that disappear mid-job."],
+    ["sc9", "Consensus lets replicas agree on one value despite failures, as long as a majority is reachable; a partitioned minority cannot make progress."],
+    ["os3", "A CPU scheduler chooses which runnable thread gets a core next; cluster scheduling is the same question one level up, for whole machines."]
+  ],
+  "myths": [
+    ["An orchestrator starts containers when you ask it to.", "You do not ask it to do anything; you declare what should exist (three replicas of this image, with these resources), and many independent control loops keep comparing that desired state with what actually exists and act to close the gap. That is why a killed container comes back without anyone asking, and why sending the same declaration twice is harmless."],
+    ["If the control plane goes down, everything running on the cluster stops.", "Running containers are managed by the agent on each node, which keeps them running and restarts crashed ones locally. Borg's paper states that tasks keep running even if all Borgmaster replicas fail. What stops is change: no new deployments, no scaling, and no rescheduling of work from nodes that die during the outage."],
+    ["The scheduler places pods where there is the most free capacity right now.", "The scheduler places pods by their declared requests, not by measured usage, and its scoring policy is a choice. Spreading (prefer the emptiest node) leaves headroom but fragments capacity; bin-packing (prefer the fullest node that fits) frees whole machines but hurts bursty workloads. Borg found both extremes wanting and used a hybrid that minimises stranded resources."],
+    ["A node that stops sending heartbeats is dead, so its pods should be replaced immediately.", "Missing heartbeats only mean the control plane cannot hear the node; the node may be fine and still running its pods behind a network partition. Replacing too eagerly can run two copies of something that must be single, and can stampede the rest of the cluster during a zone-wide network blip. Kubernetes waits a grace period, then taints the node, then evicts pods after a toleration period, at a rate-limited pace that slows further when much of a zone is unhealthy."],
+    ["One big scheduler decision per pod is the hard part.", "Each decision is cheap; doing thousands per minute over thousands of nodes is the problem. Borg scored only a random subset of feasible machines, cached scores and evaluated one task per class of identical tasks; with those optimisations off, rescheduling a cell from scratch did not finish in three days. Kubernetes similarly scores only a percentage of nodes in large clusters."]
+  ],
+  "recap": [
+    "An orchestrator turns a fleet of machines into one pool: users declare desired state and the control plane continuously reconciles actual state toward it.",
+    "All state lives as versioned objects in a small consistent store (etcd); every component talks only to the API server, which validates writes and serves watches.",
+    "A controller is a level-triggered loop: observe desired and actual state, compute the difference, act, and repeat, so missed events and crashes are self-correcting.",
+    "The scheduler binds each pending pod to a node in two passes: filter out nodes that cannot run it (resources, taints, selectors, affinity), then score the rest and pick the best.",
+    "Scoring is a policy: least-allocated spreads load and keeps headroom, most-allocated bin-packs to free whole nodes, and balanced allocation avoids stranding one resource while another runs out.",
+    "Requests, not measured usage, drive placement; reclaiming unused reservations for lower-priority work is how Borg ran about 20% of a median cell's workload.",
+    "Node agents renew a heartbeat lease every 10 seconds; the node controller marks a node unhealthy after a 50-second grace period and evicts its pods after a 300-second toleration, rate-limited.",
+    "Control-plane components run several replicas with one active leader chosen by a lease in the store (15-second lease, renewed every 2 seconds, 10-second renew deadline by default).",
+    "When the control plane is down, running workloads keep running; only changes, scaling and failure recovery stop — so the data plane must not depend on the control plane being up.",
+    "Distributed ML training needs gang scheduling (all workers or none) and topology-aware GPU placement, which a pod-at-a-time scheduler does not provide by default."
+  ],
+  "glossary": [
+    ["Allocatable", "The CPU and memory on a node available for pods after reserving some for the operating system and the node agent."],
+    ["API server", "The control plane's front door: validates and stores objects in etcd and streams changes to watchers."],
+    ["Bin-packing", "Placing work on the fullest machines that still fit it, so other machines stay empty."],
+    ["Binding", "The scheduler's decision, written to the API, that a specific pod runs on a specific node."],
+    ["Controller", "A loop that watches some objects and changes the world (or other objects) to make actual state match desired state."],
+    ["Desired state", "What the user has declared should exist, held in an object's spec."],
+    ["etcd", "A small, strongly consistent key-value store using Raft, holding all cluster state."],
+    ["Filter (predicate)", "A scheduler check that rules a node in or out for a pod, such as enough free CPU or a matching node label."],
+    ["Gang scheduling", "Scheduling a group of tasks all at once or not at all, needed when tasks are useless without each other."],
+    ["Heartbeat", "A periodic signal from a node that it is alive; in Kubernetes, renewing a Lease object."],
+    ["Kubelet", "The agent on each node that starts and stops containers to match the pods assigned to its node and reports their status."],
+    ["Lease", "An object or lock held for a limited time and renewed periodically; used for heartbeats and leader election."],
+    ["Leader election", "Choosing one active instance among replicas so that only one acts at a time."],
+    ["Level-triggered", "Acting on the current state rather than on individual change events, so a missed event does not cause a missed action."],
+    ["Pod", "The smallest unit an orchestrator schedules: one or more containers that share a network identity and run on the same node."],
+    ["Preemption", "Evicting lower-priority pods to make room for a higher-priority one."],
+    ["Reconciliation", "Repeatedly comparing desired and actual state and acting to close the gap."],
+    ["Requests and limits", "A container's declared resource needs (used for scheduling) and its caps (enforced on the node)."],
+    ["Score", "A number a scheduler assigns to each feasible node; the highest-scoring node wins."],
+    ["Spreading", "Placing work on the least-loaded machines to keep headroom and reduce correlated failures."],
+    ["Static stability", "The property that a system keeps working in its last known good configuration when its control plane is unavailable."],
+    ["Stranded resources", "Free capacity of one kind that cannot be used because another resource on the same machine is exhausted."],
+    ["Taint and toleration", "A mark on a node that repels pods, and a pod's declaration that it accepts that mark."]
+  ],
+  "qa": [
+    ["E", "What is a reconciliation loop?", "A controller repeatedly reads the desired state (for example, three replicas) and the actual state (two running pods), computes the difference and acts (create one pod), then repeats. Because it reacts to the current state rather than to individual events, a missed event, a crashed controller or a duplicate request is corrected on the next pass. Every behaviour of the orchestrator — scaling, healing, rolling updates — is one of these loops."],
+    ["E", "Why does every component talk to the API server instead of to each other?", "It keeps the system loosely coupled and observable. Components never need to know about each other; they read and write objects, and watch for changes. The API server validates every write, enforces access control and optimistic concurrency, and is the only thing that talks to etcd, so the store stays small and protected. A new component can be added by watching the same objects."],
+    ["E", "What happens to running containers if the whole control plane goes down?", "They keep running. Each node's agent already has its assigned pods and keeps them running, restarting crashed containers locally according to their restart policy, and existing network rules keep routing traffic. What stops is change: nothing new is scheduled, deployments and scaling do not happen, and pods on nodes that fail during the outage are not replaced.", "Follow-up: Is anything at risk? — Anything that depends on the control plane at runtime, such as a service that reads configuration from the API on every request; design the data plane to work from cached state."],
+    ["M", "Walk through the scheduler's filter and score on a concrete pod.", "A pod requests 2 CPU and 4 GiB. Node 1 has 1 CPU free: filtered out. Node 4 is a GPU node with a taint the pod does not tolerate: filtered out. Nodes 2 and 3 fit. Least-allocated scoring computes the free fraction after placement per resource: node 2 (16 CPU, 64 GiB, 4 and 16 already requested) gets 62.5 for CPU and 68.75 for memory, about 65.6; node 3 (8 CPU, 16 GiB, 2 and 10 requested) gets 50 and 12.5, about 31.3. Node 2 wins. A most-allocated policy would pick node 3 instead.", "Follow-up: Which is right? — Neither in general; spreading keeps headroom, packing frees whole nodes for scale-down and leaves room for large pods. Pick per cluster and workload."],
+    ["M", "How does the orchestrator detect a failed node, and how fast?", "The node agent renews a heartbeat lease every 10 seconds. If the node controller sees no renewal for the grace period (50 seconds by default in current Kubernetes), it marks the node not ready and taints it unreachable. Pods tolerate that taint for 300 seconds by default, after which they are evicted and their controllers create replacements elsewhere. So a hard node failure costs about six minutes by default, tunable per workload with tolerations.", "Follow-up: Why so slow? — Because missing heartbeats might be a network problem, not a dead node; fast eviction risks duplicate workloads and evicting a whole zone during a brief partition."],
+    ["M", "Why rate-limit evictions when nodes fail?", "Because the control plane cannot tell a node failure from a network partition. If a switch failure makes a third of the nodes unreachable, evicting all their pods at once would flood the remaining nodes with replacements, possibly overloading them, while the original pods may still be serving. Kubernetes evicts from at most 0.1 nodes per second by default and slows down further when more than 55% of nodes in a zone are unhealthy. Borg likewise rate-limits rescheduling from unreachable machines."],
+    ["M", "How do multiple scheduler or controller replicas avoid acting at the same time?", "Leader election through a lease object in the store: each replica tries to acquire or renew the lease; the holder acts, others wait. Kubernetes' defaults are a 15-second lease duration, a 10-second renew deadline and a 2-second retry period. A leader that cannot renew stops acting before its lease expires, so a new leader can take over safely. Writes still carry resource versions, so a stale leader's write against changed objects is rejected.", "Follow-up: What is the downtime on leader failure? — Up to the lease duration plus the new leader's startup and cache sync, typically tens of seconds; running workloads are unaffected."],
+    ["M", "Spreading or bin-packing?", "Spreading puts work on the least-loaded nodes: it leaves headroom for bursts, limits noisy-neighbour effects and the blast radius of one node failure. Bin-packing fills nodes tightly: it frees whole nodes to be removed by the autoscaler and keeps space for large pods, but punishes underestimated requests. Borg's paper reports that spreading caused fragmentation, best fit hurt bursty and batch workloads, and its hybrid aimed at reducing stranded resources gave 3-5% better packing than best fit."],
+    ["H", "Design the scheduler for a 5,000-node cluster.", "Keep a cache of node state updated from watches so decisions do not read etcd. Schedule from a priority queue of pending pods, one at a time, with a filter pass then a score pass, but stop filtering after enough feasible nodes are found — Kubernetes scores a percentage that falls from 50% at 100 nodes toward 10% at 5,000, never below 5% — and start each search at a rotating offset so nodes get considered evenly. Write the binding asynchronously and optimistically assume it in the cache. Batch identical pods (Borg's equivalence classes) and cache scores. Preempt lower-priority pods only when no node fits.", "Follow-up: What if two schedulers run? — Each must handle binding conflicts; the node agent rejects pods that do not fit and the scheduler retries. Borg's successor Omega explored this shared-state optimistic model."],
+    ["H", "How would you schedule a 64-GPU distributed training job?", "It needs gang scheduling: all 64 workers start together or none do, because a partial set holds GPUs while waiting forever, and two partial jobs can deadlock each other. Admit the job only when capacity for all workers exists (a queue with quotas that admits whole jobs), place workers with topology awareness — all 8 GPUs of a node, nodes on the same high-bandwidth network block — and treat the group as one unit for preemption and failure: if one worker dies, restart from the last checkpoint. The default pod-at-a-time scheduler provides none of this, so ML clusters add a job-level admission layer and gang-aware scheduling plugins.", "Follow-up: How do you avoid idle GPUs while a big job waits? — Backfill: let small, preemptible jobs use the free GPUs and preempt them when the gang can start."],
+    ["H", "What changes if an ML model or LLM sits in the scheduling path?", "Models can predict a job's real resource usage better than user-declared requests, which lets the orchestrator reclaim unused reservations safely — Borg's reclamation ran about 20% of a median cell's workload in reclaimed resources using a usage estimate. Keep the model out of the per-decision hot path: predict asynchronously and feed predictions into requests or scores, keep hard safety margins, and fall back to declared requests if the model service is down. An LLM agent operating the cluster must go through the same API, authorisation and admission checks as a human, with dry-run first.", "Follow-up: What is the risk of aggressive reclamation? — More out-of-memory kills when usage spikes; Borg measured exactly this trade-off before choosing a medium setting."],
+    ["H", "How do rolling updates work without downtime?", "A Deployment controller creates a new ReplicaSet for the new version and scales it up while scaling the old one down, bounded by maxSurge (extra pods allowed) and maxUnavailable (pods allowed to be missing). Each step waits for new pods to pass their readiness probes before removing old ones, so traffic only moves to pods that are ready. If new pods never become ready, the rollout stalls rather than taking down the old version, and it can be rolled back by scaling the old ReplicaSet up again — all expressed as desired state that controllers reconcile."]
+  ],
+  "refs": [
+    ["paper", "Large-scale cluster management at Google with Borg (Verma et al., EuroSys 2015)", "Cells of about 10,000 machines, a five-replica Paxos-backed Borgmaster, feasibility checking and scoring, scheduler scalability tricks, resource reclamation, and tasks that keep running when the master is down.", "https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/"],
+    ["paper", "Borg, Omega, and Kubernetes (Burns, Grant, Oppenheimer, Brewer, Wilkes, ACM Queue 2016)", "Lessons from three generations of Google cluster managers: API-centric design, reconciliation loops, labels, and what Kubernetes changed.", "https://research.google/pubs/borg-omega-and-kubernetes/"],
+    ["docs", "Kubernetes scheduler", "The scheduling cycle: filtering and scoring, extension points, and binding.", "https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/"],
+    ["docs", "Kubernetes: resource bin packing", "The NodeResourcesFit scoring strategies (LeastAllocated, MostAllocated, RequestedToCapacityRatio) with a worked score.", "https://kubernetes.io/docs/concepts/scheduling-eviction/resource-bin-packing/"],
+    ["docs", "Kubernetes: scheduler performance tuning", "percentageOfNodesToScore and why large clusters score only some feasible nodes.", "https://kubernetes.io/docs/concepts/scheduling-eviction/scheduler-perf-tuning/"],
+    ["docs", "Kubernetes: nodes (heartbeats and the node controller)", "Lease-based heartbeats, taints for unreachable nodes, eviction rate limits and zone health.", "https://kubernetes.io/docs/concepts/architecture/nodes/"],
+    ["docs", "Kubernetes: controllers", "The control-loop pattern and how controllers act through the API server.", "https://kubernetes.io/docs/concepts/architecture/controller/"],
+    ["docs", "Kubernetes: considerations for large clusters", "The supported envelope: 5,000 nodes, 110 pods per node, 150,000 pods.", "https://kubernetes.io/docs/setup/best-practices/cluster-large/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A company runs 2,000 servers and 400 services. Each service team has its own spreadsheet of which machines run their code. Deploys are a script that copies binaries to a list of hosts. When a machine dies at night, someone is paged to move its services by hand. Average CPU utilisation is 15%, because every team over-provisions its own machines for its own peak. A new team waits three weeks for hardware. And when the company wants to run large ML training jobs on its GPU machines, nobody can tell which GPUs are free.</p>
+<p>A container orchestrator solves this by turning the fleet into one pool. Teams stop saying "run this on hosts 17-23" and start saying "keep three copies of this container running, each needing 2 CPUs and 4 GB of memory, spread across zones". The system decides where they go, starts them, watches them, restarts them when they crash, moves them when machines fail, and packs many teams' work onto the same machines so utilisation rises. Google's Borg paper puts the stakes plainly: increasing utilisation by a few percentage points can save millions of dollars, and segregating its production and batch work into separate clusters would have needed 20-30% more machines in the median cell.</p>
+<p>Designing one is a control-plane problem. The data plane — the containers serving traffic — must keep running no matter what. The control plane — the brain that stores what should exist, decides placement and reacts to failure — must be consistent (two schedulers must not both place the same work), available enough to make changes, and fast enough to place thousands of containers a minute across thousands of machines. It must detect dead machines without mistaking a network glitch for a mass failure. And it must be built so that its own failure does not take the data plane down with it.</p>
+<p>This lesson designs the control plane of a mini Kubernetes in interview order: requirements; estimates (nodes, pods, heartbeat and pod-churn write rates into the store, scheduler throughput, state size); the API and the object model; the high-level design; then three deep dives — the declarative desired-state model and reconciliation loops, the scheduler's filter-then-score pass worked on four nodes with real numbers (and bin-packing versus spreading), and failure detection, leader election and what happens to running workloads when the control plane is down. sc15 and os13 introduced containers, Kubernetes objects and the kernel features underneath; in8 owns etcd and Raft. Here we design what sits between them. The real cases are Google's Borg paper and the "Borg, Omega, and Kubernetes" retrospective, with the Kubernetes scheduler and node documentation; the lab is a toy scheduler with filter and score, plus a reconcile loop that heals a killed pod.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a thermostat, not a remote control</h4>
+<p>A remote control sends commands: "turn on", "volume up". If the TV misses the signal, nothing happens, and nobody notices. A thermostat works differently: you set the desired temperature, and it keeps measuring the room and turning the heating on or off until the room matches — forever. If someone opens a window, it compensates. If the thermostat reboots, it simply measures again and continues. You never tell it what to do; you tell it what you want.</p>
+<p>An orchestrator is a building full of thermostats. You write down <strong>desired state</strong> — "3 replicas of web:v2, each requesting 2 CPU and 4 GiB" — as an object in a database. Separate <strong>controllers</strong>, each a thermostat for one kind of thing, keep comparing desired state with <strong>actual state</strong> and act to close the gap: one makes sure the right number of pods exist; the <strong>scheduler</strong> assigns each new pod to a machine; the <strong>agent on each machine</strong> (the kubelet in Kubernetes, the Borglet in Borg) makes sure the containers assigned to its machine are running; another controller notices machines that have gone quiet. None of them commands another. They all read and write objects through one <strong>API server</strong>, which stores them in a small, strongly consistent store (<strong>etcd</strong>, in8).</p>
+<p>The analogy breaks in two useful places. A room has one temperature; a cluster has thousands of interacting objects, so controllers must cope with conflicts (two writers changing the same object), and they do so with version numbers on every object. And a thermostat can measure the room directly; a controller sees the world only through reports from agents on machines, which arrive late or not at all — so "the machine stopped reporting" is not the same as "the machine is dead".</p>
+
+<h4>Control plane and data plane</h4>
+<p>The most important split in the design is between the <strong>control plane</strong> (API server, store, scheduler, controllers) and the <strong>data plane</strong> (node agents, container runtimes and the containers themselves, plus the network rules that route traffic to them). The control plane decides; the data plane does. A good design lets the data plane run on its last instructions when the control plane is unavailable — what AWS calls <strong>static stability</strong>, and what Borg described as tasks continuing to run even if all Borgmaster replicas fail. Keep asking, at each step of the design, "what happens to running containers if this part is down?"</p>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Architecture. Users and CI submit desired state to the API server. The API server is the only component that reads and writes etcd, a three or five member Raft cluster. The scheduler and the controller manager each run as several replicas with one elected leader; they watch the API server and write bindings and objects. On each node, a kubelet watches pods assigned to it, runs containers through the container runtime, and renews a heartbeat lease. The data plane, the running containers, continues without the control plane.">
+  <defs><marker id="in13-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="20" width="420" height="150" rx="8" style="fill:none;stroke:var(--accent);stroke-dasharray:4 3"/>
+    <text x="20" y="38" style="fill:var(--accent)">control plane (decides)</text>
+    <rect x="20" y="60" width="80" height="50" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="60" y="82" text-anchor="middle" style="fill:var(--ink)">Users, CI</text>
+    <text x="60" y="98" text-anchor="middle" style="fill:var(--muted)">desired state</text>
+    <rect x="140" y="55" width="110" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="195" y="78" text-anchor="middle" style="fill:var(--ink)">API server</text>
+    <text x="195" y="96" text-anchor="middle" style="fill:var(--muted)">validate, watch</text>
+    <line x1="100" y1="85" x2="138" y2="85" marker-end="url(#in13-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="300" y="50" width="120" height="70" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="360" y="72" text-anchor="middle" style="fill:var(--ink)">etcd</text>
+    <text x="360" y="90" text-anchor="middle" style="fill:var(--muted)">3 or 5 members</text>
+    <text x="360" y="106" text-anchor="middle" style="fill:var(--muted)">Raft (in8)</text>
+    <line x1="250" y1="85" x2="298" y2="85" marker-end="url(#in13-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="80" y="125" width="120" height="38" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="140" y="143" text-anchor="middle" style="fill:var(--ink)">Scheduler</text>
+    <text x="140" y="157" text-anchor="middle" style="fill:var(--muted)">leader + standbys</text>
+    <rect x="220" y="125" width="150" height="38" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="295" y="143" text-anchor="middle" style="fill:var(--ink)">Controllers</text>
+    <text x="295" y="157" text-anchor="middle" style="fill:var(--muted)">replicas, nodes, …</text>
+    <line x1="160" y1="125" x2="180" y2="117" marker-end="url(#in13-arrow)" style="fill:none;stroke:var(--s3)"/>
+    <line x1="260" y1="125" x2="225" y2="117" marker-end="url(#in13-arrow)" style="fill:none;stroke:var(--s3)"/>
+    <rect x="10" y="190" width="620" height="100" rx="8" style="fill:none;stroke:var(--good);stroke-dasharray:4 3"/>
+    <text x="20" y="208" style="fill:var(--good)">data plane (does) — keeps running if everything above is down</text>
+    <rect x="30" y="218" width="180" height="62" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="120" y="238" text-anchor="middle" style="fill:var(--ink)">Node 1: kubelet</text>
+    <text x="120" y="256" text-anchor="middle" style="fill:var(--muted)">runtime, pods, lease</text>
+    <text x="120" y="272" text-anchor="middle" style="fill:var(--muted)">every 10 s</text>
+    <rect x="230" y="218" width="180" height="62" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="320" y="238" text-anchor="middle" style="fill:var(--ink)">Node 2: kubelet</text>
+    <text x="320" y="256" text-anchor="middle" style="fill:var(--muted)">runtime, pods, lease</text>
+    <rect x="430" y="218" width="180" height="62" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="520" y="238" text-anchor="middle" style="fill:var(--ink)">Node N: kubelet</text>
+    <text x="520" y="256" text-anchor="middle" style="fill:var(--muted)">runtime, pods, lease</text>
+    <line x1="120" y1="218" x2="175" y2="117" marker-end="url(#in13-arrow)" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <line x1="320" y1="218" x2="215" y2="117" marker-end="url(#in13-arrow)" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <line x1="520" y1="218" x2="245" y2="112" marker-end="url(#in13-arrow)" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <text x="500" y="160" style="fill:var(--muted)">kubelets watch their pods,</text>
+    <text x="500" y="176" style="fill:var(--muted)">report status, renew leases</text>
+  </g>
+</svg>
+<figcaption>Every arrow points at the API server: components never talk to each other or to etcd directly. The dashed line between the planes is the design's most important boundary — containers on nodes keep running on their last instructions when everything above it is unavailable.</figcaption>
+</figure>
+
+<h4>The vocabulary in the order you need it</h4>
+<p>A <strong>pod</strong> is the unit of scheduling: one or more containers that share a network address and run together on one node. A <strong>node</strong> is a machine with an agent. Each container declares <strong>requests</strong> (what it needs, used for placement) and <strong>limits</strong> (caps enforced by cgroups on the node, os13). A <strong>Deployment</strong> declares "N replicas of this pod template", a <strong>ReplicaSet</strong> maintains exactly N, and a <strong>Service</strong> gives the replicas one stable address. Every object has a <strong>spec</strong> (desired state, written by users) and a <strong>status</strong> (actual state, written by the system).</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–20</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">20–28</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">28–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> (1) Users declare workloads: a container image, replica count, resource requests and limits, placement constraints (zones, labels, GPU type), and update strategy. (2) The system places each replica on a suitable node and starts it. (3) It keeps the declared number running: restarts crashed containers, replaces pods on failed nodes. (4) Rolling updates and rollbacks. (5) Scaling up and down on request. (6) Priorities: high-priority work can preempt low-priority work. (7) Expose status: what is running where, and why something is pending. Out of scope, said aloud: container networking internals (net10 and sc15), storage volumes, autoscaling policy, and multi-cluster federation.</p>
+<p><strong>Non-functional.</strong> <strong>Static stability</strong>: running workloads must not depend on the control plane being up. <strong>Correctness</strong>: never run two copies of something declared as one, never place more on a node than its allocatable resources (by requests). <strong>Scale</strong>: thousands of nodes and around a hundred thousand pods per cluster. <strong>Scheduling throughput</strong>: at least tens of pods per second sustained, with bursts during deploys. <strong>Failure detection</strong> within about a minute, replacement within minutes, without overreacting to network partitions. <strong>Control-plane availability</strong> high enough that deploys and recovery work (Borg reported 99.99% for its master).</p>
+<p><strong>Clarifying questions.</strong> How big are clusters, and is one cluster per region acceptable? Mixed workloads (latency-sensitive services and batch jobs on the same machines)? GPUs and large training jobs? Multi-tenant (several teams with quotas) or single-team? How quickly must a dead node's work be replaced?</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Size for the envelope Kubernetes documents as supported for one cluster: <strong>5,000 nodes</strong>, no more than <strong>110 pods per node</strong>, and <strong>150,000 pods</strong> in total. (Borg's median cell was about 10,000 machines, with some much larger.)</p>
+<p><strong>Heartbeat writes.</strong> Each node renews a heartbeat lease every <strong>10 seconds</strong>: 5,000 ÷ 10 = <strong>500 writes per second</strong> to the store, just to say "still alive". This is why heartbeats are a tiny separate Lease object rather than an update to the large Node object — each write is replicated through Raft to every etcd member.</p>
+<p><strong>Pod churn.</strong> Suppose 1% of pods are replaced per minute on average (deploys, batch jobs finishing, autoscaling): 1,500 new pods per minute = <strong>25 per second</strong>, with deploy bursts of 10× (250 per second). Each pod lifecycle is roughly 5-10 writes (create, bind, several status updates, delete): 25 × 8 ≈ <strong>200 writes per second</strong> average, about 2,000 in bursts.</p>
+<p><strong>Total store load.</strong> About 700-1,000 writes per second steady, a few thousand in bursts. A well-provisioned etcd cluster on fast disks handles thousands of small writes per second; each write needs a Raft round and an fsync on a majority, so disk latency is the limit. Reads are mostly served by the API servers' in-memory watch caches, not etcd.</p>
+<p><strong>State size.</strong> A pod object with its spec and status is a few kilobytes; call it 5 KB. 150,000 × 5 KB = 750 MB for pods, plus nodes, services, endpoints, config maps and events: on the order of 1-2 GB. etcd's default storage quota is 2 GiB and 8 GiB is its suggested maximum, and a single request is limited to 1.5 MiB. The control-plane store must stay small — the reason large blobs and logs never go into it.</p>
+<p><strong>Scheduler throughput.</strong> 25 pods per second steady and 250 in bursts. Evaluating 5,000 nodes per pod at, say, 1 µs per filter-and-score is 5 ms per pod — 200 pods per second on one thread, borderline for bursts. Scoring only a sample of feasible nodes (Kubernetes' default falls toward 10% at 5,000 nodes) cuts that by ten; parallelising filters across cores cuts it further.</p>
+<p><strong>Watch fan-out.</strong> 5,000 kubelets each watch their own pods; controllers watch everything of their type. A pod update fans out to every watcher of that object type, which is why API servers keep a watch cache and send each change once to many watchers from memory.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+<tr><td>Nodes / pods</td><td>supported envelope</td><td>5,000 / 150,000 (≤ 110 per node)</td></tr>
+<tr><td>Heartbeat writes</td><td>5,000 ÷ 10 s</td><td>500/s</td></tr>
+<tr><td>Pod creations</td><td>1% of 150k per minute</td><td>25/s, ~250/s in bursts</td></tr>
+<tr><td>Pod lifecycle writes</td><td>25 × ~8</td><td>~200/s, ~2,000/s bursts</td></tr>
+<tr><td>State size</td><td>150k × 5 KB + other objects</td><td>~1-2 GB (etcd default quota 2 GiB)</td></tr>
+<tr><td>Scheduling cost</td><td>5,000 nodes × 1 µs</td><td>5 ms/pod; sampling cuts it ~10×</td></tr>
+</table>
+
+<h4>3 · The API</h4>
+<p>One uniform, resource-oriented API over versioned objects. Every object type supports the same verbs, which is what lets dozens of controllers and tools share it.</p>
+<pre>POST   /apis/apps/v1/namespaces/shop/deployments           {spec: {replicas: 3, template: {...}}}
+GET    /api/v1/namespaces/shop/pods?labelSelector=app=web
+GET    /api/v1/pods?fieldSelector=spec.nodeName=node-17&amp;watch=true&amp;resourceVersion=88123
+       → stream of {type: ADDED|MODIFIED|DELETED, object: {...}}
+PUT    /api/v1/namespaces/shop/pods/web-7f9c/status          (kubelet reports status)
+POST   /api/v1/namespaces/shop/pods/web-7f9c/binding         {target: {kind: Node, name: node-17}}  (scheduler)
+PUT    /apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/node-17   (heartbeat)</pre>
+<p><strong>Watch</strong> is the key verb. A client lists objects, notes the <code>resourceVersion</code> (a cluster-wide, monotonically increasing version from the store), then watches from that version and receives every subsequent change in order. If the connection drops, it resumes from the last version it saw; if that version is too old, it lists again. Controllers are built on list-then-watch plus a local cache.</p>
+<p><strong>Optimistic concurrency.</strong> Every write carries the object's <code>resourceVersion</code> as read; the API server rejects the write with a conflict if the object changed meanwhile, and the writer re-reads and retries. No locks, and two controllers can never silently overwrite each other's changes.</p>
+
+<h4>4 · The data model</h4>
+<pre>Object metadata (every type): name, namespace, uid, labels{}, annotations{},
+                              resourceVersion, generation, ownerReferences[], deletionTimestamp
+Deployment.spec:  replicas: 3, selector: {app: web}, template: PodSpec, strategy: {maxSurge: 1, maxUnavailable: 0}
+Pod.spec:         containers: [{image: web:v2, resources: {requests: {cpu: 2, memory: 4Gi},
+                                                           limits:   {cpu: 4, memory: 4Gi}}}],
+                  nodeName: ""  (empty until scheduled), priorityClassName, tolerations[], affinity
+Pod.status:       phase: Pending|Running|Succeeded|Failed, conditions[], podIP, containerStatuses[]
+Node.status:      allocatable: {cpu: 16, memory: 64Gi, pods: 110, nvidia.com/gpu: 0}, conditions[]
+Node.spec:        taints: [{key: gpu, value: "true", effect: NoSchedule}]
+Lease:            holderIdentity, renewTime, leaseDurationSeconds        (heartbeats, leader election)</pre>
+<p><strong>Spec versus status</strong> is the contract: users and higher-level controllers write spec; the system writes status. <strong>Labels</strong> are how objects find each other — a ReplicaSet owns the pods matching its selector, a Service routes to pods matching its selector — rather than hard-coded lists, an idea the Borg-Omega-Kubernetes retrospective credits with much of Kubernetes' flexibility. <strong>Owner references</strong> chain Deployment → ReplicaSet → Pod so deleting the owner garbage-collects its children.</p>
+
+<h4>5 · High-level design and the path of one deployment</h4>
+<p>Follow <code>kubectl apply</code> of a 3-replica Deployment. (1) The API server authenticates, authorises, runs admission checks (quota, defaults, policy), and stores the Deployment in etcd. (2) The Deployment controller, watching Deployments, sees a new one with no ReplicaSet and creates one. (3) The ReplicaSet controller sees desired 3, actual 0, and creates three Pod objects with empty <code>nodeName</code>. (4) The scheduler, watching for unscheduled pods, takes each from its queue, filters and scores nodes, and writes a binding: <code>nodeName: node-17</code>. (5) The kubelet on node-17, watching for pods assigned to its node, sees the new pod, pulls the image, creates the containers with the requested cgroup limits through the container runtime, runs readiness probes, and writes status Running and Ready. (6) The endpoints controller adds the pod's IP to the Service's endpoints; network proxies on every node update their routing. No component called another: each reacted to an object changing.</p>
+
+<h4>6 · Deep dive A: desired state and reconciliation loops</h4>
+<p><strong>Imperative versus declarative.</strong> An imperative system executes commands: "start a container on node 17". If the command is lost, nothing happens; if it runs twice, two containers start; if the node dies later, nothing notices. A declarative system stores the goal: "3 replicas". Borg's paper lists this as a core availability technique: declarative desired-state representations and idempotent mutating operations, so a failed client can harmlessly resubmit any forgotten requests.</p>
+<p><strong>The loop.</strong> Every controller has the same skeleton:</p>
+<pre>loop forever:
+    desired = read spec of objects I own            # from my local cache, fed by watch
+    actual  = observe what exists                   # other objects, or the node itself
+    diff    = desired - actual
+    for each difference: take one corrective action through the API
+    wait for a change notification, or a periodic resync timeout</pre>
+<p><strong>Level-triggered, not edge-triggered.</strong> An edge-triggered controller acts on events: "pod deleted → create one". If it misses the event (crashed, disconnected), the pod is never replaced. A level-triggered controller acts on the state: "there should be 3, there are 2 → create one". Events are only a hint to look now; a periodic resync re-checks everything anyway. This makes controllers robust to restarts, missed watch events, and duplicate notifications — the property that lets a cluster heal itself without a coordinator.</p>
+<p><strong>A trace of healing.</strong> t = 0: ReplicaSet wants 3; pods a, b, c are Running. t = 1 s: the container in pod b crashes; the kubelet on its node restarts it locally (restart policy Always) with exponential back-off — the control plane is not involved. t = 60 s: the node hosting pod c loses power. Its lease stops renewing. t ≈ 110 s: after the 50-second grace period, the node controller marks the node not ready and adds the <code>unreachable</code> taint. t ≈ 410 s: pod c's 300-second toleration of that taint expires; the node controller evicts it (marks it for deletion). The ReplicaSet controller now sees 2 live pods, desired 3, and creates pod d. The scheduler binds d to a healthy node; its kubelet starts it. Nobody issued a command; four independent loops each closed their own gap.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="The reconcile loop: observe desired state (3 replicas) and actual state (2 running pods) from the cache, compute the difference (missing 1), act through the API server (create pod d), then the watch notifies of the change and the loop observes again. Missed events are covered by a periodic resync. A side note shows four controllers chaining: ReplicaSet creates a pod object, the scheduler binds it, the kubelet runs it, the endpoints controller publishes it.">
+  <defs><marker id="in13-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="30" y="30" width="150" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="105" y="52" text-anchor="middle" style="fill:var(--ink)">Observe</text>
+    <text x="105" y="70" text-anchor="middle" style="fill:var(--muted)">want 3 · have 2</text>
+    <rect x="230" y="30" width="150" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="305" y="52" text-anchor="middle" style="fill:var(--ink)">Diff</text>
+    <text x="305" y="70" text-anchor="middle" style="fill:var(--muted)">missing 1 pod</text>
+    <rect x="230" y="150" width="150" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="305" y="172" text-anchor="middle" style="fill:var(--ink)">Act via API</text>
+    <text x="305" y="190" text-anchor="middle" style="fill:var(--muted)">create pod d</text>
+    <rect x="30" y="150" width="150" height="54" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="105" y="172" text-anchor="middle" style="fill:var(--ink)">Wait</text>
+    <text x="105" y="190" text-anchor="middle" style="fill:var(--muted)">watch event or resync</text>
+    <line x1="180" y1="57" x2="228" y2="57" marker-end="url(#in13-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="305" y1="84" x2="305" y2="148" marker-end="url(#in13-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="230" y1="177" x2="182" y2="177" marker-end="url(#in13-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="105" y1="150" x2="105" y2="86" marker-end="url(#in13-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="205" y="125" text-anchor="middle" style="fill:var(--good)">level-triggered:</text>
+    <text x="205" y="141" text-anchor="middle" style="fill:var(--good)">missed events self-heal</text>
+    <text x="510" y="24" text-anchor="middle" style="fill:var(--ink);font-weight:600">Loops chain through objects</text>
+    <rect x="420" y="34" width="180" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="510" y="56" text-anchor="middle" style="fill:var(--ink)">ReplicaSet: create Pod</text>
+    <rect x="420" y="84" width="180" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="510" y="106" text-anchor="middle" style="fill:var(--ink)">Scheduler: set nodeName</text>
+    <rect x="420" y="134" width="180" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="510" y="156" text-anchor="middle" style="fill:var(--ink)">Kubelet: run, set status</text>
+    <rect x="420" y="184" width="180" height="34" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="510" y="206" text-anchor="middle" style="fill:var(--ink)">Endpoints: publish IP</text>
+    <line x1="510" y1="68" x2="510" y2="82" marker-end="url(#in13-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="510" y1="118" x2="510" y2="132" marker-end="url(#in13-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="510" y1="168" x2="510" y2="182" marker-end="url(#in13-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="510" y="238" text-anchor="middle" style="fill:var(--muted)">each arrow is an object change, not a call</text>
+  </g>
+</svg>
+<figcaption>Each controller only closes its own gap and writes the result as an object; the next controller's loop picks it up from there. Because each acts on current state rather than events, any of them can crash and restart without the cluster losing track of what it should be doing.</figcaption>
+</figure>
+
+<p><strong>Conflicts and idempotency.</strong> Two controllers may act on the same object, or one controller may restart mid-action. Optimistic concurrency (resource versions) prevents lost updates; deterministic naming and owner references prevent duplicates (a ReplicaSet that crashed after creating a pod sees it on restart, owned by itself, and does not create another). Controllers must also be careful with "expectations": after creating a pod, the controller's cache may not show it for a moment, and naive code would create another. Kubernetes' ReplicaSet controller records how many creations it expects to observe and waits for them before acting again.</p>
+
+<h4>7 · Deep dive B: the scheduler — filter, score, bind</h4>
+<p><strong>Two passes.</strong> For each pending pod, the scheduler runs <strong>filters</strong> (feasibility checks: does this node have enough unrequested CPU and memory? does it match the pod's node selector and affinity? does the pod tolerate the node's taints? is the required port free? is the GPU type right?) and then <strong>scores</strong> the nodes that passed (how good is this placement?), picking the highest score. It then writes a <strong>binding</strong>. Borg's paper describes the same two phases: feasibility checking finds machines that meet the task's constraints and have enough available resources (including resources held by lower-priority tasks that could be evicted), and scoring determines the goodness of each feasible machine.</p>
+<p><strong>A worked pass on four nodes.</strong> The pod requests <strong>2 CPU and 4 GiB</strong> and has no GPU toleration. Allocatable and already-requested resources (requests, not usage):</p>
+<table>
+<thead><tr><th>Node</th><th>Allocatable</th><th>Requested</th><th>Free</th><th>Notes</th></tr></thead>
+<tr><td>N1</td><td>8 CPU, 32 GiB</td><td>7 CPU, 10 GiB</td><td>1 CPU, 22 GiB</td><td></td></tr>
+<tr><td>N2</td><td>16 CPU, 64 GiB</td><td>4 CPU, 16 GiB</td><td>12 CPU, 48 GiB</td><td></td></tr>
+<tr><td>N3</td><td>8 CPU, 16 GiB</td><td>2 CPU, 10 GiB</td><td>6 CPU, 6 GiB</td><td></td></tr>
+<tr><td>N4</td><td>32 CPU, 128 GiB</td><td>8 CPU, 32 GiB</td><td>24 CPU, 96 GiB</td><td>taint gpu=true:NoSchedule</td></tr>
+</table>
+<p><em>Filter.</em> N1 has 1 free CPU &lt; 2 requested: <strong>out</strong>. N4 has room but carries a taint the pod does not tolerate: <strong>out</strong> (keeping expensive GPU machines for GPU work). N2 and N3 pass.</p>
+<p><em>Score with "least allocated"</em> (Kubernetes' default for its resource-fit plugin): for each resource, the fraction left free after placing the pod, times 100, averaged. N2: CPU (16 − 6) ÷ 16 = 62.5; memory (64 − 20) ÷ 64 = 68.75; score <strong>65.6</strong>. N3: CPU (8 − 4) ÷ 8 = 50; memory (16 − 14) ÷ 16 = 12.5; score <strong>31.3</strong>. N2 wins — the policy spreads work onto the emptier node.</p>
+<p><em>Score with "most allocated"</em> (the bin-packing strategy): the fraction used after placement. N2: 37.5 and 31.25 → <strong>34.4</strong>. N3: 50 and 87.5 → <strong>68.8</strong>. N3 wins — the policy fills the fuller node and leaves N2's large free space for a big pod or for the autoscaler to reclaim.</p>
+<p><em>Balance.</em> Look at N3 after placement under bin-packing: 4 CPU free but only 2 GiB of memory. Any future pod needing 3 GiB cannot use those 4 CPUs — they are <strong>stranded</strong>. A balanced-allocation score penalises placements that make one resource's utilisation run far ahead of another's: with CPU at 50% and memory at 87.5%, N3's imbalance is large; N2's 37.5% and 31.25% are close. Kubernetes adds such a score to the resource-fit score; Borg's current scoring model was a hybrid aimed specifically at reducing stranded resources, which it reports gave about 3-5% better packing efficiency than best fit.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Filter then score on four nodes for a pod requesting 2 CPU and 4 GiB. N1: CPU bar nearly full, filtered out for insufficient CPU. N4: GPU node with a taint, filtered out. N2 and N3 pass. Least-allocated scores: N2 65.6, N3 31.3, so N2 wins. Most-allocated scores: N2 34.4, N3 68.8, so N3 wins. After placement N3 would have 4 CPU free but only 2 GiB, stranding CPU.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="320" y="18" text-anchor="middle" style="fill:var(--ink);font-weight:600">Pod requests 2 CPU · 4 GiB — bars show requested share of allocatable (CPU / memory)</text>
+    <g>
+      <text x="20" y="56" style="fill:var(--ink)">N1 8 CPU · 32 GiB</text>
+      <rect x="170" y="44" width="160" height="10" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+      <rect x="170" y="44" width="140" height="10" style="fill:var(--s1)"/>
+      <rect x="170" y="58" width="160" height="10" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+      <rect x="170" y="58" width="50" height="10" style="fill:var(--s2)"/>
+      <text x="350" y="62" style="fill:var(--crit)">✕ filter: 1 CPU free &lt; 2</text>
+    </g>
+    <g>
+      <text x="20" y="102" style="fill:var(--ink)">N2 16 CPU · 64 GiB</text>
+      <rect x="170" y="90" width="160" height="10" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+      <rect x="170" y="90" width="40" height="10" style="fill:var(--s1)"/>
+      <rect x="210" y="90" width="20" height="10" style="fill:var(--accent)"/>
+      <rect x="170" y="104" width="160" height="10" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+      <rect x="170" y="104" width="40" height="10" style="fill:var(--s2)"/>
+      <rect x="210" y="104" width="10" height="10" style="fill:var(--accent)"/>
+      <text x="350" y="100" style="fill:var(--good)">least-allocated 65.6 ★</text>
+      <text x="350" y="116" style="fill:var(--muted)">most-allocated 34.4</text>
+    </g>
+    <g>
+      <text x="20" y="148" style="fill:var(--ink)">N3 8 CPU · 16 GiB</text>
+      <rect x="170" y="136" width="160" height="10" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+      <rect x="170" y="136" width="40" height="10" style="fill:var(--s1)"/>
+      <rect x="210" y="136" width="40" height="10" style="fill:var(--accent)"/>
+      <rect x="170" y="150" width="160" height="10" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+      <rect x="170" y="150" width="100" height="10" style="fill:var(--s2)"/>
+      <rect x="270" y="150" width="40" height="10" style="fill:var(--accent)"/>
+      <text x="350" y="146" style="fill:var(--muted)">least-allocated 31.3</text>
+      <text x="350" y="162" style="fill:var(--good)">most-allocated 68.8 ★</text>
+      <text x="500" y="146" style="fill:var(--crit)">after: 4 CPU free,</text>
+      <text x="500" y="162" style="fill:var(--crit)">2 GiB → CPU stranded</text>
+    </g>
+    <g>
+      <text x="20" y="194" style="fill:var(--ink)">N4 32 CPU · 128 GiB</text>
+      <rect x="170" y="182" width="160" height="10" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+      <rect x="170" y="182" width="40" height="10" style="fill:var(--s1)"/>
+      <rect x="170" y="196" width="160" height="10" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+      <rect x="170" y="196" width="40" height="10" style="fill:var(--s2)"/>
+      <text x="350" y="200" style="fill:var(--crit)">✕ filter: taint gpu=true, no toleration</text>
+    </g>
+    <rect x="20" y="226" width="12" height="10" style="fill:var(--s1)"/><text x="38" y="235" style="fill:var(--muted)">CPU requested</text>
+    <rect x="140" y="226" width="12" height="10" style="fill:var(--s2)"/><text x="158" y="235" style="fill:var(--muted)">memory requested</text>
+    <rect x="290" y="226" width="12" height="10" style="fill:var(--accent)"/><text x="308" y="235" style="fill:var(--muted)">this pod</text>
+    <text x="320" y="260" text-anchor="middle" style="fill:var(--ink-2)">filters decide who may run it; the scoring policy decides spreading versus packing</text>
+  </g>
+</svg>
+<figcaption>Two of four nodes are eliminated before any scoring. The same two survivors produce opposite winners under the two standard policies, and the bin-packing winner leaves CPU that no memory-hungry pod can use — which is why real schedulers add a balance term.</figcaption>
+</figure>
+
+<p><strong>Bin-packing versus spreading, as a decision.</strong> Spreading keeps every node partly empty: bursts have room, one node failure takes out few replicas of each service, noisy neighbours are rarer. Bin-packing leaves some nodes empty: the cluster autoscaler can remove them (direct cost savings), and large pods (a 30-CPU job) can still find a whole free node. Borg's experience is the best evidence available: its original spreading-style scoring (a variant of E-PVM, which minimises the change in a combined cost) left headroom but fragmented capacity, especially for large tasks; best fit packed tightly but penalised any misestimate of requirements, hurting bursty services and batch jobs; the hybrid that minimised stranded resources did better than either. A useful interview answer: spread latency-sensitive services across failure domains with a spreading constraint, bin-pack batch work, and let priorities decide who yields.</p>
+<p><strong>Preemption.</strong> If no node passes the filters, the scheduler looks for nodes where evicting lower-priority pods would make room, picks the one that disrupts least, evicts those pods (they go back to pending through their controllers) and places the pod. Borg did the same — preempting from lowest to highest priority until the task fit and requeuing the victims rather than migrating them.</p>
+<p><strong>Scaling the scheduler.</strong> Evaluating every node for every pod does not scale. Kubernetes stops filtering once it has found enough feasible nodes: by default it scores a percentage that falls linearly from 50% at 100 nodes to 10% at 5,000 nodes, never below 5% and never fewer than 100 nodes, starting each search where the last one stopped so all nodes get a turn. Borg used three tricks: <strong>score caching</strong> (keep scores until a machine or task changes), <strong>equivalence classes</strong> (the tasks of one job usually have identical requirements, so compute feasibility and scores once per class), and <strong>relaxed randomisation</strong> (examine machines in random order until enough feasible ones are found). Its paper reports that scheduling a cell's entire workload from scratch typically took a few hundred seconds, and did not finish after more than three days with these techniques disabled.</p>
+<p><strong>Binding without races.</strong> The scheduler decides from its cache, which may be slightly stale. It "assumes" the pod onto the node in its cache immediately (so the next decision sees the reduced capacity), writes the binding asynchronously, and if the write fails, forgets the assumption and requeues. The kubelet runs a final admission check and rejects a pod that does not fit — the safety net if two schedulers or a stale cache ever double-book a node.</p>
+
+<h4>8 · Deep dive C: failure detection, leader election, and a dead control plane</h4>
+<p><strong>Heartbeats.</strong> The kubelet renews a small Lease object for its node every 10 seconds, and also reports the node's status. The node controller watches leases. If a node's lease has not been renewed within the <strong>grace period</strong> (50 seconds by default in current Kubernetes), it sets the node's Ready condition to Unknown and adds the <code>node.kubernetes.io/unreachable</code> taint (or <code>not-ready</code> if the node reported itself unhealthy). Pods by default tolerate those taints for <strong>300 seconds</strong>; when that expires, they are evicted and their controllers create replacements. Borg used polling in the other direction: the Borgmaster polled each Borglet every few seconds, which let the master control the communication rate and avoid recovery storms; a machine that missed several polls was marked down and its tasks rescheduled.</p>
+<p><strong>Why not faster?</strong> Because silence is ambiguous. A node behind a failed switch is still running its pods; replacing them creates duplicates — harmless for stateless web servers, dangerous for anything that must be single (a stateful database member, a job with external side effects). When communication returns, Borg told the Borglet to kill the tasks that had already been rescheduled; Kubernetes has the kubelet delete pods that the API says were evicted. Duplicates during the gap are the cost of faster replacement, and the 300-second default is a per-workload knob (tolerationSeconds) precisely so stateless services can opt into faster failover.</p>
+<p><strong>Rate-limited eviction.</strong> The control plane cannot tell many failed nodes from a partition between itself and many healthy nodes. Kubernetes evicts pods from at most 0.1 nodes per second by default, and when more than 55% of nodes in a zone are unhealthy it treats the zone as partitioned and slows down further (or stops in small clusters). Borg's paper lists the same rule: rate-limit finding new places for tasks from machines that become unreachable, because large-scale failure and network partition look the same.</p>
+<p><strong>Leader election.</strong> The scheduler and the controller manager each run as several replicas for availability, but two active schedulers would double-book nodes and two ReplicaSet controllers would create twice the pods. So exactly one replica acts at a time, chosen by a <strong>lease</strong> in the store: the leader renews the lease; others retry periodically and take over if it expires. Kubernetes' defaults are a 15-second lease duration, a 10-second renew deadline (a leader that cannot renew within 10 seconds stops acting, leaving a margin before others may take over at 15) and a 2-second retry period. The underlying guarantee comes from etcd's Raft (in8): lease updates are linearisable, so two replicas cannot both believe they hold it — with the usual caveat that a paused leader might act briefly after losing it, which resource-version checks on writes catch. Borg's master was itself five replicas with a Paxos-based store and an elected master; failover typically took about 10 seconds, up to a minute in a big cell while in-memory state was rebuilt. The API servers, by contrast, are stateless and all active behind a load balancer.</p>
+<p><strong>What runs when the control plane is down.</strong> Walk the components. <em>etcd loses quorum</em>: the API server cannot write (and, for consistent reads, cannot read). <em>API server down</em>: nothing can be changed or observed. <em>Scheduler down</em>: new pods stay pending. <em>Controller manager down</em>: no scaling, no replacement, no rollouts, no node-failure handling. In every case, the data plane continues: kubelets keep running the pods they already have, restart crashed containers locally, and report status when they can reconnect; the network rules on each node keep routing to the endpoints they last knew. Running workloads are unaffected unless something fails during the outage — a node dying then is not handled until the control plane returns. This is the static-stability property, and it shapes design choices elsewhere: workloads should not call the API on their request path, node agents must cache their assignments, and the control plane must be upgraded and restarted freely without user-visible impact.</p>
+<table>
+<thead><tr><th>Down</th><th>Stops working</th><th>Keeps working</th></tr></thead>
+<tr><td>etcd quorum</td><td>All writes, consistent reads</td><td>All running pods and routing</td></tr>
+<tr><td>API servers</td><td>Every change, kubectl, watches</td><td>Running pods; local restarts</td></tr>
+<tr><td>Scheduler</td><td>Placing new pods</td><td>Everything already placed</td></tr>
+<tr><td>Controllers</td><td>Scaling, rollouts, replacing failed nodes' pods</td><td>Running pods; kubelet restarts</td></tr>
+<tr><td>One node's kubelet</td><td>Changes to that node's pods</td><td>Its containers keep running</td></tr>
+</table>
+
+<h4>9 · Failure modes and trade-offs</h4>
+<p><strong>etcd as the bottleneck.</strong> Too many objects, large objects (big config maps), or event spam push etcd toward its size quota and slow every write; when the quota is hit, writes fail cluster-wide. Keep objects small, rate-limit events, compact and defragment regularly, and run etcd on dedicated fast disks.</p>
+<p><strong>Thundering herds.</strong> After an API server restart, every kubelet and controller re-lists everything at once. Watch caches, client back-off with jitter, and priority and fairness rules on the API server keep the restart from becoming an outage.</p>
+<p><strong>Requests that lie.</strong> The scheduler trusts requests. Pods that request little and use a lot crowd their nodes (CPU throttling, out-of-memory kills); pods that request a lot and use little waste capacity. Measure the gap and right-size requests; reclaim unused reservations for low-priority work, as Borg did.</p>
+<p><strong>Correlated placement.</strong> Spreading by score alone may still put all replicas of a service in one zone. Use explicit topology spread constraints or anti-affinity for anything that must survive a zone failure.</p>
+<p><strong>Trade-offs to close on.</strong> Declarative and eventually consistent (robust, self-healing, harder to reason about timing) versus imperative (simple, fragile). One central scheduler (simple, globally informed, a throughput ceiling) versus several optimistic schedulers (scales, needs conflict handling). Spreading versus packing. Fast failure detection (less downtime, more false positives and duplicates) versus slow (fewer mistakes, longer outages). Big clusters (better packing — Borg measured the cost of splitting) versus many small ones (smaller blast radius, simpler upgrades).</p>
+</section>
+
+<section data-field="deep">
+<h4>Gang scheduling and GPUs for distributed training</h4>
+<p>A data-parallel training job with 64 workers (dl9, gpu8) is useless until all 64 run, because every step waits for an all-reduce across all of them. A pod-at-a-time scheduler happily places 40 of them and leaves 24 pending, holding 40 GPUs idle indefinitely; two such jobs each half-placed can deadlock, each waiting for GPUs the other holds. <strong>Gang scheduling</strong> places a group all at once or not at all. The usual architecture adds a job-level layer: a queue with per-team quotas admits a whole job only when capacity for all its workers exists (otherwise it waits without holding anything), and a gang-aware scheduling step reserves all the nodes together. Placement is topology-aware: 8 workers per 8-GPU node so they share NVLink, and nodes in the same network block so cross-node collectives stay fast. Failure is also group-level: if one worker's node dies, the whole job restarts from its last checkpoint, so checkpoint frequency trades lost work against checkpoint overhead. Large jobs waiting for a gang leave GPUs idle; backfilling with small preemptible jobs, and preempting them when the gang can start, recovers that capacity.</p>
+
+<h4>Resource reclamation and overcommit</h4>
+<p>Requests are reservations, and services reserve for rare peaks. Borg estimated each task's real usage every few seconds (its "reservation", from fine-grained usage plus a safety margin) and let lower-priority batch work use the difference between limits and reservations; production tasks were scheduled against limits and never relied on reclaimed resources. About 20% of the workload in a median cell ran in reclaimed resources. When Google tested more aggressive safety margins on a live cell for a week, reservations moved closer to usage and out-of-memory events rose slightly — and the team chose a medium setting. The same knob exists in any orchestrator: Kubernetes' quality-of-service classes (guaranteed, burstable, best-effort) decide which pods are killed first when a node runs short.</p>
+
+<h4>Why one API and labels</h4>
+<p>The Borg-Omega-Kubernetes retrospective describes how Borg grew many special-purpose APIs and clients, and how Kubernetes instead put every piece of state behind one uniform, versioned object API with list, watch and optimistic concurrency, so that new controllers could be added without changing the core. Labels — arbitrary key-value tags with selectors — replaced fixed groupings: a Service selects pods by label, a ReplicaSet counts pods by label, an operator can temporarily remove a pod from a Service by changing its label to debug it while the ReplicaSet starts a replacement. Composability came from those two choices.</p>
+
+<h4>Shared-state schedulers: the Omega idea</h4>
+<p>A single scheduler is a throughput ceiling and a bottleneck for specialised policies (batch, ML, services each want different logic). Google's Omega explored giving several schedulers a shared view of cluster state and letting each commit placements optimistically, with conflicts detected at commit time and retried. Kubernetes supports multiple schedulers through a field on the pod naming its scheduler; the kubelet's final admission check and resource-version conflicts protect against double-booking. The cost is wasted work on conflicts when clusters are nearly full.</p>
+
+<h4>Cluster size: one big pool versus many small ones</h4>
+<p>Borg's evaluation used "compaction" — how small a cell could be and still fit its workload — to compare policies, and showed that splitting workloads into separate cells costs machines: separating production and non-production work needed 20-30% more machines in the median cell, because production jobs reserve for spikes they rarely hit and batch work fills the gaps. The counter-pressure is blast radius and operability: a control-plane bug, a bad upgrade or an etcd problem affects the whole cluster. Many organisations settle on large clusters per region with strict isolation between namespaces, plus a few separate clusters for regulated or very risky workloads.</p>
+
+<h4>Testing the control plane</h4>
+<p>Borg kept periodic checkpoints of its master's state and a simulator (Fauxmaster) that ran the production scheduler code against them, which let the team debug failures and evaluate policy changes on real workloads offline. The general lesson: the scheduler and controllers are deterministic functions of state, so record the state and replay it. Policy changes (a new scoring weight) should be evaluated by replaying real snapshots and comparing outcomes — packing efficiency, pending time, preemptions — before rollout. A scoring change that looks better on average can still starve one class of pods, so compare pending-time distributions per priority, not just the mean.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: Borg, and what Kubernetes kept</h4>
+<p>Google's Borg paper (Verma, Pedrosa, Korupolu, Oppenheimer, Tune and Wilkes, EuroSys 2015) describes the cluster manager that ran most of Google's workloads. A <strong>cell</strong> — median about 10,000 machines — has one logically centralised controller, the <strong>Borgmaster</strong>, and an agent, the <strong>Borglet</strong>, on each machine. The Borgmaster is replicated five times, with state kept in memory and in a Paxos-based store on the replicas' disks; one elected master serves as both the Paxos leader and the state mutator, and failover typically takes about 10 seconds. It reports 99.99% availability for the Borgmaster in practice, from replication, admission control and deliberately simple dependencies. The scheduler is a separate process that scans pending tasks by priority and assigns them with feasibility checking and scoring, made scalable by score caching, equivalence classes and relaxed randomisation. A busy Borgmaster used 10-14 CPU cores and up to 50 GiB of RAM, and several cells had arrival rates above 10,000 tasks per minute.</p>
+<p>The availability design is the part every interview should borrow: tasks keep running when the master or their own Borglet goes down; mutations are declarative and idempotent; rescheduling from unreachable machines is rate-limited; task-machine pairings that crash are avoided. And the utilisation results justify building such a system at all: segregating production and batch work would cost 20-30% more machines in the median cell, and resource reclamation let about 20% of the workload run in capacity that would otherwise sit reserved and idle.</p>
+<p>The "Borg, Omega, and Kubernetes" retrospective (Burns, Grant, Oppenheimer, Brewer and Wilkes, ACM Queue 2016) explains what changed in Kubernetes: everything goes through one API server over a consistent store; controllers are independent reconciliation loops rather than one monolithic master; labels replace fixed job/task groupings; and pods give each group of containers its own IP address. The Kubernetes documentation encodes the operational numbers this lesson used: lease heartbeats every 10 seconds, a 50-second grace period, 300-second default tolerations, eviction at 0.1 nodes per second, a 55% unhealthy-zone threshold, and a supported envelope of 5,000 nodes and 150,000 pods.</p>
+
+<h4>Failure modes you will see</h4>
+<p><strong>Pods stuck Pending.</strong> The scheduler's events say why: insufficient CPU, no node matches affinity, untolerated taint. Usually requests are too large or constraints too strict; sometimes the cluster is genuinely full and the autoscaler is slow.</p>
+<p><strong>Mass eviction after a network blip.</strong> A short partition between the control plane and a rack exceeds the grace period; nodes are tainted; if tolerations are short, pods are evicted and recreated elsewhere while the originals still run. Zone-aware rate limits and sensible tolerations are the guard.</p>
+<p><strong>etcd quota exceeded.</strong> Writes fail cluster-wide with "database space exceeded". Compaction and defragmentation, and finding the object type that grew (often events or a misbehaving controller writing large objects).</p>
+<p><strong>Controller hot loops.</strong> Two controllers fighting over a field (each "correcting" the other) generate endless writes. Watch for objects with rapidly increasing resource versions.</p>
+
+<h4>What to monitor</h4>
+<p>API server request latency and error rate by verb; etcd write latency (fsync), database size and leader changes; scheduler queue length, scheduling latency and attempts per pod; pending pods by reason; node Ready counts and lease ages; eviction counts; controller work-queue depth and retries; and for the data plane, container restarts and out-of-memory kills per node.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> build a toy scheduler that filters and scores the four nodes from the lesson under two policies, then a reconcile loop that keeps three replicas running while a chaos function kills pods and a node. Python 3.12 standard library.</p>
+<pre>"""Toy orchestrator: filter + score scheduling, and a level-triggered reconcile loop that heals."""
+import itertools, random
+
+NODES = {   # name: allocatable, requested, taints
+    "N1": {"cpu": 8,  "mem": 32,  "req_cpu": 7, "req_mem": 10, "taints": set(), "up": True},
+    "N2": {"cpu": 16, "mem": 64,  "req_cpu": 4, "req_mem": 16, "taints": set(), "up": True},
+    "N3": {"cpu": 8,  "mem": 16,  "req_cpu": 2, "req_mem": 10, "taints": set(), "up": True},
+    "N4": {"cpu": 32, "mem": 128, "req_cpu": 8, "req_mem": 32, "taints": {"gpu"}, "up": True},
+}
+
+def feasible(node, pod):
+    if not node["up"]: return "node down"
+    if node["cpu"] - node["req_cpu"] &lt; pod["cpu"]: return "insufficient cpu"
+    if node["mem"] - node["req_mem"] &lt; pod["mem"]: return "insufficient memory"
+    if node["taints"] - pod["tolerations"]: return f"untolerated taint {node['taints'] - pod['tolerations']}"
+    return None
+
+def score(node, pod, policy):
+    cpu_used = (node["req_cpu"] + pod["cpu"]) / node["cpu"]
+    mem_used = (node["req_mem"] + pod["mem"]) / node["mem"]
+    if policy == "least":  return 100 * ((1 - cpu_used) + (1 - mem_used)) / 2
+    if policy == "most":   return 100 * (cpu_used + mem_used) / 2
+    raise ValueError(policy)
+
+def schedule(pod, policy, verbose=False):
+    best = None
+    for name, node in NODES.items():
+        why = feasible(node, pod)
+        if why:
+            if verbose: print(f"  {name}: filtered ({why})")
+            continue
+        s = score(node, pod, policy)
+        if verbose: print(f"  {name}: score {s:.1f}")
+        if best is None or s &gt; best[1]: best = (name, s)
+    return best[0] if best else None
+
+POD = {"cpu": 2, "mem": 4, "tolerations": set()}
+for policy in ("least", "most"):
+    print(f"policy={policy}"); print("  -&gt; bind to", schedule(POD, policy, verbose=True))
+
+# --- reconcile loop ------------------------------------------------------------------------
+desired, pods, ids = 3, {}, itertools.count(1)          # pods: id -&gt; node
+
+def bind(pod_id, node):
+    pods[pod_id] = node; NODES[node]["req_cpu"] += POD["cpu"]; NODES[node]["req_mem"] += POD["mem"]
+
+def unbind(pod_id):
+    node = pods.pop(pod_id); NODES[node]["req_cpu"] -= POD["cpu"]; NODES[node]["req_mem"] -= POD["mem"]
+
+def reconcile():                                        # level-triggered: look at state, not events
+    for pid, node in list(pods.items()):                # evict pods on nodes marked down
+        if not NODES[node]["up"]: unbind(pid); print(f"    evicted pod-{pid} from dead {node}")
+    while len(pods) &lt; desired:
+        node = schedule(POD, "least")
+        if node is None: print("    pending: no feasible node"); break
+        pid = next(ids); bind(pid, node); print(f"    created pod-{pid} on {node}")
+    while len(pods) &gt; desired:
+        unbind(max(pods)); print("    scaled down")
+
+random.seed(4)
+for tick in range(6):
+    print(f"tick {tick}: running {sorted(pods.items())}")
+    if tick == 2: victim = random.choice(list(pods)); unbind(victim); print(f"  chaos: killed pod-{victim}")
+    if tick == 4: dead = pods[min(pods)]; NODES[dead]["up"] = False; print(f"  chaos: node {dead} lost")
+    reconcile()</pre>
+<ol>
+<li>Run it. The first block should filter N1 (insufficient CPU) and N4 (untolerated taint) and print 65.6 for N2 and 31.2 for N3 under <code>least</code>, choosing N2; under <code>most</code> it prints 34.4 and 68.8 and chooses N3 — the lesson's worked numbers.</li>
+<li>Watch the reconcile ticks: three pods are created at tick 0; at tick 2 one is killed and the next reconcile recreates it; at tick 4 a node is marked down and its pods are evicted and replaced elsewhere. No step was told "replace pod X"; each tick just compared 3 with what existed.</li>
+<li>Add <code>"gpu"</code> to <code>POD["tolerations"]</code> and rerun: N4 now passes the filter and wins under <code>least</code> because it is the emptiest — which is exactly why GPU nodes carry taints.</li>
+<li>Change <code>reconcile</code>'s scheduling policy to <code>"most"</code> and see the replicas pile onto one node — then ask what a single node failure would do to that service, and why real systems add spreading constraints.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>You are designing the control plane for a 3,000-node cluster with 90,000 pods. Kubelets renew a lease every 10 seconds; each pod lifecycle generates about 8 writes; 2% of pods turn over per minute normally and 15% per minute during a fleet-wide deploy. etcd on your hardware sustains about 4,000 small writes per second at acceptable latency. (a) Is the steady state safe? (b) Is the deploy safe? (c) What would you change?</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> Heartbeats: 3,000 ÷ 10 = 300 writes/s. Pod churn: 2% × 90,000 = 1,800 pods per minute = 30 per second × 8 = 240 writes/s. Total about <strong>540 writes per second</strong> — 14% of capacity. Safe.</p>
+<p><strong>(b)</strong> Deploy: 15% × 90,000 = 13,500 pods per minute = 225 per second × 8 = 1,800 writes/s, plus 300 for heartbeats = <strong>2,100 writes per second</strong> — over half of capacity, before events, endpoint updates (each new pod changes its Service's endpoints, which fan out) and controller retries. Endpoint updates for a large Service can multiply this; it is the kind of burst that pushes etcd latency up, which slows every controller, which causes retries — a feedback loop.</p>
+<p><strong>(c)</strong> Pace the rollout: Deployments roll in waves bounded by maxSurge and maxUnavailable, so limit how many services deploy concurrently (for example a fleet-wide deploy over 30 minutes instead of 6). Use sliced endpoint objects so a pod change rewrites one small slice, not a list of thousands. Rate-limit events or store them outside the main etcd. Give the API server priority-and-fairness limits so heartbeats and system controllers are never starved by deploy traffic. And measure: etcd fsync latency and the API server's request latency are the leading indicators.</p>
+</details>
+<b>Diagnose it</b>
+<p>During a 4-minute network partition between the control plane and one of three zones, the zone's 900 nodes stop renewing leases. After the partition heals, you find hundreds of services briefly ran twice as many replicas, and a stateful queue consumer processed some messages twice. What happened, and what do you change?</p>
+<details><summary>Answer</summary>
+<p>After the 50-second grace period, the node controller marked the zone's nodes unreachable and tainted them. A third of the cluster being unhealthy is below the 55% zone threshold for the whole cluster but the entire zone was unhealthy, so the zone-level rate limits applied — yet pods whose tolerations were short (someone had set <code>tolerationSeconds: 30</code> for fast failover) were evicted within the 4 minutes, and their controllers created replacements in the other zones, while the originals were still running in the partitioned zone, serving whoever could reach them. When the partition healed, the kubelets learned their pods had been deleted and stopped them — but in the meantime, two copies of the queue consumer ran. Changes: keep short tolerations only for stateless services; give singletons default or longer tolerations, and protect them with real fencing (a lease or lock with fencing tokens, in8) so a second copy cannot act even if it runs; check that zone-unhealthy thresholds suit a three-zone layout; and alert on mass taints so humans see a partition as a partition.</p>
+</details>
+</section>

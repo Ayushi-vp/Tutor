@@ -1,14 +1,20 @@
 import { Link } from "react-router-dom";
-import { BANK, BLURB, DSA, NAV, PILLARS, ALL_IDS, ROADMAP, idsForView } from "../content";
+import { BANK, BLURB, DSA, NAV, PILLARS, ALL_IDS, ROADMAP, VIEW_TITLE, idsForView } from "../content";
 import { barsH, fig, heat, seqLegend, tableOf } from "../legacy/viz.js";
+import { SkillTree } from "../components/SkillTree";
 import { useProgress } from "../store";
+import { lessonPath } from "../lesson";
+import { nextSteps } from "../tree";
 import { todayKey } from "../util";
+import { fmt, nearestMilestone, TOPIC_IDS, xpOf } from "../xp";
 
 export function Overview() {
   const { state, progressOf, streak, get } = useProgress();
   const total = progressOf(ALL_IDS);
   const doneToday = state.days[todayKey()] || 0;
   const reviewCount = Object.values(state.items).filter(v => v === "rev").length;
+  const xp = xpOf(TOPIC_IDS, get);
+  const goal = nearestMilestone(get);
 
   const pillars = PILLARS.map(p => ({ p, g: progressOf(p.ids) }));
   // Pillar sizes differ by 100x (the bank vs ML coding), so bars show the share done, not raw counts.
@@ -40,14 +46,13 @@ export function Overview() {
       + "</div>" + seqLegend("none", "busy", "items/day"),
   });
 
-  const next: { tag: string; t: string; s: string; v: string }[] = [];
+  // Topics whose prerequisites are done, best first; then review flags and the week's plan.
+  const next: { tag: string; t: string; s: string; to: string }[] = nextSteps(get, 3).map((st, i) => (
+    { tag: i ? "Then" : "Learn", t: st.t, s: st.why, to: lessonPath(st.id) }));
+  if (reviewCount) next.push({ tag: "Review", t: `${reviewCount} item${reviewCount === 1 ? "" : "s"} flagged for a second pass`, s: "Clear these before adding new material", to: "/dsa" });
   const wk = ROADMAP.find(w => w.items.some(i => get(i[0]) !== "done")) || ROADMAP[0];
   const step = wk.items.find(i => get(i[0]) !== "done");
-  if (step) next.push({ tag: `Week ${wk.w}`, t: step[1], s: wk.focus, v: "roadmap" });
-  if (reviewCount) next.push({ tag: "Review", t: `${reviewCount} item${reviewCount === 1 ? "" : "s"} flagged for a second pass`, s: "Clear these before adding new material", v: "dsa" });
-  const weakest = [...pillars].sort((a, b) => a.g.p - b.g.p)[0];
-  next.push({ tag: "Weakest", t: `${weakest.p.n} — ${weakest.g.p}% covered`, s: `${weakest.g.n - weakest.g.d} items left in this pillar`, v: weakest.p.view });
-  next.push({ tag: "Drill", t: "Run a timed mock round", s: "Pressure exposes what reading never does", v: "mock" });
+  if (step) next.push({ tag: `Week ${wk.w}`, t: step[1], s: wk.focus, to: "/roadmap" });
 
   return (
     <div className="wrap">
@@ -60,18 +65,38 @@ export function Overview() {
         <div className="stat"><span className="k">Flagged for review</span><span className="v">{reviewCount}</span><span className="d">{reviewCount ? "clear these first" : "nothing outstanding"}</span></div>
         <div className="stat"><span className="k">Curriculum</span><span className="v">{total.n}</span><span className="d">{DSA.length} problems · {BANK.length} questions</span></div>
       </div>
+      <div className="card xp-card">
+        <div className="xp-card-h">
+          <span className="k">Topic XP</span>
+          <span className="v">{fmt(xp.earned)}<small> / {fmt(xp.available)} XP</small></span>
+          <span className="xp-key">Easy 50 · Medium 100 · Hard 200</span>
+        </div>
+        <div className="bar" role="progressbar" aria-label="Topic XP earned" aria-valuemin={0} aria-valuemax={100} aria-valuenow={xp.p}><i style={{ width: `${xp.p}%` }} /></div>
+        <p className="xp-next">
+          {goal
+            ? <>Next milestone: <b>{fmt(goal.need)} XP to {goal.milestone.n}</b> in {VIEW_TITLE[goal.view]}. <Link to={`/${goal.view}`}>Open track</Link></>
+            : xp.earned
+              ? "Every started track has reached its final milestone."
+              : "Complete your first topic to start earning XP. Harder topics are worth more."}
+        </p>
+      </div>
       <div className="sec hero">
         <div dangerouslySetInnerHTML={{ __html: cover }} />
         <div className="card">
           <div className="card-t">Next up</div>
-          <p className="card-s" style={{ marginBottom: 10 }}>Picked from your plan, your review flags and your thinnest pillar.</p>
+          <p className="card-s" style={{ marginBottom: 10 }}>Topics you have unlocked — their prerequisites are done — then your review flags and this week's plan.</p>
           <div className="nextlist">{next.map(n => (
-            <div className="nextrow" key={n.tag}>
+            <div className="nextrow" key={n.tag + n.t}>
               <span className="nx">{n.tag}</span><span><b>{n.t}</b><small>{n.s}</small></span>
-              <Link className="go" to={`/${n.v}`}>Open</Link>
+              <Link className="go" to={n.to}>Open</Link>
             </div>))}
           </div>
         </div>
+      </div>
+      <div className="sec">
+        <div className="rowh"><div><h2 className="sec-h">Learning map</h2>
+          <p className="sec-s">Each track as a tree. A topic is ready once the topics it builds on are done; hover one to trace its path.</p></div></div>
+        <SkillTree />
       </div>
       <div className="sec" dangerouslySetInnerHTML={{ __html: cal }} />
       <div className="sec">

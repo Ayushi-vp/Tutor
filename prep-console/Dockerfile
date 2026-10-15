@@ -16,6 +16,7 @@ WORKDIR /app
 COPY backend/requirements.txt backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 COPY backend backend
+COPY content content
 COPY --from=ui /src/frontend/dist frontend/dist
 RUN useradd --system --uid 10001 prep && mkdir /data && chown prep /data
 USER prep

@@ -59,7 +59,8 @@ def main() -> None:
         start = s.index(f'{{ g: "{a.group}", items: [')
         end = s.index(" ] },", start)
         anchor = s.find(f'{{ v: "{a.after}",', start, end) if a.after else -1
-        if anchor >= 0:
+        # the group's last item shares its line with the closing " ] },": append at the end instead
+        if anchor >= 0 and s.index("\n", anchor) < end:
             line_end = s.index("\n", anchor)
             s = s[:line_end] + "\n" + nav_item + "," + s[line_end:]
         else:

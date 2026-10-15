@@ -1,0 +1,629 @@
+<!-- topic source for mlc/mc18; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "mc18",
+  "t": "A GPT-style decoder and generation with a KV cache",
+  "tag": "Transformers",
+  "sum": "A pre-norm decoder with weight tying, then generation two ways: recomputing everything (310 token-forwards for 20 new tokens after a 6-token prompt) and prefill plus one-token decode steps with a KV cache (25), worked by hand on mc16's three tokens, tested so the cache changes nothing but speed, plus chunked prefill, the quadratic cost of growing the cache by concatenation, and the memory arithmetic that drives GQA.",
+  "prereq": [
+    [
+      "lm3",
+      "A transformer block: attention and a feed-forward network, each wrapped in a residual connection with normalisation."
+    ],
+    [
+      "lm5",
+      "The KV cache stores past keys and values so generation does not recompute them; MQA and GQA shrink it."
+    ],
+    [
+      "mc16",
+      "Multi-head causal attention with masks, and splitting heads by reshape."
+    ],
+    [
+      "mc17",
+      "Positions: here learned absolute embeddings, offset correctly for each new token; RoPE works the same way with angle offsets."
+    ]
+  ],
+  "myths": [
+    [
+      "The KV cache changes the model's outputs slightly, so it is an approximation.",
+      "It is exact. A causal model's keys and values for earlier positions do not depend on later tokens, so storing them and reusing them gives identical logits. The test checks greedy generation with and without the cache produces the same tokens and that every decode step equals the last row of a full forward pass."
+    ],
+    [
+      "The cache saves a little attention work.",
+      "Without it, generating token t re-runs the whole network on all t tokens, so 20 tokens after a 6-token prompt cost 310 token-forwards in the test; with it, 25. Over long generations the saving grows quadratically, and it covers every projection and feed-forward layer, not just attention."
+    ],
+    [
+      "Decoding is compute-bound like training.",
+      "Each decode step does a few matrix-vector products per layer but must read every weight and the whole KV cache from memory, so it is memory-bandwidth bound. That is why batching many requests together, shrinking the cache (GQA, quantisation) and paging it efficiently matter more for serving than raw FLOPs."
+    ],
+    [
+      "Appending to the cache with concatenate is fine.",
+      "np.concatenate copies the whole cache every step, so growing it to T entries costs O(T²) copying. In the test, 1,500 appends took 573 ms by concatenation against 1.9 ms writing into a preallocated buffer. Real servers preallocate or page the cache in fixed-size blocks."
+    ],
+    [
+      "Weight tying is a minor trick.",
+      "Sharing the token-embedding matrix with the output projection removes vocabulary × d parameters, which is 38.6 million of GPT-2 small's roughly 124 million, and ties the meaning of 'input token' and 'output token'. GPT-2 and nanoGPT use it; many larger models untie them because the embedding is a small fraction of their parameters."
+    ],
+    [
+      "Prefill and decode are the same operation.",
+      "Prefill runs the whole prompt through the network in parallel (matrix-matrix products, compute-bound) and fills the cache; decode runs one token at a time (matrix-vector products, memory-bound). Their very different costs are why serving systems schedule them separately and why time-to-first-token and time-per-output-token are separate metrics."
+    ]
+  ],
+  "recap": [
+    "A GPT-style decoder embeds tokens, adds positions, runs pre-norm blocks (x + Attn(Norm(x)), then x + MLP(Norm(x))), normalises, and projects to logits with the transposed embedding matrix (weight tying).",
+    "Naive generation re-runs the full sequence for every new token, costing 310 token-forwards for 20 tokens after a 6-token prompt.",
+    "A KV cache stores each layer's keys and values; prefill processes the prompt once and fills it, then each decode step processes only the new token against the cached keys and values: 25 token-forwards for the same output.",
+    "On mc16's three tokens, the decode step for token 3 against cached keys for tokens 1 and 2 reproduces the full pass's weights [0.248, 0.248, 0.504].",
+    "The new token's position offset must be the current sequence length, both for the positional embedding and for the causal mask against cached keys.",
+    "The cache is exact: cached and uncached generation produce identical tokens, and chunked prefill equals a single prefill.",
+    "Cache memory is 2 × layers × KV heads × head dimension × tokens × bytes: 128 KiB per token and 1 GiB per 8,192-token conversation for a Llama-3-8B-sized model in bf16.",
+    "Growing the cache by concatenation is quadratic; production systems preallocate or page it, and GQA shrinks it by sharing KV heads."
+  ],
+  "glossary": [
+    [
+      "Autoregressive generation",
+      "Producing text one token at a time, feeding each new token back as input for the next."
+    ],
+    [
+      "Chunked prefill",
+      "Processing a long prompt in pieces, each attending to the cache built by earlier pieces, to bound memory or interleave with decoding."
+    ],
+    [
+      "Continuous batching",
+      "Adding and removing sequences from the running batch at every decode step, so finished requests free their slots immediately."
+    ],
+    [
+      "Decode step",
+      "One generation step that processes a single new token against the KV cache."
+    ],
+    [
+      "Greedy decoding",
+      "Always choosing the highest-probability next token."
+    ],
+    [
+      "Grouped-query attention (GQA)",
+      "Several query heads share one key and value head, so only the smaller set of key/value heads is cached."
+    ],
+    [
+      "KV cache",
+      "Per-layer stored keys and values of all previous tokens, reused at each generation step."
+    ],
+    [
+      "Logits",
+      "The model's unnormalised scores over the vocabulary for the next token."
+    ],
+    [
+      "Memory-bandwidth bound",
+      "Limited by how fast data can be read from memory rather than by arithmetic throughput."
+    ],
+    [
+      "PagedAttention",
+      "Storing the KV cache in fixed-size blocks with a block table, like virtual memory pages, so it can grow without large copies or fragmentation."
+    ],
+    [
+      "Pre-norm",
+      "Applying normalisation to a sub-layer's input inside the residual branch: x + F(Norm(x))."
+    ],
+    [
+      "Prefill",
+      "Processing the whole prompt in one parallel forward pass and filling the KV cache."
+    ],
+    [
+      "Prefix caching",
+      "Reusing the KV cache of a shared prompt prefix across requests instead of recomputing it."
+    ],
+    [
+      "Residual stream",
+      "The running sum x that each block reads from and adds its output to."
+    ],
+    [
+      "Speculative decoding",
+      "Letting a small draft model propose several tokens that the large model verifies in one pass, keeping the large model's output distribution."
+    ],
+    [
+      "Time per output token (TPOT)",
+      "Average latency between successive generated tokens; dominated by decode steps."
+    ],
+    [
+      "Time to first token (TTFT)",
+      "Latency from receiving a request to emitting the first output token; dominated by prefill."
+    ],
+    [
+      "Weight tying",
+      "Using the token-embedding matrix, transposed, as the output projection to logits."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "Describe one pre-norm decoder block.",
+      "x = x + Attention(Norm(x)) with a causal mask, then x = x + MLP(Norm(x)), where the MLP is typically Linear(d, 4d) → GELU → Linear(4d, d). Each sub-layer reads a normalised copy of the residual stream and adds its result back. After the last block, a final normalisation and the output projection give logits."
+    ],
+    [
+      "E",
+      "What is weight tying and why use it?",
+      "The output projection to vocabulary logits reuses the token-embedding matrix transposed, so logits = h·Eᵀ. It saves vocabulary × d parameters (38.6 million for GPT-2 small's 50,257 × 768) and couples input and output token representations, which tends to help small and medium models. nanoGPT ties them; many large models do not."
+    ],
+    [
+      "E",
+      "What does the KV cache store and why is it valid?",
+      "For every layer and every previous token, the key and value vectors. In a causal model, position i's keys and values depend only on tokens 0..i, so they never change when later tokens are appended; computing them once and reusing them is exact."
+    ],
+    [
+      "M",
+      "Count the work: 20 new tokens after a 6-token prompt, with and without a cache.",
+      "Without a cache, step t runs the network on the whole sequence: 6 + 7 + … + 25 = 310 token-forwards. With a cache, prefill processes 6 tokens and each of the next 19 steps processes one: 25 (the 20th token is emitted without another forward pass). Attention per step is still linear in the current length, but every projection and MLP runs on one token instead of all of them."
+    ],
+    [
+      "M",
+      "Walk through one decode step for the third token of mc16's example.",
+      "The cache holds keys and values for tokens 1 and 2 ([1, 0] and [0, 1]). Token 3, [1, 1], computes its query, key and value, appends its key and value, and scores its query against all three keys: [1, 1, 2]/√2. Softmax gives [0.248, 0.248, 0.504], and the weighted sum of values is [0.752, 0.752], identical to row 3 of the full causal pass.",
+      "Follow-up: which mask does the decode step need? — None beyond the cache's length: a single new query may see every cached key and itself."
+    ],
+    [
+      "M",
+      "How do you test that a KV cache is correct?",
+      "Greedy-generate with and without the cache and require identical tokens; at each decode step, compare the step's logits with the last row of a full forward pass on the whole sequence; check chunked prefill equals single prefill; check the cache's length grows by exactly one per step. All four appear in this lesson's tests."
+    ],
+    [
+      "M",
+      "What position does the new token get, and what breaks if it is wrong?",
+      "Its absolute position, the current sequence length (len(ids) − 1 for the token just appended). The positional embedding (or RoPE angle) and the causal mask's offset both use it. Using 0 or an off-by-one position makes every generated token see slightly wrong distances, which degrades quality without obviously failing."
+    ],
+    [
+      "M",
+      "How much KV cache does a Llama-3-8B-sized model need?",
+      "2 (keys and values) × 32 layers × 8 KV heads × 128 head dimension × 2 bytes = 131,072 bytes per token, 128 KiB. An 8,192-token conversation needs exactly 1 GiB. With 40 GB free after the weights, about 37 such conversations fit. Without GQA (32 KV heads) each would need 4 GiB and only about 9 would fit."
+    ],
+    [
+      "M",
+      "Why is decoding memory-bound, and what follows?",
+      "Each decode step multiplies every weight matrix by a single vector, so each weight is read once per step for a couple of FLOPs. Reading 16 GB of weights takes milliseconds on a GPU whose arithmetic could do far more. Hence batching many sequences per step (reusing each weight read), shrinking weights (quantisation) and caches (GQA, cache quantisation), and speculative decoding."
+    ],
+    [
+      "H",
+      "Prefill versus decode: how do they differ, and how do serving systems exploit it?",
+      "Prefill is a large matrix-matrix computation over the prompt, compute-bound and parallel; decode is a sequence of matrix-vector steps, memory-bound. Systems batch decode steps across requests (continuous batching), split long prefills into chunks so they do not stall everyone's decoding, and sometimes run prefill and decode on different machines (disaggregation). TTFT measures prefill, TPOT decode.",
+      "Follow-up: what does chunked prefill require of the model code? — Exactly this lesson's mask: a chunk's queries at absolute positions S − T … S − 1 may see all cached keys and earlier positions in the chunk."
+    ],
+    [
+      "H",
+      "Why do servers use paged KV caches?",
+      "Requests have unpredictable lengths. Preallocating the maximum length per request wastes memory; growing contiguous arrays requires copies and fragments memory. PagedAttention stores the cache in fixed-size blocks indexed by a per-request block table, like virtual memory, so memory is allocated on demand, nearly without waste, and blocks can be shared between requests with a common prefix. vLLM reported 2-4× throughput gains from this."
+    ],
+    [
+      "H",
+      "How would you reduce KV-cache memory further?",
+      "Fewer KV heads (GQA or MQA), lower precision for cached values (8-bit or 4-bit KV quantisation), sliding-window attention for some layers so their cache is bounded, sharing caches across requests with common prefixes (prefix caching), and evicting or compressing old entries for very long contexts. Each trades some quality or complexity for memory, which buys batch size and therefore throughput."
+    ],
+    [
+      "H",
+      "Your cached generation diverges from the uncached reference after a few dozen tokens. What do you check?",
+      "Position offsets for new tokens (and RoPE angle offsets), the mask for chunked prefill, whether the cache is per layer (sharing one cache across layers is a common bug), whether keys are cached before or after RoPE consistently, dtype differences (a bfloat16 cache against a float32 reference drifts slightly, which is expected; exact mismatch in float32 is a bug), and padding: left-padded batches need per-sequence positions."
+    ]
+  ],
+  "refs": [
+    [
+      "code",
+      "nanoGPT model.py (Karpathy)",
+      "The reference for this problem: a GPT-2-style decoder with pre-norm blocks (x = x + attn(ln_1(x))), causal scaled_dot_product_attention, weight tying (wte.weight = lm_head.weight), GPT-2 small's 12 layers, 12 heads, 768 dimensions and block size 1,024, and the vocabulary of 50,257 padded to 50,304.",
+      "https://github.com/karpathy/nanoGPT"
+    ],
+    [
+      "docs",
+      "Hugging Face Transformers: KV cache",
+      "Cache classes, static versus dynamic caches, and how generation uses them.",
+      "https://huggingface.co/docs/transformers/en/kv_cache"
+    ],
+    [
+      "paper",
+      "Pope et al. (2022), Efficiently Scaling Transformer Inference",
+      "Memory-bandwidth analysis of decoding, KV-cache sizes, and multi-query attention at scale.",
+      "https://arxiv.org/abs/2211.05102"
+    ],
+    [
+      "paper",
+      "Kwon et al. (2023), Efficient Memory Management for LLM Serving with PagedAttention",
+      "vLLM's paged KV cache: block tables, near-zero waste, prefix sharing, 2-4× throughput.",
+      "https://arxiv.org/abs/2309.06180"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>When a chatbot answers a question, it produces its reply one token at a time: compute a probability for every possible next token, pick one, append it, and repeat. A 500-token answer is 500 passes through the model. Done naively, each pass reprocesses the entire conversation so far, so the 500th token costs 500 times as much as the first, and the whole answer costs about 125,000 token-forwards instead of 500. Every production LLM server avoids that waste with a <strong>KV cache</strong>: it stores the keys and values that each attention layer computed for earlier tokens and reuses them, so each new token needs only its own computation. In this lesson's small test, generating 20 tokens after a 6-token prompt took 310 token-forwards without a cache and 25 with one.</p>
+<p>"Implement a small GPT and add KV-cached generation" is one of the most common LLM coding questions, because it tests whether you understand how the pieces of a decoder fit together (embeddings, positions, pre-norm blocks, causal attention, weight-tied output) and whether you can reason about state across steps. The cache is where the subtle bugs live: the new token's position must be the current length, not zero; the causal mask during chunked prefill must account for tokens already cached; each layer needs its own cache; and the cached output must match the uncached one exactly, which is the test interviewers want to see.</p>
+<p>The cache is also the heart of LLM serving economics. A Llama-3-8B-sized model needs 128 KiB of cache per token in bf16, 1 GiB for one 8,000-token conversation. The number of conversations a GPU can serve at once, and therefore the cost per token, is set largely by how much cache fits. That is why grouped-query attention (which shrinks the cache four- to eight-fold), paged cache allocation, cache quantisation and prefix sharing are central topics for anyone deploying LLMs, and why interviewers follow the coding question with memory arithmetic.</p>
+<p>It is also a rare interview problem where the clean solution and the production solution share the same core: the forty lines of cached attention written here are, line for line, the logic inside every serving engine, wrapped in better memory management.</p>
+<p>The lesson builds a tiny GPT in NumPy, works one cached decode step by hand on the three-token example from mc16, writes a naive single-head decode with list caches and the full multi-layer cached generator, and tests that the cache changes nothing but speed: identical greedy outputs, each step equal to the last row of a full pass, chunked prefill equal to single prefill. It also shows why appending to the cache by concatenation is quadratic, and the drill computes cache sizes for a real model configuration.</p>
+<p>By the end you should be able to sketch, from memory, the decoder's forward pass, the two-phase generation loop, the exact condition each new query uses to decide which cached keys it may see, and the one-line formula for cache memory, and to explain to a product manager why the number of simultaneous users a GPU can serve depends mostly on that formula.</p>
+</section>
+
+<section data-field="primer">
+<p>A GPT-style model is a stack of identical blocks on top of a lookup table. The lookup table, the <strong>token embedding</strong>, turns each token ID into a vector of d numbers; a second table adds a vector for each position (or, in modern models, positions enter through RoPE, mc17). The resulting sequence of vectors, the <strong>residual stream</strong>, flows through the blocks. Each block does two things, each as a small detour that adds its result back to the stream: causal self-attention (mc16), where each position gathers information from earlier positions, and a feed-forward network applied to each position separately. Before each detour the stream is normalised (pre-norm). At the end, a final normalisation and a projection onto the vocabulary give, for every position, a score for every possible next token. With <strong>weight tying</strong>, that projection is the embedding table itself, transposed: the score for token j is the dot product of the final vector with token j's embedding.</p>
+<p>Training uses all positions at once: position t's logits are trained to predict token t + 1, and the causal mask makes sure position t cannot peek at it. Generation is different: you have a prompt, you want one new token, then another. The simple way is to run the whole model on the prompt, take the last position's logits, pick a token, append it, and run the whole model again on the longer sequence. Every pass recomputes every earlier position, even though, because of the causal mask, nothing about those positions has changed.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="A pre-norm GPT block: the residual stream x passes straight through; one branch normalises, applies causal attention and adds back; a second branch normalises, applies the MLP and adds back; the final norm and the tied embedding produce logits">
+  <defs><marker id="mc18-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="100" width="90" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="65" y="118" text-anchor="middle" style="fill:var(--ink)">tok + pos</text>
+    <text x="65" y="134" text-anchor="middle" style="fill:var(--muted)">embedding</text>
+    <line x1="110" y1="120" x2="600" y2="120" marker-end="url(#mc18-arrow)" style="stroke:var(--ink);stroke-width:2;fill:none"/>
+    <text x="560" y="112" style="fill:var(--ink)">residual stream</text>
+    <rect x="150" y="30" width="130" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="215" y="54" text-anchor="middle" style="fill:var(--ink)">Norm → causal attn</text>
+    <path d="M140,120 C140,80 150,50 150,50" style="fill:none;stroke:var(--ink-2)"/>
+    <path d="M280,50 C300,50 300,110 300,118" marker-end="url(#mc18-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="306" y="96" style="fill:var(--accent)">+</text>
+    <rect x="330" y="30" width="120" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="390" y="54" text-anchor="middle" style="fill:var(--ink)">Norm → MLP (4d)</text>
+    <path d="M320,120 C320,80 330,50 330,50" style="fill:none;stroke:var(--ink-2)"/>
+    <path d="M450,50 C470,50 470,110 470,118" marker-end="url(#mc18-arrow)" style="fill:none;stroke:var(--s2)"/>
+    <text x="476" y="96" style="fill:var(--s2)">+</text>
+    <text x="300" y="164" text-anchor="middle" style="fill:var(--muted)">× n_layers (nanoGPT's GPT-2 small: 12 layers, 12 heads, d = 768)</text>
+    <rect x="460" y="190" width="160" height="40" rx="6" style="fill:var(--surface-2);stroke:var(--ink)"/>
+    <text x="540" y="208" text-anchor="middle" style="fill:var(--ink)">Norm → h · Eᵀ</text>
+    <text x="540" y="224" text-anchor="middle" style="fill:var(--muted)">tied with the embedding E</text>
+    <line x1="590" y1="130" x2="560" y2="188" marker-end="url(#mc18-arrow)" style="stroke:var(--ink-2);fill:none"/>
+    <text x="20" y="210" style="fill:var(--ink-2)">attention keys and values from this branch</text>
+    <text x="20" y="228" style="fill:var(--ink-2)">are what the KV cache stores, per layer</text>
+  </g>
+</svg>
+<figcaption>A pre-norm decoder block. The residual stream passes through untouched; each branch reads a normalised copy and adds its output back. The keys and values computed inside each attention branch are what generation caches.</figcaption>
+</figure>
+<p>The KV cache removes that waste. Inside every attention layer, each position produces a query, a key and a value; later positions look back at earlier keys and values, and earlier positions never look forward. So once a token's key and value have been computed for a layer, they are final. Store them. To generate the next token, run only the new token through the network: at each layer, compute its query, key and value, append the key and value to that layer's cache, and let its query attend over the whole cache. Everything else in the block (the projections, the feed-forward network) works on one vector instead of the whole sequence.</p>
+<p>A useful way to see why this is exact: think of the causal mask as a rule that information only flows forward in time. Token 5's key and value at layer 3 are computed from tokens 1 to 5 only. When token 6 arrives, nothing about tokens 1 to 5 changes, so recomputing their keys and values would produce the same numbers again. The cache simply refuses to compute the same numbers twice. This is also why the cache only works for causal (decoder) attention; a bidirectional encoder's representation of token 5 does depend on token 6.</p>
+<p>Generation therefore has two phases. <strong>Prefill</strong> processes the prompt in one parallel pass, exactly like training, and fills the cache. <strong>Decode</strong> then loops: one token in, one set of logits out, cache one longer. Prefill is a big burst of matrix-matrix work; decode is a long series of small matrix-vector steps that mainly read weights and cache from memory. Where the picture needs care: the new token must be given its true position, both for the positional embedding and for the mask, and the cache costs memory proportional to layers × heads × tokens, which becomes the limiting resource of an LLM server.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The problem as it is usually asked</h4>
+<p>"Implement a small GPT forward pass in NumPy (embeddings, pre-norm blocks with causal multi-head attention and an MLP, weight-tied output), then a <code>generate</code> function, first naive, then with a KV cache. Show the cache gives the same output." Clarify: greedy decoding is fine for testing (mc20 covers sampling); learned absolute positions or RoPE; one sequence or a batch (one, to keep it short); and whether the cache may grow by concatenation (acceptable in an interview if you say what production does instead). Outline: the model, naive generation, prefill plus decode with per-layer caches and position offsets, and equivalence tests.</p>
+
+<h4>2. The maths in plain words</h4>
+<p>The forward pass, for a sequence of T tokens: look up token embeddings (T × d), add position embeddings for positions start..start+T−1, and for each layer add the attention branch's output and then the MLP branch's output to the stream. Attention splits Q, K, V into heads, scores queries against keys with the causal rule, and mixes values. The final logits are the normalised stream times the transposed embedding matrix.</p>
+<p>With a cache, the attention layer receives the new tokens' queries, keys and values and the cached keys and values of everything before them. It appends the new keys and values to the cache, and each new query attends over the full cache. The causal rule needs one adjustment: if S keys are now available and T new tokens were just added, new token t sits at absolute position S − T + t, and may see keys 0 through S − T + t. For a single decode token (T = 1) that is every key, so no masking is needed; for chunked prefill (T &gt; 1) the new tokens must still not see each other's futures.</p>
+
+<h4>3. The equations</h4>
+<pre>forward(ids, start):
+  x = E[ids] + P[start : start + T]                         (T, d)
+  for each layer ℓ:
+      x = x + Attn_ℓ(Norm(x), cache_ℓ)                      pre-norm residual
+      x = x + W2_ℓ · GELU(W1_ℓ · Norm(x))
+  logits = Norm(x) · Eᵀ                                     weight tying, (T, vocab)
+
+Attn with cache (per head):
+  q, k, v = split(x · W_qkv)                                 new tokens only
+  K = [K_cache; k],  V = [V_cache; v]                        S = len(K) keys
+  allowed[t, j] = (j ≤ S − T + t)                            absolute-position causal rule
+  out = softmax(qKᵀ/√d_k masked) · V
+
+generate(prompt, n):
+  logits = forward(prompt, caches, start = 0)                prefill
+  repeat n times:  tok = argmax(logits[−1]);  append tok
+                   logits = forward([tok], caches, start = len − 1)   decode
+
+work for n new tokens after a p-token prompt:
+  no cache:   Σ_{L=p}^{p+n−1} L token-forwards                p = 6, n = 20 → 310
+  cache:      p + (n − 1)                                     → 25
+
+cache memory: 2 × layers × kv_heads × head_dim × tokens × bytes</pre>
+
+<h4>4. A worked example by hand</h4>
+<p>Reuse mc16's three tokens, <code>x₁ = [1, 0]</code>, <code>x₂ = [0, 1]</code>, <code>x₃ = [1, 1]</code>, with one head, d_k = 2 and identity projections, so each token's query, key and value equal its vector.</p>
+<ul>
+<li><strong>Prefill tokens 1 and 2.</strong> The cache now holds keys <code>[1, 0], [0, 1]</code> and the same values. (Their attention outputs were computed during prefill: [1, 0] and [0.330, 0.670], as in mc16.)</li>
+<li><strong>Decode token 3.</strong> Compute its query, key and value, all <code>[1, 1]</code>. Append key and value: the cache has three entries.</li>
+<li><strong>Scores.</strong> Query [1, 1] against keys [1, 0], [0, 1], [1, 1]: dot products 1, 1, 2; divided by √2: 0.707, 0.707, 1.414. No mask is needed: a single new token may see all cached keys and itself.</li>
+<li><strong>Weights.</strong> Softmax gives <code>[0.248, 0.248, 0.504]</code>, exactly row 3 of mc16's full causal pass.</li>
+<li><strong>Output.</strong> <code>0.248·[1, 0] + 0.248·[0, 1] + 0.504·[1, 1] = [0.752, 0.752]</code>, identical to the full pass.</li>
+</ul>
+<p>The decode step did one query's worth of work instead of three, and reproduced the full result exactly, because keys and values 1 and 2 were already final. Now the work count for the test's generation: a 6-token prompt and 20 new tokens. Without a cache, generating the k-th new token re-runs the model on 5 + k tokens, so the total is 6 + 7 + … + 25 = (6 + 25) × 20/2 = <strong>310</strong> token-forwards. With a cache, prefill processes 6 tokens and each of the next 19 decode steps processes one; the 20th token is read from the last step's logits without another pass: <strong>25</strong>. The first solution block asserts all of this.</p>
+<pre class="run">import math
+import time
+import numpy as np
+
+# The hand-worked example: mc16's three tokens, Q = K = V = X, one head, d_k = 2.
+X3 = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+# Prefill tokens 1 and 2: the cache stores their keys and values.
+K_cache, V_cache = X3[:2].copy(), X3[:2].copy()
+# Decode step for token 3: its query meets the cached keys plus its own key.
+q3 = X3[2]
+K = np.vstack([K_cache, X3[2]]); V = np.vstack([V_cache, X3[2]])
+s = K @ q3 / math.sqrt(2)                                   # [0.707, 0.707, 1.414]
+w = np.exp(s - s.max()); w /= w.sum()
+assert np.allclose(w, [0.2483, 0.2483, 0.5035], atol=1e-4)  # the same row as the full causal pass
+assert np.allclose(w @ V, [0.7517, 0.7517], atol=1e-4)
+
+# Work saved: generating 20 tokens after a 6-token prompt.
+no_cache = sum(range(6, 26))               # every step re-runs the whole sequence: 6 + 7 + ... + 25
+with_cache = 6 + 19                        # prefill 6, then one token per decode step (the last token needs no step)
+assert (no_cache, with_cache) == (310, 25)</pre>
+
+<h4>5. The naive implementation: one head, list caches, explicit loops</h4>
+<p>The simplest possible cached decode step, for one head: append the new key and value to Python lists, compute the new query's scores against every cached key with loops, softmax them, and take the weighted sum of cached values.</p>
+<pre class="run">def decode_step_naive(q, k_new, v_new, k_list, v_list):
+    """One head, one new token: append to Python-list caches, then attend with explicit loops."""
+    k_list.append(k_new); v_list.append(v_new)
+    d = len(q)
+    scores = [sum(qi * ki for qi, ki in zip(q, k)) / math.sqrt(d) for k in k_list]
+    m = max(scores); e = [math.exp(x - m) for x in scores]; tot = sum(e)
+    return [sum(e[j] / tot * v_list[j][c] for j in range(len(v_list))) for c in range(len(v_new))]</pre>
+<p>It shows the whole idea in ten lines and is easy to verify by eye. The test runs it position by position over a prompt for one head of the real model's first layer and checks the outputs equal that head's full causal attention. Its cost per step is linear in the cache length but entirely interpreted; the model below does the same with arrays for every head and layer at once.</p>
+
+<h4>6. The vectorised model and cached generation</h4>
+<pre class="run">def softmax(z):
+    z = z - z.max(-1, keepdims=True); e = np.exp(z)
+    return e / e.sum(-1, keepdims=True)
+
+def rms_norm(x, g, eps=1e-6):
+    return g * x / np.sqrt((x * x).mean(-1, keepdims=True) + eps)
+
+def gelu(x):
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
+
+class TinyGPT:
+    def __init__(self, vocab, d=32, n_heads=4, n_layers=2, max_T=64, seed=0):
+        rng = np.random.default_rng(seed)
+        init = lambda *shape: rng.normal(0, 0.1, shape)
+        self.h, self.dk = n_heads, d // n_heads
+        self.tok, self.pos = init(vocab, d), init(max_T, d)
+        self.layers = [dict(g1=np.ones(d), Wqkv=init(d, 3 * d), Wo=init(d, d),
+                            g2=np.ones(d), W1=init(d, 4 * d), W2=init(4 * d, d)) for _ in range(n_layers)]
+        self.g_final = np.ones(d)
+        self.tokens_processed = 0
+
+    def attn(self, L, x, cache):
+        T, D = x.shape
+        q, k, v = np.split(x @ L["Wqkv"], 3, axis=-1)
+        heads = lambda t: t.reshape(T, self.h, self.dk).transpose(1, 0, 2)      # (h, T, dk)
+        q, k, v = heads(q), heads(k), heads(v)
+        if cache is not None:
+            if "k" in cache:                                   # append to what earlier steps stored
+                k = np.concatenate([cache["k"], k], axis=1)
+                v = np.concatenate([cache["v"], v], axis=1)
+            cache["k"], cache["v"] = k, v
+        S = k.shape[1]                                         # keys available: past + new
+        scores = q @ k.transpose(0, 2, 1) / np.sqrt(self.dk)   # (h, T, S)
+        # new query t sits at absolute position S - T + t and may see keys 0 .. S - T + t
+        allowed = np.arange(S)[None, :] &lt;= (S - T + np.arange(T))[:, None]
+        scores = np.where(allowed, scores, -np.inf)            # every row keeps at least itself
+        return (softmax(scores) @ v).transpose(1, 0, 2).reshape(T, D) @ L["Wo"]
+
+    def forward(self, ids, caches=None, start=0):
+        self.tokens_processed += len(ids)
+        x = self.tok[ids] + self.pos[start:start + len(ids)]
+        for i, L in enumerate(self.layers):
+            x = x + self.attn(L, rms_norm(x, L["g1"]), None if caches is None else caches[i])   # pre-norm
+            x = x + gelu(rms_norm(x, L["g2"]) @ L["W1"]) @ L["W2"]
+        return rms_norm(x, self.g_final) @ self.tok.T          # weight tying: logits (T, vocab)
+
+    def generate(self, prompt, n_new, use_cache=True):
+        ids = list(prompt)
+        if not use_cache:
+            for _ in range(n_new):                             # recompute everything every step
+                ids.append(int(self.forward(np.array(ids))[-1].argmax()))
+            return ids
+        caches = [{} for _ in self.layers]
+        logits = self.forward(np.array(ids), caches)           # prefill: the whole prompt at once
+        for step in range(n_new):
+            ids.append(int(logits[-1].argmax()))
+            if step &lt; n_new - 1:                               # decode: one new token per step
+                logits = self.forward(np.array(ids[-1:]), caches, start=len(ids) - 1)
+        return ids</pre>
+<p><strong>Structure.</strong> <code>TinyGPT</code> holds a token table, a learned position table, and per layer a fused Q/K/V projection (<code>Wqkv</code>, d × 3d, as in nanoGPT's <code>c_attn</code>), an output projection, two RMSNorm gains and the MLP's two matrices. The final RMSNorm feeds logits computed with <code>self.tok.T</code>: weight tying.</p>
+<p><strong>attn with a cache.</strong> The cache for a layer is a dictionary holding <code>k</code> and <code>v</code> of shape (h, S, d_k). New keys and values are concatenated after the cached ones and stored back. The causal rule uses absolute positions: <code>allowed[t, j] = j ≤ S − T + t</code>. For a decode step (T = 1) it allows every key; for a full forward without a cache (S = T) it is the usual lower triangle; for chunked prefill it is a lower triangle shifted right by the number of cached tokens.</p>
+<p><strong>forward</strong> takes a <code>start</code> offset so position embeddings match each token's absolute position, and a list of per-layer caches (or None). It counts processed tokens, which the tests use to confirm the 310-versus-25 arithmetic.</p>
+<p><strong>generate</strong> has both modes. Without a cache it re-runs the growing sequence each step. With one, it prefills the prompt, then for each new token appends the argmax of the last logits and runs a one-token forward at <code>start = len(ids) − 1</code>, skipping the pass after the final token.</p>
+<figure>
+<svg viewBox="0 0 640 240" width="100%" role="img" aria-label="Prefill then decode: the 6-token prompt is processed in one parallel pass that fills the cache; each decode step processes one token and appends one key and value per layer; without a cache every step reprocesses the whole sequence">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">with a KV cache: 6 + 19 = 25 token-forwards</text>
+    <rect x="20" y="34" width="120" height="26" style="fill:var(--accent);opacity:0.35;stroke:var(--accent)"/>
+    <text x="80" y="52" text-anchor="middle" style="fill:var(--ink)">prefill: 6 tokens</text>
+    <rect x="145" y="34" width="18" height="26" style="fill:var(--s2);opacity:0.5;stroke:var(--s2)"/>
+    <rect x="166" y="34" width="18" height="26" style="fill:var(--s2);opacity:0.5;stroke:var(--s2)"/>
+    <rect x="187" y="34" width="18" height="26" style="fill:var(--s2);opacity:0.5;stroke:var(--s2)"/>
+    <text x="215" y="52" style="fill:var(--s2)">… 19 decode steps, 1 token each</text>
+    <text x="20" y="84" style="fill:var(--ink-2)">cache per layer: K, V of shape (heads, length, d_k), one row longer after every step</text>
+    <text x="20" y="122" style="fill:var(--ink);font-weight:600">without a cache: 6 + 7 + … + 25 = 310 token-forwards</text>
+    <rect x="20" y="134" width="60" height="12" style="fill:var(--crit);opacity:0.3"/>
+    <rect x="20" y="148" width="70" height="12" style="fill:var(--crit);opacity:0.3"/>
+    <rect x="20" y="162" width="80" height="12" style="fill:var(--crit);opacity:0.3"/>
+    <rect x="20" y="176" width="90" height="12" style="fill:var(--crit);opacity:0.3"/>
+    <text x="130" y="170" style="fill:var(--crit)">… each step re-runs every earlier token (20 rows)</text>
+    <text x="20" y="214" style="fill:var(--ink-2)">prefill: matrix × matrix, compute-bound (time to first token)</text>
+    <text x="20" y="232" style="fill:var(--ink-2)">decode: matrix × vector, memory-bound (time per output token)</text>
+  </g>
+</svg>
+<figcaption>The two phases of generation and the work each avoids. Cached decoding processes each token once; uncached generation re-runs a growing triangle of work. The phases also have different bottlenecks, which is why servers measure and schedule them separately.</figcaption>
+</figure>
+
+<h4>Cache memory, worked</h4>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="KV cache layout for a Llama-3-8B-sized model: 32 layers, each with a K and a V tensor of shape 8 KV heads by tokens by 128; per token 2 x 32 x 8 x 128 x 2 bytes = 128 KiB; 8,192 tokens = 1 GiB">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">KV cache for one sequence (Llama-3-8B shape, bf16)</text>
+    <g>
+      <rect x="20" y="40" width="110" height="34" style="fill:var(--s2);opacity:0.3;stroke:var(--s2)"/><text x="75" y="61" text-anchor="middle" style="fill:var(--ink)">layer 1: K</text>
+      <rect x="130" y="40" width="110" height="34" style="fill:var(--s3);opacity:0.3;stroke:var(--s3)"/><text x="185" y="61" text-anchor="middle" style="fill:var(--ink)">layer 1: V</text>
+      <rect x="20" y="78" width="110" height="34" style="fill:var(--s2);opacity:0.3;stroke:var(--s2)"/><text x="75" y="99" text-anchor="middle" style="fill:var(--ink)">layer 2: K</text>
+      <rect x="130" y="78" width="110" height="34" style="fill:var(--s3);opacity:0.3;stroke:var(--s3)"/><text x="185" y="99" text-anchor="middle" style="fill:var(--ink)">layer 2: V</text>
+      <text x="130" y="134" text-anchor="middle" style="fill:var(--muted)">… 32 layers</text>
+    </g>
+    <text x="270" y="50" style="fill:var(--ink-2)">each tensor: 8 KV heads × tokens × 128 dims</text>
+    <text x="270" y="78" style="fill:var(--ink-2)">per token: 2 × 32 × 8 × 128 values</text>
+    <text x="270" y="96" style="fill:var(--ink-2)">  = 65,536 values × 2 bytes = 128 KiB</text>
+    <text x="270" y="124" style="fill:var(--accent)">8,192 tokens → exactly 1 GiB</text>
+    <text x="270" y="150" style="fill:var(--ink-2)">40 GB free → about 37 such conversations</text>
+    <text x="270" y="176" style="fill:var(--crit)">without GQA (32 KV heads): 4 GiB each, about 9 fit</text>
+    <text x="20" y="210" style="fill:var(--muted)">this lesson's TinyGPT: 2 layers × 4 heads × 8 dims, float64 → 2 × 2 × 4 × 8 × 8 = 1 KiB per token</text>
+  </g>
+</svg>
+<figcaption>Where the cache's memory goes. Every layer keeps a key and a value tensor that grows by one row per token, so memory is linear in layers, KV heads, head size and tokens; grouped-query attention cuts the KV-head factor, which is the biggest single lever.</figcaption>
+</figure>
+<p>The formula is short enough to do in your head: two tensors (keys and values) per layer, each holding KV heads × head dimension numbers per token, at the cache's precision. For the Llama-3-8B shape that is 2 × 32 × 8 × 128 = 65,536 numbers per token, 131,072 bytes in bf16, 128 KiB. Multiply by context length for one conversation and by the number of concurrent conversations for a server. Three things change the answer by large factors: the number of KV heads (GQA's 4× here), the precision (an 8-bit cache halves it), and whether some layers use a sliding window, whose cache stops growing at the window size. Weights, by contrast, are fixed: 16 GB for 8 billion bf16 parameters regardless of traffic. On a busy server the cache, not the model, is what runs out.</p>
+<h4>Batching generation</h4>
+<p>The class here generates one sequence at a time. Real servers generate many at once, and that changes three things. Prompts have different lengths, so either they are left-padded to a common length (each sequence then needs its own positions, starting at its first real token, and a padding mask over keys), or the server stores sequences raggedly with per-sequence caches and offsets, which paged caches make natural. Sequences finish at different times, so finished ones are removed and new ones inserted between steps (continuous batching). And the decode step becomes a small batched matrix multiply, (batch, d) times (d, ·), which reuses each weight read across all sequences, the main reason batching raises throughput so much. None of this changes the per-sequence logic tested here; it changes the bookkeeping around it.</p>
+<h4>Choosing the next token</h4>
+<p>The generator uses argmax (greedy decoding) because it is deterministic, which makes the cached-versus-uncached test exact. Real systems usually sample from the softmax of the last logits with a temperature, top-k or top-p filter (mc20). The cache is unaffected by the choice: it depends only on which tokens were appended, not on how they were chosen. For testing sampled generation, fix the random seed and draw from identical logits in both paths.</p>
+<h4>7. Testing it</h4>
+<p>The tests check: the naive list-cache step reproduces the hand example; greedy generation of 20 tokens is identical with and without the cache, and the processed-token counts are 310 and 25; feeding tokens one at a time through the cache gives, at every step, logits equal to the last row of a full forward pass on the whole sequence, and the first layer's cache grows by one entry per step; a prompt prefilled in two chunks (4 then 2 tokens) gives the same final logits as one prefill; the naive one-head loop equals the model's first-layer, first-head causal attention over the prompt; weight tying holds; growing a cache by concatenation is far slower than writing into a preallocated buffer (573 ms against 1.9 ms for 1,500 appends); and cached generation of 40 tokens is faster in wall time.</p>
+<pre class="run">rng = np.random.default_rng(0)
+
+# 1. The naive list cache reproduces the hand-worked decode step.
+kl, vl = [list(X3[0]), list(X3[1])], [list(X3[0]), list(X3[1])]
+assert np.allclose(decode_step_naive(list(X3[2]), list(X3[2]), list(X3[2]), kl, vl), [0.7517, 0.7517], atol=1e-4)
+
+# 2. Cached generation equals recomputing everything; and it processes far fewer tokens.
+model = TinyGPT(vocab=50)
+prompt = [3, 14, 15, 9, 2, 6]
+model.tokens_processed = 0; slow = model.generate(prompt, 20, use_cache=False); n_slow = model.tokens_processed
+model.tokens_processed = 0; fast = model.generate(prompt, 20); n_fast = model.tokens_processed
+assert slow == fast and (n_slow, n_fast) == (310, 25)
+
+# 3. Step by step: each cached decode step reproduces the last row of a full forward pass.
+ids = list(prompt)
+caches = [{} for _ in model.layers]
+model.forward(np.array(ids), caches)
+for tok in [7, 1, 8]:
+    ids.append(tok)
+    step_logits = model.forward(np.array([tok]), caches, start=len(ids) - 1)[-1]
+    assert np.allclose(step_logits, model.forward(np.array(ids))[-1])
+assert caches[0]["k"].shape == (model.h, len(ids), model.dk)     # the cache grows by one per step
+
+# 4. Chunked prefill (prompt in two pieces) matches a single prefill.
+c1 = [{} for _ in model.layers]
+model.forward(np.array(prompt[:4]), c1)
+assert np.allclose(model.forward(np.array(prompt[4:]), c1, start=4)[-1], model.forward(np.array(prompt))[-1])
+
+# 5. The naive per-head decode step equals the model's attention for one head of the first layer.
+L = model.layers[0]
+xin = rms_norm(model.tok[np.array(prompt)] + model.pos[:len(prompt)], L["g1"])
+qkv = xin @ L["Wqkv"]; d = qkv.shape[1] // 3
+q, k, v = qkv[:, :d], qkv[:, d:2 * d], qkv[:, 2 * d:]
+head = slice(0, model.dk)
+kl, vl, outs = [], [], []
+for t in range(len(prompt)):
+    outs.append(decode_step_naive(list(q[t, head]), list(k[t, head]), list(v[t, head]), kl, vl))
+full_scores = q[:, head] @ k[:, head].T / np.sqrt(model.dk)
+full_scores = np.where(np.tril(np.ones((6, 6), bool)), full_scores, -np.inf)
+assert np.allclose(outs, softmax(full_scores) @ v[:, head])
+
+# 6. Weight tying: the output layer is the token embedding matrix transposed.
+h_last = rng.normal(size=32)
+assert np.allclose(rms_norm(h_last, model.g_final) @ model.tok.T, model.tok @ rms_norm(h_last, model.g_final))
+
+# 7. Concatenating onto the cache every step copies it every step; a preallocated buffer does not.
+steps, hd = 1500, (4, 64)
+t0 = time.perf_counter()
+cache = np.zeros((hd[0], 0, hd[1]))
+for _ in range(steps):
+    cache = np.concatenate([cache, np.ones((hd[0], 1, hd[1]))], axis=1)
+t_concat = time.perf_counter() - t0
+t0 = time.perf_counter()
+buf = np.zeros((hd[0], steps, hd[1]))
+for t in range(steps):
+    buf[:, t] = 1.0
+t_prealloc = time.perf_counter() - t0
+assert np.array_equal(cache, buf) and t_concat &gt; 3 * t_prealloc
+
+# 8. Wall time: cached vs uncached generation of 40 tokens.
+t0 = time.perf_counter(); model.generate(prompt, 40, use_cache=False); t_slow = time.perf_counter() - t0
+t0 = time.perf_counter(); model.generate(prompt, 40); t_fast = time.perf_counter() - t0
+if __name__ == "__main__":
+    print(f"tokens processed for 20 new: no cache {n_slow}, cache {n_fast}")
+    print(f"cache growth over 1,500 steps: concatenate {t_concat*1e3:.0f} ms, preallocated {t_prealloc*1e3:.1f} ms")
+    print(f"generate 40: no cache {t_slow*1e3:.0f} ms, cache {t_fast*1e3:.0f} ms ({t_slow/t_fast:.1f}x)")</pre>
+<p>The step-by-step comparison is the strongest test, because it isolates each decode step: any error in the position offset, the mask or the cache update shows up at the first step where it matters, with a precise location, instead of as a different token somewhere in a long generation. Comparing generated tokens alone can miss small logit errors that happen not to change the argmax.</p>
+<p>The wall-time saving in the test, 2.4 times for 40 tokens, is far smaller than the 12-fold reduction in token-forwards, and the gap is instructive. TinyGPT is tiny (d = 32, two layers), so each forward pass is dominated by Python and NumPy call overhead, which is roughly the same whether the pass processes one token or forty. The cached path also concatenates arrays every step. In a real model, each forward pass is dominated by the arithmetic and memory traffic of large matrices, which scale with the number of tokens processed, so the measured speed-up approaches the token-forward ratio for long generations. Measuring both the operation count and the wall time, and explaining the difference, is the habit that makes performance claims trustworthy.</p>
+
+<h4>8. Numerical and practical traps</h4>
+<p><strong>Trap 1: the position offset.</strong> The new token's positional embedding (or RoPE angle) must use its absolute position. Using 0 makes every new token look like the start of the text; using an off-by-one makes distances wrong by one. The step-by-step test catches both.</p>
+<p><strong>Trap 2: the chunk mask.</strong> When several new tokens are processed at once against a cache, the mask must be the shifted triangle, not the plain one (which would hide all cached keys from the first new tokens) and not "allow all" (which would let them see each other's futures). The chunked-prefill test checks it.</p>
+<p><strong>Trap 3: one cache for all layers.</strong> Each layer has its own keys and values. Sharing one dictionary across layers overwrites them, and outputs diverge immediately.</p>
+<p><strong>Trap 4: quadratic cache growth.</strong> <code>np.concatenate</code> allocates a new array and copies the old cache every step, so total copying is O(T²). For a tiny model it is invisible; for long generations it dominates. Preallocate to the maximum length and write in place, or allocate in blocks (paging).</p>
+<p><strong>Trap 5: −∞ masks.</strong> Safe here because every query can at least see itself; with left padding a padded position's row can be fully masked, and −∞ then gives NaN (mc16). Use a finite value or skip padded rows.</p>
+<p><strong>Trap 6: precision drift.</strong> A bfloat16 cache and a float32 reference will disagree slightly and the disagreement grows along the sequence; that is expected. In float64 or float32 the cached and uncached paths should agree to rounding error, and any larger difference is a bug.</p>
+
+<h4>9. Edge cases worth naming</h4>
+<p>Generating past the position table's length fails with learned absolute positions (the model has no embedding for position 1,025 in GPT-2); RoPE models instead degrade gradually (mc17). A prompt of length one has a one-token prefill. Generating zero new tokens should return the prompt unchanged, which the step-skipping logic handles. A batch of prompts with different lengths needs either left padding with per-sequence positions and masks, or a ragged representation, which is what paged caches make convenient. And stopping conditions (an end-of-sequence token, a maximum length) belong in the loop, before the next forward pass, so no wasted step is run.</p>
+
+<h4>10. Complexity</h4>
+<p>For a model with L layers and width d, a forward pass over T tokens costs about <code>L·(12·T·d² + 2·T²·d)</code> multiply-adds (projections and MLP, plus attention). Generating n tokens after a prompt of p without a cache sums that over every length from p to p + n − 1, roughly <code>O(L·n·(p + n)·d²)</code> for the dense parts. With a cache, prefill costs one pass over p tokens and each decode step <code>L·(12·d² + 2·S·d)</code> for a cache of length S, so the dense work is linear in n and only the attention over the cache grows with length. Cache memory is <code>2·L·h_kv·d_k</code> numbers per token. For GPT-2 small in float32 (L = 12, d = 768, no GQA) that is 2 × 12 × 768 × 4 bytes = 72 KiB per token.</p>
+
+<h4>11. Talking through the design</h4>
+<p>In the interview: write the block (pre-norm, causal attention, MLP), weight-tied logits, and naive generation; explain why keys and values of earlier tokens never change; add per-layer caches, prefill, decode with the position offset, and the absolute-position mask; then test cached against uncached at every step. Follow with cost: the 310-versus-25 count, cache memory per token, and the memory-bound nature of decoding that leads to batching, GQA and paged caches.</p>
+<p>A strong closing move is to state the invariant your tests enforce, in one sentence: for every step, the cached path's logits equal the last row of an uncached forward pass over the same tokens. Every optimisation a serving system adds, from paging to prefix sharing to speculative verification, is judged against that invariant, so naming it shows you know how such systems are kept correct as they get faster.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why decoding is memory-bound</h4>
+<p>During a decode step, each weight matrix is multiplied by a single vector: two floating-point operations per weight read. A GPU can perform hundreds of operations in the time it reads one weight from high-bandwidth memory, so for a single sequence it spends most of its time waiting for memory. Pope and colleagues' analysis of transformer inference makes this quantitative and shows the same is true of the KV cache at long context: every step reads the whole cache. The standard remedies all follow from it. Batching many sequences per step reuses each weight read across the batch. Quantising weights and caches reduces the bytes read. Multi-query and grouped-query attention cut the cache's bytes. Speculative decoding verifies several draft tokens in one step, turning matrix-vector work into small matrix-matrix work.</p>
+<h4>Continuous batching and paged caches</h4>
+<p>Requests arrive and finish at different times with different lengths. Static batching waits for a whole batch to finish, wasting slots on finished requests. Continuous batching inserts new requests and removes finished ones at every decode step, keeping the batch full. That only works if each request's cache can grow independently without copying, which is what PagedAttention provides: the cache is stored in fixed-size blocks (for example 16 tokens), each request has a block table mapping logical positions to physical blocks, and attention kernels read through the table. Kwon and colleagues report that this nearly eliminates memory waste from fragmentation and over-reservation and allows sharing blocks between requests with a common prefix, improving throughput by two to four times over earlier systems.</p>
+<h4>Prefix caching</h4>
+<p>Many requests share long prefixes: a system prompt, a few-shot template, a document asked about repeatedly. Their KV caches for the shared prefix are identical, so a server can compute them once and reuse the blocks for every request that starts the same way, skipping that part of prefill entirely. The correctness argument is the one this lesson tests: keys and values at a position depend only on tokens up to that position. The engineering problem is lookup (hashing token blocks) and eviction.</p>
+<h4>Speculative decoding</h4>
+<p>A small draft model proposes k tokens; the large model processes all k in one forward pass with the cache (a chunked step, like the test's two-piece prefill) and accepts the longest prefix consistent with its own distribution, using a rejection-sampling rule that keeps the output distribution exactly the large model's. When the draft is often right, several tokens are produced per expensive step. The chunked-prefill mask from this lesson is exactly what verification needs.</p>
+<h4>Weight tying, initialisation and scale</h4>
+<p>nanoGPT ties <code>wte.weight</code> to <code>lm_head.weight</code>, initialises weights with standard deviation 0.02, and scales the residual output projections by 1/√(2·n_layer), following GPT-2, so that the residual stream's variance does not grow with depth. With tying, the logit for token j is the dot product of the final hidden state with token j's input embedding, which encourages tokens used in similar contexts to have similar embeddings. For a 50,257-token vocabulary and d = 768 the tied matrix is 38.6 million parameters, almost a third of GPT-2 small; for a 70-billion-parameter model with a 128,000-token vocabulary and d = 8,192 it is about 1 billion, small enough that many large models untie the output layer for flexibility.</p>
+<h4>GQA in the cache code</h4>
+<p>With grouped-query attention, the Q/K/V projection produces h query heads but only h_kv key and value heads, and only the h_kv heads are cached. In the attention step, each group of h/h_kv query heads attends to its shared key/value head; in NumPy that is a reshape of the queries to (h_kv, h/h_kv, T, d_k) against keys of shape (h_kv, 1, S, d_k), which broadcasting expands without copying. Nothing else in prefill, decode or the position logic changes, which is why converting a model's serving code to GQA is mostly a matter of shapes, and why the cache shrinks by exactly h/h_kv.</p>
+<h4>Cache compression at long context</h4>
+<p>At very long contexts the cache dominates memory even with GQA. Options in use: quantising cached keys and values to 8 or 4 bits (keys often need per-channel scales because of outlier dimensions), sliding-window attention in some layers so their cache holds only the last few thousand tokens, keeping a few initial "sink" tokens plus a recent window for streaming (mc16's attention sinks), and evicting tokens that recent queries rarely attend to. Each saves memory at some risk to quality, measured with long-context retrieval tests rather than perplexity alone.</p>
+<h4>Sliding-window layers</h4>
+<p>Some models restrict attention in some or all layers to the most recent W tokens (for example 4,096). For those layers the cache becomes a ring buffer of W entries: each new key and value overwrites the oldest, positions keep counting up (RoPE uses the true position), and the mask allows only keys within the window. Memory per sequence for those layers stops growing at W tokens, which is why mixing sliding-window and full-attention layers is a popular way to support long contexts cheaply. The chunked-prefill and decode logic in this lesson carries over, with the window added to the allowed-key condition.</p>
+</section>
+
+<section data-field="prod">
+<h4>Where this runs</h4>
+<p>Every LLM serving stack (vLLM, TensorRT-LLM, SGLang, Hugging Face TGI, llama.cpp) implements exactly this structure: a prefill pass that fills a per-layer KV cache, and decode steps that append to it. The differences are in how the cache is stored (paged blocks, quantised), how requests are batched (continuously), and how kernels read the cache efficiently.</p>
+<h4>Failure modes and symptoms</h4>
+<p><strong>Cached and uncached outputs disagree.</strong> Usually a position offset, a mask bug in chunked prefill, or a shared cache across layers. The step-by-step comparison localises it to the first bad step.</p>
+<p><strong>Out-of-memory under load.</strong> The server works for one user and fails at 50 concurrent long conversations. Cache memory scales with total tokens in flight. Cap concurrent tokens, use paged allocation with admission control, quantise the cache, or move to a GQA model. Plot cache utilisation against request volume to see the cliff before users do.</p>
+<p><strong>Latency spikes when long prompts arrive.</strong> A large prefill monopolises the GPU and every in-flight decode stalls. Chunked prefill interleaves pieces of the long prompt with decode steps; disaggregated serving runs prefill on separate hardware.</p>
+<p><strong>Throughput far below expectations.</strong> Batch size one, memory-bound decode. Enable continuous batching; check the GPU's memory bandwidth utilisation rather than its FLOP utilisation. A decode-heavy workload at 30% of peak FLOPs can still be saturating memory bandwidth.</p>
+<p><strong>Quality drops on long chats.</strong> The conversation exceeds the trained context, a sliding window evicts important early tokens, or cache quantisation is too aggressive. Evaluate long-context tasks at realistic lengths with the production cache settings.</p>
+<p><strong>Non-determinism across batch sizes.</strong> The same prompt gives slightly different outputs when served alone and in a busy batch. Batched kernels sum in different orders, and with bf16 the small differences can change an argmax several hundred tokens in. This is usually acceptable but surprises teams that compare transcripts; when exact reproducibility matters, fix the batch composition or use deterministic kernels, and compare log-probabilities rather than text.</p>
+<p><strong>Prefix-cache false sharing.</strong> Two requests share a cached prefix that is not actually identical (a different system prompt version, a different tokenizer normalisation), producing subtly wrong outputs for one of them. Key prefix caches on exact token IDs and model version, never on raw text. Log the hit rate too.</p>
+<h4>What to monitor</h4>
+<p>Time to first token and time per output token (separately, as percentiles), tokens in flight and cache memory utilisation, prefix-cache hit rate, batch size per decode step, and occasional cached-versus-uncached spot checks on fixed prompts to catch numerical regressions after kernel or configuration changes.</p>
+<h4>A cost estimate</h4>
+<p>A Llama-3-8B-sized model in bf16 has about 16 GB of weights. On an 80 GB GPU that leaves roughly 40 GB for the cache after activations and overheads. At 128 KiB per token (32 layers, 8 KV heads, head dimension 128), that is about 300,000 cached tokens: 37 conversations of 8,192 tokens, or 150 of 2,000. Each decode step must read the 16 GB of weights once for the whole batch plus every active conversation's cache; at about 3 TB/s of memory bandwidth, reading the weights alone takes roughly 5 ms, so a single conversation gets at most about 200 tokens per second while a batch of 37 shares that same weight read. That arithmetic is why batch size, set by cache memory, sets serving cost.</p>
+<h4>The reference for this problem</h4>
+<p>Karpathy's nanoGPT <code>model.py</code> is the reference implementation this lesson's model follows. Its blocks are pre-norm, <code>x = x + self.attn(self.ln_1(x))</code> then the MLP branch likewise; attention uses a fused <code>c_attn</code> projection to 3 × n_embd split into q, k, v, and PyTorch's <code>scaled_dot_product_attention</code> with <code>is_causal=True</code>; the token embedding and output head share weights (<code>self.transformer.wte.weight = self.lm_head.weight</code>, commented as weight tying); and the default configuration is GPT-2 small: <code>block_size = 1024</code>, <code>vocab_size = 50304</code> ("GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency"), 12 layers, 12 heads and 768 dimensions. Its initialisation uses standard deviation 0.02, with residual projections scaled by 0.02/√(2·n_layer). This lesson's TinyGPT keeps that structure at toy size, uses RMSNorm without biases, and adds the per-layer KV cache whose correctness the tests establish.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then vary it, break it and time it. Python 3.12 with NumPy only.</p>
+<ol>
+<li>Run the four blocks as one script. All assertions pass and it prints the token-forward counts, the concatenation-versus-preallocation timing and the generation timing.</li>
+<li><strong>Vary the inputs.</strong> Count by hand the token-forwards for a 10-token prompt and 50 new tokens with and without a cache, then confirm with <code>tokens_processed</code>.</li>
+<li><strong>Break the offset.</strong> Call the decode step with <code>start=0</code> and rerun the step-by-step test. At which step does it fail? Then use <code>start=len(ids)</code> (off by one).</li>
+<li><strong>Break the mask.</strong> In <code>attn</code>, replace the absolute-position mask with a plain lower triangle of size T and rerun the chunked-prefill test; then with "allow everything".</li>
+<li><strong>Break the cache.</strong> Pass the same dictionary to every layer and compare generations.</li>
+<li><strong>Improve it.</strong> Replace concatenation with a preallocated (h, max_T, d_k) buffer and a length counter per layer, and time generation of 60 tokens before and after.</li>
+<li><strong>Measure it.</strong> Print the cache's total bytes after generation and compare it with the formula 2 × layers × heads × head dimension × tokens × 8 bytes for float64.</li>
+</ol>
+<p>What to look for: the offset bugs fail on the first decode step, the plain triangle hides cached keys from the second chunk, "allow everything" leaks the future within the chunk, the shared cache diverges at once, and preallocation removes the quadratic copying while leaving outputs bit-identical. Rerun the step-by-step test after every change (and the generation-equality test); it is the safety net that makes such optimisations safe.</p>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>Write a function for the KV-cache size and use it for Llama-3-8B (32 layers, 8 KV heads, head dimension 128, bf16). How much cache does one 8,192-token conversation need, and how many such conversations fit in the 40 GB left on an 80 GB GPU after the weights? What if the model used 32 KV heads (no GQA)?</p>
+<details><summary>Answer</summary>
+<pre class="run">def kv_cache_bytes(layers, kv_heads, head_dim, tokens, bytes_per_value=2):
+    return 2 * layers * kv_heads * head_dim * tokens * bytes_per_value      # 2 = keys and values
+
+per_token = kv_cache_bytes(32, 8, 128, 1)
+per_conv = kv_cache_bytes(32, 8, 128, 8192)
+assert per_token == 131_072                        # 128 KiB per token
+assert per_conv == 1024 ** 3                       # exactly 1 GiB per 8k-token conversation
+assert int(40e9 // per_conv) == 37                 # ~37 concurrent 8k conversations
+assert kv_cache_bytes(32, 32, 128, 8192) == 4 * per_conv    # without GQA: 4 GiB each, ~9 fit</pre>
+<p>128 KiB per token, 1 GiB per 8k conversation, so about 37 concurrent conversations in 40 GB. Without GQA (32 KV heads) each conversation needs 4 GiB and only 9 fit. GQA's 4× reduction translates directly into 4× more concurrent users, and into faster decoding, because at long context the cache is read every step just like the weights.</p>
+</details>
+</section>

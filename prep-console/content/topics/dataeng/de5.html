@@ -1,0 +1,583 @@
+<!-- topic source for dataeng/de5; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "de5",
+  "t": "Spark execution: driver and executors, the DAG, stages and tasks, narrow vs wide transformations, shuffles, Catalyst, adaptive query execution and the Spark UI",
+  "tag": "Compute",
+  "sum": "What actually happens when a Spark job runs: the driver and executors, lazy transformations and actions, how a query becomes a DAG of stages split at shuffles, how input files become partitions and tasks, what a shuffle writes and reads, the Catalyst optimiser's phases, adaptive query execution, the executor memory model and spill — and how to read the Spark UI to find out why a job is slow, with defaults checked against Spark 4.2.",
+  "prereq": [
+    [
+      "sc18",
+      "Batch jobs split input across workers, map each record, shuffle by key, then reduce; the shuffle is where data crosses the network and where skew hurts."
+    ],
+    [
+      "de2",
+      "Parquet files are read by footer then byte ranges; column projection and predicate pushdown mean an engine reads only the columns and row groups it needs."
+    ],
+    [
+      "de3",
+      "Files and partitions decide how much is read; Spark packs small files into 128 MB read tasks and creates one output file per task per partition it writes."
+    ],
+    [
+      "os10",
+      "The page cache keeps recently read file data in memory; local disks are much faster than object storage for small random reads."
+    ]
+  ],
+  "myths": [
+    [
+      "Spark is fast because it keeps everything in memory.",
+      "Spark keeps intermediate data in memory when it fits and when you ask it to cache, but a typical SQL job streams data through operators, writes shuffle data to local disk, and spills to disk when memory runs out. Its speed comes as much from planning (column pruning, predicate pushdown, choosing join strategies), code generation and avoiding repeated reads as from memory."
+    ],
+    [
+      "More executors always make a job faster.",
+      "Only the parallel parts get faster. A job limited by one huge skewed task, by the driver collecting results, by object-store listing, or by too few partitions does not speed up with more machines, and too many tiny tasks add scheduling overhead. Look at task time distributions before adding hardware."
+    ],
+    [
+      "Setting spark.sql.shuffle.partitions higher fixes out-of-memory errors.",
+      "It helps when every shuffle partition is too large, because each reducer then holds less. It does nothing for a skewed key, where one partition stays huge however many partitions there are, and too many partitions create tiny tasks and many small output files. Adaptive query execution coalesces small partitions and splits skewed ones at runtime, which is usually better than a fixed global number."
+    ],
+    [
+      "df.count() or df.show() is a cheap way to check a DataFrame.",
+      "Each action runs the whole lineage from the source unless the data is cached: count() on a DataFrame built from a 2 TB join recomputes the join. show() reads only enough partitions to return 20 rows, so it can succeed on data whose other partitions would fail. Use explain() to inspect plans without running them, and cache deliberately when reusing a result."
+    ],
+    [
+      "The Spark UI is only for debugging failures.",
+      "It is the main performance tool: stage timelines, task time distributions (min, median, max), shuffle read and write sizes, spill, and the SQL plan annotated with row counts per operator. Most slow jobs can be diagnosed from it in minutes, before changing a single setting."
+    ]
+  ],
+  "recap": [
+    "A Spark application has one driver, which plans the work and schedules tasks, and many executors, which run tasks on their cores and hold data; one core runs one task at a time.",
+    "Transformations are lazy and only build a plan; an action such as write, count or collect triggers a job, which the driver turns into a DAG of stages.",
+    "Narrow transformations (filter, select, map) let each output partition depend on one input partition and are pipelined inside a stage; wide transformations (groupBy, join, distinct, repartition) need a shuffle, which ends one stage and starts the next.",
+    "Each stage runs one task per partition; input partitions come from files packed up to 128 MB, and post-shuffle partitions default to 200 before adaptive execution adjusts them.",
+    "A shuffle writes each map task's output partitioned by key to local disk and has reduce tasks fetch their piece from every map task, so its cost is bytes over the network and disk plus the number of map × reduce blocks.",
+    "Catalyst turns a query into an analysed logical plan, optimises it with rules such as predicate pushdown and column pruning, chooses a physical plan (for example the join strategy), and generates code; explain() shows each step.",
+    "Adaptive query execution, on by default since Spark 3.2, re-plans between stages using real shuffle statistics: it coalesces small partitions, switches sort-merge joins to broadcast joins, and splits skewed partitions.",
+    "Executors divide their heap into a unified execution-and-storage region (60% of heap minus 300 MiB by default) plus user memory, with extra off-heap overhead; when execution memory runs out, operators spill to disk, and when the container exceeds its limit it is killed.",
+    "The Spark UI's stage page — task duration percentiles, shuffle read and write, spill and GC time — answers most 'why is this slow' questions: skew shows as max far above median, too many tiny tasks as millisecond medians, memory pressure as spill and GC."
+  ],
+  "glossary": [
+    [
+      "Action",
+      "A Spark operation that returns a result or writes output (count, collect, write, show), triggering execution of the lazy plan."
+    ],
+    [
+      "Adaptive query execution (AQE)",
+      "Spark SQL's runtime re-optimisation between stages, using actual shuffle statistics to coalesce partitions, change join strategies and handle skew; enabled by default since Spark 3.2."
+    ],
+    [
+      "Broadcast",
+      "Sending a copy of a small dataset to every executor so each task can use it locally, avoiding a shuffle of the large side."
+    ],
+    [
+      "Catalyst",
+      "Spark SQL's extensible query optimiser, which applies rules to logical and physical plans (described in the Spark SQL paper, SIGMOD 2015)."
+    ],
+    [
+      "Cluster manager",
+      "The system that allocates machines or containers to Spark applications: Kubernetes, YARN or Spark's standalone manager."
+    ],
+    [
+      "Coalesce (partitions)",
+      "Merging adjacent small partitions into fewer, larger ones without a full shuffle."
+    ],
+    [
+      "DAG",
+      "Directed acyclic graph: the graph of stages (and within them, operators) a job executes, with edges for data dependencies."
+    ],
+    [
+      "DataFrame",
+      "Spark's distributed table abstraction with a schema, whose operations are planned and optimised by Catalyst."
+    ],
+    [
+      "Driver",
+      "The process that runs the application's main program, builds plans, schedules tasks on executors and collects results."
+    ],
+    [
+      "Executor",
+      "A worker process (a JVM) that runs tasks in parallel on its cores and stores cached and shuffle data for one application."
+    ],
+    [
+      "GC (garbage collection)",
+      "The JVM's automatic reclaiming of unused memory; long GC pauses show up as GC time in the Spark UI and indicate memory pressure."
+    ],
+    [
+      "Job",
+      "The work triggered by one action; consists of one or more stages."
+    ],
+    [
+      "JVM",
+      "Java virtual machine: the runtime in which the Spark driver and executors run."
+    ],
+    [
+      "Lineage",
+      "The record of transformations that produced a dataset, which Spark uses to recompute lost partitions after a failure."
+    ],
+    [
+      "Narrow transformation",
+      "A transformation where each output partition depends on a single input partition, so no data moves between executors."
+    ],
+    [
+      "OOM",
+      "Out of memory: a process ran out of the memory it is allowed to use, either inside the JVM heap (OutOfMemoryError) or at the container limit (killed by the cluster manager)."
+    ],
+    [
+      "Partition (Spark)",
+      "A chunk of a dataset processed by one task; distinct from a table's storage partition (de3)."
+    ],
+    [
+      "RDD",
+      "Resilient distributed dataset: Spark's original low-level abstraction, an immutable partitioned collection that can be recomputed from its lineage."
+    ],
+    [
+      "Shuffle",
+      "Redistributing data across executors by key between stages: map tasks write partitioned output to local disk and reduce tasks fetch their partition from all of them."
+    ],
+    [
+      "Slot",
+      "One executor core available to run one task; total slots = executors × cores per executor."
+    ],
+    [
+      "Spill",
+      "Writing intermediate data (sort buffers, hash tables) from memory to local disk when execution memory is exhausted, then merging it back."
+    ],
+    [
+      "Stage",
+      "A set of tasks that run the same pipelined operators on different partitions, bounded by shuffles or the job's input and output."
+    ],
+    [
+      "Straggler",
+      "A task that takes much longer than its peers, holding up the end of its stage."
+    ],
+    [
+      "Task",
+      "The unit of work run on one core: one stage's operators applied to one partition."
+    ],
+    [
+      "Transformation",
+      "A lazy operation that defines a new DataFrame or RDD from existing ones (filter, select, join, groupBy)."
+    ],
+    [
+      "Tungsten",
+      "Spark's project for efficient execution: compact binary row format, off-heap memory management and whole-stage code generation."
+    ],
+    [
+      "UDF",
+      "User-defined function: custom code applied to rows or columns; Python UDFs run outside the JVM and are opaque to the optimiser."
+    ],
+    [
+      "Wave",
+      "One round of tasks filling all available slots; a stage with 4,000 tasks on 160 slots runs in 25 waves."
+    ],
+    [
+      "Whole-stage code generation",
+      "Compiling a chain of operators in a stage into one Java function that processes rows in a tight loop, avoiding per-operator overhead."
+    ],
+    [
+      "Wide transformation",
+      "A transformation where an output partition needs data from many input partitions (groupBy, join, distinct, repartition), requiring a shuffle."
+    ],
+    [
+      "YARN",
+      "Hadoop's cluster resource manager, one of the systems that can allocate containers for Spark executors."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What are the driver and executors, and what does each do?",
+      "The driver runs your program: it builds the logical plan, asks Catalyst to optimise it, splits the physical plan into stages and tasks, schedules tasks on executors, tracks their progress and retries failures, and receives results of actions like collect. Executors are worker processes, each with several cores and a heap, that run tasks and keep shuffle files and cached data. A driver that does too much — collecting a large result, broadcasting a huge table, planning millions of files — becomes the bottleneck regardless of executor count."
+    ],
+    [
+      "E",
+      "Explain narrow versus wide transformations with examples.",
+      "In a narrow transformation each output partition depends on exactly one input partition: filter, select, withColumn, map. Spark pipelines consecutive narrow transformations in the same task with no data movement. In a wide transformation an output partition needs rows from many input partitions: groupBy, join (unless broadcast), distinct, orderBy, repartition. These require a shuffle, which ends a stage; the next stage cannot start its tasks until all map outputs are written."
+    ],
+    [
+      "E",
+      "What is lazy evaluation in Spark and why does it matter?",
+      "Transformations only record what to do; nothing runs until an action. That lets Catalyst see the whole query and optimise it — push filters to the Parquet reader, prune unused columns, choose join strategies — before reading any data. The flip side is that every action re-executes the plan from its sources unless an intermediate result is cached, so calling count() and then write() on the same expensive DataFrame does the work twice."
+    ],
+    [
+      "M",
+      "How does Spark decide how many tasks a stage has?",
+      "For a file scan, Spark splits input into partitions of up to spark.sql.files.maxPartitionBytes (128 MB), packing small files together and charging each file an extra 4 MB open cost; a 500 GB projected scan becomes roughly 4,000 tasks. After a shuffle, the number of partitions is spark.sql.shuffle.partitions (200 by default), and AQE then coalesces them towards the advisory size (64 MB) or splits skewed ones. Explicit repartition or coalesce calls override this.",
+      "Follow-up: With 20 executors of 8 cores, how long does a 4,000-task stage take if each task takes 30 seconds? — 160 slots, so 25 waves of 30 seconds, about 12.5 minutes, plus scheduling overhead and any stragglers in the last wave."
+    ],
+    [
+      "M",
+      "Walk through what physically happens during a shuffle.",
+      "Each map task computes its output rows and assigns each to a reduce partition by hashing the key modulo the number of partitions. It sorts or buckets its output by partition, spilling to disk if needed, and writes one data file plus an index file to the executor's local disk. When all map tasks finish, reduce tasks start and each fetches its partition's block from every map output over the network, up to 48 MB in flight at a time by default, then merges and processes them. The cost is map-side serialisation and disk writes, network transfer, and reduce-side merging — and the number of blocks is map tasks times reduce partitions, so 4,000 × 2,000 is eight million small fetches.",
+      "Follow-up: What happens if an executor holding shuffle files dies? — Reduce tasks fail to fetch its blocks, Spark marks those map outputs lost and re-runs the map tasks that produced them (lineage), which is why losing executors late in a big job is expensive; an external shuffle service or decommissioning helps keep shuffle files available."
+    ],
+    [
+      "M",
+      "What does adaptive query execution change at runtime?",
+      "After each shuffle stage finishes, Spark knows the real size of every shuffle partition and re-optimises the rest of the plan. It coalesces many small partitions into fewer of about 64 MB, so 200 partitions of 5 MB become about 16 tasks; it can convert a planned sort-merge join into a broadcast join if one side turned out small; and it splits skewed partitions (bigger than 5 times the median and 256 MB) into several tasks, replicating the matching rows of the other side. It fixes estimates that were wrong at planning time, which they often are after filters and joins."
+    ],
+    [
+      "M",
+      "Describe Spark's executor memory model and what spill means.",
+      "Each executor JVM heap reserves 300 MiB, and spark.memory.fraction (0.6) of the rest forms a unified region shared by execution memory (sort buffers, hash tables for joins and aggregations, shuffle buffers) and storage memory (cached data, broadcast variables); the remaining 40% is user memory for your objects and UDFs. Execution can evict cached blocks down to a protected storage share. When an operator cannot get more execution memory, it spills — sorts what it has, writes it to local disk, frees the memory and merges later — which is slow but safe. Separate off-heap overhead (10% of executor memory, at least 384 MiB) covers JVM internals, Python workers and network buffers; exceeding the container limit gets the executor killed."
+    ],
+    [
+      "M",
+      "When should you cache a DataFrame, and what can go wrong?",
+      "Cache when the same expensive intermediate result is used by more than one action or branch — for example a filtered, joined table that feeds three different aggregations — so it is computed once. Caching costs storage memory, which competes with execution memory and can cause spill or eviction, and a cache is only filled when an action runs. Common mistakes are caching something used once, caching a huge table that does not fit (it is then partly recomputed anyway), and forgetting to unpersist, which leaves less memory for later stages.",
+      "Follow-up: What is the difference between cache and checkpoint? — cache keeps the data but also its lineage, so lost partitions are recomputed; checkpoint writes the data to reliable storage and truncates the lineage, which helps very long iterative lineages and makes recomputation cheap at the cost of a write."
+    ],
+    [
+      "M",
+      "What does Catalyst do to a query before it runs?",
+      "It parses SQL or DataFrame code into an unresolved logical plan, resolves names and types against the catalog (analysis), applies rule-based optimisations to the logical plan — pushing filters down to the scan, pruning unused columns, folding constants, simplifying expressions, reordering some joins with statistics — and then generates physical plans, choosing strategies such as broadcast hash join versus sort-merge join, before generating Java code for whole stages. df.explain(mode='extended') prints the parsed, analysed, optimised and physical plans."
+    ],
+    [
+      "H",
+      "A daily job that took 20 minutes now takes 4 hours. Input size grew 10%. How do you find out why?",
+      "Compare the two runs stage by stage in the Spark UI or history server. Find which stage grew; then look at its task-duration percentiles. If the max is far above the median, it is skew — find the hot key from the shuffle-read sizes of the slowest tasks. If all tasks got slower with heavy spill and GC, memory pressure — a partition size or join build side crossed a threshold. If the stage count or plan changed, compare the SQL plans: a broadcast join that became a sort-merge join because a dimension table crossed the broadcast threshold is a classic. Also check the scan: number of files and bytes read, in case pruning or pushdown stopped working, and whether executors were lost and stages recomputed.",
+      "Follow-up: The plan is the same and there is no skew, but every task spills now. What changed? — Probably row width or partition size: a new wide column or a 10% growth that pushed each post-shuffle partition past execution memory; raise partitions or memory, or let AQE target smaller partitions with a smaller advisory size."
+    ],
+    [
+      "H",
+      "Why might a PySpark job with Python UDFs be slow, and what are the alternatives?",
+      "A plain Python UDF runs in separate Python worker processes: every row is serialised from the JVM, sent over a socket, deserialised, processed by the Python interpreter one row at a time, and sent back, and Catalyst cannot optimise inside it. Alternatives in order of preference: rewrite with built-in Spark SQL functions (fully optimised and code-generated); use pandas or Arrow-based vectorised UDFs, which move data in Arrow batches and process whole columns with NumPy; and for heavy ML inference, mapInPandas or mapInArrow over partitions so the model is loaded once per task. Also account for Python worker memory in the executor's overhead, or containers get killed.",
+      "Follow-up: What error would you see if Python workers use too much memory? — The executor container exceeds its memory limit and the cluster manager kills it (on Kubernetes an OOMKilled pod, on YARN a 'container killed for exceeding memory limits' message), not a Java OutOfMemoryError."
+    ],
+    [
+      "H",
+      "Design the cluster for a nightly job that reads 2 TB of Parquet, joins it to a 300 GB table and aggregates to 5 GB, finishing within an hour.",
+      "Work backwards from the shuffle. The scan of 2 TB with column pruning might read 600 GB, about 4,800 tasks of 128 MB; the join shuffles both sides — on the order of 900 GB — so shuffle partitions should be about 900 GB ÷ 200 MB ≈ 4,500 to keep each reduce task's build side within memory. With executors of 8 cores and 32 GB, each core has about 2.3 GB of unified memory, comfortable for 200 MB partitions. If each task processes about 50 MB/s end to end, 900 GB of shuffle is 18,000 core-seconds of reduce work plus a similar amount of map work; 400 cores (50 executors) gives roughly 1.5 minutes of pure compute per stage at perfect parallelism, so the real constraints are network and disk throughput for the shuffle and stragglers. I would start with 50 such executors, AQE on, and measure.",
+      "Follow-up: How could you avoid shuffling the 2 TB side at all? — If both tables are bucketed or partitioned compatibly on the join key, a storage-partitioned join avoids the shuffle; or if the 300 GB side can be filtered to under a few gigabytes, broadcast it (de6)."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing",
+      "Zaharia et al., NSDI 2012 — RDDs, lineage-based fault tolerance, and the evaluation (up to 20× faster than Hadoop on iterative jobs, 1 TB scanned interactively in 5–7 s).",
+      "https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final138.pdf"
+    ],
+    [
+      "paper",
+      "Spark SQL: Relational Data Processing in Spark",
+      "Armbrust et al., SIGMOD 2015 — DataFrames and the Catalyst optimiser's analysis, optimisation, physical planning and code generation phases.",
+      "https://people.csail.mit.edu/matei/papers/2015/sigmod_spark_sql.pdf"
+    ],
+    [
+      "docs",
+      "Spark SQL performance tuning (Spark 4.2)",
+      "Adaptive query execution settings, join strategy hints, file packing and shuffle partition defaults.",
+      "https://spark.apache.org/docs/latest/sql-performance-tuning.html"
+    ],
+    [
+      "docs",
+      "Spark Web UI",
+      "What each tab of the UI shows: jobs, stages, task metrics, storage, executors and the SQL plan.",
+      "https://spark.apache.org/docs/latest/web-ui.html"
+    ],
+    [
+      "docs",
+      "Spark tuning guide: memory management",
+      "Unified execution and storage memory, spark.memory.fraction and garbage collection.",
+      "https://spark.apache.org/docs/latest/tuning.html"
+    ],
+    [
+      "docs",
+      "Spark cluster mode overview",
+      "Driver, executors, cluster managers, jobs, stages and tasks.",
+      "https://spark.apache.org/docs/latest/cluster-overview.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>An ML engineer writes a feature job in PySpark: read a year of events, filter to purchases, join to the users table, group by user and compute twenty aggregates. On a sample it runs in a minute. On the full data it runs for three hours and then fails with "ExecutorLostFailure … exceeding memory limits". They double the cluster. It runs for two and a half hours and fails the same way. A colleague opens the Spark UI, scrolls to one stage, and points: 3,999 tasks finished in about 40 seconds each, and one task has been running for two hours with 80 GB of shuffle read. One user ID — a test account that a load-testing tool used — has 400 million events. No amount of hardware would have fixed it, because one key goes to one task on one core.</p>
+<p>Spark is the workhorse of large-scale data engineering and of ML data preparation: feature pipelines, training-set joins, deduplication of text corpora, embedding backfills. It hides an enormous amount — you write something that looks like pandas or SQL and it runs across hundreds of machines. That is wonderful until it is slow or broken, and then the abstraction becomes the problem: the code says nothing about stages, shuffles, partitions or memory, yet those decide whether the job takes minutes or hours. The engineers who are good with Spark are not the ones who know the most configuration keys; they are the ones who can picture what the cluster is physically doing for each line of code, and who can read the Spark UI to confirm it.</p>
+<p>This lesson builds that picture from the bottom. It starts with the parts of a Spark application (driver, executors, cores) and lazy evaluation, then how a query becomes a graph of stages, why some operations cut stages and others do not, how files become partitions and tasks, what a shuffle actually writes and reads, how the Catalyst optimiser rewrites your query, how adaptive query execution re-plans at runtime, how executor memory is divided and what spill is, and finally how to read the Spark UI. The public case is the paper that started it all — the 2012 RDD paper — and the 2015 Spark SQL paper that introduced Catalyst. de6 then applies all of this to the hardest operation, the join.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a kitchen brigade</h4>
+<p>Picture a large restaurant kitchen preparing a banquet. The <strong>head chef</strong> reads the menu (your program), works out the most efficient way to produce it, breaks it into tasks, and assigns tasks to cooks; the head chef cooks nothing. The <strong>cooks</strong>, grouped at stations, each work on one task at a time: chop this crate of onions, sear this tray of steaks. Many cooks work in parallel on identical tasks with different ingredients.</p>
+<p>Some steps can be done start to finish at one station: wash, peel and chop a crate of potatoes — each crate is independent. Those are <strong>narrow</strong> steps, and a cook does them one after another without handing anything over. Other steps need everything of one kind gathered in one place: to plate "all the dishes for table 12", every station must send table 12's items to one plating station. That gathering is a <strong>shuffle</strong>: every station sorts its output by table and sends each pile to the right plating station, and the plating cannot start until every station has finished sending. The kitchen's work naturally divides into <strong>phases</strong> separated by these gathering moments — those are <strong>stages</strong>.</p>
+<p>The kitchen's problems map exactly onto Spark's. If one table ordered 400 dishes and every other table 10, one plating station is buried while the rest idle — <strong>skew</strong>. If a station runs out of counter space, it stacks trays on the floor and works slower — <strong>spill</strong>. If the head chef insists on tasting every dish personally, the whole kitchen waits on one person — a <strong>driver bottleneck</strong>. And a smart head chef will rewrite the menu's instructions — "only fetch the vegetables we actually use; filter out the spoiled ones at the market, not after cooking" — that is the <strong>optimiser</strong>.</p>
+<p>The analogy breaks in one place: in Spark, if a cook collapses, the head chef can re-do that cook's work from the original ingredients because the recipe (the <strong>lineage</strong>) is written down and the ingredients (input files) are still in the pantry. Real kitchens cannot un-cook a dish, which is why Spark's fault tolerance is so cheap compared with copying every intermediate result.</p>
+
+<h4>The pieces in one picture</h4>
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="A Spark driver schedules tasks on three executors, each with four cores running tasks, local disk for shuffle files, and reading Parquet from object storage">
+  <defs><marker id="de5-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="90" width="130" height="80" rx="8" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="85" y="114" text-anchor="middle" style="fill:var(--ink);font-weight:600">Driver</text>
+    <text x="85" y="132" text-anchor="middle" style="fill:var(--ink-2)">plan, optimise,</text>
+    <text x="85" y="148" text-anchor="middle" style="fill:var(--ink-2)">schedule tasks,</text>
+    <text x="85" y="164" text-anchor="middle" style="fill:var(--ink-2)">collect results</text>
+    <rect x="200" y="20" width="250" height="66" rx="8" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="215" y="38" style="fill:var(--ink);font-weight:600">Executor 1</text>
+    <rect x="215" y="46" width="44" height="26" rx="3" style="fill:none;stroke:var(--s1)"/><text x="237" y="64" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="265" y="46" width="44" height="26" rx="3" style="fill:none;stroke:var(--s1)"/><text x="287" y="64" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="315" y="46" width="44" height="26" rx="3" style="fill:none;stroke:var(--s1)"/><text x="337" y="64" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="365" y="46" width="44" height="26" rx="3" style="fill:none;stroke:var(--s1)"/><text x="387" y="64" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <text x="430" y="64" style="fill:var(--muted)">disk</text>
+    <rect x="200" y="97" width="250" height="66" rx="8" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="215" y="115" style="fill:var(--ink);font-weight:600">Executor 2</text>
+    <rect x="215" y="123" width="44" height="26" rx="3" style="fill:none;stroke:var(--s2)"/><text x="237" y="141" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="265" y="123" width="44" height="26" rx="3" style="fill:none;stroke:var(--s2)"/><text x="287" y="141" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="315" y="123" width="44" height="26" rx="3" style="fill:none;stroke:var(--s2)"/><text x="337" y="141" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="365" y="123" width="44" height="26" rx="3" style="fill:none;stroke:var(--s2)"/><text x="387" y="141" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <text x="430" y="141" style="fill:var(--muted)">disk</text>
+    <rect x="200" y="174" width="250" height="66" rx="8" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="215" y="192" style="fill:var(--ink);font-weight:600">Executor 3</text>
+    <rect x="215" y="200" width="44" height="26" rx="3" style="fill:none;stroke:var(--s3)"/><text x="237" y="218" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="265" y="200" width="44" height="26" rx="3" style="fill:none;stroke:var(--s3)"/><text x="287" y="218" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="315" y="200" width="44" height="26" rx="3" style="fill:none;stroke:var(--s3)"/><text x="337" y="218" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <rect x="365" y="200" width="44" height="26" rx="3" style="fill:none;stroke:var(--s3)"/><text x="387" y="218" text-anchor="middle" style="fill:var(--ink-2)">task</text>
+    <text x="430" y="218" style="fill:var(--muted)">disk</text>
+    <rect x="500" y="90" width="120" height="80" rx="8" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="560" y="116" text-anchor="middle" style="fill:var(--ink);font-weight:600">Object store</text>
+    <text x="560" y="134" text-anchor="middle" style="fill:var(--ink-2)">Parquet input</text>
+    <text x="560" y="150" text-anchor="middle" style="fill:var(--ink-2)">and output</text>
+    <line x1="150" y1="115" x2="198" y2="55" marker-end="url(#de5-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <line x1="150" y1="130" x2="198" y2="130" marker-end="url(#de5-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <line x1="150" y1="145" x2="198" y2="205" marker-end="url(#de5-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <line x1="498" y1="120" x2="452" y2="55" marker-end="url(#de5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="498" y1="130" x2="452" y2="130" marker-end="url(#de5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="498" y1="140" x2="452" y2="205" marker-end="url(#de5-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="320" y="256" text-anchor="middle" style="fill:var(--ink-2)">12 cores = 12 slots: at most 12 tasks run at once; shuffle files live on executors' local disks</text>
+  </g>
+</svg>
+<figcaption>A small Spark application: one driver, three executors with four cores each. The driver sends tasks (orange arrows); executors read input directly from object storage, run tasks on their cores, and keep shuffle output on their own local disks — which is why losing an executor can mean recomputing work.</figcaption>
+</figure>
+<p>Two more words are worth fixing now because the rest of the lesson leans on them. A <strong>partition</strong> is the chunk of data one task processes, and the number of partitions decides how many tasks a stage has. A <strong>slot</strong> is one executor core: the cluster in the figure can run twelve tasks at a time, so a stage with 120 tasks runs in ten rounds, or <strong>waves</strong>. Nearly every Spark performance question reduces to these numbers — how many partitions, how big each one is, how many slots there are, and whether any one partition is much bigger than the rest.</p>
+<p>A reader who stops here should hold three ideas: the driver plans and executors do; work is split into stages at every point where data must be regrouped by key; and the slowest task of a stage decides when the stage ends.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Why distribute at all</h4>
+<p>A single modern server core can scan and decode Parquet at very roughly a few hundred megabytes per second, and a large machine might sustain a few gigabytes per second from local NVMe. A nightly job over 10 TB of compressed Parquet at 2 GB/s is 5,000 seconds — over 80 minutes — before any joining or aggregation, and that assumes the data is on local disk rather than object storage. And memory: a join or group-by over billions of rows needs hash tables or sort buffers far larger than one machine's RAM. Splitting the work across many cores on many machines turns 80 minutes into a few minutes, as long as the work divides evenly and the cost of moving data between machines does not eat the gain. Spark is a framework for exactly that division. (For data that fits on one machine — often anything below a few hundred gigabytes — single-node engines such as DuckDB or Polars are frequently faster and cheaper; de13 compares them.)</p>
+
+<h4>2. The anatomy of a Spark application</h4>
+<p>A <strong>Spark application</strong> is one program — a PySpark script, a Scala job, a notebook session — with its own processes. The <strong>driver</strong> is the process running your main program. It holds the <code>SparkSession</code>, turns your DataFrame code or SQL into plans, divides the work, schedules it, and gathers results. <strong>Executors</strong> are worker processes (Java virtual machines) launched on cluster machines for this application; each has a number of <strong>cores</strong> (<code>spark.executor.cores</code>) and a memory size (<code>spark.executor.memory</code>, 1 GB by default — always set explicitly in practice). A <strong>cluster manager</strong> — Kubernetes, YARN or Spark's standalone manager — supplies the machines or containers. In PySpark, the Python code runs in the driver, and the executors are still JVMs; Python worker processes appear on executors only when you use Python functions on rows (UDFs, section 9).</p>
+<p>Each executor core runs one <strong>task</strong> at a time, so the cluster's parallelism is executors × cores: 20 executors × 8 cores = 160 <strong>slots</strong>. A <strong>task</strong> is the smallest unit of work: one stage's operators applied to one partition of data. When a stage has more tasks than slots, they run in <strong>waves</strong>: 4,000 tasks on 160 slots is 25 waves.</p>
+
+<h4>3. Lazy evaluation, actions and the DAG</h4>
+<p>Spark operations come in two kinds. <strong>Transformations</strong> — <code>filter</code>, <code>select</code>, <code>withColumn</code>, <code>join</code>, <code>groupBy(...).agg(...)</code> — return a new DataFrame and do nothing else; they only record what should be computed. <strong>Actions</strong> — <code>write</code>, <code>count</code>, <code>collect</code>, <code>show</code>, <code>toPandas</code> — require a result, so they trigger execution. Each action creates a <strong>job</strong>.</p>
+<p>Laziness lets Spark see the whole computation before running it and optimise it as a unit, which is the job of Catalyst (section 7). It also means the record of transformations, the <strong>lineage</strong>, is always available. This was the central idea of the RDD paper: instead of replicating intermediate data to survive failures, remember how each piece was computed from stable input, and recompute only the lost pieces if a machine dies. The cost of laziness is that every action re-runs its lineage from the source unless you explicitly <code>cache()</code> or <code>persist()</code> an intermediate result. A common accident is calling <code>df.count()</code> for logging and then <code>df.write...</code> — the whole pipeline runs twice.</p>
+<p>When an action fires, the driver turns the plan into a <strong>DAG</strong> (directed acyclic graph) of <strong>stages</strong>. To see where stage boundaries fall, you need the distinction between narrow and wide transformations.</p>
+
+<h4>4. Narrow and wide transformations, stages and shuffles</h4>
+<p>A dataset in Spark is divided into <strong>partitions</strong> — chunks, each processed by one task. (These are Spark's in-memory partitions, not the table's storage partitions from de3, although reading a table creates them from its files.)</p>
+<p>A <strong>narrow transformation</strong> computes each output partition from exactly one input partition. <code>filter(col("event_type") == "purchase")</code> on partition 17 produces output partition 17; it never needs to look at partition 18. So does <code>select</code>, <code>withColumn</code>, and a map over rows. Spark chains consecutive narrow transformations into one task: read a row group, filter it, compute a column, write it — all inside one task, row batch by row batch, with no intermediate data written anywhere. This chaining is called <strong>pipelining</strong>.</p>
+<p>A <strong>wide transformation</strong> needs, for some output partition, rows from many input partitions. To compute "total spend per user", all of user 553's rows must end up in one place, but they are scattered across all input partitions. So Spark must <strong>shuffle</strong>: every task of the first stage splits its output by key into as many buckets as there will be output partitions, and every task of the next stage collects its bucket from all of them. <code>groupBy</code>, <code>join</code> (unless one side is broadcast), <code>distinct</code>, <code>orderBy</code>, window functions with <code>partitionBy</code> and explicit <code>repartition</code> are wide.</p>
+<p>A <strong>stage</strong> is a maximal chain of pipelined narrow work; every shuffle ends one stage and begins another. A typical feature query — read events, filter, join to users, group by user, write — has three stages: stage 1 reads and filters events and writes them shuffled by <code>user_id</code>; stage 2 reads users and writes them shuffled by <code>user_id</code> (stages 1 and 2 can run in parallel); stage 3 reads both shuffles, joins, aggregates (the aggregation can reuse the join's partitioning, so no further shuffle) and writes the output. Stage 3 cannot start any task until stages 1 and 2 have finished completely, because any of their tasks might hold some of the rows a stage-3 task needs.</p>
+
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="Three stages: stage 1 scans and filters events, stage 2 scans users, both shuffle by user_id to stage 3 which joins, aggregates and writes">
+  <defs><marker id="de5-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="20" width="220" height="110" rx="8" style="fill:none;stroke:var(--s1);stroke-width:1.5"/>
+    <text x="30" y="38" style="fill:var(--ink);font-weight:600">Stage 1 · 4,000 tasks</text>
+    <text x="30" y="60" style="fill:var(--ink-2);font-family:var(--mono)">Scan events (Parquet)</text>
+    <text x="30" y="78" style="fill:var(--ink-2);font-family:var(--mono)">→ Filter purchase</text>
+    <text x="30" y="96" style="fill:var(--ink-2);font-family:var(--mono)">→ Project 3 cols</text>
+    <text x="30" y="118" style="fill:var(--s1)">pipelined in each task</text>
+    <rect x="20" y="150" width="220" height="90" rx="8" style="fill:none;stroke:var(--s2);stroke-width:1.5"/>
+    <text x="30" y="168" style="fill:var(--ink);font-weight:600">Stage 2 · 80 tasks</text>
+    <text x="30" y="190" style="fill:var(--ink-2);font-family:var(--mono)">Scan users</text>
+    <text x="30" y="208" style="fill:var(--ink-2);font-family:var(--mono)">→ Project 4 cols</text>
+    <rect x="270" y="95" width="90" height="70" rx="6" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="315" y="120" text-anchor="middle" style="fill:var(--accent);font-weight:600">SHUFFLE</text>
+    <text x="315" y="138" text-anchor="middle" style="fill:var(--ink-2)">by user_id</text>
+    <text x="315" y="154" text-anchor="middle" style="fill:var(--ink-2)">local disk</text>
+    <rect x="390" y="60" width="230" height="140" rx="8" style="fill:none;stroke:var(--s3);stroke-width:1.5"/>
+    <text x="400" y="78" style="fill:var(--ink);font-weight:600">Stage 3 · 200 → AQE 120 tasks</text>
+    <text x="400" y="100" style="fill:var(--ink-2);font-family:var(--mono)">SortMergeJoin user_id</text>
+    <text x="400" y="118" style="fill:var(--ink-2);font-family:var(--mono)">→ HashAggregate</text>
+    <text x="400" y="136" style="fill:var(--ink-2);font-family:var(--mono)">→ Write Parquet</text>
+    <text x="400" y="162" style="fill:var(--ink-2)">starts only when stages 1</text>
+    <text x="400" y="178" style="fill:var(--ink-2)">and 2 are 100% finished</text>
+    <line x1="240" y1="80" x2="268" y2="115" marker-end="url(#de5-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="240" y1="195" x2="268" y2="150" marker-end="url(#de5-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="360" y1="130" x2="388" y2="130" marker-end="url(#de5-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="320" y="268" text-anchor="middle" style="fill:var(--ink-2)">narrow steps share a stage; every shuffle is a stage boundary and a synchronisation point</text>
+  </g>
+</svg>
+<figcaption>The DAG for "events joined to users, aggregated per user". Within a stage, operators run back to back inside each task with no intermediate storage. The shuffle in the middle is where data is written to local disk, crosses the network and is regrouped by key — and where a slow task in stage 1 delays every task in stage 3.</figcaption>
+</figure>
+
+<h4>5. From files to partitions to tasks</h4>
+<p>For a file-based scan (Parquet, ORC, CSV), Spark's planner lists the input files (or gets them from a table format's metadata, de4) and divides them into read partitions. Large splittable files are cut into pieces of up to <code>spark.sql.files.maxPartitionBytes</code> — 128 MB by default in Spark 4.2 — aligned to Parquet row groups. Small files are packed together into one partition up to the same size, with each file charged an extra <code>spark.sql.files.openCostInBytes</code> (4 MB) to account for the cost of opening it. So:</p>
+<ul>
+<li>500 GB in 1,000 files of 500 MB → about 4,000 read tasks of ~128 MB.</li>
+<li>500 GB in 500,000 files of 1 MB → each file "costs" 5 MB for packing, so about 25 files per task, ~20,000 tasks, each opening 25 files — the small-files problem of de2 surfacing as task count and request count.</li>
+</ul>
+<p>Note that the 128 MB is measured on the files as stored. With column projection (de2), a task assigned 128 MB of file may actually read 20 MB of it, if the query needs three of thirty columns. Tasks are cheap to read in that case, and Spark's task count can look high for the work done.</p>
+<p>After a shuffle, the number of partitions is set by <code>spark.sql.shuffle.partitions</code>, 200 by default — a number chosen long ago for small clusters and wrong for most real jobs in both directions: a 2 TB shuffle into 200 partitions makes 10 GB per reduce task (spill, OOM), and a 50 MB shuffle into 200 partitions makes 250 KB tasks (pure overhead) and 200 tiny output files. Adaptive query execution (section 8) mostly fixes this at runtime.</p>
+
+<h4>6. What a shuffle really does</h4>
+<p>Follow one shuffle with real numbers: stage 1 has 4,000 map tasks; the shuffle has 400 reduce partitions; the total shuffled data after filtering and projection is 200 GB.</p>
+<p><strong>Map side.</strong> Each map task processes its input and, for every output row, computes its target partition: <code>hash(user_id) mod 400</code>. It buffers rows in memory sorted by target partition (Spark's default sort-based shuffle), spills sorted runs to disk if the buffer fills, and at the end writes <em>one</em> data file containing its 400 partitions back to back, plus an index file giving each partition's offset. Each map task writes on average 200 GB ÷ 4,000 = 50 MB. Shuffle output is compressed by default (<code>spark.shuffle.compress</code> is true).</p>
+<p><strong>Reduce side.</strong> Once every map task has finished, each of the 400 reduce tasks fetches its partition from all 4,000 map outputs — 4,000 blocks of on average 50 MB ÷ 400 = 125 KB each — over the network, keeping up to 48 MB of fetches in flight by default (<code>spark.reducer.maxSizeInFlight</code>). It merges them and runs its operators: here a join and an aggregation over 200 GB ÷ 400 = 500 MB of input. Across the whole shuffle there are 4,000 × 400 = 1.6 million blocks.</p>
+<p>The shuffle is expensive in four ways. <strong>Bytes</strong>: 200 GB is serialised, compressed, written to local disk, read back, sent over the network and decompressed — at least twice through disk and once through the network. <strong>Block count</strong>: millions of small fetches stress the network and the executors serving them; very many map tasks times very many reduce partitions is a classic cause of slow shuffle reads. <strong>Synchronisation</strong>: no reduce task starts until the slowest map task finishes. <strong>Fragility</strong>: shuffle files live on executors' local disks; if an executor dies after the map stage, its outputs are lost and those map tasks must be re-run before the reduce stage can continue (unless an external shuffle service or a remote shuffle store keeps them). Reducing shuffle volume — filtering and projecting before the shuffle, pre-aggregating on the map side (which Spark does automatically for <code>groupBy().agg()</code> with a partial aggregation before the shuffle), broadcasting small tables instead of shuffling large ones — is the single most effective optimisation in Spark.</p>
+
+<h4>7. Catalyst: how your query is rewritten</h4>
+<p>The Spark SQL paper (Armbrust et al., SIGMOD 2015) introduced <strong>Catalyst</strong>, the optimiser behind DataFrames and SQL. It works in phases, each visible with <code>df.explain(mode="extended")</code>:</p>
+<ol>
+<li><strong>Parsed (unresolved) logical plan</strong>: the operators you wrote, with names not yet checked.</li>
+<li><strong>Analysed logical plan</strong>: names resolved against the catalog and the DataFrame schemas, types checked, functions bound. Errors like "column not found" come from here.</li>
+<li><strong>Optimised logical plan</strong>: rule-based rewrites applied repeatedly until nothing changes. The important ones: <em>predicate pushdown</em> (move filters as close to the data source as possible, into the Parquet reader where de2's statistics can skip row groups), <em>column pruning</em> (read only columns used anywhere downstream), <em>constant folding</em> and expression simplification, combining adjacent filters and projections, and eliminating unnecessary operators.</li>
+<li><strong>Physical plan</strong>: concrete algorithms chosen. For joins this is where Spark chooses between broadcast hash join, sort-merge join and shuffled hash join, using size estimates (de6). Exchanges (shuffles) are inserted where required.</li>
+<li><strong>Code generation</strong>: <em>whole-stage code generation</em>, from the Tungsten project, compiles each stage's chain of operators into a single Java function with a tight loop over rows, instead of calling each operator per row through virtual function calls. In <code>explain()</code> output, operators prefixed with <code>*(n)</code> belong to generated code block <em>n</em>.</li>
+</ol>
+<p>Here is what that looks like for a simple query (Needs Spark; abridged and illustrative — exact operator names, IDs and fields vary by version):</p>
+<pre>df = (spark.read.parquet("s3://lake/silver/events")
+        .filter("event_type = 'purchase' AND date &gt;= '2026-10-01'")
+        .groupBy("user_id").agg(F.sum("price").alias("spend")))
+df.explain()
+
+== Physical Plan ==
+AdaptiveSparkPlan isFinalPlan=false
++- HashAggregate(keys=[user_id], functions=[sum(price)])
+   +- Exchange hashpartitioning(user_id, 200)
+      +- HashAggregate(keys=[user_id], functions=[partial_sum(price)])
+         +- Project [user_id, price]
+            +- Filter (event_type = purchase)
+               +- FileScan parquet [user_id, price, event_type, date]
+                    PartitionFilters: [date &gt;= 2026-10-01]
+                    PushedFilters: [EqualTo(event_type,purchase)]
+                    ReadSchema: struct&lt;user_id:bigint,price:double,event_type:string&gt;</pre>
+<p>Read it bottom up. The scan reads only four of the table's columns (column pruning: <code>ReadSchema</code>), prunes storage partitions by date (<code>PartitionFilters</code>) and pushes the event-type filter into the Parquet reader (<code>PushedFilters</code>), so row groups without purchases are skipped using statistics. A partial aggregation runs <em>before</em> the shuffle, so each map task sends one partial sum per user it saw rather than every purchase row. <code>Exchange hashpartitioning(user_id, 200)</code> is the shuffle — the stage boundary. The final aggregation combines partial sums. <code>AdaptiveSparkPlan isFinalPlan=false</code> says AQE may still change the plan at runtime.</p>
+<p>Catalyst cannot optimise what it cannot see. A Python UDF is a black box: filters on its output cannot be pushed into the scan, and its cost is unknown. Neither can Catalyst fix a logically wasteful query — a cross join written by mistake, or a <code>distinct()</code> on a 2 TB table nobody needed.</p>
+
+<h4>8. Adaptive query execution</h4>
+<p>The plan Catalyst picks before running is based on estimates, and estimates after filters and joins are often wrong by orders of magnitude. <strong>Adaptive query execution (AQE)</strong> — on by default since Spark 3.2 (<code>spark.sql.adaptive.enabled</code>) — re-optimises the remaining plan each time a shuffle stage completes, using the actual size of every shuffle partition. It does three main things.</p>
+<p><strong>Coalescing shuffle partitions.</strong> If the 200 post-shuffle partitions turn out to hold 6 GB in total, AQE merges adjacent partitions towards the advisory size, <code>spark.sql.adaptive.advisoryPartitionSizeInBytes</code> (64 MB by default): about 94 tasks instead of 200. In Spark 4.2 the default <code>coalescePartitions.parallelismFirst=true</code> means it prioritises keeping enough tasks to use the cluster's parallelism over hitting the advisory size exactly, with a minimum partition size of 1 MB. This is why teams can set <code>spark.sql.shuffle.partitions</code> high (say 2,000) and let AQE coalesce down — you get enough partitions for big days and no tiny tasks on small days.</p>
+<p><strong>Switching join strategies.</strong> If a join was planned as a sort-merge join because the estimate for one side was 5 GB, but after filtering that side is 8 MB, AQE can convert it to a broadcast hash join (de6) — or at least read the shuffle locally to avoid network transfer.</p>
+<p><strong>Splitting skewed partitions.</strong> A partition is considered skewed if it is larger than <code>skewedPartitionFactor</code> (5.0) times the median partition size and larger than <code>skewedPartitionThresholdInBytes</code> (256 MB). For a sort-merge join, AQE splits such a partition into several sub-partitions and duplicates the matching partition of the other side for each, so the work for one hot key range runs as several tasks. de6 works through this with numbers.</p>
+<p>AQE's limits: it acts only at shuffle boundaries (it cannot fix a skewed scan or a skewed task inside a stage without a shuffle), its skew handling covers specific join types, and it cannot split a single key's rows if the downstream operator genuinely needs them together (a <code>groupBy</code> on a hot key with a non-decomposable aggregate).</p>
+
+<h4>9. Executor memory and spill</h4>
+<p>An executor container's memory is divided into regions, and knowing them explains most out-of-memory errors.</p>
+<figure>
+<svg viewBox="0 0 640 210" width="100%" role="img" aria-label="Executor memory for a 16 GB heap: 300 MiB reserved, unified region of about 9.4 GB shared by execution and storage, about 6.3 GB user memory, plus 1.6 GB overhead outside the heap">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="24" style="fill:var(--ink);font-weight:600">Container = heap 16 GB + overhead 1.6 GB</text>
+    <rect x="20" y="40" width="18" height="90" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <rect x="38" y="40" width="330" height="90" style="fill:var(--surface-2);stroke:var(--s1);stroke-width:1.5"/>
+    <line x1="203" y1="40" x2="203" y2="130" style="fill:none;stroke:var(--s1);stroke-dasharray:4 3"/>
+    <rect x="368" y="40" width="200" height="90" style="fill:var(--surface-2);stroke:var(--s2);stroke-width:1.5"/>
+    <rect x="568" y="40" width="52" height="90" style="fill:var(--surface-2);stroke:var(--crit);stroke-width:1.5"/>
+    <text x="120" y="66" text-anchor="middle" style="fill:var(--ink)">Execution</text>
+    <text x="120" y="84" text-anchor="middle" style="fill:var(--ink-2)">sorts, hash tables,</text>
+    <text x="120" y="100" text-anchor="middle" style="fill:var(--ink-2)">shuffle buffers</text>
+    <text x="285" y="66" text-anchor="middle" style="fill:var(--ink)">Storage</text>
+    <text x="285" y="84" text-anchor="middle" style="fill:var(--ink-2)">cache, broadcast</text>
+    <text x="285" y="100" text-anchor="middle" style="fill:var(--ink-2)">(protected 50%)</text>
+    <text x="203" y="122" text-anchor="middle" style="fill:var(--s1)">boundary moves</text>
+    <text x="468" y="72" text-anchor="middle" style="fill:var(--ink)">User memory</text>
+    <text x="468" y="90" text-anchor="middle" style="fill:var(--ink-2)">your objects, UDF data,</text>
+    <text x="468" y="106" text-anchor="middle" style="fill:var(--ink-2)">internal metadata</text>
+    <text x="594" y="80" text-anchor="middle" style="fill:var(--ink)">Over-</text>
+    <text x="594" y="96" text-anchor="middle" style="fill:var(--ink)">head</text>
+    <text x="29" y="150" text-anchor="middle" style="fill:var(--muted)">300 MiB</text>
+    <text x="203" y="150" text-anchor="middle" style="fill:var(--ink-2)">unified: 0.6 × (16 GB − 300 MiB) ≈ 9.4 GB</text>
+    <text x="468" y="150" text-anchor="middle" style="fill:var(--ink-2)">0.4 × … ≈ 6.3 GB</text>
+    <text x="594" y="150" text-anchor="middle" style="fill:var(--ink-2)">≈1.6 GB</text>
+    <text x="320" y="180" text-anchor="middle" style="fill:var(--ink-2)">8 cores share the unified region: ≈ 1.2 GB of execution memory per running task if nothing is cached</text>
+    <text x="320" y="200" text-anchor="middle" style="fill:var(--crit)">overhead: JVM internals, Python workers, network buffers — exceed it and the container is killed</text>
+  </g>
+</svg>
+<figcaption>How a 16 GB executor divides its memory with Spark 4.2 defaults. The unified region is shared by execution and caching; the line between them moves. Notice how little each task actually gets when eight run at once — and that Python workers live outside the heap, in the overhead.</figcaption>
+</figure>
+<p>Work through a 16 GB executor heap with 8 cores. Spark reserves 300 MiB. Of the rest, <code>spark.memory.fraction</code> (0.6) forms the <strong>unified region</strong>: about 9.4 GB, shared by <em>execution memory</em> (sort buffers, hash tables for joins and aggregations, shuffle buffers) and <em>storage memory</em> (cached DataFrames, broadcast variables). Execution can borrow all of it and can evict cached blocks, except for a protected share set by <code>spark.memory.storageFraction</code> (0.5 of the unified region) when it is in use. The remaining 40% of the heap (about 6.3 GB) is <strong>user memory</strong> for your own data structures and Spark's internal metadata. Outside the heap, <strong>memory overhead</strong> — 10% of executor memory with a minimum of 384 MiB by default, so about 1.6 GB here — covers JVM internals, thread stacks, network buffers and, crucially for PySpark, the Python worker processes. The container size requested from Kubernetes or YARN is heap plus overhead: about 17.6 GB.</p>
+<p>The 9.4 GB unified region is shared by up to 8 concurrently running tasks, so each task can count on roughly 1.2 GB of execution memory. A reduce task whose sort-merge join has a 500 MB partition is comfortable. One with a 6 GB skewed partition is not. When an operator cannot acquire more execution memory, it <strong>spills</strong>: it sorts or flushes what it has to local disk, frees the memory, continues, and merges the spilled runs at the end. Spill is safe but slow — it adds serialisation and disk I/O, often several times the data's size. The Spark UI reports "spill (memory)" (the in-memory size of what was spilled) and "spill (disk)" (its serialised size). Some structures cannot spill gracefully — a broadcast table that does not fit, a single huge row, a UDF holding a large list — and those produce Java <code>OutOfMemoryError</code>s. When native memory outside the heap grows (Python workers, Arrow buffers, off-heap allocations) past the overhead, the cluster manager kills the container, and the error says so rather than mentioning a Java OOM.</p>
+
+<h4>10. Reading the Spark UI</h4>
+<p>The Spark UI (live on the driver while the job runs, and through the history server afterwards) is how you see all of the above. The tabs that matter most:</p>
+<ul>
+<li><strong>Jobs</strong>: one row per action, with its stages and duration. Start here to see which job is slow.</li>
+<li><strong>Stages</strong>: for each stage, the number of tasks, input size, shuffle read and write, and — on the stage detail page — the <strong>summary metrics</strong> table: min, 25th percentile, median, 75th percentile and max of task duration, GC time, input, shuffle read, spill. Plus an event timeline showing tasks on executors over time.</li>
+<li><strong>SQL / DataFrame</strong>: the physical plan as a graph, annotated with runtime metrics per operator — rows output, data size, time, and for scans the number of files and bytes read. Here you see that the filter passed 2% of rows, or that a join produced 10× more rows than its input (an exploding join on duplicated keys).</li>
+<li><strong>Executors</strong>: per-executor task time, GC time, shuffle and storage use, and failures.</li>
+<li><strong>Storage</strong>: what is cached and how much of it fits in memory.</li>
+</ul>
+<p>The summary metrics table diagnoses the common problems by shape:</p>
+<table>
+<thead><tr><th>What you see</th><th>What it means</th></tr></thead>
+<tr><td>Max duration 50× the median; max shuffle read 50× the median</td><td>Skew: one or a few keys dominate a partition (de6)</td></tr>
+<tr><td>Median task 50 ms; tens of thousands of tasks</td><td>Too many tiny tasks: small files or too many shuffle partitions</td></tr>
+<tr><td>Large spill on most tasks; GC time a big fraction of duration</td><td>Partitions too large for execution memory</td></tr>
+<tr><td>Stage retried; "FetchFailed" errors</td><td>Lost executor or shuffle files; map stage recomputed</td></tr>
+<tr><td>Few tasks running while many slots sit idle</td><td>Too few partitions, or the stage is waiting on the driver</td></tr>
+<tr><td>Scan reads far more bytes or files than expected</td><td>Lost partition pruning or pushdown, or small files (de2, de3)</td></tr>
+</table>
+
+<h4>11. A worked job, end to end</h4>
+<p>A nightly feature job reads 30 days of events — 9 TB on disk, of which the 4 needed columns are 1.2 TB — filters to purchases (2% of rows), joins to a 40 GB users table on <code>user_id</code>, aggregates per user, and writes 3 GB. The cluster has 25 executors of 8 cores and 32 GB heap: 200 slots, each with about 2.3 GB of execution memory when all run at once.</p>
+<p><strong>Stage 1 (scan events).</strong> Storage partitions prune to 30 days; the planner makes about 9 TB ÷ 128 MB ≈ 70,000 read tasks. With column projection each task reads about 17 MB, and with the pushed-down event-type filter on well-clustered files (de3), most row groups are skipped. Suppose each task takes 3 seconds: 70,000 tasks ÷ 200 slots = 350 waves × 3 s ≈ 18 minutes. Output after filtering, projection and partial aggregation: about 20 GB of shuffle write. The time here is dominated by task count, which hints at a layout fix — if clustering on <code>event_type</code> lets whole files be skipped via table-format statistics, the task count itself drops.</p>
+<p><strong>Stage 2 (scan users).</strong> 40 GB, about 320 tasks, a minute; 40 GB of shuffle write (or none, if users is broadcast — at 40 GB it is far too large, de6).</p>
+<p><strong>Stage 3 (join and aggregate).</strong> 60 GB of shuffle read. With <code>spark.sql.shuffle.partitions</code> set to 2,000 and AQE coalescing towards 64 MB, about 940 tasks of 64 MB, each well within 2.3 GB of execution memory — about 5 waves of a few seconds each. Unless a hot user key makes one partition 30 GB, in which case AQE's skew handling must split it, or the stage waits on one task.</p>
+<p>Total: about 20–25 minutes, of which most is stage 1's scan overhead. The lesson of the arithmetic is typical: the scan and its file layout dominate, the shuffle is modest because filtering and partial aggregation happen first, and the risk sits in skew. Each of those is visible in the UI within the first few minutes of the job.</p>
+</section>
+
+<section data-field="deep">
+<h4>Lineage, determinism and fault tolerance</h4>
+<p>The RDD paper's key insight was that coarse-grained transformations — the same function applied to every element of a partition — can be logged cheaply as lineage, so fault tolerance does not need data replication. When a task fails, Spark re-runs it (up to <code>spark.task.maxFailures</code>, 4 by default). When an executor is lost, Spark re-runs the tasks whose outputs were stored on it, walking back up the lineage as far as needed. This works only if recomputation gives the same result, which is why non-determinism is dangerous: a <code>repartition()</code> followed by a non-deterministic operation, a UDF calling <code>random()</code> or the current time, or a <code>limit</code> without an order, can produce different rows on recomputation, and if only some partitions are recomputed, the output can contain duplicates or gaps. Spark marks some such stages as indeterminate and retries the whole stage, but the safe rule is to make data-dependent randomness deterministic (seed it from row content) and to avoid relying on row order without a sort.</p>
+
+<h4>Why the shuffle is sort-based, and what remote shuffle changes</h4>
+<p>Early Spark used hash-based shuffle, where each map task wrote a separate file per reduce partition: 4,000 maps × 4,000 reduces was 16 million files. Sort-based shuffle writes one file plus an index per map task by sorting output by partition ID, keeping file counts linear in map tasks while still letting reducers fetch contiguous ranges. The remaining scalability problem is the many-to-many fetch pattern — millions of small random reads from executors' disks — and the loss of shuffle data with executors, which hurts on Kubernetes and spot instances. Push-based shuffle (merging blocks per reducer on the map side, from Spark 3.2 on YARN) and remote shuffle services (Apache Celeborn and Apache Uniffle are open-source examples) move shuffle data to dedicated servers that merge it per partition, so reducers do a few large sequential reads and executors can be released or pre-empted without losing shuffle outputs. They add a service to operate; they matter most for very large shuffles on elastic clusters.</p>
+
+<h4>Whole-stage codegen and vectorisation</h4>
+<p>Tuple-at-a-time interpretation (each operator calls the next for every row through a virtual interface) spends most of its time on function call overhead and branch mispredictions rather than useful work. Whole-stage code generation fuses a stage's operators into one generated function, so a filter-project-aggregate chain becomes a loop with the predicate inlined and the aggregate state in local variables — closer to hand-written code. Parquet scans use a separate vectorised reader that decodes column batches directly. Some operators break codegen (certain complex expressions, Python UDFs, very wide schemas past a method-size limit), falling back to interpreted execution; in <code>explain()</code> output, operators without the <code>*(n)</code> prefix are outside generated code, which is a hint when a stage is unexpectedly CPU-bound. Native execution engines (such as Apache Gluten, incubating, with the Velox library, and vendor engines like Databricks Photon) go further by replacing the JVM operators with vectorised C++ ones — a sign that CPU efficiency, not I/O, has become the bottleneck for many Spark workloads.</p>
+
+<h4>Statistics and the cost-based optimiser</h4>
+<p>Catalyst's rules are mostly heuristics; join ordering and strategy depend on size estimates. Spark can collect table and column statistics (<code>ANALYZE TABLE … COMPUTE STATISTICS FOR COLUMNS</code>) and use a cost-based optimiser (<code>spark.sql.cbo.enabled</code>, off by default) to reorder multi-way joins and estimate selectivities. In practice many teams rely on AQE's runtime statistics instead, because stored statistics go stale and estimates after several joins are unreliable anyway. Table formats increasingly provide row counts and column bounds from metadata, which helps the static planner without explicit ANALYZE runs.</p>
+
+<h4>Dynamic allocation and cluster sizing</h4>
+<p>With dynamic allocation, Spark requests more executors when tasks are queued and releases idle ones, which suits jobs with very different stage sizes. Its catch is shuffle data: an executor holding shuffle files cannot be released without losing them, unless an external shuffle service (on YARN) or shuffle tracking/decommissioning (on Kubernetes) preserves or migrates them. Executor sizing is a trade: few large executors (many cores, big heaps) share broadcast data and cached blocks efficiently but suffer longer garbage-collection pauses and bigger blast radius on failure; many small executors isolate failures but duplicate broadcasts and add overhead. Four to eight cores and a heap sized for at least a few gigabytes of execution memory per core is a common middle ground; tune from the UI, not from folklore.</p>
+
+<h4>Python, Arrow and Spark Connect</h4>
+<p>PySpark's DataFrame API is a thin layer: your Python builds a plan that runs in the JVM, so most PySpark code is as fast as Scala. Python cost appears only when rows must cross into Python — UDFs, <code>toPandas()</code>, <code>collect()</code>. Arrow-based pandas UDFs and <code>mapInArrow</code> move whole column batches instead of rows. Spark Connect, introduced in Spark 3.4, separates the client from the driver: a thin client sends unresolved plans over gRPC to a remote Spark server, which suits notebooks, IDEs and services that should not host a driver — and makes driver-side mistakes (collecting huge results) visible as network transfers rather than local OOMs.</p>
+</section>
+
+<section data-field="prod">
+<h4>How Spark jobs fail and slow down in production</h4>
+<p><strong>Skewed stages.</strong> One task runs for hours while thousands finished in seconds. In the UI: max shuffle read far above median. Causes: hot keys (null keys, test accounts, a "default" category), skewed joins, <code>groupBy</code> on a low-cardinality column. Fixes in de6: AQE skew join handling, salting, isolating hot keys, broadcasting.</p>
+<p><strong>Executor OOM and container kills.</strong> Java <code>OutOfMemoryError</code> in executor logs, or the cluster manager killing containers for exceeding memory. Causes: partitions too large, oversized broadcasts, data skew, Python workers or Arrow buffers exceeding overhead, collecting large lists in UDFs. Fixes: more and smaller partitions, larger overhead for PySpark, avoiding per-row Python, executors sized with enough memory per core.</p>
+<p><strong>Driver OOM and driver bottlenecks.</strong> <code>collect()</code> or <code>toPandas()</code> on large results, broadcasting a large table (the driver builds broadcasts), planning over millions of files, or very large query plans built in loops. <code>spark.driver.maxResultSize</code> (1 GB by default) fails a job whose collected results exceed it — a useful safety net, not a limit to raise casually.</p>
+<p><strong>Lost executors and FetchFailed.</strong> Spot interruptions or node failures lose shuffle files; reduce stages fail with FetchFailed and map stages are recomputed, sometimes repeatedly. Fixes: graceful decommissioning, external or remote shuffle, on-demand nodes for the shuffle-heavy part, fewer, larger shuffles.</p>
+<p><strong>Too many small tasks and files.</strong> Millisecond median task times, tens of thousands of tasks, and thousands of tiny output files. Fixes: compaction of inputs, AQE coalescing, <code>repartition</code> before writes (de3).</p>
+<p><strong>Plan regressions.</strong> The same code becomes slower because statistics or sizes crossed a threshold: a broadcast join becomes a sort-merge join, or the reverse a broadcast that is now too large times out (<code>spark.sql.broadcastTimeout</code>, 300 s). Keep the physical plans of important jobs and diff them when performance changes.</p>
+
+<h4>What to watch</h4>
+<p>Per job run: duration per stage, input bytes and files, shuffle read and write, spill, GC time fraction, task duration percentiles, failed and retried tasks, executors lost. Plot them across runs; regressions are easiest to catch as a change in shape (a new long-tail task, a doubled shuffle) the day they appear. The Spark event log, kept by the history server, holds all of this and can be parsed for automated checks.</p>
+
+<h4>The case: the RDD paper and the Spark SQL paper</h4>
+<p>"Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing" (Zaharia et al., UC Berkeley, NSDI 2012) introduced the design every later Spark feature rests on. The paper's motivation is that MapReduce-style frameworks made data reuse across computations expensive — the only way to share data between two MapReduce jobs was to write it to a distributed file system, with replication, disk I/O and serialisation — while iterative machine-learning algorithms (logistic regression, k-means, PageRank) and interactive data mining reuse the same data again and again. RDDs are read-only, partitioned collections built only by deterministic, coarse-grained transformations from stable storage or other RDDs; because a program cannot reference an RDD it cannot reconstruct, fault tolerance comes from recomputing lost partitions from lineage instead of replicating data. Users control persistence (keep this RDD in memory, spill to disk if needed) and partitioning (hash-partition two datasets the same way so they join without a shuffle — the same idea as de3's bucketing). The paper reports Spark up to 20× faster than Hadoop for iterative applications, a real-world analytics report sped up 40×, and interactive scans of a 1 TB dataset with 5–7 seconds of latency.</p>
+<p>"Spark SQL: Relational Data Processing in Spark" (Armbrust et al., SIGMOD 2015) added the layer most engineers use today. It introduced the DataFrame API — relational operations that integrate with procedural code and are evaluated lazily so they can be optimised — and Catalyst, an extensible optimiser written with Scala pattern-matching rules, with phases for analysis, logical optimisation, physical planning and code generation. DataFrames also store data in a compact columnar format rather than as Java or Python objects. The trajectory from these two papers — lineage for fault tolerance, then declarative plans for optimisation, then adaptive re-planning at runtime — explains why modern Spark advice is "write declarative DataFrame or SQL code, avoid row-level Python, and read the plan and the UI", rather than hand-tuning RDD operations.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> simulate one shuffle by hand to see stage boundaries, block counts and skew. Python 3.12 standard library; about 15 minutes. A real Spark version follows, marked Needs Spark.</p>
+<ol>
+<li>Generate 1,000,000 <code>(user_id, amount)</code> rows where 1% of rows belong to user 0 and the rest to random users 1–100,000. Split them into 40 "map partitions" of 25,000 rows each.</li>
+<li>Map stage: for each map partition, compute a partial sum per user (a dict), then split it into 16 buckets by <code>hash(user_id) % 16</code>. Record bytes per bucket as <code>len(pickle.dumps(bucket))</code>.</li>
+<li>Reduce stage: for each of the 16 reduce partitions, gather its bucket from all 40 map outputs and merge the sums. Print the number of blocks (40 × 16), total shuffle bytes, and rows per reduce partition.</li>
+<li>Repeat without the partial aggregation (send raw rows) and compare shuffle bytes.</li>
+<li>Needs Spark: <code>df.groupBy("user_id").agg(F.sum("amount")).explain()</code> should show a <code>partial_sum</code> HashAggregate below an <code>Exchange hashpartitioning(user_id, 200)</code> and a final HashAggregate above it.</li>
+</ol>
+<p><strong>What to look for.</strong> With partial aggregation, shuffle bytes shrink by the ratio of rows to distinct users per map partition — user 0's 10,000 rows become 40 partial sums. Without it, the reduce partition holding user 0 receives about 10,000 more rows than its peers: that is skew, and it is invisible in the totals and obvious in the per-partition counts. The 640 blocks is the map × reduce product that grows painfully at real scale.</p>
+<p>Keep the script: the same three numbers — blocks, bytes, largest partition — are what the Spark UI's stage page reports for every real shuffle.</p>
+</section>
+
+<section data-field="drill">
+<p><b>Diagnose: the 20-minute job that now takes 4 hours</b></p>
+<p>A nightly Spark job builds per-merchant features: read 7 days of transactions (about 1.4 TB on disk), join to a <code>merchants</code> dimension table, aggregate per merchant, write. Until last week it ran in 20 minutes on 40 executors of 8 cores. Now it takes 4 hours, with no code change. The Spark UI for last night's run shows: stage 1 (scan transactions) 6 minutes, as before; stage 2 (scan merchants) 40 seconds; stage 3 (join and aggregate) 3 hours 50 minutes. Stage 3 summary metrics: 1,800 tasks; median duration 9 s; 75th percentile 11 s; max 3 h 41 min; median shuffle read 180 MB; max shuffle read 410 GB; max spill (disk) 620 GB. The SQL tab shows a SortMergeJoin between the two. The merchants table grew from 9 MB to 14 MB last week. What happened, and what do you do?</p>
+<details><summary>Answer</summary>
+<p><strong>Two changes, one symptom.</strong> First, the plan: a 9 MB merchants table was below the 10 MB broadcast threshold (<code>spark.sql.autoBroadcastJoinThreshold</code>), so the join was almost certainly a broadcast hash join — no shuffle of the 1.4 TB transactions side, and no skew problem, because each task joined its own slice of transactions against a full in-memory copy of merchants. At 14 MB it crossed the threshold, and Catalyst planned a sort-merge join instead: both sides are now shuffled by <code>merchant_id</code>. Second, the data's shape: the max task read 410 GB while the median read 180 MB, so one <code>merchant_id</code> — a huge marketplace or payment aggregator, or a placeholder ID for unknown merchants — holds about a third of all transactions. In a sort-merge join all of that key's rows go to one reduce task on one core, which sorts 410 GB with about 2 GB of execution memory, spilling 620 GB to disk. That single task is the 3 h 41 min.</p>
+<p><strong>Why AQE did not save it.</strong> The partition clearly qualifies as skewed (410 GB is far above 5 × the 180 MB median and above 256 MB), and AQE can split a sort-merge join's skewed partition into sub-tasks, each joining a slice of the hot side against a copy of the matching merchants rows. But the aggregation that follows groups by <code>merchant_id</code> and relies on the join's output being partitioned by that key; splitting the hot partition would break that and require an extra shuffle, and by default AQE declines skew optimisation that introduces an extra shuffle (<code>spark.sql.adaptive.forceOptimizeSkewedJoin</code> is false). The SQL tab shows whether a skew-join split was applied. AQE could also have switched to a broadcast join at runtime, but only if the merchants side measured under the adaptive broadcast threshold.</p>
+<p><strong>Fixes, in order.</strong> (1) Restore the broadcast: a 14 MB table is trivially broadcastable; add a <code>broadcast(merchants)</code> hint or raise the threshold to, say, 50 MB, since executors have gigabytes of memory. That removes the transactions shuffle entirely and with it the skew — the job returns to about 20 minutes. (2) Investigate the hot key: if it is a placeholder for "unknown merchant", filter or handle it separately; it is probably also distorting the features. (3) Guard against recurrence: alert when stage 3's max-to-median task ratio exceeds, say, 20, and keep the physical plan of the job under review so a strategy change shows up in a diff. de6 covers join strategies and skew handling in depth.</p>
+</details>
+</section>

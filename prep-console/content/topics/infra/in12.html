@@ -1,0 +1,467 @@
+<!-- topic source for infra/in12; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "in12",
+  "t": "Design a distributed tracing system (Jaeger, Zipkin, OpenTelemetry)",
+  "tag": "Observability",
+  "sum": "The tracing backend itself: the trace/span data model, context propagation with a W3C traceparent decoded by hand, head versus tail sampling and what each loses, span volume and storage maths, the collector pipeline, and lookup by trace id versus search by attributes.",
+  "prereq": [
+    ["sc13", "Metrics, logs and traces are the three signals; a trace follows one request across services as a tree of timed spans, and sampling keeps its cost down."],
+    ["sc14", "Microservices call each other over HTTP or gRPC; one user request can touch dozens of services, and latency anywhere shows up end to end."],
+    ["in6", "A metrics system stores aggregated time series cheaply; exemplars link a metric data point to an example trace id."],
+    ["in1", "Kafka is a durable, partitioned log that buffers bursts between producers and consumers and lets several consumers read the same data."],
+    ["in2", "A wide-column store like Cassandra partitions rows by key, so fetching everything for one key is fast while arbitrary queries need separate index tables."],
+    ["ae1", "An LLM application request passes through a gateway, retrieval, prompt assembly, model inference and tool calls; tracing shows where its time and tokens went."]
+  ],
+  "myths": [
+    ["Tracing means recording every request.", "At 100,000 requests per second with 20 spans each, recording everything is about a gigabyte of span data per second and over 80 TB a day. Google's Dapper found that sampling one request in a thousand was still enough for high-volume services, because a pattern that matters shows up thousands of times. Production systems sample, and the design question is how."],
+    ["Head sampling and tail sampling are interchangeable.", "Head sampling decides at the first service, before anything has happened, so it is cheap and consistent but keeps rare errors and slow requests only at the sampling rate. Tail sampling decides after the whole trace is seen, so it can keep every error and every slow trace, but every span must be shipped to and buffered in one collector for each trace. They lose different things."],
+    ["A trace id in the logs is enough to get distributed tracing.", "A shared id lets you grep logs, but a trace also needs parent-child structure (which call caused which), timing for every span, and propagation through every hop — HTTP headers, message queues, thread pools, async callbacks. A single hop that drops the context breaks the trace into disconnected pieces."],
+    ["Span timestamps from different machines can be compared directly.", "Each span's times come from its own host's clock, and clocks differ by milliseconds or more. A child span can appear to start before its parent. Trace viewers correct for this using the fact that a server's span must sit inside the client's span for the same call, and engineers learn to read small gaps with suspicion."],
+    ["The tracing backend is just a database of spans.", "The hard parts are around the database: absorbing bursts without slowing applications (asynchronous export, local buffers, a queue), assembling spans that arrive from thousands of hosts at different times, making sampling decisions that keep whole traces, and supporting two very different queries — fetch one trace by id, and search all traces by service, operation, duration and tags."]
+  ],
+  "recap": [
+    "A trace is a tree of spans sharing one trace id; each span has its own span id, a parent span id, a name, start and end times, attributes and a status.",
+    "Context propagation carries the trace id and the current span id to every downstream call; the W3C traceparent header encodes version, a 16-byte trace id, an 8-byte parent span id and flags whose lowest bit means sampled.",
+    "Instrumentation lives in shared libraries (RPC frameworks, HTTP clients, queue clients) so developers get traces without writing code, which is how Dapper achieved near-universal coverage.",
+    "Span volume is requests per second times spans per request times sampling rate; at 100,000 requests per second, 20 spans each and 500 bytes per span, full tracing is about 1 GB/s.",
+    "Head sampling decides at the root and propagates the decision, so whole traces are kept or dropped cheaply, but rare errors are kept only at the sampling rate.",
+    "Tail sampling buffers every span of a trace in one collector until the trace is complete, then keeps it by policy (errors, latency, a baseline percentage), at the cost of shipping and holding all spans.",
+    "A collector pipeline receives spans over OTLP, batches them, routes them by trace id to a sampling tier, buffers them in Kafka and writes them to storage.",
+    "Storage serves two queries: fetch-by-trace-id, a single partition read, and search by service, operation, duration and tags, which needs index tables or a columnar store.",
+    "Dapper reported about 426 bytes per span, 204 ns to create a root span, under 15 seconds median collection latency and over 1 TB of sampled trace data per day.",
+    "For LLM applications, each retrieval, model call and tool call is a span carrying model name and token counts, and prompt content is captured only by opt-in because it is sensitive."
+  ],
+  "glossary": [
+    ["Attribute", "A key-value pair on a span, such as http.route=/checkout or db.system=postgresql."],
+    ["Baggage", "User-defined key-value pairs propagated with the trace context to all downstream services."],
+    ["Collector", "A service that receives spans from applications, processes them (batching, sampling, enrichment) and exports them to storage."],
+    ["Context propagation", "Passing the trace id and current span id from one unit of work to the next: across threads, RPCs and message queues."],
+    ["Head sampling", "Deciding whether to record a trace at its first span, before its outcome is known, and passing that decision downstream."],
+    ["Instrumentation", "Code that creates spans; automatic instrumentation lives in libraries and frameworks, manual instrumentation is added by developers."],
+    ["OTLP", "The OpenTelemetry Protocol: the standard wire format for sending traces, metrics and logs to a collector, over gRPC or HTTP."],
+    ["OpenTelemetry", "The vendor-neutral standard and set of SDKs, APIs and a collector for producing and shipping telemetry."],
+    ["Parent span id", "The id of the span that caused this one; empty for the root span."],
+    ["Root span", "The first span of a trace, usually the request entering the system."],
+    ["Sampling decision", "Whether a trace is recorded and kept; carried in the sampled flag of the trace context."],
+    ["Span", "One timed operation within a trace, such as an RPC, a database query or a function call."],
+    ["Span id", "An 8-byte identifier unique to a span within its trace."],
+    ["Span kind", "Whether a span is a SERVER handling a request, a CLIENT making one, a PRODUCER or CONSUMER of a message, or INTERNAL."],
+    ["Tail sampling", "Deciding whether to keep a trace after all its spans have arrived, based on what happened in it."],
+    ["Trace", "The record of one request's path through a system: all spans that share one trace id."],
+    ["Trace id", "A 16-byte identifier shared by every span of one trace."],
+    ["traceparent", "The W3C HTTP header that carries version, trace id, parent span id and trace flags."],
+    ["tracestate", "The W3C companion header carrying vendor-specific trace data, up to 32 entries."],
+    ["Waterfall", "The standard trace view: spans as horizontal bars on a shared time axis, nested under their parents."]
+  ],
+  "qa": [
+    ["E", "What are a trace and a span?", "A trace is the record of one request as it moves through a system. It is made of spans, each a timed unit of work — an incoming request, an outgoing call, a query — with a span id, the id of its parent span, a name, start and end time, attributes and a status. All spans of a trace share the trace id, and the parent links form a tree that shows which work caused which."],
+    ["E", "Decode this header: traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01.", "Version 00. Trace id 4bf92f3577b34da6a3ce929d0e0e4736 — 32 hex characters, 16 bytes, shared by every span of the trace. Parent id 00f067aa0ba902b7 — 16 hex characters, 8 bytes, the span id of the caller's span. Flags 01 — the lowest bit is set, so the caller sampled (recorded) this trace. The receiving service creates its own span with a new span id, parent 00f067aa0ba902b7, and the same trace id.", "Follow-up: What does it send downstream? — The same trace id, its own new span id as the parent id, and the same flags."],
+    ["E", "Why is tracing instrumentation put in shared libraries?", "Because coverage is everything: one uninstrumented hop breaks the trace. If the RPC framework, HTTP client, database driver and queue client create spans and propagate context automatically, every service gets tracing without developers writing code. Dapper's paper credits this — instrumentation in a small set of common libraries — for near-universal coverage at Google."],
+    ["M", "Compare head and tail sampling.", "Head sampling decides at the root span (for example, keep 1% by hashing the trace id) and propagates the decision in the trace flags, so every service records or skips consistently and unsampled requests cost almost nothing. It keeps rare errors and slow requests only at 1%. Tail sampling waits until the trace is complete and keeps it by policy — all errors, all slow traces, a baseline sample — but requires every span to be exported and routed by trace id to one collector that buffers it for tens of seconds.", "Follow-up: Can you combine them? — Yes: head-sample generously (say 10-20%) to cap volume from applications, then tail-sample within that; or always export spans with errors regardless of the head decision."],
+    ["M", "How much storage does tracing need for 100,000 requests per second?", "Assume 20 spans per request and 500 bytes per span: 2 million spans and 1 GB per second unsampled, about 86 TB a day. At 1% head sampling, 10 MB/s and 864 GB a day; 14 days of retention is about 12 TB raw, perhaps 2-3 TB after compression, then multiplied by replication. Tail sampling keeping about 2.5% (baseline plus errors plus slowest) is about 2.2 TB a day.", "Follow-up: What drives the number most? — Spans per request; a chatty service that creates a span per cache lookup can double the bill on its own."],
+    ["M", "How does context propagate through a message queue?", "The producer injects the trace context (traceparent and tracestate) into message headers when it publishes and records a PRODUCER span. The consumer extracts it and starts a CONSUMER span. Because a message may be consumed much later or in a batch, the consumer span is often linked to the producer span rather than made its child, so the trace shows the cause without pretending the consumer ran inside the producer's request."],
+    ["M", "Describe the collector pipeline from application to storage.", "The SDK in each process batches finished spans in memory and exports them asynchronously over OTLP, dropping rather than blocking when its buffer is full. A local agent or sidecar collector receives them, adds host metadata and forwards them. A gateway tier routes spans by trace id so all spans of a trace reach the same tail-sampling collector, which buffers and decides. Kept spans go to Kafka, and ingesters write them to the trace store and the search index.", "Follow-up: Why Kafka in the middle? — It absorbs bursts and storage outages without back-pressuring applications, and lets other consumers (service-graph builders, metrics from spans) read the same stream."],
+    ["M", "Lookup by trace id versus search by attributes: how do you support both?", "Lookup by id is a key-value read: store spans partitioned by trace id so one partition read returns the whole trace. Search ('traces of service checkout, operation POST /pay, longer than 2 s, with error=true, in the last hour') needs indexes keyed by service, operation, time and duration, or a columnar store that scans those columns fast. Jaeger's Cassandra schema uses separate index tables for service, operation, duration and tags that return trace ids; columnar stores like ClickHouse answer with filtered scans."],
+    ["H", "How do you size tail-sampling collectors?", "They must receive every span: 2 million spans per second at 500 bytes is 1 GB/s of ingress. They hold each trace until its decision wait expires (OpenTelemetry's processor defaults to 30 seconds): 2 million × 30 × 500 bytes is 30 GB of span data, and in-memory structures can be two to three times that, so 60-90 GB across the tier — say 20 collectors with 4-8 GB each — plus headroom. The processor's num_traces limit (default 50,000) must exceed traces per second times the wait, or traces are dropped before evaluation.", "Follow-up: What happens to a span that arrives after the decision? — It is too late for that decision; implementations either drop it or cache the decision per trace id for a while and apply it to late spans."],
+    ["H", "A trace shows a child span starting 3 ms before its parent. What is going on?", "Clock skew between the two hosts. Span timestamps come from each host's clock, and NTP keeps clocks within milliseconds, not microseconds. The client span for a call and the server span for the same call must nest, so viewers estimate the skew from the difference and shift the server's spans. Real causality comes from parent ids, not timestamps; durations measured on one host are reliable, cross-host gaps are not."],
+    ["H", "How would you trace an LLM request across retrieval, model and tools?", "Make each stage a span under one trace: the API request, embedding the query, the vector search (with index, top-k and latency), reranking, prompt assembly (with token count), the model call (model name, input and output tokens, time to first token, finish reason), each tool call, and output checks. OpenTelemetry's GenAI conventions, still in development, define attributes such as gen_ai.request.model, gen_ai.usage.input_tokens and gen_ai.usage.output_tokens. Prompt and response text are sensitive and large, so capture them only by opt-in, redact, and store them separately with shorter retention.", "Follow-up: How does sampling change for agents? — Agent runs are long and produce hundreds of spans; tail-sample on outcome (failure, user thumbs-down, cost above a threshold) rather than at random, and link sub-agent traces instead of nesting everything in one."],
+    ["H", "What would you change for a system where a request fans out to 1,000 backends?", "Span count per trace explodes: a search front end that fans out to 1,000 index shards creates 2,000 spans per request. Sample harder at the root, collapse identical fan-out spans into an aggregate (count, min, max, slowest few) at the client, cap spans per trace, and keep full detail only for tail-sampled slow traces. Dapper reported traces with thousands of spans and kept collection out-of-band so trace data never rode in RPC responses.", "Follow-up: Why not send trace data back in the response? — It can dwarf small responses and distort the very latencies being measured, and it assumes every call is perfectly nested."]
+  ],
+  "refs": [
+    ["paper", "Dapper, a Large-Scale Distributed Systems Tracing Infrastructure (Sigelman et al., Google, 2010)", "The foundational design: trace trees and spans, instrumentation in common libraries, out-of-band collection into Bigtable, sampling as low as 1/1024, and measured overheads.", "https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/"],
+    ["docs", "W3C Trace Context (Recommendation, 2021)", "The traceparent and tracestate headers: field formats, validity rules and the sampled flag.", "https://www.w3.org/TR/trace-context/"],
+    ["docs", "OpenTelemetry: Sampling", "Head versus tail sampling, what each costs, and where each is implemented.", "https://opentelemetry.io/docs/concepts/sampling/"],
+    ["code", "OpenTelemetry Collector tail sampling processor", "Policies (latency, status code, probabilistic, rate limiting, composite), decision_wait and num_traces defaults, and the requirement that all spans of a trace reach one instance.", "https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor"],
+    ["docs", "Jaeger architecture", "Jaeger v2 as an OpenTelemetry Collector distribution: collector, query, ingester, Kafka buffering and storage backends.", "https://www.jaegertracing.io/docs/latest/architecture/"],
+    ["docs", "Zipkin architecture", "The original open-source Dapper-style tracer: reporters, transport, collector, storage and query.", "https://zipkin.io/pages/architecture.html"],
+    ["docs", "OpenTelemetry GenAI semantic conventions", "Span attributes for model calls, token usage and tool calls (in development).", "https://github.com/open-telemetry/semantic-conventions-genai"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A customer reports that checkout "sometimes takes ten seconds". The checkout page calls an API gateway, which calls the order service, which calls inventory, pricing, the payment service (which calls a fraud model and a card network), the loyalty service and a shipping-quote service; several of those talk to databases and caches, and one publishes to a queue. Every team's dashboards are green. Average latencies look fine. Logs exist on fifty machines, each with its own timestamps and no common key. Somewhere in that graph, one in a few hundred requests waits nine seconds for something, and nobody can see which.</p>
+<p>Metrics (in6) say <em>that</em> something is slow, aggregated over many requests. Logs say what one process did. Neither shows <em>one request's whole journey</em>: which services it touched, in what order, which calls ran in parallel, and where its time went. That is what a distributed trace is, and Google's Dapper paper describes exactly this motivation: a web search touches thousands of machines across many services, and an engineer looking at overall latency "may know there is a problem, but may not be able to guess which service is at fault".</p>
+<p>Building tracing raises its own system design problem, and that problem is the subject of this lesson. Every service must pass context along on every call, in every language, through every queue and thread pool, or traces fall apart. Recording every request would produce terabytes a day and slow applications down, so the system must sample — and the choice of when to decide what to keep determines which problems you can debug. Spans arrive at the backend from thousands of machines, out of order and at different times, and must be assembled into traces. And the storage must answer two different questions: "show me trace 4bf92f…", and "find me slow checkout traces with errors in the last hour".</p>
+<p>This lesson builds the tracing backend in interview order: requirements; estimates done by hand (spans per second, bytes per span, storage per day under different sampling, collector memory); the API and data model (spans, context and the W3C traceparent header, decoded by hand); the high-level design and the path of one span; then three deep dives — context propagation, head versus tail sampling, and storage and query. sc13 and sc14 introduced traces from the user's side; in6 owns time-series storage; ae1 and hd7 show tracing an LLM application. Here we design the system behind them. The real case is the Dapper paper, with the W3C and OpenTelemetry specifications and Jaeger's architecture; the lab builds a tiny tracer that propagates traceparent across three fake services and compares head and tail sampling on simulated traffic.</p>
+</section>
+
+<section data-field="primer">
+<h4>The mental model: a parcel with a tracking number</h4>
+<p>Think of a parcel sent across the country. At the first depot it gets a <strong>tracking number</strong>. Every depot, van and sorting machine that handles it records a scan: "arrived at Leeds hub 09:14, left 09:52". Some scans happen in parallel — the parcel is weighed while its label is printed. Each scan says which earlier step led to it. Later, anyone can type the tracking number and see the whole journey as a timeline, and the company can also search: "all parcels delayed more than a day at Leeds last week".</p>
+<p>In tracing, the tracking number is the <strong>trace id</strong>, created when the request enters the system. Each scan is a <strong>span</strong>: one timed unit of work — handling an HTTP request, calling another service, running a query — with its own <strong>span id</strong>, the id of the span that caused it (its <strong>parent</strong>), a name, a start and end time, and <strong>attributes</strong> such as the HTTP route or the database table. The label that travels with the parcel is the <strong>trace context</strong>, carried in a header (<code>traceparent</code>) on every call so the next service knows which trace it is part of and which span called it. The tracking website is the <strong>tracing backend</strong>: collectors that receive spans, storage that keeps them, and a query service with a <strong>waterfall</strong> view.</p>
+<p>Where the analogy breaks: a parcel company scans every parcel, while a tracing system usually records only a <strong>sample</strong> of requests, because there are billions. And a depot's clock is the company's clock, while each server's clock is its own — so two spans' timestamps from different machines can disagree by milliseconds.</p>
+
+<h4>A trace as a picture</h4>
+<p>The standard view of one trace is a waterfall: time runs left to right, each span is a bar, children are indented under their parents. Parallel calls appear as overlapping bars; sequential ones as a staircase. The longest chain of dependent spans — the <strong>critical path</strong> — is where shaving time would actually shorten the request. Reading a waterfall is the skill this whole system exists to support.</p>
+
+<figure>
+<svg viewBox="0 0 640 290" width="100%" role="img" aria-label="A trace waterfall for one checkout request lasting 920 milliseconds. Root span: gateway POST /checkout 0 to 920 ms. Child: order-service create order 10 to 900 ms. Its children: inventory reserve 20 to 140 ms and pricing quote 20 to 110 ms in parallel, then payment charge 150 to 880 ms, which contains fraud-model score 160 to 260 ms and card network authorize 270 to 860 ms, the long bar. A database insert 885 to 898 ms.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="10" y="18" style="fill:var(--ink);font-weight:600">trace 4bf92f35…4736 · POST /checkout · 920 ms</text>
+    <line x1="200" y1="28" x2="200" y2="270" style="fill:none;stroke:var(--line-2)"/>
+    <line x1="620" y1="28" x2="620" y2="270" style="fill:none;stroke:var(--line-2);stroke-dasharray:3 3"/>
+    <text x="200" y="284" text-anchor="middle" style="fill:var(--muted)">0 ms</text>
+    <text x="410" y="284" text-anchor="middle" style="fill:var(--muted)">460</text>
+    <text x="620" y="284" text-anchor="middle" style="fill:var(--muted)">920 ms</text>
+    <text x="10" y="46" style="fill:var(--ink)">gateway</text>
+    <rect x="200" y="36" width="420" height="14" rx="2" style="fill:var(--s1)"/>
+    <text x="22" y="72" style="fill:var(--ink)">order: create</text>
+    <rect x="204.6" y="62" width="406.3" height="14" rx="2" style="fill:var(--s2)"/>
+    <text x="34" y="98" style="fill:var(--ink)">inventory: reserve</text>
+    <rect x="209.1" y="88" width="54.8" height="14" rx="2" style="fill:var(--s3)"/>
+    <text x="34" y="124" style="fill:var(--ink)">pricing: quote</text>
+    <rect x="209.1" y="114" width="41.1" height="14" rx="2" style="fill:var(--s3)"/>
+    <text x="34" y="150" style="fill:var(--ink)">payment: charge</text>
+    <rect x="268.5" y="140" width="333.5" height="14" rx="2" style="fill:var(--s4)"/>
+    <text x="46" y="176" style="fill:var(--ink)">fraud: score</text>
+    <rect x="273.0" y="166" width="45.7" height="14" rx="2" style="fill:var(--s5)"/>
+    <text x="46" y="202" style="fill:var(--ink)">card network: auth</text>
+    <rect x="323.3" y="192" width="269.3" height="14" rx="2" style="fill:var(--crit)"/>
+    <text x="34" y="228" style="fill:var(--ink)">db: INSERT order</text>
+    <rect x="604.3" y="218" width="5.9" height="14" rx="2" style="fill:var(--s6)"/>
+    <text x="458" y="186" text-anchor="middle" style="fill:var(--crit)">590 ms: the critical path</text>
+    <text x="300" y="258" style="fill:var(--muted)">inventory ∥ pricing run in parallel; payment waits for both</text>
+  </g>
+</svg>
+<figcaption>Nesting shows causality and bar positions show time. The two short bars side by side ran in parallel; the long red bar inside payment is where 64% of the request went, which no single service's dashboard would reveal.</figcaption>
+</figure>
+
+<h4>The pieces of a tracing system</h4>
+<p>Four parts, which the rest of the lesson builds in order. <strong>Instrumentation</strong>: libraries in each process that create spans and propagate context (OpenTelemetry SDKs — software development kits, one per language — and auto-instrumentation for common frameworks, which wraps HTTP servers, clients and database drivers so spans appear without any application code). <strong>Collection</strong>: agents and collectors that receive finished spans, batch them, sample them and forward them. <strong>Storage</strong>: a store that can return all spans of a trace by id, and indexes that let you search. <strong>Query and analysis</strong>: an API and UI for waterfalls, search, service dependency graphs, and metrics derived from spans.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Requirements</span></div><div class="ck"><span class="ck-m">5–12</span><span class="ck-t">Estimates</span></div><div class="ck"><span class="ck-m">12–20</span><span class="ck-t">API &amp; data</span></div><div class="ck"><span class="ck-m">20–28</span><span class="ck-t">Architecture</span></div><div class="ck"><span class="ck-m">28–48</span><span class="ck-t">Deep dives</span></div><div class="ck"><span class="ck-m">48–56</span><span class="ck-t">Failures</span></div><div class="ck"><span class="ck-m">56–60</span><span class="ck-t">Close</span></div></div>
+
+<h4>1 · Requirements</h4>
+<p><strong>Functional.</strong> (1) Applications in many languages produce spans with minimal code, through libraries. (2) Context propagates across HTTP, gRPC, message queues and async work using a standard format. (3) Fetch a full trace by trace id and show it as a waterfall. (4) Search traces by service, operation, time range, duration and attributes (status=error, customer.tier=gold). (5) Derive a service dependency graph and per-operation latency and error metrics from spans. (6) Configurable sampling, including keeping all errors and slow requests. Out of scope, said aloud: logs and metrics storage (in6), profiling, and alerting (spans feed metrics, which feed alerts).</p>
+<p><strong>Non-functional.</strong> <strong>Low overhead</strong> on applications — the hard constraint; teams switch tracing off if it costs measurable latency. <strong>Never block the application</strong>: if the backend is down, spans are dropped, requests are not slowed. Ingest hundreds of thousands to millions of spans per second. Traces searchable within seconds to a minute of the request. Retention of days to weeks. Loss of some spans is acceptable; loss of the application's availability is not. Sensitive data must not leak into spans.</p>
+<p><strong>Clarifying questions.</strong> How many requests per second, and how many services does a typical request touch? What retention? Must every error be captured, or is a sample enough? Are there regulated data (payments, health) that must not appear in spans? Self-hosted (Jaeger, Tempo) or a vendor? These decide the sampling strategy and the storage engine.</p>
+
+<h4>2 · Back-of-envelope estimates</h4>
+<p>Assume <strong>100,000 requests per second</strong> at peak entering the system, an average of <strong>20 spans per request</strong> (a dozen services plus database and cache calls), and <strong>500 bytes per span</strong> on the wire (ids, name, timestamps, a dozen attributes; Dapper reported 426 bytes per span on average), retention of <strong>14 days</strong>.</p>
+<p><strong>Unsampled volume.</strong> 100,000 × 20 = <strong>2 million spans per second</strong>. × 500 B = <strong>1 GB/s</strong> = 8 Gbit/s. Per day: 1 GB × 86,400 = <strong>86 TB</strong>. Fourteen days: 1.2 PB. Nobody stores this; it is the number that justifies sampling.</p>
+<p><strong>Head sampling at 1%.</strong> 20,000 spans per second, 10 MB/s, <strong>864 GB per day</strong>, 12 TB for 14 days before compression. Span data compresses well (repeated service names, attribute keys and similar values) — assume 5× — so about 2.4 TB, then times the store's replication (3×): about 7 TB of disk. Ordinary.</p>
+<p><strong>Tail sampling.</strong> Suppose policy keeps a 1% baseline, all traces with errors (0.5% of requests) and the slowest 1%: about 2.5% of traces, so 50,000 spans per second, 25 MB/s, <strong>2.2 TB per day</strong>. Storage is modest. The cost is upstream: the collector tier must receive <em>all</em> 2 million spans per second (1 GB/s of ingress) and hold each trace until its decision. With a 30-second decision wait — the default in OpenTelemetry's tail-sampling processor — that is 2,000,000 × 30 × 500 B = <strong>30 GB</strong> of span data in memory at any moment, and two to three times that in object overhead: 60-90 GB across the tier, about 20 collectors of 4-8 GB each.</p>
+<p><strong>Application overhead.</strong> Dapper measured 204 ns to create and destroy a root span and 176 ns for a non-root span on a 2.2 GHz server. For a request with 20 spans that is about 4 µs — negligible next to a request of tens of milliseconds. Serialisation and export cost more, which is why exports are batched and asynchronous; Dapper's collection daemon used under 0.3% of one core and less than 0.01% of network traffic.</p>
+<p><strong>Index size.</strong> At 1% head sampling, 1,000 traces per second are kept. If each trace adds 10 index entries (service, operation, duration bucket, a few tags) at 100 bytes each, that is 1 MB/s, 86 GB a day — small next to the spans, but it is the part that must be fast to query.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+<tr><td>Spans per second (all)</td><td>100k req/s × 20</td><td>2M/s, 1 GB/s</td></tr>
+<tr><td>Per day unsampled</td><td>1 GB/s × 86,400</td><td>~86 TB</td></tr>
+<tr><td>1% head sampling</td><td>20k spans/s × 500 B</td><td>~864 GB/day; ~2.4 TB for 14 days compressed</td></tr>
+<tr><td>Tail keeping ~2.5%</td><td>50k spans/s × 500 B</td><td>~2.2 TB/day stored</td></tr>
+<tr><td>Tail collector buffer</td><td>2M/s × 30 s × 500 B</td><td>30 GB data, 60-90 GB RAM</td></tr>
+<tr><td>Span creation cost (Dapper)</td><td>20 × ~180-200 ns</td><td>~4 µs per request</td></tr>
+</table>
+
+<h4>3 · The API</h4>
+<p>Three interfaces: the propagation format between services, the export protocol from applications, and the query API.</p>
+<pre>Propagation (W3C Trace Context, on every outgoing request):
+  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+  tracestate:  vendorA=t61rcWkgMzE,vendorB=opaque-value       (optional, up to 32 entries)
+
+Export (OTLP over gRPC or HTTP, batched, async):
+  POST /v1/traces   ExportTraceServiceRequest{resource_spans: [{resource: {service.name, host, version},
+                                                                spans: [ ... ]}]}
+
+Query:
+  GET /api/traces/{trace_id}                                  → all spans of one trace
+  GET /api/traces?service=checkout&amp;operation=POST%20/pay&amp;minDuration=2s
+                 &amp;tags={"error":"true"}&amp;start=…&amp;end=…&amp;limit=20  → matching trace summaries
+  GET /api/dependencies?start=…&amp;end=…                        → service call graph with counts</pre>
+<p><strong>The traceparent header, decoded by hand.</strong> Take <code>00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</code> (the example in the W3C Recommendation). Split on dashes: four fields. <strong>Version</strong> <code>00</code> — the only version defined so far; a receiver seeing a higher version still tries to parse the next fields in this format. <strong>Trace id</strong> <code>4bf92f3577b34da6a3ce929d0e0e4736</code> — 32 hex characters, 16 bytes; every span of the request carries it. <strong>Parent id</strong> <code>00f067aa0ba902b7</code> — 16 hex characters, 8 bytes: the span id of the span that made this call. <strong>Trace flags</strong> <code>01</code> — one byte, of which only the lowest bit is defined: 1 means the caller sampled (recorded) this trace. An id of all zeros is invalid, and a receiver must ignore the header and start a new trace. The 16-byte random trace id makes collisions negligible across the trillions of traces a large system creates in a year.</p>
+<p>What the receiving service does: it starts a SERVER span with the same trace id, a fresh random 8-byte span id — say <code>b7ad6b7169203331</code> — and parent <code>00f067aa0ba902b7</code>. When it calls the next service, it creates a CLIENT span (span id <code>e457b5a2e4d86bd1</code>, parent <code>b7ad6b7169203331</code>) and sends <code>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-e457b5a2e4d86bd1-01</code>. The trace id never changes; the parent id field always names the immediate caller's span; the sampled flag is passed through so every service makes the same decision.</p>
+
+<h4>4 · The data model</h4>
+<pre>Span {
+  trace_id        bytes[16]
+  span_id         bytes[8]
+  parent_span_id  bytes[8]          -- empty for the root span
+  name            "POST /checkout" | "SELECT orders" | "chat gpt-x"
+  kind            SERVER | CLIENT | PRODUCER | CONSUMER | INTERNAL
+  start_time_ns, end_time_ns
+  attributes      {http.route: "/checkout", http.response.status_code: 200, db.system: "postgresql", ...}
+  events          [{time, name: "exception", attributes: {exception.type, exception.message}}]
+  links           [{trace_id, span_id}]   -- causal links that are not parent/child (batches, fan-in)
+  status          UNSET | OK | ERROR
+}
+Resource { service.name: "payment", service.version: "2.14.1", host.name, deployment.environment }</pre>
+<p>The <strong>resource</strong> describes the process that produced the spans and is sent once per batch, not per span — a simple saving. <strong>Kind</strong> lets the backend pair a CLIENT span with the SERVER span on the other side of the same call (to compute network time and correct clock skew) and build the service graph. <strong>Links</strong> handle cases a tree cannot: a batch consumer that processes messages from 50 different traces links to each, instead of pretending to be the child of one.</p>
+<p>In storage, spans are grouped by trace id. Jaeger's Cassandra schema, for example, keeps a traces table partitioned by trace id plus separate index tables (by service name, by service and operation, by duration, by tag) that map search criteria and time buckets to trace ids — the two-query problem made concrete.</p>
+
+<h4>5 · High-level design and the path of one span</h4>
+<p>(1) A request reaches the gateway with no traceparent. The SDK's sampler makes a <strong>head decision</strong> — say keep 1%, decided by the trace id's bits so it is reproducible — and starts the root span. (2) Every outgoing call carries traceparent with the sampled flag; downstream services honour it (a "parent-based" sampler), so a trace is recorded everywhere or nowhere. (3) When a span ends, the SDK puts it in an in-memory queue; a background exporter sends batches (say every 5 seconds or 512 spans) over OTLP to a <strong>local agent</strong> on the same node. If the queue is full, new spans are dropped and a counter increments — the application is never blocked. (4) The agent adds host and container metadata and forwards to the <strong>gateway collectors</strong>. (5) If tail sampling is used, the gateway tier routes each span by hashing its trace id to one <strong>sampling collector</strong>, which buffers the trace and decides when it is complete. (6) Kept spans go to <strong>Kafka</strong>, partitioned by trace id. (7) <strong>Ingesters</strong> consume from Kafka and write spans to the trace store and index entries to the search index. (8) The <strong>query service</strong> serves trace-by-id and search, and a <strong>stream job</strong> reads the same Kafka topic to compute the service dependency graph and RED metrics (rate, errors, duration) per operation.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Collector pipeline: applications with SDKs export OTLP batches to node agents; agents send to a gateway tier that load-balances by trace id; tail-sampling collectors buffer each trace for about 30 seconds and apply policies (errors, latency, baseline); kept spans go to Kafka; ingesters write to a trace store keyed by trace id and to a search index; the query service reads both; a stream job derives service graphs and metrics.">
+  <defs><marker id="in12-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="30" width="90" height="120" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="52" text-anchor="middle" style="fill:var(--ink)">Services</text>
+    <text x="55" y="72" text-anchor="middle" style="fill:var(--muted)">SDK: spans,</text>
+    <text x="55" y="88" text-anchor="middle" style="fill:var(--muted)">propagate,</text>
+    <text x="55" y="104" text-anchor="middle" style="fill:var(--muted)">batch, drop</text>
+    <text x="55" y="120" text-anchor="middle" style="fill:var(--muted)">if full</text>
+    <rect x="125" y="60" width="70" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="160" y="85" text-anchor="middle" style="fill:var(--ink)">Node</text>
+    <text x="160" y="101" text-anchor="middle" style="fill:var(--ink)">agent</text>
+    <line x1="100" y1="90" x2="123" y2="90" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="112" y="80" text-anchor="middle" style="fill:var(--muted)">OTLP</text>
+    <rect x="220" y="50" width="90" height="80" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="265" y="74" text-anchor="middle" style="fill:var(--ink)">Gateway</text>
+    <text x="265" y="92" text-anchor="middle" style="fill:var(--muted)">route by</text>
+    <text x="265" y="108" text-anchor="middle" style="fill:var(--muted)">hash(trace_id)</text>
+    <line x1="195" y1="90" x2="218" y2="90" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="335" y="30" width="120" height="120" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="395" y="52" text-anchor="middle" style="fill:var(--ink)">Tail sampler ×N</text>
+    <text x="395" y="72" text-anchor="middle" style="fill:var(--muted)">buffer ~30 s</text>
+    <text x="395" y="92" text-anchor="middle" style="fill:var(--good)">keep: error</text>
+    <text x="395" y="108" text-anchor="middle" style="fill:var(--good)">keep: &gt; 2 s</text>
+    <text x="395" y="124" text-anchor="middle" style="fill:var(--good)">keep: 1% rest</text>
+    <text x="395" y="140" text-anchor="middle" style="fill:var(--crit)">drop the rest</text>
+    <line x1="310" y1="90" x2="333" y2="90" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="480" y="60" width="70" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="515" y="85" text-anchor="middle" style="fill:var(--ink)">Kafka</text>
+    <text x="515" y="101" text-anchor="middle" style="fill:var(--muted)">by trace</text>
+    <line x1="455" y1="90" x2="478" y2="90" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="570" y="60" width="62" height="60" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="601" y="85" text-anchor="middle" style="fill:var(--ink)">Ingest</text>
+    <text x="601" y="101" text-anchor="middle" style="fill:var(--ink)">ers</text>
+    <line x1="550" y1="90" x2="568" y2="90" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="440" y="180" width="110" height="46" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="495" y="200" text-anchor="middle" style="fill:var(--ink)">Trace store</text>
+    <text x="495" y="216" text-anchor="middle" style="fill:var(--muted)">key = trace_id</text>
+    <rect x="560" y="180" width="72" height="46" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="596" y="200" text-anchor="middle" style="fill:var(--ink)">Search</text>
+    <text x="596" y="216" text-anchor="middle" style="fill:var(--muted)">index</text>
+    <line x1="590" y1="120" x2="510" y2="178" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--s3)"/>
+    <line x1="601" y1="120" x2="598" y2="178" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--s3)"/>
+    <rect x="270" y="180" width="140" height="46" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="340" y="200" text-anchor="middle" style="fill:var(--ink)">Query service + UI</text>
+    <text x="340" y="216" text-anchor="middle" style="fill:var(--muted)">by id · search · graph</text>
+    <line x1="438" y1="203" x2="412" y2="203" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--s3)"/>
+    <rect x="90" y="180" width="150" height="46" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="165" y="200" text-anchor="middle" style="fill:var(--ink)">Stream job</text>
+    <text x="165" y="216" text-anchor="middle" style="fill:var(--muted)">service graph, RED</text>
+    <path d="M515,120 L515,160 L165,160 L165,178" marker-end="url(#in12-arrow)" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="320" y="250" text-anchor="middle" style="fill:var(--muted)">applications never wait on anything right of the SDK's queue</text>
+  </g>
+</svg>
+<figcaption>The only stateful step before Kafka is the tail sampler, and it only works because the gateway sends every span of a trace to the same sampler instance. Everything to the right of the SDK is asynchronous: a slow backend costs dropped spans, never slower requests.</figcaption>
+</figure>
+
+<h4>6 · Deep dive A: context propagation</h4>
+<p><strong>Inside a process.</strong> The SDK keeps the "current span" in a context object attached to the current thread or, in async runtimes, the current task (Python's <code>contextvars</code>, Java's thread-locals plus context wrappers for executors, Go's explicit <code>context.Context</code> argument). Starting a span makes it current; starting a child reads the current span as parent. The classic breakage is handing work to a thread pool or callback without carrying the context: the work starts a new, disconnected trace. Instrumentation libraries wrap executors and async primitives to carry it automatically; Dapper's paper reports that a few dozen applications at Google still needed manual propagation for unusual control flow.</p>
+<p><strong>Across processes.</strong> On an outgoing call, the SDK <em>injects</em> the context into the carrier — HTTP headers for HTTP and gRPC (as metadata), message headers for Kafka or AMQP. On the receiving side it <em>extracts</em> it and starts a SERVER or CONSUMER span with that parent. A standard format matters because the call may cross languages, proxies and vendors: the W3C traceparent header is understood by OpenTelemetry SDKs, load balancers and cloud services, and <code>tracestate</code> carries vendor-specific extras (up to 32 entries) without breaking the shared fields. Proxies and gateways must forward these headers; a proxy that strips unknown headers silently splits traces.</p>
+<p><strong>Queues and batches.</strong> A message published now may be consumed in a second or a day, possibly in a batch with messages from other requests. The producer injects context into the message headers and records a PRODUCER span; the consumer creates a CONSUMER span that either continues the trace (one message per processing) or carries <strong>links</strong> to each message's producer span (batch processing). Links keep traces honest: the batch job is not "part of" 50 different requests, but each request can show that its message was processed by it.</p>
+<p><strong>Baggage.</strong> Sometimes services need request-scoped values that the trace context does not carry — a tenant id, a feature-flag cohort. The W3C <code>baggage</code> header propagates such key-value pairs to every downstream service. It is sent on every call, so it must stay small, and it must never carry secrets, because it leaves your network on any call to a third party unless stripped at the edge.</p>
+<p><strong>Clock skew.</strong> Each span's timestamps come from the host that recorded it. A CLIENT span on host A (start 10.000 s, end 10.050 s) and the SERVER span for the same call on host B (start 9.998 s, end 10.040 s by B's clock) cannot both be right: the server cannot start before the client sent. Viewers estimate B's offset from the pair (here B is at least 2 ms behind) and shift B's spans for display. Durations within one host are trustworthy; cross-host gaps of a few milliseconds are not, and the parent link, not the timestamp, is the source of truth for causality.</p>
+
+<h4>7 · Deep dive B: head versus tail sampling</h4>
+<p><strong>Head sampling.</strong> The decision is made when the root span starts, before anything is known about the request, and propagated in the sampled flag. OpenTelemetry's ratio-based sampler computes it from the trace id — keep the trace if its id, read as a number, falls below the ratio times the maximum — so any service seeing the same trace id would reach the same decision even without the flag. Downstream services use a parent-based sampler: record if and only if the parent was sampled. Strengths: unsampled requests cost almost nothing anywhere (spans are not even exported), the volume leaving applications is cut at the source, and every kept trace is complete. Weakness: the decision is blind. If 0.1% of requests fail and you keep 1%, you keep one failing trace in a thousand failing requests; a bug that happens once an hour is captured once in 100 hours on average. Dapper reported that for high-volume services, sampling as low as 1/1024 still gave enough data for most analyses, because a pattern that matters appears thousands of times; its adaptive sampler targeted a number of traces per unit time instead of a fixed probability, so low-traffic services sampled more.</p>
+<p><strong>Tail sampling.</strong> The decision is made after the trace is complete, using what happened in it. Every service records and exports every span (or a generous head sample). A gateway tier routes spans by trace id — the OpenTelemetry load-balancing exporter does this with consistent hashing — so all spans of a trace reach the same sampling collector. That collector holds each trace in memory for a <strong>decision wait</strong> (30 seconds by default in OpenTelemetry's tail-sampling processor), then evaluates policies: keep if any span has status ERROR; keep if the root's duration exceeds 2 seconds; keep traces for VIP tenants; otherwise keep 1% at random; and rate-limit the total. Policies available in that processor include latency, status code, probabilistic, string and numeric attribute, rate limiting, span count and composite.</p>
+<p><strong>What each loses, side by side.</strong></p>
+<table>
+<thead><tr><th></th><th>Head sampling (1%)</th><th>Tail sampling (errors + slow + 1%)</th></tr></thead>
+<tr><td>Decision made</td><td>At the root, before the outcome</td><td>After the trace completes</td></tr>
+<tr><td>Rare errors kept</td><td>1% of them</td><td>All of them</td></tr>
+<tr><td>Data leaving applications</td><td>1%</td><td>100% (or the head-sampled share)</td></tr>
+<tr><td>Collector state</td><td>None</td><td>All in-flight traces for ~30 s (tens of GB)</td></tr>
+<tr><td>Trace completeness</td><td>Complete if propagation works</td><td>Late spans after the decision may be lost</td></tr>
+<tr><td>Representativeness</td><td>Unbiased sample, easy statistics</td><td>Biased toward errors and slowness; weight by sampling probability</td></tr>
+<tr><td>Failure mode</td><td>Missing the trace you need</td><td>Collector memory pressure; dropped traces before evaluation</td></tr>
+</table>
+<p><strong>Head sampling worked.</strong> A customer reports one failed payment at 14:03. Errors on that path occur at 0.05% of 2,000 requests per second, one per second. At 1% head sampling, the chance that this customer's trace was kept is 1%. You will find <em>other</em> failing traces (about 36 per hour are kept), which is often enough to diagnose a systematic bug, but not this customer's specific request.</p>
+<p><strong>Tail sampling worked.</strong> With all errors kept, the customer's trace is there. The cost: all 2 million spans per second go to the sampling tier; it buffers 30 GB of span data; if one trace's spans arrive over more than 30 seconds (a slow batch step), the later spans arrive after the decision and are dropped or kept separately by a cached decision; and if traffic spikes so that more traces are in flight than the configured <code>num_traces</code> (50,000 by default in the processor), the oldest are evicted before they are evaluated — at 100,000 traces per second and a 30-second wait you need room for 3 million, so the default would be far too small.</p>
+<p><strong>The hybrid most teams run.</strong> Head-sample at a rate that caps application and network overhead (say 10-25%), export every span with an error regardless of the head decision (so the collector can upgrade those traces), and tail-sample inside that stream. Record the sampling probability on every kept trace, so analyses can re-weight: a trace kept at 1% stands for 100 requests, one kept because it errored stands for itself.</p>
+
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Head versus tail sampling on the same ten traces, two of which have an error and one of which is slow. Head sampling picks traces at random at the start: it happens to keep one normal trace and misses both errors and the slow one. Tail sampling sees each trace complete, then keeps both errors, the slow trace and one random normal trace.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="320" y="18" text-anchor="middle" style="fill:var(--ink);font-weight:600">Ten requests, two errors, one slow: what does each sampler keep?</text>
+    <text x="10" y="52" style="fill:var(--ink)">traffic</text>
+    <g>
+      <rect x="110" y="40" width="40" height="16" rx="2" style="fill:var(--s2)"/>
+      <rect x="160" y="40" width="40" height="16" rx="2" style="fill:var(--crit)"/>
+      <rect x="210" y="40" width="40" height="16" rx="2" style="fill:var(--s2)"/>
+      <rect x="260" y="40" width="40" height="16" rx="2" style="fill:var(--s2)"/>
+      <rect x="310" y="40" width="80" height="16" rx="2" style="fill:var(--s5)"/>
+      <rect x="400" y="40" width="40" height="16" rx="2" style="fill:var(--s2)"/>
+      <rect x="450" y="40" width="40" height="16" rx="2" style="fill:var(--s2)"/>
+      <rect x="500" y="40" width="40" height="16" rx="2" style="fill:var(--crit)"/>
+      <rect x="550" y="40" width="40" height="16" rx="2" style="fill:var(--s2)"/>
+      <rect x="600" y="40" width="30" height="16" rx="2" style="fill:var(--s2)"/>
+    </g>
+    <text x="180" y="72" text-anchor="middle" style="fill:var(--crit)">error</text>
+    <text x="350" y="72" text-anchor="middle" style="fill:var(--s5)">slow (3 s)</text>
+    <text x="520" y="72" text-anchor="middle" style="fill:var(--crit)">error</text>
+    <text x="10" y="112" style="fill:var(--ink)">head 10%</text>
+    <text x="10" y="128" style="fill:var(--muted)">decide at start</text>
+    <rect x="410" y="100" width="20" height="16" rx="2" style="fill:var(--s2)"/>
+    <text x="420" y="134" text-anchor="middle" style="fill:var(--good)">kept</text>
+    <text x="250" y="114" style="fill:var(--crit)">✕ both errors and the slow trace lost</text>
+    <text x="10" y="172" style="fill:var(--ink)">tail policy</text>
+    <text x="10" y="188" style="fill:var(--muted)">decide at end</text>
+    <rect x="160" y="160" width="40" height="16" rx="2" style="fill:var(--crit)"/>
+    <rect x="310" y="160" width="80" height="16" rx="2" style="fill:var(--s5)"/>
+    <rect x="500" y="160" width="40" height="16" rx="2" style="fill:var(--crit)"/>
+    <rect x="550" y="160" width="40" height="16" rx="2" style="fill:var(--s2)"/>
+    <text x="320" y="210" text-anchor="middle" style="fill:var(--good)">keeps every error and the slow one, plus a random baseline — but had to buffer all ten</text>
+  </g>
+</svg>
+<figcaption>Head sampling keeps an unbiased random slice and is blind to outcomes; tail sampling keeps exactly the traces you will want to look at, paying for it by receiving and holding everything until each trace is complete.</figcaption>
+</figure>
+
+<h4>8 · Deep dive C: storage and query</h4>
+<p><strong>Two access patterns.</strong> <em>Lookup by trace id</em> — someone pastes an id from a log line, an error page or an exemplar on a metrics chart (in6) — must return every span of that trace, quickly. <em>Search</em> — "slow checkout traces with errors for gold customers in the last hour" — must scan many traces by service, operation, time, duration and attributes and return a list of trace ids with summaries.</p>
+<p><strong>Lookup by id.</strong> Store spans in a key-value or wide-column store partitioned by trace id (in2): all spans of a trace are one partition, read in one request. Writes are append-only and high-volume; reads are rare and by key — the shape Cassandra-style stores handle well. Dapper wrote each trace as a single Bigtable row with one column per span, which exploited Bigtable's sparse rows for traces of arbitrary size. Since trace ids are random, partitions spread evenly across nodes. Retention is enforced by time-to-live on rows, or by dropping whole daily tables, which is much cheaper than deleting rows.</p>
+<p><strong>Search with index tables.</strong> In a key-value store, search needs explicitly maintained indexes: for each kept trace, the ingester writes entries such as (service, time bucket) → trace id; (service, operation, time bucket) → trace id; (service, duration, time bucket) → trace id; (service, tag key=value, time bucket) → trace id. A query reads the most selective index range and intersects the results, then fetches summaries. This is fast for the indexed fields and impossible for anything not indexed; every indexed tag multiplies write volume, so tag indexing is limited to an allow-list.</p>
+<p><strong>Search with a columnar store.</strong> The alternative stores spans in a columnar database (ClickHouse is common for this; db12 explains columnar storage) with columns for service, name, duration, status and a map of attributes, sorted by service and time. A query filters on columns and scans compressed data very fast, so any attribute is searchable without pre-declared indexes, at the cost of more CPU per query. Lookup by trace id then needs either a secondary structure (a skip index or a separate small table from trace id to time range) or scanning a time window. Many modern backends take a third path: write spans as large compressed blocks to object storage, keep a small index from trace id to block (often with Bloom filters), and search by scanning blocks in parallel — cheapest storage, slower search.</p>
+<p><strong>Assembly and late spans.</strong> Spans of one trace arrive from many hosts over seconds to minutes (batched exporters flush every few seconds; a slow downstream may finish long after the root). The store does not need complete traces — it appends spans to the trace's partition as they come — but anything that computes per-trace results (tail sampling, trace-level metrics, "root duration" indexes) must decide when a trace is "complete enough", usually by a quiet period after the last span. Dapper reported a median of under 15 seconds from application to central repository, with a long tail: its 98th percentile was under two minutes about 75% of the time and could grow to hours.</p>
+<p><strong>Derived data.</strong> The same span stream yields cheap, unsampled-quality aggregates if computed before sampling: request rate, error rate and latency histograms per service and operation, and a service dependency graph from CLIENT→SERVER pairs. Computing them in the collector before tail sampling gives accurate metrics from 100% of spans while storing only a few percent of traces — the most useful single optimisation in a tracing pipeline.</p>
+
+<h4>9 · Failure modes and trade-offs</h4>
+<p><strong>Broken propagation.</strong> A proxy strips headers or a thread pool loses context: traces split into fragments, each looking like a separate request. Detect by counting traces whose root span is a SERVER span with a remote caller (an orphan) and by checking that SERVER spans have parents for internal callers.</p>
+<p><strong>Backend overload.</strong> If collectors fall behind, SDK queues fill and spans are dropped at the source — the right failure, but it should be visible: export failure and drop counters per service. Kafka in front of storage absorbs storage slowness; without it, an Elasticsearch or Cassandra hiccup turns into collector back-pressure and drops.</p>
+<p><strong>Cardinality and cost blow-ups.</strong> One team adds a span per cache lookup, or puts a user id into span names: span count or index size jumps overnight. Enforce per-service span budgets, keep high-cardinality values in attributes, not names, and alert on volume per service.</p>
+<p><strong>Sensitive data.</strong> SQL statements with literal values, URLs with tokens, prompts with personal data end up in attributes. Dapper stored RPC method names but no payloads, with application annotations as an explicit opt-in. Scrub in the collector (attribute processors that hash or remove known keys), and default content capture to off.</p>
+<p><strong>Trade-offs to close on.</strong> Head (cheap, unbiased, blind) versus tail (targeted, expensive, stateful). Key-value plus index tables (fast lookups, limited search) versus columnar (flexible search, more CPU) versus object storage blocks (cheapest, slowest). Collection latency versus batching efficiency. Detail (more spans) versus cost. And always: tracing must fail open — dropping spans is acceptable, slowing requests is not.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why sampling by trace id keeps traces whole</h4>
+<p>If each service flipped its own coin, a trace touching 20 services would almost never be recorded completely. Two mechanisms prevent this. Propagating the decision in the sampled flag makes downstream services follow the root. And computing the decision deterministically from the trace id means that even a component that never saw the flag — Dapper's second-round sampling in its collectors, for example — reaches the same answer: Dapper hashed the trace id to a number between 0 and 1 and kept the span only if it fell below the collection coefficient, so whole traces were kept or dropped together. Changing one coefficient adjusted the global write rate.</p>
+
+<h4>Adaptive and rate-based sampling</h4>
+<p>A fixed probability over-samples busy services and under-samples quiet ones: 1% of 50,000 requests per second is 500 traces per second, 1% of 2 per second is one trace every 50 seconds. Dapper moved toward an adaptive scheme parameterised by a desired number of sampled traces per unit time, and recorded the probability actually used with each trace. Jaeger offers remote sampling, where SDKs poll the backend for per-service and per-operation probabilities, including adaptive ones computed from observed traffic. The essential detail is recording the probability with each trace, or every count computed from traces will be wrong.</p>
+
+<h4>Exemplars: the bridge between metrics and traces</h4>
+<p>A latency histogram on a dashboard tells you the p99 jumped; it cannot tell you which request. Exemplars attach a sample trace id to a histogram bucket at write time, so a click on the spike opens a real trace from that bucket (in6). This only works if the trace was kept, which is an argument for tail sampling slow requests, or for at least keeping traces whose ids were recorded as exemplars.</p>
+
+<h4>Span metrics before sampling</h4>
+<p>Request rates, error rates and latency distributions computed from spans are exact only if computed before sampling. Putting a span-to-metrics processor in the collector tier, ahead of the tail sampler, gives per-operation RED metrics from 100% of traffic while storing perhaps 2% of traces. The metrics flow to the time-series system; traces remain the drill-down. This also means the cost of 100% export buys you something even for traces you discard.</p>
+
+<h4>Tracing LLM and agent workloads</h4>
+<p>An LLM request is a short trace with very different span costs: a 30 ms retrieval, a 2-second model call, a tool call that waits on an external API. Useful attributes are not HTTP routes but model name, token counts, time to first token, cache hits and finish reasons; OpenTelemetry's GenAI conventions (marked as in development) name them, for example <code>gen_ai.operation.name</code>, <code>gen_ai.request.model</code>, <code>gen_ai.usage.input_tokens</code> and <code>gen_ai.usage.output_tokens</code>. Agents break assumptions: one task can run for minutes and produce hundreds of spans, sub-agents may run in parallel, and the interesting outcome (did the task succeed? did the user approve?) is known only at the end or later. Tail-sample on outcome and cost rather than latency, link spans from asynchronous sub-tasks instead of nesting them, and keep prompt and completion text out of spans by default, storing it — when enabled — in a separate, access-controlled store referenced by span id.</p>
+
+<h4>Trace ids everywhere else</h4>
+<p>A trace is only useful if people can get to it. Write the current trace id into every log line (most logging libraries can add it automatically from the active context), return it in a response header on errors so support staff can paste it, and attach it as an exemplar to metrics. Then the three signals join on one key: an alert on a metric leads to an exemplar trace, the trace's slow span leads to that service's logs for the same trace id. The catch is sampling: a log line can carry the id of a trace that head sampling dropped. Either keep traces whose ids were surfaced (tail sampling can treat "logged an error" as a keep policy), or make the UI say clearly that the trace was not sampled rather than showing an empty page.</p>
+
+<h4>Out-of-band collection, and why</h4>
+<p>Dapper deliberately did not send trace data back to callers inside RPC responses. Its paper gives two reasons: many responses are small (often under ten kilobytes) while traces can have thousands of spans, so in-band data would dwarf application data and change the network behaviour being measured; and in-band schemes assume perfect nesting, while much middleware returns before all of its own backends have finished. Writing spans to local logs (or a local agent) and collecting them separately keeps tracing's footprint off the request path — the same principle as the SDK's drop-if-full queue.</p>
+</section>
+
+<section data-field="prod">
+<h4>The real case: Dapper, and the standards that followed</h4>
+<p>Google's Dapper paper (Sigelman, Barroso, Burrows, Stephenson, Plakal, Beaver, Jaspan and Shanbhag, 2010) reports two years of running tracing across Google's production fleet, and most of today's tracing design comes from it. Traces are trees of spans; each span records its name, span id and parent id, and all spans of a trace share a trace id — all probabilistically unique 64-bit integers in Dapper (W3C later standardised a 128-bit trace id). Instrumentation was confined to a small set of libraries — the RPC framework, threading and control-flow code — under 1,000 lines of C++ and 800 lines of Java, which gave near-universal coverage without developers' involvement. Spans were written to local log files, pulled by a daemon on every machine, and written to regional Bigtable repositories, one row per trace and one column per span.</p>
+<p>The paper's numbers are still the reference for overhead and scale: 204 ns to create and destroy a root span and 176 ns for other spans; about 9 ns for an annotation on an unsampled span and 40 ns on a sampled one; the collection daemon below 0.3% of one core; 426 bytes per span on average and less than 0.01% of network traffic; more than 1 TB of sampled trace data per day, with users wanting two weeks of retention; and a median collection latency under 15 seconds. On sampling, it found that tracing every request in a web-search cluster had a noticeable latency cost, that the cost was within measurement error at rates below 1/16, and that 1/1024 still gave enough data for high-volume services; it added a second, trace-id-based sampling stage in collection to control repository write load.</p>
+<p>The open-source lineage made this a standard. Twitter's Zipkin implemented the Dapper model with pluggable transports and storage; Uber's Jaeger followed, and Jaeger v2 is now itself a distribution of the OpenTelemetry Collector, with roles for collector, query and an ingester that reads from Kafka, and storage backends including Cassandra, Elasticsearch, OpenSearch, ClickHouse and Badger. The W3C Trace Context Recommendation (2021) fixed the propagation format so that traces survive crossing vendors and clouds, and OpenTelemetry unified the SDKs, the OTLP wire protocol and the collector, whose tail-sampling processor makes the trade-offs in this lesson concrete configuration.</p>
+
+<h4>Failure modes you will see</h4>
+<p><strong>Orphan spans everywhere after a proxy upgrade.</strong> The new proxy version strips unknown headers; every trace splits at that hop. Detection: a spike in root spans for internal services. Fix: forward traceparent, tracestate and baggage explicitly.</p>
+<p><strong>Tail sampler out of memory during an incident.</strong> Error traffic doubles traffic volume (retries), traces take longer (timeouts), so more traces are in flight for longer; the sampler evicts before evaluating — exactly when you need the traces. Size for incident traffic, cap per-trace span counts, and shorten the decision wait under pressure.</p>
+<p><strong>Search is slow but lookups are fast.</strong> Index tables were not written for a tag people now filter on, or the columnar store's sort key does not match the common filter. Revisit which attributes are indexed, from query logs.</p>
+<p><strong>Missing spans from short-lived jobs.</strong> A batch job or serverless function exits before its exporter flushes. Flush on shutdown, and give functions a synchronous flush at the end of each invocation.</p>
+
+<h4>What to monitor in the tracing system itself</h4>
+<p>Spans received, dropped (SDK queue full, collector refused) and exported per service; collector queue sizes and memory; tail-sampler traces in flight, evictions before decision, and decisions per policy; Kafka lag for ingesters; end-to-end latency from span end to searchable; storage write errors; orphan-span rate; and span volume per service against its budget.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> build a tiny tracer that propagates a W3C traceparent through three fake services and prints the trace tree, then simulate head and tail sampling on 100,000 synthetic traces and see what each keeps. Python 3.12 standard library.</p>
+<pre>"""Mini tracer: traceparent propagation across 3 'services', a trace tree, head vs tail sampling."""
+import contextvars, os, random, time
+
+SPANS = []                                            # stands in for the exporter
+current = contextvars.ContextVar("current", default=None)
+
+class Span:
+    def __init__(self, name, trace_id, parent_id, sampled):
+        self.name, self.trace_id, self.parent_id, self.sampled = name, trace_id, parent_id, sampled
+        self.span_id = os.urandom(8).hex()
+        self.start = time.perf_counter(); self.end = None; self.error = False
+    def __enter__(self):
+        self.token = current.set(self); return self
+    def __exit__(self, exc_type, *_):
+        self.end = time.perf_counter(); self.error = exc_type is not None
+        current.reset(self.token)
+        if self.sampled: SPANS.append(self)
+        return False
+    def traceparent(self):                            # what goes on the wire
+        return f"00-{self.trace_id}-{self.span_id}-{'01' if self.sampled else '00'}"
+
+def start_span(name, headers=None):
+    parent = current.get()
+    if parent:                                        # in-process child
+        return Span(name, parent.trace_id, parent.span_id, parent.sampled)
+    if headers and "traceparent" in headers:          # extract from the incoming request
+        ver, tid, pid, flags = headers["traceparent"].split("-")
+        return Span(name, tid, pid, int(flags, 16) &amp; 1 == 1)
+    tid = os.urandom(16).hex()                        # new root: head decision from the trace id
+    return Span(name, tid, None, int(tid[:8], 16) / 0xFFFFFFFF &lt; HEAD_RATE)
+
+# --- three fake services calling each other over 'HTTP' (a dict of headers) -------------
+def remote(service, headers):                         # a fresh Context = a separate process
+    return contextvars.Context().run(service, headers)
+
+def inventory(headers):
+    with start_span("inventory: reserve", headers): time.sleep(0.01)
+
+def payment(headers):
+    with start_span("payment: charge", headers):
+        with start_span("payment: card network"): time.sleep(0.03)
+
+def checkout():
+    with start_span("checkout: POST /order") as root:
+        with start_span("checkout: call inventory") as c:
+            remote(inventory, {"traceparent": c.traceparent()})
+        with start_span("checkout: call payment") as c:
+            remote(payment, {"traceparent": c.traceparent()})
+        print("root traceparent:", root.traceparent())
+
+HEAD_RATE = 1.0
+checkout()
+by_parent = {}
+for s in SPANS: by_parent.setdefault(s.parent_id, []).append(s)
+def show(parent_id, depth=0):
+    for s in sorted(by_parent.get(parent_id, []), key=lambda s: s.start):
+        print("  " * depth + f"{s.name:&lt;28} {1000 * (s.end - s.start):6.1f} ms  span={s.span_id}")
+        show(s.span_id, depth + 1)
+show(None)
+
+# --- head vs tail on 100k synthetic traces: 0.1% errors, 1% slow ---------------------------
+random.seed(3)
+traces = [{"error": random.random() &lt; 0.001, "ms": random.lognormvariate(4, 0.5) * (8 if random.random() &lt; 0.01 else 1)}
+          for _ in range(100_000)]
+head = [t for t in traces if random.random() &lt; 0.01]
+tail = [t for t in traces if t["error"] or t["ms"] &gt; 500 or random.random() &lt; 0.01]
+for name, kept in (("head 1%", head), ("tail err+slow+1%", tail)):
+    print(f"{name:&gt;17}: kept {len(kept):5} traces, errors {sum(t['error'] for t in kept):3} "
+          f"of {sum(t['error'] for t in traces)}, slow(&gt;500ms) {sum(t['ms'] &gt; 500 for t in kept):4} "
+          f"of {sum(t['ms'] &gt; 500 for t in traces)}")</pre>
+<ol>
+<li>Run it. The tree should show <code>checkout: POST /order</code> at the top, the two CLIENT call spans beneath it, each service's SERVER span beneath its call, and the card-network span under <code>payment: charge</code> — even though the services ran in a fresh context and received only a header string. That is propagation.</li>
+<li>Break it on purpose: replace <code>with start_span("checkout: call payment") as c:</code> with <code>c = start_span("checkout: call payment")</code> (and dedent the next line). The CLIENT span is never ended or exported, so payment's whole subtree vanishes from the printed tree — its parent is missing. Real HTTP client wrappers that forget to end their span cause exactly this.</li>
+<li>Set <code>HEAD_RATE = 0.0</code>: nothing is exported, and the printed flags end in <code>-00</code>. Every downstream service follows the root's decision.</li>
+<li>Read the sampling comparison: head sampling keeps about 1,000 traces but only around 1% of the ~100 errors and slow traces; tail sampling keeps all of them for a few hundred more traces. Then count what tail sampling had to receive: all 100,000.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Estimate it</b>
+<p>Your platform serves 40,000 requests per second at peak, each producing 35 spans of about 400 bytes. Leadership wants "every error trace kept" (errors are 0.2% of requests) plus a 2% baseline, 7 days of retention, and the tracing bill under control. (a) What does the collector tier receive? (b) How much is stored per day and in total? (c) How much memory do tail samplers need with a 20-second decision wait? (d) What would you change if that memory is too much?</p>
+<details><summary>Answer</summary>
+<p><strong>(a)</strong> 40,000 × 35 = 1.4 million spans per second; × 400 B = <strong>560 MB/s</strong> (about 4.5 Gbit/s) into the collector tier, because tail sampling needs every span.</p>
+<p><strong>(b)</strong> Kept traces: 0.2% errors + 2% baseline ≈ 2.2% (the overlap is negligible). 1.4M × 2.2% ≈ 30,800 spans/s × 400 B ≈ 12.3 MB/s ≈ <strong>1.06 TB per day</strong>; 7 days ≈ 7.4 TB raw, roughly 1.5 TB at 5× compression, ×3 replication ≈ 4.5 TB on disk.</p>
+<p><strong>(c)</strong> In flight: 1.4M spans/s × 20 s = 28 million spans × 400 B = 11.2 GB of span data, so roughly <strong>22-34 GB of memory</strong> with object overhead, spread over the sampler tier (for example 8 instances of 4 GB). The trace capacity setting must cover 40,000 traces/s × 20 s = 800,000 traces, plus headroom for incident traffic.</p>
+<p><strong>(d)</strong> Head-sample first, keeping errors: SDKs sample 20% at the head but always export spans of traces that end in error (or export error spans unconditionally and let the collector upgrade them). The tail tier then receives about 20% plus errors — around 115 MB/s and 5-7 GB of memory — while every error still arrives. Also compute RED metrics in the collector before sampling, so dashboards stay exact. Mention the remaining gap: an error recorded only in a downstream service of a head-dropped trace arrives as a partial trace, which is still more useful than none.</p>
+</details>
+<b>Diagnose it</b>
+<p>After moving a service to an async framework, its traces in the UI show the incoming request span with no children, and dozens of new single-span "traces" appear for its database calls. What is wrong?</p>
+<details><summary>Answer</summary>
+<p>Context is lost inside the process. The database calls run in tasks or callbacks that do not inherit the current span, so each starts a new root span with a new trace id. The fix is in-process propagation: use the framework's OpenTelemetry instrumentation (which carries context across awaits and executors), or pass the context explicitly when scheduling work (Python <code>contextvars</code> are copied into new asyncio tasks automatically, but not into thread pools without wrapping; Go needs <code>ctx</code> passed down; Java needs context-wrapping executors). Detect it in future by alerting on root spans whose kind is CLIENT (a database call should never be a root) — they mean propagation broke.</p>
+</details>
+</section>

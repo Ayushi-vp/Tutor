@@ -1,0 +1,806 @@
+<!-- topic source for lld/ld22; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld22",
+  "t": "A streaming parser for LLM output: SSE events and incremental JSON",
+  "tag": "AI systems",
+  "sum": "Parse a model's stream as it arrives: an incremental Server-Sent Events parser that follows the HTML standard (line endings, comments, multi-line data, ids, a CR split from its LF, UTF-8 split mid-character), then a character-by-character JSON parser that shows partial objects while tokens stream in, survives chunk boundaries inside strings, escapes, surrogate pairs and numbers, and validates strictly at the end.",
+  "prereq": [
+    ["net11", "Server-Sent Events stream text events from server to client over one long-lived HTTP response."],
+    ["ae4", "Structured output: the model emits JSON that must be parsed and validated before the application trusts it."],
+    ["ae10", "Streaming UX: showing tokens as they arrive cuts perceived latency; time to first token is the key metric."],
+    ["ld4", "A streamed response has a commit point: once output reaches the user, failures cannot be hidden by retrying."],
+    ["py5", "Generators and iterators process data piece by piece without holding all of it in memory."],
+    ["ld21", "The tool-calling loop validates a tool's input against its JSON schema before running it."]
+  ],
+  "myths": [
+    ["Each network chunk is one event (or one token).", "TCP delivers a byte stream; how it is cut into reads depends on buffers, proxies and timing. A chunk can end in the middle of a line, between the CR and LF of one line ending, or inside a multi-byte UTF-8 character. A parser that assumes chunk = event works on a laptop and fails behind a proxy that re-chunks the response."],
+    ["You can parse streaming JSON by calling json.loads on the accumulated text and catching errors.", "That works but re-parses the whole buffer on every chunk, so total work grows with the square of the response length, and it tells you nothing until the document is complete. An incremental parser does constant work per character and can show the user fields as they form."],
+    ["Splitting SSE lines on '\\n' is enough.", "The standard allows CRLF, a lone LF, or a lone CR to end a line. A server or proxy that sends CRLF makes every line end in '\\r' under a naive split, so 'data: x\\r' fails comparisons and blank lines are never seen. And a CR at the very end of one chunk must wait to see whether the next chunk starts with LF."],
+    ["Showing partial numbers is fine because they only grow.", "A partial '12' may become '123' or '12.5' or '12e3', which are different values, and '-' alone is not a number at all. Partial strings are safe to show because characters only append; numbers and literals (true, false, null) should appear only once a terminating character proves they are complete."],
+    ["If every partial snapshot parsed, the final result is valid.", "Partial snapshots are lenient by design: they show what has arrived. The final document can still be truncated (the stream stopped at max tokens), have an unpaired surrogate, or miss required fields. Validation must run once, strictly, at the end, and its failure must be handled — the stream finishing is not the same as the output being valid."]
+  ],
+  "recap": [
+    "A model's stream arrives as arbitrary byte chunks, so parsing must work no matter where chunks are cut.",
+    "SSE decoding uses an incremental UTF-8 decoder so a character split across chunks is held until complete, and one leading byte-order mark is stripped.",
+    "SSE lines end with CRLF, LF or CR; a CR at the end of a chunk must wait to see whether an LF follows.",
+    "Lines starting with a colon are comments; field:value has one leading space removed from the value; data lines accumulate and join with newlines; a blank line dispatches the event if there is data.",
+    "The id field sets the last event ID (used to resume), and retry sets the reconnection time; unknown fields are ignored.",
+    "An incremental JSON parser keeps a stack of open containers and a small state per container (expecting key, colon, value, comma or close).",
+    "Strings appear as soon as they open and grow per character; keys appear when complete; numbers and literals appear only when a terminator proves they are complete.",
+    "Escapes, including \\u sequences and surrogate pairs, can be split across chunks, so the parser keeps partial escape state.",
+    "At the end of the stream the parser checks the document is complete and well-formed, and then the application validates its shape.",
+    "Property tests that feed random documents in random chunk sizes and compare with json.loads are the strongest evidence the parser is right."
+  ],
+  "glossary": [
+    ["BOM", "Byte order mark: the character U+FEFF that some encoders put at the start of a text stream; SSE strips one if present."],
+    ["Chunk boundary", "The point where one network read ends and the next begins; it can fall anywhere in the data."],
+    ["CRLF", "The two-character line ending carriage return (\\r) plus line feed (\\n)."],
+    ["Dispatch", "In SSE, turning the accumulated fields into an event when a blank line arrives."],
+    ["Escape sequence", "A backslash followed by characters that stand for another character inside a JSON string, such as \\n or \\u00e9."],
+    ["Incremental decoder", "A decoder that accepts bytes in pieces and holds back an incomplete multi-byte character until the rest arrives."],
+    ["Incremental parser", "A parser that consumes input as it arrives and keeps its state between pieces, instead of needing the whole input at once."],
+    ["Last event ID", "The most recent id field seen in an SSE stream, sent back by a reconnecting client so the server can resume."],
+    ["Partial snapshot", "The value as far as it can be known so far, shown before the document is complete."],
+    ["Property test", "A test that checks a rule over many generated inputs, such as 'parsing any document in any chunking equals json.loads'."],
+    ["SSE", "Server-Sent Events: a text format and browser API for a stream of events from server to client over HTTP."],
+    ["State machine", "A program whose behaviour on each input depends on which of a fixed set of states it is in, and which moves between states."],
+    ["Surrogate pair", "Two UTF-16 code units (a high one D800-DBFF and a low one DC00-DFFF) that together encode a character above U+FFFF, such as an emoji, written in JSON as two \\u escapes."],
+    ["Terminator", "The character that proves a token has ended, such as a comma, closing bracket or whitespace after a number."]
+  ],
+  "qa": [
+    ["E", "What does an SSE stream look like on the wire?", "Lines of text. Each line is a field like 'event: content_block_delta', 'data: {...}', 'id: 42' or 'retry: 3000', or a comment starting with a colon. A blank line ends an event, which is then dispatched with its type (default 'message'), its data (multiple data lines joined by newlines) and the last event ID. Lines can end with CRLF, LF or CR."],
+    ["E", "Why can't you split the incoming bytes on newlines and decode each line?", "Because chunk boundaries fall anywhere: inside a multi-byte UTF-8 character (decoding the halves separately produces garbage or errors), between a CR and its LF, or in the middle of a line. Decode with an incremental UTF-8 decoder that holds incomplete characters, keep the unterminated tail of each chunk in a buffer, and handle a trailing CR specially."],
+    ["E", "When is it safe to show a partial value to the user?", "When it can only grow by appending. A string's characters only append, so showing 'São Pau' while 'lo' is in flight is fine. A number may change meaning (12 → 123 → 12.5) and a literal is meaningless until complete, so show those only after a terminator. Keys too: show a field only when its key is complete."],
+    ["M", "How does the SSE parser handle a CR at the end of a chunk?", "It cannot know yet whether the CR is a lone line ending or the first half of CRLF. It ends the line at the CR, records a pending-CR flag, and if the next chunk starts with LF it drops that LF. Without the flag the LF would be read as a second line ending — an empty line — and dispatch the event early, or the CR would stay in the buffer and corrupt the next line.", "Follow-up: Why does the spec allow three line endings? — For compatibility with servers and platforms that produce any of them; the parser must accept all."],
+    ["M", "Describe the state your incremental JSON parser keeps.", "A stack of open containers, each with a state: for an object, expecting a key or close, a colon, a value, or a comma or close, plus the current key; for an array, expecting a value or close, or a comma or close. A token in progress: a string (its characters so far, whether it is a key, any partial escape and a pending high surrogate), or the text of a number or literal. Plus whether the top-level value is complete."],
+    ["M", "How do you handle a \\u escape split across chunks?", "Keep the escape in progress as text: a backslash, then 'u', then up to four hex digits, consuming one character per call. Only when the fourth digit arrives is the code point computed. If it is a high surrogate (D800-DBFF), hold it until the next \\u escape supplies the low surrogate and combine them into one character; anything else after a high surrogate is an error."],
+    ["M", "What is the cost of re-parsing the accumulated buffer on every chunk?", "If a response of n characters arrives in chunks of c characters, re-parsing does about n/c parses averaging n/2 characters: O(n²/c) work. For a 40,000-character structured output in 5-character chunks that is about 160 million character visits, versus 40,000 for an incremental parser. It also gives no partial result until the end.", "Follow-up: Then why do some libraries do it? — Simplicity; with a 'complete the partial JSON' trick (close open brackets and quotes, then parse) it works for small outputs. It does not scale and is fragile with escapes."],
+    ["M", "How do tool-call arguments arrive in a streamed Claude response?", "As content_block_delta events whose delta has type input_json_delta and a partial_json string; concatenated, the partial_json pieces form the tool's input JSON. Text arrives as text_delta deltas. Each event is an SSE event with an event: line naming its type and a data: line holding JSON. So the stack is SSE parsing, then per-event JSON parsing, then incremental parsing of the concatenated partial_json."],
+    ["H", "How would you test this parser to be confident it is correct?", "Three layers. Unit tests for each rule (one space stripped, comments ignored, data joined, CR at chunk end). Exhaustive split tests: for a fixed stream, try every two-way split point and many random multi-way splits down to one byte, and require identical events. And property tests for JSON: generate random documents with nested containers, escapes, non-ASCII and surrogate pairs, serialise them with and without ensure_ascii and indentation, feed them in random chunk sizes, and require finish() to equal json.loads. Add a list of invalid documents that must be rejected.", "Follow-up: What did the property test catch that unit tests would not? — Interactions: a chunk ending right after a backslash inside a key, or a number terminated by the first character of the next chunk."],
+    ["H", "The stream ends but the JSON is incomplete. What do you do?", "Treat it as a failure, not a result: finish() raises. Check the stream's stop reason — max_tokens means the output was cut off, and the fix is a larger limit or a smaller requested output; a network drop means retry, which ld4's commit point complicates if partial output was already shown. Never fill in missing brackets and act on the result, because truncation can drop required fields or cut a value short.", "Follow-up: Could you salvage the partial data? — For display, yes, the snapshot is useful; for anything that acts (a tool call, a database write), no."],
+    ["H", "How would you make partial updates cheaper than deep-copying a snapshot per chunk?", "Emit events instead of snapshots: 'key started at path $.items[2].name', 'string appended \"lo\" at path …', 'value complete at path …'. The consumer applies them to its own copy or patches the UI directly. That is O(size of the change) per chunk instead of O(document). The parser already knows the path from its stack, so it is a small change.", "Follow-up: When is a snapshot still preferable? — When consumers are simple and documents small; a React state update from a snapshot is easy to reason about."],
+    ["H", "Where would you validate structured output, and what if validation fails after the user has seen partial output?", "Stream partial output to the UI for responsiveness, but gate any action on full validation at the end: well-formed JSON from finish(), then schema validation (types, required fields, enums), then business rules. If validation fails, mark the displayed output as invalid and either retry the generation with the error fed back (as with tool errors) or fall back. This is the same commit-point problem as streamed text: what the user has seen cannot be unseen, so design the UI to show partial results as provisional."]
+  ],
+  "refs": [
+    ["docs", "HTML Living Standard: server-sent events", "The event stream format and the exact interpretation rules: line endings, BOM, comments, field parsing, data buffer, last event ID, retry and dispatch.", "https://html.spec.whatwg.org/multipage/server-sent-events.html"],
+    ["docs", "Claude API: streaming messages", "The SSE event types of a streamed response (message_start, content_block_delta with text_delta or input_json_delta, message_stop, ping) and how tool input arrives as partial_json.", "https://platform.claude.com/docs/en/build-with-claude/streaming"],
+    ["docs", "RFC 8259: The JSON data interchange format", "The grammar this parser implements: number syntax, string escapes, \\u escapes and surrogate pairs, whitespace.", "https://www.rfc-editor.org/rfc/rfc8259"],
+    ["docs", "Python codecs: incremental decoders", "getincrementaldecoder holds back incomplete multi-byte sequences between calls.", "https://docs.python.org/3/library/codecs.html#incremental-encoding-and-decoding"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A product team ships a feature where the model fills in a form: it returns JSON with a title, a summary, a list of tags and a confidence score. The first version waits for the whole response, parses it, and shows the form — six seconds of spinner. Users hate it. The second version streams the response and calls <code>json.loads</code> on the accumulated text every time a chunk arrives, ignoring errors until one succeeds. It feels faster but the CPU graph climbs with response length, the form appears all at once at the very end anyway, and one day, behind a corporate proxy, the stream starts producing garbled accented characters and the occasional event that is silently lost. The bugs are in two places nobody wrote tests for: the parser for the event stream itself, which assumed every network read was a whole line of whole characters, and the JSON handling, which had no notion of a partial value.</p>
+<p>Streaming is the default way to consume large language models, because time to first token is the latency users feel. That makes parsing a stream a core AI-engineering skill, and machine-coding rounds increasingly ask for it: "here is a stream of bytes from a model API; parse the events" and then "the model is producing JSON; show the fields as they arrive". Both are classic incremental-parsing problems — state that survives between chunks, inputs that can be cut anywhere — with standards that define exactly what correct means: the HTML Living Standard for Server-Sent Events and RFC 8259 for JSON.</p>
+<p>This lesson builds both parsers in interview order. It starts with what actually arrives on the wire and why chunks cannot be trusted; then an SSE parser that handles every line-ending form, comments, multi-line data, ids, retry, a byte-order mark, a CR separated from its LF by a chunk boundary, and UTF-8 characters split mid-sequence. Then an incremental JSON parser, a character-driven state machine with a stack, which shows strings growing, keys appearing when complete and numbers only once terminated, survives escapes and surrogate pairs split across chunks, and validates strictly at the end. The full solution is one Python 3.12 file with eight tests, including exhaustive split tests and a property test over 400 random documents in random chunk sizes, and an end-to-end test that streams a tool's arguments the way Claude's API does.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: reading a telegram delivered in torn strips</h4>
+<p>Imagine a long telegram delivered to you as strips of paper torn at random places — sometimes mid-word, sometimes mid-letter if the handwriting has letters that span two strips. You cannot read each strip on its own; you have to keep the unfinished end of the last strip in your hand and join it to the start of the next. The telegram has a format: each message ends with an empty line, and lines can be separated by different marks depending on which operator wrote them. When an empty line arrives, you hand the complete message to someone else. That is an <strong>SSE parser</strong>: a buffer for the unfinished part, a decoder for the letters, and a rule for when a message is complete.</p>
+<p>Now suppose each message contains a form being filled in, written out as JSON. You want to show the form as it is being written, not after. You keep track of where you are — inside the main object, inside the "tags" list, in the middle of a string — like a finger on a nested outline. A name being written letter by letter can be shown letter by letter. A number cannot: "12" might be the start of "125". That is the <strong>incremental JSON parser</strong>: a stack of where you are, a little state for each level, and a rule for what is safe to show.</p>
+<p>The analogy breaks in a helpful way: with paper you can see that a strip is torn mid-letter. With bytes you cannot, so the decoder needs to know the encoding's rules (UTF-8 says how many bytes each character takes) to hold back an incomplete character.</p>
+
+<h4>What arrives on the wire</h4>
+<p>A streamed model response is an HTTP response with content type <code>text/event-stream</code>. Its body is a sequence of SSE events. In Anthropic's Messages API, for example, each event has an <code>event:</code> line naming its type — <code>message_start</code>, <code>content_block_start</code>, <code>content_block_delta</code>, <code>content_block_stop</code>, <code>message_delta</code>, <code>message_stop</code>, and occasional <code>ping</code>s — and a <code>data:</code> line holding JSON. Text arrives in <code>content_block_delta</code> events whose delta has type <code>text_delta</code>; a tool call's arguments arrive as deltas of type <code>input_json_delta</code> carrying a <code>partial_json</code> fragment. So there are three layers: bytes → SSE events; each event's data → a JSON object (complete within the event); and the concatenated text or <code>partial_json</code> fragments → a JSON document that is itself arriving piece by piece.</p>
+
+<figure>
+<svg viewBox="0 0 640 270" width="100%" role="img" aria-label="Three parsing layers. Network chunks of bytes, cut arbitrarily, enter the SSE parser, which uses an incremental UTF-8 decoder and a line buffer to produce events. Each event's data is a complete JSON object parsed with json.loads. The partial_json fragments from successive delta events are fed to the incremental JSON parser, which keeps a stack of open containers and produces partial snapshots and finally a validated value.">
+  <defs><marker id="ld22-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="10" y="22" style="fill:var(--ink);font-weight:600">bytes (cut anywhere)</text>
+    <rect x="10" y="32" width="90" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="55" y="50" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">event: con</text>
+    <rect x="104" y="32" width="110" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="159" y="50" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">tent_block_del</text>
+    <rect x="218" y="32" width="96" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="266" y="50" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">ta\r | \ndata</text>
+    <rect x="318" y="32" width="70" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="353" y="50" text-anchor="middle" style="fill:var(--crit);font-family:var(--mono)">"S\xc3</text>
+    <rect x="392" y="32" width="70" height="26" rx="3" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="427" y="50" text-anchor="middle" style="fill:var(--crit);font-family:var(--mono)">\xa3o P…</text>
+    <text x="480" y="50" style="fill:var(--muted)">ã split in two</text>
+    <rect x="10" y="90" width="200" height="64" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="110" y="110" text-anchor="middle" style="fill:var(--ink);font-weight:600">SSE parser</text>
+    <text x="110" y="128" text-anchor="middle" style="fill:var(--muted)">UTF-8 decoder · line buffer</text>
+    <text x="110" y="144" text-anchor="middle" style="fill:var(--muted)">pending CR · data/event/id</text>
+    <line x1="200" y1="60" x2="130" y2="88" marker-end="url(#ld22-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="240" y="90" width="180" height="64" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="330" y="110" text-anchor="middle" style="fill:var(--ink);font-weight:600">event.data → json.loads</text>
+    <text x="330" y="128" text-anchor="middle" style="fill:var(--muted)">complete per event</text>
+    <text x="330" y="144" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">delta.partial_json</text>
+    <line x1="210" y1="122" x2="238" y2="122" marker-end="url(#ld22-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="450" y="90" width="180" height="64" rx="4" style="fill:var(--surface-2);stroke:var(--accent);stroke-width:1.5"/>
+    <text x="540" y="110" text-anchor="middle" style="fill:var(--ink);font-weight:600">IncrementalJSON</text>
+    <text x="540" y="128" text-anchor="middle" style="fill:var(--muted)">stack of containers</text>
+    <text x="540" y="144" text-anchor="middle" style="fill:var(--muted)">string/escape/number state</text>
+    <line x1="420" y1="122" x2="448" y2="122" marker-end="url(#ld22-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="300" y="190" width="160" height="64" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="380" y="210" text-anchor="middle" style="fill:var(--ink)">snapshot() per chunk</text>
+    <text x="380" y="228" text-anchor="middle" style="fill:var(--good);font-family:var(--mono)">{"city": "São Pau"}</text>
+    <text x="380" y="245" text-anchor="middle" style="fill:var(--muted)">→ UI, provisional</text>
+    <rect x="480" y="190" width="150" height="64" rx="4" style="fill:var(--surface-2);stroke:var(--crit)"/>
+    <text x="555" y="210" text-anchor="middle" style="fill:var(--ink)">finish() + schema</text>
+    <text x="555" y="228" text-anchor="middle" style="fill:var(--muted)">strict, once</text>
+    <text x="555" y="245" text-anchor="middle" style="fill:var(--muted)">→ act on it</text>
+    <line x1="520" y1="156" x2="420" y2="188" marker-end="url(#ld22-arrow)" style="fill:none;stroke:var(--good)"/>
+    <line x1="555" y1="156" x2="555" y2="188" marker-end="url(#ld22-arrow)" style="fill:none;stroke:var(--crit)"/>
+  </g>
+</svg>
+<figcaption>Every layer must tolerate the layer below it being cut anywhere. The SSE parser absorbs byte-level cuts, including a CR separated from its LF and a two-byte character split in half; the JSON parser absorbs cuts in the model's own output. Partial snapshots feed the screen; only the strict result feeds actions.</figcaption>
+</figure>
+
+<h4>What the round expects</h4>
+<p>An <code>SSEParser</code> with <code>feed(bytes) → events</code> that follows the standard; an <code>IncrementalJSON</code> with <code>feed(text)</code>, <code>snapshot()</code> and <code>finish()</code>; a clear rule for what partial values are shown; strict errors with positions; and tests that split inputs at every possible point. Interviewers listen for whether you test chunk boundaries deliberately, because that is where every real bug lives.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–17</span><span class="ck-t">SSE parser</span></div><div class="ck"><span class="ck-m">17–22</span><span class="ck-t">Naive JSON</span></div><div class="ck"><span class="ck-m">22–36</span><span class="ck-t">Incremental JSON</span></div><div class="ck"><span class="ck-m">36–41</span><span class="ck-t">Split &amp; property tests</span></div><div class="ck"><span class="ck-m">41–45</span><span class="ck-t">Extensions</span></div></div>
+
+<h4>1 · Clarify the requirements</h4>
+<p>Ask: is the input bytes or already-decoded text? (Bytes — so UTF-8 decoding is our problem.) Which SSE features matter — event types, ids for resumption, retry? (All of them, per the standard.) What JSON will be streamed — any valid JSON, or a known schema? (Any valid JSON; a schema check at the end.) What should partial output look like, and how often is it needed? (A snapshot after each chunk, for a UI.) What happens on invalid input or a truncated stream? (A clear error with a position; never a silently repaired value.) Performance target? (Linear in input size; a chunk should cost time proportional to its own length.)</p>
+
+<h4>2 · Entities and the interface</h4>
+<pre>SSEParser.feed(chunk: bytes) -&gt; list[SSEEvent]     # events completed by this chunk
+SSEParser.close()                                  # end of stream: discard an unfinished event
+SSEEvent(type: str, data: str, id: str)
+
+IncrementalJSON.feed(text: str) -&gt; None            # consume characters
+IncrementalJSON.snapshot() -&gt; Any                  # deep copy of the partial value
+IncrementalJSON.finish() -&gt; Any                    # complete value, or JSONStreamError
+check_shape(value, schema) -&gt; list[str]            # end-of-stream validation</pre>
+<p>Keeping the two parsers separate matters: SSE is the transport format, JSON is the payload, and the same JSON parser serves a stream of plain text deltas, a stream of tool-argument fragments, or a file read in blocks.</p>
+
+<h4>3 · Stage one: the SSE parser</h4>
+<p><strong>The rules, from the standard.</strong> The stream is UTF-8; one leading byte-order mark (U+FEFF) is stripped. Lines end with CRLF, a lone LF, or a lone CR. For each line: if it is empty, <em>dispatch</em> the event; if it starts with a colon, ignore it (a comment — servers send these as keep-alives); otherwise split at the first colon into field and value, and if the value starts with a space, remove exactly that one space; a line with no colon is a field with an empty value. Fields: <code>data</code> appends the value plus a newline to the data buffer; <code>event</code> sets the event type; <code>id</code> sets the last event ID unless the value contains a NUL character; <code>retry</code> sets the reconnection time if the value is all ASCII digits; anything else is ignored. Dispatch: if the data buffer is empty, reset and produce nothing; otherwise remove the final newline, produce an event of the given type (default <code>message</code>) with the data and the last event ID, and reset the data and type buffers — but not the last event ID, which persists. At end of stream, an event without its terminating blank line is discarded.</p>
+<p><strong>Bytes to text.</strong> Decoding each chunk with <code>chunk.decode("utf-8")</code> fails when a chunk ends in the middle of a multi-byte character: "ã" is two bytes, <code>C3 A3</code>, and if a chunk ends after <code>C3</code> the decode raises (or, with <code>errors="replace"</code>, silently produces "�" twice). Python's <code>codecs.getincrementaldecoder("utf-8")()</code> keeps incomplete sequences between calls and returns only whole characters. That one line fixes the "garbled accents behind the proxy" bug from the opening story.</p>
+<p><strong>Lines across chunks.</strong> Keep a text buffer. After appending a chunk, repeatedly find the first CR or LF; the text before it is a complete line; consume the line ending. The subtle case is a CR that is the <em>last</em> character of the buffer: it might be a lone CR (a line ending on its own) or the first half of CRLF whose LF is in the next chunk. The parser ends the line at the CR and sets <code>pending_cr</code>; when the next chunk arrives, if it starts with LF, that LF is dropped. Without this, the LF would be read as a second, empty line — a dispatch — and the event would be emitted early with partial data, or an empty-data dispatch would silently swallow the next field. The test <code>test_sse_cr_at_chunk_end_is_one_line_ending</code> feeds <code>"data: a\r"</code>, then <code>"\n"</code> (nothing must happen), then <code>"\r\n"</code> (now the event dispatches).</p>
+<p><strong>A worked parse.</strong> Feed the stream <code>": keep-alive\nevent: content_block_delta\nid: 7\ndata: {"text": "Hel"}\n\n</code>. Line 1 starts with a colon: ignored. Line 2 sets the type. Line 3 sets the last ID to 7. Line 4 appends <code>{"text": "Hel"}</code> plus a newline to the data buffer (one space after the colon removed). Line 5 is empty: dispatch — strip the trailing newline, emit <code>SSEEvent("content_block_delta", '{"text": "Hel"}', "7")</code>, reset data and type. A following <code>data:no-space</code> and <code>data:  two-spaces</code> produce data <code>"no-space\n two-spaces"</code>: no space to strip on the first, exactly one stripped on the second, joined with a newline.</p>
+
+<h4>4 · Stage two: JSON the naive way</h4>
+<pre>buf = ""
+for piece in fragments:
+    buf += piece
+    try:
+        show(json.loads(buf))       # succeeds only when the document is complete
+    except json.JSONDecodeError:
+        pass</pre>
+<p>Three problems. It shows nothing until the end, which defeats the purpose. It re-parses everything every time: for a 40,000-character output in 5-character fragments, 8,000 parses averaging 20,000 characters is 160 million character visits instead of 40,000 — quadratic. And a popular patch, "repair" the partial text by closing open quotes and brackets and then parsing, works for simple cases but breaks on a fragment ending after a backslash or inside a <code>\u</code> escape, and still re-parses everything. The fix is a parser whose state survives between fragments.</p>
+
+<h4>5 · Stage three: the incremental JSON parser</h4>
+<p><strong>The state.</strong> A <strong>stack</strong> of open containers. Each frame holds the container itself (a dict or list that is already attached to the partial value) and its state. An object frame is in one of: <code>key_or_end</code> (just opened: a key or <code>}</code>), <code>key</code> (after a comma: a key is required — this is what rejects a trailing comma), <code>colon</code>, <code>value</code>, <code>in_string</code>, or <code>comma_or_end</code>; plus the current key. An array frame is in <code>value_or_end</code>, <code>value</code>, <code>in_string</code> or <code>comma_or_end</code>. Separately, a <strong>token in progress</strong>: a string (its characters so far, whether it is a key, an escape in progress, a pending high surrogate) or the text of a number or literal.</p>
+<p><strong>One character at a time.</strong> <code>feed</code> loops over characters and calls <code>_char</code>. Inside a string, characters go to the string handler. Inside a number or literal, characters that can continue it are appended; any other character <em>terminates</em> it — the number is validated against JSON's grammar (<code>-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?</code>, which rejects <code>01</code>, <code>1.</code> and <code>-</code>), placed, and the terminating character is then processed normally. Outside tokens: whitespace is skipped; the frame's state says what is legal; <code>{</code> and <code>[</code> create a container, attach it where a value is expected and push a frame; <code>"</code> starts a key or a string value; <code>-</code> or a digit starts a number; <code>t</code>, <code>f</code>, <code>n</code> start a literal; <code>,</code>, <code>:</code>, <code>}</code> and <code>]</code> move frame states or pop frames. Anything else raises <code>JSONStreamError</code> with the character position.</p>
+<p><strong>What becomes visible when.</strong> Containers are attached the moment they open, so the snapshot shows <code>{}</code> immediately. A key is not shown until its closing quote: half a key is useless. A string <em>value</em> is attached as <code>""</code> when its opening quote arrives and re-set on every character, so the user watches it grow. A number or literal is attached only when terminated. Worked on the test stream, fed as <code>{"na</code> | <code>me": "Ad</code> | <code>a", "age": 3</code> | <code>6, "tags": ["x</code> | <code>", "y"], "ok": tr</code> | <code>ue}</code>, the snapshots after each piece are: <code>{}</code>; <code>{"name": "Ad"}</code>; <code>{"name": "Ada"}</code> (36 is not shown — it is only "3" so far); <code>{"name": "Ada", "age": 36, "tags": ["x"]}</code> (the comma terminated 36); then <code>"y"</code> appears, then <code>"ok": true</code> once <code>}</code> terminates the literal.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="The parser's stack while reading the document part way. The bottom frame is the root object in state comma_or_end after key age. Above it, a frame for the tags array in state in_string, containing x and a partial string. The token in progress is a string value with characters so far. To the right, the snapshot shows name Ada, age 36, tags x and the partial string.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">input so far:</text>
+    <text x="120" y="22" style="fill:var(--ink);font-family:var(--mono)">{"name": "Ada", "age": 36, "tags": ["x", "y</text>
+    <text x="20" y="56" style="fill:var(--muted)">token in progress</text>
+    <rect x="20" y="64" width="250" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="30" y="82" style="fill:var(--ink);font-family:var(--mono)">string value, chars = ["y"]</text>
+    <text x="30" y="98" style="fill:var(--muted);font-family:var(--mono)">esc = None, high_surrogate = None</text>
+    <text x="20" y="128" style="fill:var(--muted)">stack (top first)</text>
+    <rect x="20" y="136" width="250" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="30" y="154" style="fill:var(--ink);font-family:var(--mono)">list  ["x", "y"]</text>
+    <text x="30" y="170" style="fill:var(--muted);font-family:var(--mono)">state = in_string</text>
+    <rect x="20" y="182" width="250" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="30" y="200" style="fill:var(--ink);font-family:var(--mono)">dict  {name, age, tags}</text>
+    <text x="30" y="216" style="fill:var(--muted);font-family:var(--mono)">state = value, key = "tags"</text>
+    <rect x="330" y="64" width="290" height="160" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="475" y="86" text-anchor="middle" style="fill:var(--ink);font-weight:600">snapshot()</text>
+    <text x="345" y="112" style="fill:var(--ink);font-family:var(--mono)">{"name": "Ada",</text>
+    <text x="345" y="132" style="fill:var(--ink);font-family:var(--mono)"> "age": 36,</text>
+    <text x="345" y="152" style="fill:var(--ink);font-family:var(--mono)"> "tags": ["x", "y"]}</text>
+    <text x="345" y="180" style="fill:var(--good)">strings: shown as they grow</text>
+    <text x="345" y="198" style="fill:var(--muted)">numbers, true/false/null: only</text>
+    <text x="345" y="214" style="fill:var(--muted)">after a terminator</text>
+  </g>
+</svg>
+<figcaption>The containers in the stack are the same objects as in the snapshot, attached the moment they opened; the stack only remembers what each one is waiting for. The string being read is already visible as "y" and will be overwritten with "yes" if more characters arrive.</figcaption>
+</figure>
+
+<h4>6 · Stage four: escapes and surrogate pairs across chunks</h4>
+<p>JSON strings can contain escapes: <code>\"</code>, <code>\\</code>, <code>\/</code>, <code>\b</code>, <code>\f</code>, <code>\n</code>, <code>\r</code>, <code>\t</code>, and <code>\uXXXX</code> with four hex digits. A chunk can end right after the backslash, or after <code>\u00</code>. So the parser keeps the escape in progress as a short string and completes it one character at a time; a <code>\u</code> escape is decoded only when the fourth hex digit arrives, and a non-hex digit raises an error.</p>
+<p>Characters above U+FFFF — every emoji — are written in escaped JSON as a <strong>surrogate pair</strong>: <code>json.dumps("😀")</code> with ASCII escaping gives <code>"😀"</code>. The first escape is a <em>high surrogate</em> (D800-DBFF) that is not a character by itself. The parser holds it, requires that the very next thing be a <code>\u</code> escape with a <em>low surrogate</em> (DC00-DFFF), and combines them: code point = 0x10000 + ((high − 0xD800) × 1024) + (low − 0xDC00). For D83D and DE00: 0x10000 + (0x3D × 0x400) + 0x200 = 0x1F600, 😀. A lone low surrogate, a high surrogate followed by anything else, or a string that ends with a pending high surrogate is an error. The test serialises a document with escapes, a surrogate pair and accented characters using ASCII escaping, then tries every split point and several three-way splits, requiring the exact same result each time.</p>
+<p>Unescaped control characters (code points below 0x20, such as a raw newline) are not allowed inside JSON strings; the parser rejects them, which catches a common model mistake.</p>
+
+<h4>7 · Stage five: finishing and validating</h4>
+<p><code>finish()</code> is strict. If a number or literal is still open (the document is just <code>42</code> at top level, with nothing after it), it is terminated and validated. Then, if a string is open, the stack is not empty, or no complete top-level value exists, the document is incomplete: raise with the position. Anything other than whitespace after the top-level value has already raised during <code>feed</code>. Only then does the application check the shape: the tiny <code>check_shape</code> validator in the solution (types, required keys, array items) returns a list of path-qualified errors — or, in a real system, the same JSON Schema validator as ld21's tool registry. Partial snapshots are deliberately lenient; the final value is deliberately strict, and nothing acts on a value that has not passed both.</p>
+
+<h4>8 · Stage six: testing chunk boundaries on purpose</h4>
+<p>Every real bug in streaming parsers lives at a chunk boundary, so the tests attack boundaries directly. For SSE, a stream containing a BOM, CRLF, a lone CR, a lone LF, accented characters, an arrow, an emoji and an unterminated final event is fed split at <em>every</em> possible byte position, and in 300 random splits into pieces of 1-4 bytes; every split must produce the same two events. For JSON, a <strong>property test</strong> generates 400 random documents — nested objects and arrays, keys with quotes, backslashes and non-Latin letters, strings with escapes and emoji, integers, floats, literals — serialises each with random choices of ASCII escaping and indentation, feeds them in random 1-5-character pieces, takes a snapshot after every piece, and requires <code>finish()</code> to equal <code>json.loads</code> on the full text. A list of invalid documents (leading zero, half literal, missing colon, trailing comma, bad escape, lone surrogate, trailing garbage, raw newline in a string, missing comma, unterminated object, bad hex, comma in an empty object) must each raise.</p>
+<p>Finally, an end-to-end test builds a body of SSE events shaped like Claude's stream — <code>message_start</code>, a series of <code>content_block_delta</code> events whose data is <code>{"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "…"}}</code>, then <code>message_stop</code> — delivers it in 7-byte network chunks, feeds each <code>partial_json</code> to the incremental parser, records the <code>city</code> field as it grows ("S", "São P", … "São Paulo"), and validates the final arguments against a schema.</p>
+
+<h4>9 · The full solution</h4>
+<p>Python 3.12, standard library only; eight tests run in about a second.</p>
+<pre>"""A streaming parser for LLM output: an incremental Server-Sent Events parser (HTML Living Standard
+rules: CR/LF/CRLF line endings split anywhere, comments, multi-line data, id, retry, BOM, UTF-8
+split across chunks), then an incremental JSON parser that emits partial objects as tokens arrive,
+handling chunk boundaries inside strings, escapes, surrogate pairs, numbers and literals, with
+strict validation at the end. Python 3.12, standard library only.  Run: python stream_parse.py"""
+from __future__ import annotations
+
+import codecs
+import copy
+import json
+import random
+import re
+from dataclasses import dataclass
+from typing import Any
+
+
+# ================================================================ Server-Sent Events
+@dataclass(frozen=True)
+class SSEEvent:
+    type: str            # "message" unless an event: field set it
+    data: str
+    id: str              # the last event ID at dispatch time ("" if none yet)
+
+
+class SSEParser:
+    """feed(bytes) -&gt; list of events dispatched by that chunk. Bytes can be split anywhere."""
+
+    def __init__(self) -&gt; None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+        self._buf = ""                  # text not yet terminated by a line ending
+        self._pending_cr = False        # chunk ended in CR: an LF at the next chunk's start is the same line ending
+        self._started = False           # strip one leading BOM
+        self._data: list[str] = []
+        self._event = ""
+        self.last_id = ""
+        self.retry_ms: int | None = None
+
+    def feed(self, chunk: bytes) -&gt; list[SSEEvent]:
+        text = self._decoder.decode(chunk)
+        if not self._started and text:
+            self._started = True
+            if text.startswith("\ufeff"):
+                text = text[1:]
+        if self._pending_cr and text.startswith("\n"):
+            text = text[1:]
+        self._pending_cr = False
+        self._buf += text
+        events: list[SSEEvent] = []
+        while True:
+            i = min((p for p in (self._buf.find("\r"), self._buf.find("\n")) if p != -1), default=-1)
+            if i == -1:
+                break
+            line = self._buf[:i]
+            if self._buf[i] == "\r":
+                if i + 1 == len(self._buf):     # CR is last: maybe half of a CRLF
+                    self._pending_cr = True
+                    self._buf = ""
+                else:
+                    self._buf = self._buf[i + 2:] if self._buf[i + 1] == "\n" else self._buf[i + 1:]
+            else:
+                self._buf = self._buf[i + 1:]
+            ev = self._line(line)
+            if ev is not None:
+                events.append(ev)
+        return events
+
+    def close(self) -&gt; None:
+        """End of stream: an event without its terminating blank line is discarded, per the spec."""
+        self._buf, self._data, self._event = "", [], ""
+
+    def _line(self, line: str) -&gt; SSEEvent | None:
+        if line == "":
+            return self._dispatch()
+        if line.startswith(":"):
+            return None                                     # comment (often a keep-alive)
+        field, sep, value = line.partition(":")
+        if sep and value.startswith(" "):
+            value = value[1:]                               # exactly one leading space removed
+        if field == "data":
+            self._data.append(value)
+        elif field == "event":
+            self._event = value
+        elif field == "id":
+            if "\0" not in value:
+                self.last_id = value
+        elif field == "retry":
+            if value.isascii() and value.isdigit():
+                self.retry_ms = int(value)
+        return None                                         # unknown fields are ignored
+
+    def _dispatch(self) -&gt; SSEEvent | None:
+        data, etype = "\n".join(self._data), self._event or "message"
+        had_data = bool(self._data)
+        self._data, self._event = [], ""
+        if not had_data:
+            return None                                     # empty data buffer: no event
+        return SSEEvent(etype, data, self.last_id)
+
+
+# ================================================================ incremental JSON
+class JSONStreamError(ValueError):
+    pass
+
+
+_WS = " \t\n\r"
+_ESC = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+_NUM_CHARS = set("0123456789+-.eE")
+_LITERALS = {"true": True, "false": False, "null": None}
+
+
+_NUMBER = re.compile(r"-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?")
+
+
+def _valid_number(s: str) -&gt; bool:
+    return _NUMBER.fullmatch(s) is not None
+
+
+class IncrementalJSON:
+    """feed(text) consumes characters as they arrive and keeps a partial value:
+       - containers appear as soon as they open; keys appear once complete;
+       - string values appear immediately and grow as characters arrive;
+       - numbers and true/false/null appear only once complete (12 could still become 123).
+    snapshot() returns a deep copy of the partial value; finish() validates and returns the final one."""
+
+    def __init__(self) -&gt; None:
+        self.root: Any = None
+        self._has_root = False
+        self._done = False              # root value complete
+        self._stack: list[dict] = []    # frames: {"c": container, "state": ..., "key": ...}
+        self._tok: str | None = None    # "str" | "num" | "lit" while a scalar token is open
+        self._buf = ""                  # number/literal text, or string escape in progress
+        self._str: list[str] = []       # current string's characters
+        self._str_is_key = False
+        self._esc: str | None = None    # None, "\\" or "\\uXXXX..." in progress
+        self._high: int | None = None   # pending high surrogate
+        self.pos = 0                    # characters consumed, for error messages
+
+    # ---- public API
+    def feed(self, text: str) -&gt; None:
+        for ch in text:
+            self._char(ch)
+            self.pos += 1
+
+    def snapshot(self) -&gt; Any:
+        return copy.deepcopy(self.root)
+
+    def finish(self) -&gt; Any:
+        if self._tok in ("num", "lit"):
+            self._end_scalar()
+        if self._tok == "str" or self._stack or not self._done:
+            raise JSONStreamError(f"incomplete JSON at end of stream (position {self.pos})")
+        return self.root
+
+    # ---- placing values
+    def _place(self, value: Any) -&gt; None:
+        """Attach a new value (container or complete scalar) where the grammar expects one."""
+        if not self._stack:
+            if self._has_root:
+                raise JSONStreamError(f"unexpected value after the top-level value at {self.pos}")
+            self.root, self._has_root = value, True
+            return
+        f = self._stack[-1]
+        if f["state"] == "value" and isinstance(f["c"], dict):
+            f["c"][f["key"]] = value
+            f["state"] = "comma_or_end"
+        elif f["state"] in ("value_or_end", "value") and isinstance(f["c"], list):
+            f["c"].append(value)
+            f["state"] = "comma_or_end"
+        else:
+            raise JSONStreamError(f"unexpected value at {self.pos}")
+
+    def _value_complete(self) -&gt; None:
+        if not self._stack:
+            self._done = True
+
+    def _expecting_value(self) -&gt; bool:
+        if not self._stack:
+            return not self._has_root
+        f = self._stack[-1]
+        return f["state"] == "value" or (f["state"] == "value_or_end" and isinstance(f["c"], list))
+
+    # ---- scalars
+    def _end_scalar(self) -&gt; None:
+        s, kind = self._buf, self._tok
+        self._tok, self._buf = None, ""
+        if kind == "num":
+            if not _valid_number(s):
+                raise JSONStreamError(f"invalid number {s!r} ending at {self.pos}")
+            self._place(float(s) if any(c in s for c in ".eE") else int(s))
+        else:
+            if s not in _LITERALS:
+                raise JSONStreamError(f"invalid literal {s!r} ending at {self.pos}")
+            self._place(_LITERALS[s])
+        self._value_complete()
+
+    def _string_char(self, ch: str) -&gt; None:
+        if self._esc is not None:
+            self._esc += ch
+            if self._esc == "\\u" or (self._esc.startswith("\\u") and len(self._esc) &lt; 6):
+                return                                          # still collecting 4 hex digits
+            if self._esc.startswith("\\u"):
+                hexs = self._esc[2:]
+                if any(c not in "0123456789abcdefABCDEF" for c in hexs):
+                    raise JSONStreamError(f"bad \\u escape {self._esc!r} at {self.pos}")
+                cp = int(hexs, 16)
+                self._esc = None
+                if 0xD800 &lt;= cp &lt;= 0xDBFF:                      # high surrogate: wait for the low half
+                    self._high = cp
+                    return
+                if 0xDC00 &lt;= cp &lt;= 0xDFFF:
+                    if self._high is None:
+                        raise JSONStreamError(f"lone low surrogate at {self.pos}")
+                    cp = 0x10000 + ((self._high - 0xD800) &lt;&lt; 10) + (cp - 0xDC00)
+                    self._high = None
+                self._emit_str(chr(cp))
+                return
+            if ch not in _ESC:
+                raise JSONStreamError(f"bad escape \\{ch} at {self.pos}")
+            self._esc = None
+            self._emit_str(_ESC[ch])
+            return
+        if self._high is not None and ch != "\\":
+            raise JSONStreamError(f"high surrogate not followed by a low surrogate at {self.pos}")
+        if ch == "\\":
+            self._esc = "\\"
+        elif ch == '"':
+            self._close_string()
+        elif ord(ch) &lt; 0x20:
+            raise JSONStreamError(f"unescaped control character in string at {self.pos}")
+        else:
+            self._emit_str(ch)
+
+    def _emit_str(self, s: str) -&gt; None:
+        self._str.append(s)
+        if not self._str_is_key:                                # grow the visible partial value
+            self._set_current_string("".join(self._str))
+
+    def _set_current_string(self, s: str) -&gt; None:
+        if not self._stack:
+            self.root = s
+            return
+        f = self._stack[-1]
+        if isinstance(f["c"], dict):
+            f["c"][f["key"]] = s
+        else:
+            f["c"][-1] = s
+
+    def _close_string(self) -&gt; None:
+        s = "".join(self._str)
+        self._tok, self._str = None, []
+        if self._high is not None:
+            raise JSONStreamError(f"unpaired high surrogate at {self.pos}")
+        if self._str_is_key:
+            f = self._stack[-1]
+            f["key"], f["state"] = s, "colon"
+        else:
+            self._set_current_string(s)
+            if self._stack:
+                self._stack[-1]["state"] = "comma_or_end"
+            self._value_complete()
+
+    def _open_string_value(self) -&gt; None:
+        self._place("")                                         # visible immediately as ""
+        if self._stack:
+            self._stack[-1]["state"] = "in_string"
+        self._tok, self._str, self._str_is_key = "str", [], False
+
+    # ---- the character dispatcher
+    def _char(self, ch: str) -&gt; None:
+        if self._tok == "str":
+            self._string_char(ch)
+            return
+        if self._tok in ("num", "lit"):
+            if (self._tok == "num" and ch in _NUM_CHARS) or (self._tok == "lit" and ch.isalpha()):
+                self._buf += ch
+                return
+            self._end_scalar()                                  # this char terminates it; fall through
+        if ch in _WS:
+            return
+        if self._done:
+            raise JSONStreamError(f"unexpected {ch!r} after the top-level value at {self.pos}")
+        f = self._stack[-1] if self._stack else None
+
+        if f is not None and isinstance(f["c"], dict) and f["state"] in ("key_or_end", "key"):
+            if ch == '"':
+                self._tok, self._str, self._str_is_key = "str", [], True
+            elif ch == "}" and f["state"] == "key_or_end":
+                self._close_container()
+            else:
+                raise JSONStreamError(f"expected a key at {self.pos}, got {ch!r}")
+            return
+        if f is not None and f["state"] == "colon":
+            if ch != ":":
+                raise JSONStreamError(f"expected ':' at {self.pos}, got {ch!r}")
+            f["state"] = "value"
+            return
+        if f is not None and f["state"] == "comma_or_end":
+            if ch == ",":
+                f["state"] = "key" if isinstance(f["c"], dict) else "value"
+            elif ch == ("}" if isinstance(f["c"], dict) else "]"):
+                self._close_container()
+            else:
+                raise JSONStreamError(f"expected ',' or close at {self.pos}, got {ch!r}")
+            return
+        if f is not None and isinstance(f["c"], list) and f["state"] == "value_or_end" and ch == "]":
+            self._close_container()
+            return
+        if not self._expecting_value():
+            raise JSONStreamError(f"unexpected {ch!r} at {self.pos}")
+        if ch == "{":
+            d: dict = {}
+            self._place(d)
+            self._stack.append({"c": d, "state": "key_or_end", "key": None})
+        elif ch == "[":
+            a: list = []
+            self._place(a)
+            self._stack.append({"c": a, "state": "value_or_end", "key": None})
+        elif ch == '"':
+            self._open_string_value()
+        elif ch == "-" or ch.isdigit():
+            self._tok, self._buf = "num", ch
+        elif ch in "tfn":
+            self._tok, self._buf = "lit", ch
+        else:
+            raise JSONStreamError(f"unexpected {ch!r} at {self.pos}")
+
+    def _close_container(self) -&gt; None:
+        self._stack.pop()
+        if self._stack:
+            self._stack[-1]["state"] = "comma_or_end"
+        self._value_complete()
+
+
+# ================================================================ end-of-stream validation
+def check_shape(value: Any, schema: dict, path: str = "$") -&gt; list[str]:
+    """Tiny schema check run once the stream is complete: types, required keys, items."""
+    errors: list[str] = []
+    types = {"object": dict, "array": list, "string": str, "number": (int, float),
+             "integer": int, "boolean": bool}
+    t = schema.get("type")
+    if t and (not isinstance(value, types[t]) or (t in ("number", "integer") and isinstance(value, bool))):
+        return [f"{path}: expected {t}"]
+    if t == "object":
+        for k in schema.get("required", []):
+            if k not in value:
+                errors.append(f"{path}: missing {k!r}")
+        for k, sub in schema.get("properties", {}).items():
+            if k in value:
+                errors += check_shape(value[k], sub, f"{path}.{k}")
+    if t == "array" and "items" in schema:
+        for i, v in enumerate(value):
+            errors += check_shape(v, schema["items"], f"{path}[{i}]")
+    return errors
+
+
+# ================================================================ tests
+def chunks(data: str | bytes, sizes: list[int]):
+    i = 0
+    for n in sizes:
+        yield data[i:i + n]
+        i += n
+    if i &lt; len(data):
+        yield data[i:]
+
+
+def sse_all(raw: bytes, split) -&gt; list[SSEEvent]:
+    p, out = SSEParser(), []
+    for c in split(raw):
+        out += p.feed(c)
+    p.close()
+    return out
+
+
+def test_sse_basic_fields_and_comments() -&gt; None:
+    raw = (b": keep-alive\n"
+           b"event: content_block_delta\nid: 7\ndata: {\"text\": \"Hel\"}\n\n"
+           b"data:no-space\ndata:  two-spaces\n\n"
+           b"retry: 3000\nfoo: ignored\ndata\n\n"
+           b"id\ndata: x\n\n")
+    p = SSEParser()
+    evs = p.feed(raw)
+    assert evs[0] == SSEEvent("content_block_delta", '{"text": "Hel"}', "7")
+    assert evs[1] == SSEEvent("message", "no-space\n two-spaces", "7")     # one space stripped, lines joined
+    assert evs[2] == SSEEvent("message", "", "7") and p.retry_ms == 3000   # 'data' with no colon = empty value
+    assert evs[3] == SSEEvent("message", "x", "")                           # 'id' with no value resets it
+    assert len(evs) == 4
+
+
+def test_sse_line_endings_split_anywhere() -&gt; None:
+    raw = "\ufeffevent: a\r\ndata: 1\r\rdata: é→😀\rdata: z\n\ndata: tail-without-blank-line\n".encode()
+    expected = [SSEEvent("a", "1", ""), SSEEvent("message", "é→😀\nz", "")]
+    for cut in range(len(raw) + 1):                                 # every two-way split
+        assert sse_all(raw, lambda r: chunks(r, [cut])) == expected, cut
+    rng = random.Random(0)
+    for _ in range(300):                                            # random multi-way splits, 1-byte chunks too
+        sizes = [rng.randint(1, 4) for _ in range(len(raw))]
+        assert sse_all(raw, lambda r: chunks(r, sizes)) == expected
+
+
+def test_sse_cr_at_chunk_end_is_one_line_ending() -&gt; None:
+    p = SSEParser()
+    assert p.feed(b"data: a\r") == []
+    assert p.feed(b"\n") == []                  # the LF completes CRLF; it is not a blank line
+    assert p.feed(b"\r\n") == [SSEEvent("message", "a", "")]
+
+
+def test_json_partial_snapshots() -&gt; None:
+    p, snaps = IncrementalJSON(), []
+    for piece in ['{"na', 'me": "Ad', 'a", "age": 3', '6, "tags": ["x', '", "y"], "ok": tr', 'ue}']:
+        p.feed(piece)
+        snaps.append(p.snapshot())
+    assert snaps == [
+        {},                                                    # key incomplete: not shown yet
+        {"name": "Ad"},                                        # string value grows
+        {"name": "Ada"},                                       # 36 not final yet (could be 365)
+        {"name": "Ada", "age": 36, "tags": ["x"]},
+        {"name": "Ada", "age": 36, "tags": ["x", "y"]},        # 'tr' not shown
+        {"name": "Ada", "age": 36, "tags": ["x", "y"], "ok": True},
+    ]
+    assert p.finish() == {"name": "Ada", "age": 36, "tags": ["x", "y"], "ok": True}
+
+
+def test_json_escapes_and_surrogates_split_anywhere() -&gt; None:
+    text = json.dumps({"q": 'say "hi"\\ok\n\t', "emoji": "😀 é", "u": "\u00e9\u20ac",
+                       "nested": [1, -2.5e-3, {"k": [True, False, None]}], "z": ""}, ensure_ascii=True)
+    assert "\\ud83d\\ude00" in text                              # a surrogate pair as two escapes
+    expected = json.loads(text)
+    for cut in range(len(text) + 1):
+        for cut2 in (cut + 1, cut + 3, cut + 7):
+            p = IncrementalJSON()
+            for c in chunks(text, [cut, cut2 - cut]):
+                p.feed(c)
+            assert p.finish() == expected, (cut, cut2)
+
+
+def random_json(rng: random.Random, depth: int = 0) -&gt; Any:
+    kind = rng.choice(["obj", "arr", "str", "int", "float", "lit"] if depth &lt; 3 else ["str", "int", "float", "lit"])
+    if kind == "obj":
+        return {rng.choice(["a", "b\"q", "ключ", "k\\n", "😀"]) + str(i): random_json(rng, depth + 1)
+                for i in range(rng.randint(0, 4))}
+    if kind == "arr":
+        return [random_json(rng, depth + 1) for _ in range(rng.randint(0, 4))]
+    if kind == "str":
+        return "".join(rng.choice('ab "\\/\n\t\u00e9\u4e2d😀') for _ in range(rng.randint(0, 8)))
+    if kind == "int":
+        return rng.randint(-10**6, 10**6)
+    if kind == "float":
+        return rng.choice([0.5, -1.25e-7, 3.0e10, 123.456])
+    return rng.choice([True, False, None])
+
+
+def test_json_property_random_documents_random_chunks() -&gt; None:
+    rng = random.Random(42)
+    for _ in range(400):
+        doc = random_json(rng)
+        text = json.dumps(doc, ensure_ascii=rng.random() &lt; 0.5, indent=rng.choice([None, 1]))
+        p = IncrementalJSON()
+        i = 0
+        while i &lt; len(text):
+            n = rng.randint(1, 5)
+            p.feed(text[i:i + n])
+            i += n
+            snap = p.snapshot()                                    # never raises mid-stream on valid input
+            assert snap is None or isinstance(snap, (dict, list, str, int, float, bool))
+        assert p.finish() == json.loads(text)
+
+
+def test_json_rejects_invalid_input() -&gt; None:
+    bad = ['{"a": 01}', '{"a": tru}', '{"a" 1}', '[1, 2,]', '{"a": "x\\q"}', '"\\ud83d"',
+           '{"a": 1} {', '{"a": "line\nbreak"}', '[1 2]', '{"a": 1', '"\\u12G4"', '{,}']
+    for text in bad:
+        try:
+            p = IncrementalJSON()
+            p.feed(text)
+            p.finish()
+        except JSONStreamError:
+            continue
+        raise AssertionError(f"accepted invalid JSON: {text!r}")
+
+
+def test_end_to_end_llm_stream() -&gt; None:
+    """SSE events carrying JSON deltas whose text is itself streamed JSON (a tool's arguments)."""
+    args = {"city": "São Paulo", "days": 3, "units": "metric"}
+    payload = json.dumps(args)
+    parts = [payload[i:i + 5] for i in range(0, len(payload), 5)]
+    body = "event: message_start\ndata: {}\n\n"
+    for part in parts:
+        delta = {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": part}}
+        body += f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+    body += "event: message_stop\ndata: {}\n\n"
+    raw = body.encode()
+    sse, js, seen_city = SSEParser(), IncrementalJSON(), []
+    for i in range(0, len(raw), 7):                                  # 7-byte network chunks
+        for ev in sse.feed(raw[i:i + 7]):
+            if ev.type == "content_block_delta":
+                js.feed(json.loads(ev.data)["delta"]["partial_json"])
+                city = (js.snapshot() or {}).get("city")
+                if city and (not seen_city or seen_city[-1] != city):
+                    seen_city.append(city)
+    final = js.finish()
+    assert final == args and seen_city[-1] == "São Paulo" and len(seen_city) &gt; 1   # city grew live
+    schema = {"type": "object", "required": ["city", "days"],
+              "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}
+    assert check_shape(final, schema) == []
+    assert check_shape({"city": 5}, schema) == ["$: missing 'days'", "$.city: expected string"]
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
+    for t in tests:
+        t()
+        print("ok ", t.__name__)
+    print(f"{len(tests)} tests passed")</pre>
+
+<h4>10 · Edge cases</h4>
+<p><strong>A chunk that is empty</strong>: the decoder returns nothing; nothing happens. <strong>A BOM in the middle of the stream</strong>: only a leading one is stripped; later ones are data. <strong>id containing NUL</strong>: ignored, per the standard. <strong>retry with non-digits</strong> (<code>retry: 3s</code>): ignored. <strong>Very long lines</strong>: the line buffer grows without bound; cap it (say 1 MB) and raise, so a misbehaving server cannot exhaust memory. <strong>Invalid UTF-8</strong>: the strict decoder raises; decide whether to fail the stream or use <code>errors="replace"</code>. <strong>Top-level scalars</strong>: <code>"text"</code> or <code>42</code> are valid JSON; a model asked for an object should still be validated as one. <strong>Duplicate keys</strong>: JSON allows them and this parser, like <code>json.loads</code>, keeps the last; a stricter mode could reject them. <strong>Deep nesting</strong>: the explicit stack has no recursion limit, unlike a recursive parser — but a cap protects memory. <strong>Big numbers</strong>: integers stay exact in Python; floats lose precision beyond 2<sup>53</sup> as everywhere.</p>
+
+<h4>11 · Extensions the interviewer will ask for</h4>
+<p><strong>Events instead of snapshots</strong>: emit (path, change) events — key started, string appended, value completed — so consumers update incrementally in O(change) rather than deep-copying; the stack already knows the path. <strong>Field-complete callbacks</strong>: call a handler when a given path completes (start rendering the "summary" section once its string closes). <strong>Async iteration</strong>: wrap the parsers in an async generator over an HTTP client's byte stream. <strong>Reconnection</strong>: on a dropped SSE connection, reconnect after the <code>retry</code> time with a <code>Last-Event-ID</code> header carrying the parser's <code>last_id</code>, as browsers' EventSource does. <strong>Schema-guided partials</strong>: with a known schema, show placeholders for fields not yet started. <strong>Performance</strong>: process runs of ordinary characters inside strings with one slice instead of per-character calls; that is where a C-speed scan (<code>str.find</code> for the next quote or backslash) gives a large constant-factor win.</p>
+
+<h4>12 · Complexity</h4>
+<p>Both parsers do O(1) amortised work per input character (SSE: each character is scanned once for line endings and copied once into a line; JSON: each character visits <code>_char</code> once), so total time is O(n) for an n-character stream regardless of chunking — versus O(n²/c) for re-parsing the buffer per chunk of size c. Memory: SSE holds the current line and the current event's data; JSON holds the partial value (O(n)) and a stack as deep as the nesting. <code>snapshot()</code> deep-copies the partial value, O(n) per call, which is why events replace snapshots for large documents.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why SSE dominates model APIs</h4>
+<p>Server-Sent Events are plain HTTP: a normal request, a response that stays open, text lines in the body. That means they pass through load balancers, proxies, CDNs and corporate firewalls that would block or mangle other protocols, work with ordinary HTTP authentication and retries, and need nothing special on the client beyond reading a response body. Model responses are one-directional — the server talks, the client listens — so the two-way channel WebSockets provide is unnecessary. The format's details then make sense: comments as keep-alives so idle intermediaries do not close the connection during a long pause; ids and <code>Last-Event-ID</code> so a browser can resume; <code>retry</code> so the server can tell clients how fast to reconnect. Model APIs mostly do not support resumption by id, so a dropped stream generally means re-issuing the request — another reason the commit point (ld4) matters.</p>
+
+<h4>The repair-and-parse approach, and when it is acceptable</h4>
+<p>Many client libraries show partial JSON by "repairing" the buffer — appending the closing quotes and brackets the open structure needs — and calling a normal parser. It is attractive because it reuses a fast, correct parser. Its costs: quadratic total work, fragility at escape boundaries (a buffer ending in <code>\</code> or <code>\u00</code> cannot be closed with a quote), and ambiguity for numbers and literals (repairing <code>tr</code> needs a guess). For short outputs — a few hundred characters of tool arguments — it is fine and simpler. For long structured outputs, documents with many escapes, or high-throughput servers parsing thousands of streams at once, an incremental state machine is the right tool. Saying both, with the crossover, is what an interviewer wants to hear.</p>
+
+<h4>Tokens are not characters</h4>
+<p>Models produce tokens, and a token can be several characters, part of a multi-byte character, or a mix of structure and content (<code>"name": "</code> may be one or two tokens). The API delivers text deltas, which are already decoded characters, but there is no guarantee a delta ends at a JSON token boundary — or, at the byte level, at a character boundary. This is why the parser must be character-driven at the JSON layer and byte-aware at the transport layer. It also explains a UX quirk: partial strings can appear to "jump" by several characters at once, because one delta carried a multi-character token.</p>
+
+<h4>Constrained decoding changes the failure modes, not the parser</h4>
+<p>With structured outputs or strict tool use, the provider constrains generation so the output matches a schema. That removes most syntax errors and schema violations in complete outputs, but the stream is still delivered in arbitrary fragments, still needs incremental parsing for a responsive UI, and can still be cut off by a token limit or a dropped connection, leaving an incomplete document. The end-of-stream checks therefore remain: completeness from <code>finish()</code>, shape from the schema, and meaning from business rules that no schema can express.</p>
+
+<h4>Backpressure and the slow consumer</h4>
+<p>A parser that is fast enough on average can still fall behind if the consumer is slow — a UI that re-renders a large form on every snapshot, or a server that forwards parsed events to a mobile client on a poor connection. Because the HTTP response is a stream, falling behind does not lose data; it fills buffers, first in the client's socket and then, through TCP flow control, back toward the provider, which may eventually time out the stream. The usual fixes are to decouple parsing from rendering (parse every chunk, render at most every 50-100 ms from the latest state) and, on servers relaying streams, to bound the buffer per client and drop or conflate intermediate updates for slow clients while always delivering the final value. Parsing must never be the thing that is skipped, because the parser's state is what makes the final result correct.</p>
+
+<h4>Partial output and safety</h4>
+<p>Showing partial output means showing content before it has been checked. For most structured outputs that is harmless, but if outputs pass through moderation, PII redaction or a policy check, those checks run on the complete text, and the user has already seen the partial version. Designs that need checks before display either buffer until a check passes (sacrificing latency), check incrementally on sentence or field boundaries, or show partial content in a clearly provisional state. The same applies to tool arguments: render them as they arrive for transparency, but never execute a tool on a partial snapshot.</p>
+</section>
+
+<section data-field="prod">
+<h4>How streaming parsers fail in production</h4>
+<p><strong>Garbled non-ASCII text.</strong> Symptom: occasional "�" in streamed output, only behind some proxies or on some networks. Cause: per-chunk decoding of UTF-8 split mid-character. Fix: an incremental decoder; test with multi-byte characters at every split.</p>
+<p><strong>Events lost or merged.</strong> Symptom: rare missing deltas, or two deltas concatenated. Cause: splitting on <code>\n</code> only while a proxy normalised line endings to CRLF, or a CR/LF pair split across reads. Fix: handle all three line endings and the pending CR; test every split.</p>
+<p><strong>CPU climbing with response length.</strong> Symptom: server CPU for streaming endpoints grows faster than traffic as responses lengthen. Cause: re-parsing the accumulated buffer per chunk. Fix: incremental parsing, or snapshots throttled to every N milliseconds.</p>
+<p><strong>Acting on truncated output.</strong> Symptom: a tool runs with arguments missing a field, or a form is saved half-filled. Cause: treating "the stream ended" as "the document is complete", or repairing partial JSON before acting. Fix: strict <code>finish()</code>, check the stop reason (a <code>max_tokens</code> stop means truncation), schema validation before any action.</p>
+<p><strong>Proxies that buffer.</strong> Symptom: streaming works directly but arrives all at once through one environment. Cause: an intermediary (a reverse proxy, a compression layer) buffering the response body. Fix: disable buffering and compression for <code>text/event-stream</code> on that path; the parser cannot fix this, but its time-to-first-event metric reveals it.</p>
+<p><strong>Idle connections dropped.</strong> Symptom: long generations fail after exactly 60 seconds of silence. Cause: an intermediary's idle timeout during a long pause before output. Fix: servers send comment or ping events as keep-alives; clients must ignore them correctly — which a parser that treats every line as data would not.</p>
+
+<h4>What to measure</h4>
+<p>Time to first byte and to first parsed event; time to first visible field; parse time per chunk and per stream; parser errors by type (invalid UTF-8, invalid JSON at a position, incomplete at end); the share of streams ending with <code>max_tokens</code>; snapshot frequency and size; and dropped-connection rates by network path.</p>
+
+<h4>Knobs</h4>
+<p>Maximum line length and maximum event size (memory safety); snapshot throttle interval for the UI (every chunk is often too frequent — 50-100 ms is plenty for humans); strict versus replacement decoding for invalid bytes; maximum nesting depth; and whether partial values are shown at all for fields that drive actions.</p>
+
+<h4>The real references</h4>
+<p>The SSE rules in this solution come from the HTML Living Standard's server-sent events section, which specifies the stream's ABNF grammar (an end of line is CRLF, CR or LF), that one leading BOM is stripped by UTF-8 decoding, how lines are interpreted (empty line dispatches, colon-prefixed lines are comments, one leading space removed from a value), what each field does (data accumulates with newlines, id sets the last event ID unless it contains NUL, retry accepts only ASCII digits), and that an event without its blank line at end of stream is discarded. The event shapes in the end-to-end test follow Claude's streaming documentation: <code>message_start</code>, <code>content_block_start</code>, <code>content_block_delta</code> with <code>text_delta</code> or <code>input_json_delta</code> (carrying <code>partial_json</code>), <code>content_block_stop</code>, <code>message_delta</code>, <code>message_stop</code>, and <code>ping</code> events. The JSON grammar — number syntax, string escapes, surrogate pairs — is RFC 8259's.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then break it, measure it and extend it. Python 3.12, standard library only. For each break, predict which test fails before running it; the split tests should find every boundary bug without you writing a new case, which is the point of testing every split.</p>
+<ol>
+<li>Save the full solution as <code>stream_parse.py</code> and run it (set <code>PYTHONIOENCODING=utf-8</code> on a Windows console). Eight tests pass in about a second.</li>
+<li><strong>Break the decoder.</strong> Replace the incremental decoder with <code>chunk.decode("utf-8", errors="replace")</code>. Which test fails, and at which split points?</li>
+<li><strong>Break the CR handling.</strong> Remove the <code>pending_cr</code> logic. Find the smallest chunking of <code>b"data: a\r\n\r\n"</code> that now produces the wrong events.</li>
+<li><strong>Measure the quadratic.</strong> Generate a 50,000-character JSON document and feed it in 5-character pieces two ways: the incremental parser, and <code>json.loads</code> on the accumulated buffer after every piece. Time both; then double the document and time again.</li>
+<li><strong>Extend it: path events.</strong> Make <code>feed</code> return a list of <code>(path, event)</code> tuples such as <code>("$.tags[1]", "string_append", "y")</code> and <code>("$.age", "complete", 36)</code>, and write a test that rebuilds the final value from events alone.</li>
+<li><strong>Extend it: speed.</strong> Inside strings, use <code>str.find</code> to jump to the next quote or backslash and append the whole run at once; re-run the property test and the timing.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Debug it</b>
+<p>A streaming chat client works in development. In production, about one response in two hundred shows a duplicated or missing chunk of text, always at a delta boundary, and users in Brazil report "SÃ£o" instead of "São" occasionally. The client decodes each network read with <code>bytes.decode()</code> and splits it with <code>text.split("\n")</code>. What two bugs are there, and how would you prove each?</p>
+<details><summary>Answer</summary>
+<p><strong>Bug 1: per-read UTF-8 decoding.</strong> When a read ends between the two bytes of "ã" (C3 A3), decoding the halves separately fails or, with lenient decoding, produces wrong characters; "SÃ£o" is what you get when UTF-8 bytes are decoded as Latin-1 somewhere in a fallback path. Prove it by feeding a stream containing "São" split at every byte position. Fix: an incremental UTF-8 decoder. <strong>Bug 2: line splitting per read.</strong> Splitting each read on "\n" treats the end of every read as the end of a line, so a line split across two reads becomes two lines: the second half is parsed as a field with an unknown name (dropped — missing text) or a data line glued wrongly (duplicated or merged text). If production traffic passes through a proxy that uses CRLF, lines also keep a trailing "\r". Prove it by replaying a captured stream split at every position. Fix: a persistent line buffer, all three line endings, and the pending-CR rule.</p>
+</details>
+<b>Design it</b>
+<p>A form-filling feature streams a 30-field JSON object from a model. Product wants each field to appear as soon as it is known, the "description" field to render word by word, and the form to auto-save only valid, complete output. Some responses hit the token limit. Sketch the client.</p>
+<details><summary>Answer</summary>
+<p>SSE parser over the byte stream; for each text delta, feed the incremental JSON parser; every 50 ms (not every chunk), take a snapshot or apply path events and render: fields appear when their key is complete, string fields (description) grow per character, numbers and booleans appear once terminated. Mark the whole form "generating". On <code>message_stop</code>, check the stop reason: if <code>max_tokens</code>, show the form as incomplete with the missing fields highlighted and offer to continue or regenerate; never auto-save. Otherwise call <code>finish()</code> (catching incomplete or invalid JSON), validate against the form's schema (required fields, types, enums) and business rules, and only then auto-save. If validation fails, show the errors and optionally ask the model to fix them with the error messages fed back.</p>
+</details>
+</section>

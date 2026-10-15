@@ -1,0 +1,537 @@
+<!-- topic source for torch/pt8; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "pt8",
+  "t": "Checkpointing and resuming: what to save, safe formats, sharded checkpoints and exact resumption",
+  "tag": "Checkpoints",
+  "sum": "A checkpoint is more than the weights: optimiser, scheduler, scaler, RNG states and data position. How torch.save and torch.load work, why weights_only=True became the default and what CVE-2025-32434 taught, safetensors, distributed checkpoints, atomic writes, and a resume that is truly exact.",
+  "prereq": [
+    [
+      "pt4",
+      "state_dict maps dotted names to parameter and buffer tensors; load_state_dict with strict=True raises on mismatches; DDP adds a module. prefix and torch.compile adds _orig_mod."
+    ],
+    [
+      "pt5",
+      "The DataLoader's sampler order and worker seeds come from a generator; IterableDatasets track their own position per worker and rank."
+    ],
+    [
+      "pt6",
+      "The optimiser keeps per-parameter state (Adam's moments), schedulers count steps, and reproducibility needs seeded torch, NumPy and Python RNGs plus deterministic kernels."
+    ],
+    [
+      "pt7",
+      "Mixed-precision fp16 training uses a GradScaler whose scale grows and shrinks over the run; parameters and optimiser state are float32."
+    ]
+  ],
+  "myths": [
+    [
+      "Saving model.state_dict() is a checkpoint.",
+      "It is the weights. Resuming from weights alone restarts AdamW with zero moments, the scheduler at step 0 (back into warmup), the GradScaler at its initial scale, fresh RNG streams and the data from the start of the epoch. The loss usually jumps and the run diverges from the one you interrupted. A training checkpoint needs all of that state."
+    ],
+    [
+      "torch.load is safe as long as the file has a .pt extension.",
+      "A .pt file is a zip containing a pickle, and unpickling can execute arbitrary code. That is why PyTorch 2.6 switched torch.load to weights_only=True by default, which only allows tensors, primitive types and allow-listed classes. Even that restricted loader had a remote-code-execution bug in 2.5.1 and earlier (CVE-2025-32434), so untrusted weights should come as safetensors and PyTorch should be current."
+    ],
+    [
+      "Saving a slice of a tensor saves only the slice.",
+      "torch.save writes whole storages, so a view saves the storage it points into. Saving the first two elements of a 1,000-element tensor writes all 1,000 (5.5 KB instead of a few hundred bytes on 2.14). Clone the slice first. The flip side is useful: tied weights share a storage and are saved once."
+    ],
+    [
+      "A checkpoint saved from 8 GPUs can only be loaded on 8 GPUs.",
+      "Plain per-rank shards can, but torch.distributed.checkpoint (DCP) stores tensors with metadata describing how they were sharded and reshards on load, so a checkpoint written by 64 ranks can be read by 32 or by one. The model and optimiser must be wrapped the same way, and get_state_dict/set_state_dict handle the FSDP and DDP details."
+    ],
+    [
+      "Writing the checkpoint file directly is fine.",
+      "If the job is killed mid-write — preemption, OOM, a node failure — the file is truncated, and the next start tries to resume from a corrupt checkpoint, having overwritten the good one. Write to a temporary name and rename it into place (an atomic operation on POSIX file systems), keep the last few checkpoints, and verify a checkpoint loads before deleting older ones."
+    ]
+  ],
+  "recap": [
+    "A training checkpoint holds the model state_dict, the optimiser state_dict, the scheduler and GradScaler state, the step and epoch counters, every RNG state that affects training, the data position, and the config needed to rebuild the objects.",
+    "torch.save writes a zip archive with a pickle of the object structure and one file per storage; views save their whole storage and tied tensors are stored once.",
+    "Since PyTorch 2.6, torch.load defaults to weights_only=True, which refuses arbitrary classes (including NumPy RNG state) unless allow-listed with add_safe_globals; use weights_only=False only for files you trust.",
+    "CVE-2025-32434 showed that even the restricted loader could execute code before 2.6.0; untrusted weights should be loaded from safetensors files, which contain only a JSON header and raw bytes.",
+    "Load with map_location to choose the device, mmap=True to avoid reading everything into RAM, and on the meta device with assign=True to avoid allocating the model twice.",
+    "Distributed checkpoints (torch.distributed.checkpoint) write one shard per rank plus metadata, support resharding to a different number of GPUs, and can save asynchronously so training continues while the write finishes.",
+    "Write atomically (temporary file then rename), keep several checkpoints, and test resume regularly by comparing a resumed run with an uninterrupted one."
+  ],
+  "glossary": [
+    [
+      "add_safe_globals",
+      "torch.serialization.add_safe_globals: allow-list specific classes or functions so weights_only loading may reconstruct them."
+    ],
+    [
+      "Async checkpointing",
+      "Copying state to host memory quickly, then writing it to storage in the background while training continues."
+    ],
+    [
+      "Atomic write",
+      "Writing to a temporary file and renaming it over the target, so readers see either the old or the new file, never a partial one."
+    ],
+    [
+      "CVE",
+      "Common Vulnerabilities and Exposures: the public identifier system for security vulnerabilities, recorded in databases such as the US NVD."
+    ],
+    [
+      "DCP (torch.distributed.checkpoint)",
+      "PyTorch's distributed checkpoint library: each rank writes its shards in parallel, with metadata that allows loading under a different sharding."
+    ],
+    [
+      "JSON",
+      "JavaScript Object Notation, a plain-text data format; safetensors uses it for its header."
+    ],
+    [
+      "map_location",
+      "torch.load argument that remaps where loaded storages are placed, for example loading a GPU checkpoint onto the CPU."
+    ],
+    [
+      "mmap loading",
+      "torch.load(..., mmap=True): map the file into memory and read storages lazily instead of copying them all into RAM."
+    ],
+    [
+      "Model soup",
+      "Averaging the weights of several fine-tuned models that share a base model, often improving robustness."
+    ],
+    [
+      "Pickle",
+      "Python's object serialisation format; loading a pickle can call arbitrary functions, so it must not be used on untrusted files."
+    ],
+    [
+      "POSIX",
+      "The family of Unix standards; on POSIX file systems, renaming a file over another is atomic."
+    ],
+    [
+      "Preemption",
+      "A scheduler or cloud provider stopping a job (often with short notice) to reclaim its machines, as with spot instances."
+    ],
+    [
+      "RCE (remote code execution)",
+      "A vulnerability that lets an attacker run code of their choosing on the victim's machine."
+    ],
+    [
+      "Resharding",
+      "Loading a checkpoint saved with one parallel layout (number of GPUs, sharding scheme) into another."
+    ],
+    [
+      "RNG state",
+      "The internal state of a random number generator; restoring it makes the generator produce the same future sequence."
+    ],
+    [
+      "safetensors",
+      "A file format holding a JSON header (names, dtypes, shapes, offsets) followed by raw tensor bytes; it cannot execute code and supports zero-copy loading."
+    ],
+    [
+      "StatefulDataLoader",
+      "A DataLoader replacement in torchdata that can save and restore its position, including per-worker dataset state."
+    ],
+    [
+      "weights_only",
+      "torch.load mode (default True since 2.6) that uses a restricted unpickler allowing only tensors, primitive containers and allow-listed types."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What must a training checkpoint contain to resume a run?",
+      "The model state_dict, optimiser state_dict (Adam's moments and step counts), scheduler state_dict, GradScaler state_dict if using fp16, the global step and epoch, the RNG states of torch (CPU and every CUDA device), NumPy and Python's random, the data loader's position, and enough config to rebuild model, optimiser and data pipeline identically. Missing any one makes the resumed run diverge from the original."
+    ],
+    [
+      "E",
+      "Why did PyTorch change torch.load's default to weights_only=True?",
+      "A .pt file contains a pickle, and unpickling can construct arbitrary objects and call arbitrary functions, so loading a malicious checkpoint executes code. weights_only=True (the default since 2.6) uses a restricted unpickler that only rebuilds tensors, primitive types and allow-listed classes. Files that contain other objects now fail to load with an error that tells you to pass weights_only=False only if you trust the source, or to allow-list the needed class.",
+      "Follow-up: Is weights_only=True enough for untrusted files? — It is much safer, but CVE-2025-32434 was a remote-code-execution bug in that very path in 2.5.1 and earlier; keep PyTorch current and prefer safetensors for anything downloaded."
+    ],
+    [
+      "E",
+      "What is safetensors and why is it preferred for sharing weights?",
+      "A format consisting of an 8-byte little-endian header length, a JSON header mapping each tensor name to dtype, shape and byte offsets, and then the raw bytes. Loading cannot run code, the header can be read without reading the data, and tensors can be memory-mapped without copying. It only stores tensors (plus string metadata), so it is for weights, not for arbitrary training state."
+    ],
+    [
+      "M",
+      "You resume from a checkpoint and the loss jumps up for a few hundred steps, then recovers. What was probably not saved?",
+      "The optimiser state. With fresh AdamW moments, the first updates use bias-corrected estimates from a single gradient — unit-size steps in every coordinate at the full learning rate, effectively a warmup-free restart — which disturbs the weights until the moments re-accumulate. A wrong scheduler state (learning rate back to warmup or jumping) and a GradScaler restarting at 65,536 (several skipped steps) give similar but distinguishable signatures. Check what the checkpoint contains and log the learning rate and scale right after resuming.",
+      "Follow-up: How would you prove the resume is exact? — Run N steps, checkpoint, resume and run M more; compare with an uninterrupted N + M run under deterministic settings: losses should match bitwise or within float noise."
+    ],
+    [
+      "M",
+      "How do you save and restore RNG state, and what goes wrong with torch.load?",
+      "Save torch.get_rng_state(), torch.cuda.get_rng_state_all(), np.random.get_state() and random.getstate(); restore with the corresponding set functions after building everything else. The trap on 2.6+ is that np.random.get_state() returns a tuple containing a NumPy array and type objects that weights_only loading refuses — on 2.14 the load fails with 'Weights only load failed'. Either store the NumPy state as plain lists and ints, allow-list the needed globals, or load that trusted file with weights_only=False.",
+      "Follow-up: Do DataLoader workers need their RNG states saved? — Their seeds derive from base_seed drawn from the main process RNG or the loader's generator, so restoring that generator and the epoch reproduces them; per-worker augmentation RNGs you created yourself need their own handling."
+    ],
+    [
+      "M",
+      "How do you load a GPU checkpoint for a 70B model on a machine without enough RAM to hold it twice?",
+      "Build the model on the meta device so no memory is allocated, then torch.load(path, map_location='cpu', mmap=True, weights_only=True) so storages are memory-mapped from disk instead of read into RAM, and model.load_state_dict(sd, assign=True) so the model adopts those tensors instead of copying into freshly allocated ones. Then move layers to the GPU as needed. For sharded safetensors files, load shard by shard.",
+      "Follow-up: What do you have to redo after assign=True? — Weight tying, because assignment replaces the shared Parameter in each module separately, and any dtype conversion, since the model takes the checkpoint's dtype."
+    ],
+    [
+      "M",
+      "Why write checkpoints with a temporary file and a rename?",
+      "Because jobs die mid-write: preemptions, OOM kills, node failures, full disks. A direct write leaves a truncated file under the real name; if that was the only or latest checkpoint, the next attempt to resume fails or reads garbage. Writing to name.tmp and then os.replace(name.tmp, name) is atomic on POSIX file systems, so the visible file is always complete. On object storage, upload under a temporary key and write a small 'latest' pointer last."
+    ],
+    [
+      "M",
+      "What does torch.save actually write?",
+      "A zip archive containing data.pkl — a pickle of the object structure in which each tensor refers to a storage by key — and one file per storage with the raw bytes, plus a byteorder record and version. Because storages are stored once, two tensors sharing a storage (tied weights, views) are saved once and remain shared after loading; but a small view saves the whole storage behind it, so clone slices before saving."
+    ],
+    [
+      "H",
+      "Design checkpointing for a 512-GPU training run that is preempted roughly once a day.",
+      "Use torch.distributed.checkpoint so all ranks write their shards in parallel to a shared or object store, with get_state_dict to produce sharded model and optimiser state for FSDP. Save asynchronously: stage tensors to pinned host memory (a pause of seconds), then let a background thread write while training continues. Checkpoint every 20–30 minutes so a preemption costs little compute, keep the last three plus milestones, write a completion marker only after every rank has finished, and resume from the newest checkpoint with a marker. Include data-loader state for every rank and worker, RNG states and step counters. Test resume weekly by restarting from a recent checkpoint and comparing with the live run.",
+      "Follow-up: How do you pick the interval? — Balance the time to save (pause plus any slowdown) against expected lost work: roughly √(2 × save cost × mean time between failures) by Young's approximation; with a 30-second effective cost and one failure per 24 hours that is about 38 minutes."
+    ],
+    [
+      "H",
+      "How does resharding in DCP work, and why does it matter?",
+      "Each rank saves the pieces of each tensor it owns together with metadata recording, for every tensor, its global shape and which offsets each saved chunk covers. On load, each rank describes what it needs under the new layout, and a load planner reads the overlapping byte ranges from whichever saved chunks contain them. It matters because the number of GPUs often changes between training phases, between training and evaluation, or after failures, and because the same checkpoint must be converted to a single-file format for release.",
+      "Follow-up: What is the main cost? — Small, scattered reads when the layouts differ a lot; storage throughput rather than compute dominates load time."
+    ],
+    [
+      "H",
+      "A colleague saves checkpoints with torch.save(model) instead of torch.save(model.state_dict()). What problems does that cause?",
+      "Pickling the whole module stores references to its class by import path, so the checkpoint only loads if the same code exists at the same module path — refactoring a file breaks every old checkpoint. Loading requires weights_only=False (arbitrary code), so it cannot be loaded safely, and it captures incidental state (hooks, wrappers such as DDP or compile) in the file. state_dicts plus a config to rebuild the model are robust to refactors, loadable with weights_only=True, and convertible to safetensors."
+    ]
+  ],
+  "refs": [
+    [
+      "docs",
+      "NVD — CVE-2025-32434 (PyTorch torch.load with weights_only=True)",
+      "Remote command execution when loading a model with torch.load(weights_only=True) in PyTorch 2.5.1 and earlier; patched in 2.6.0.",
+      "https://nvd.nist.gov/vuln/detail/CVE-2025-32434"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — Serialization semantics",
+      "What torch.save writes, storage sharing, weights_only and add_safe_globals, mmap and map_location.",
+      "https://docs.pytorch.org/docs/2.14/notes/serialization.html"
+    ],
+    [
+      "docs",
+      "PyTorch 2.14 — torch.distributed.checkpoint",
+      "Distributed save/load, resharding, async_save and get_state_dict/set_state_dict for FSDP and DDP models.",
+      "https://docs.pytorch.org/docs/2.14/distributed.checkpoint.html"
+    ],
+    [
+      "code",
+      "safetensors README",
+      "The format specification (8-byte header length, JSON header, raw data) and the safety and zero-copy rationale.",
+      "https://raw.githubusercontent.com/huggingface/safetensors/main/README.md"
+    ],
+    [
+      "docs",
+      "PyTorch tutorials — Saving and loading a general checkpoint",
+      "The canonical pattern for saving model, optimiser, epoch and loss together.",
+      "https://docs.pytorch.org/tutorials/recipes/recipes/saving_and_loading_a_general_checkpoint.html"
+    ],
+    [
+      "code",
+      "torchdata README — StatefulDataLoader",
+      "A drop-in DataLoader that can checkpoint and restore its iteration state, including worker state.",
+      "https://raw.githubusercontent.com/meta-pytorch/data/main/README.md"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A team trains on cloud spot instances, which are cheap because the provider can take them back at short notice. Their script saves <code>model.state_dict()</code> every hour. After a preemption, the job restarts from the latest file — and the loss, which had been falling smoothly, jumps back up and takes thousands of steps to recover. The run that finally finishes is measurably worse than an uninterrupted run with the same budget. Nothing crashed. The checkpoint simply did not contain the optimiser's moment estimates, the learning-rate scheduler's step count (so the run went back into warmup), the gradient scaler's state, the random number generator states, or the position in the data. Each restart was a slightly different, slightly worse training run.</p>
+<p>Elsewhere, an engineer downloads a fine-tuned model from a public hub and loads it with <code>torch.load</code>. The file is a pickle, and pickles can run code. For years that was the default way PyTorch weights were shared. In PyTorch 2.6 the default of <code>torch.load</code> changed to a restricted mode, <code>weights_only=True</code>, that refuses arbitrary objects — and then a vulnerability was published, CVE-2025-32434, showing that in 2.5.1 and earlier even that restricted mode could be abused for remote code execution. A checkpoint is not just data; it is a file format with a security model.</p>
+<p>And at scale, a checkpoint is a distributed systems problem. A 70B-parameter model's full training state is over a terabyte; written by one process it would take far too long, and written by 512 processes it must be consistent across all of them, survive a crash in the middle, and be loadable later on a different number of GPUs.</p>
+<p>Interviewers ask about checkpoints because resuming correctly is where training-loop knowledge, systems knowledge and security knowledge meet: "what exactly do you save?", "why did the loss jump after resume?", "how do you load a 70B model on a machine with 128 GB of RAM?", "design checkpointing for a run on 512 GPUs that gets preempted daily". This lesson answers them: the full list of state a training run has, how <code>torch.save</code> and <code>torch.load</code> work underneath, the <code>weights_only</code> change and the CVE, safetensors, loading big models without copying, atomic writes, distributed and asynchronous checkpoints with resharding, and how to test that a resume is truly exact.</p>
+</section>
+
+<section data-field="primer">
+<p>Think of a training run as a long journey in a car with a navigator. If you have to stop and continue tomorrow, writing down only where the car is (the weights) is not enough. You also need the navigator's notes on how fast you have been going and in which direction (the optimiser's momentum and variance estimates), the planned speed for each stretch of road (the learning-rate schedule and where you are on it), the gearbox setting (the gradient scaler's current scale), the next pages of the route you were about to drive (the data position), and the dice you roll for detours (random number generators). Restart with only the car's position and you will drive on — but a different journey.</p>
+<p>That gives the first half of the picture: a checkpoint is a snapshot of <em>all</em> the state that determines the future of the run. The second half is how it is stored:</p>
+<ul>
+<li><strong>torch.save / torch.load</strong> — PyTorch's native format: a zip file holding a pickle of the Python structure plus raw bytes for each tensor storage. Flexible (any Python object) and therefore dangerous (loading a pickle can run code). Since 2.6, loading is restricted to tensors and simple types by default.</li>
+<li><strong>safetensors</strong> — a simple format with a JSON header and raw bytes, for weights only. Cannot run code; can be read lazily. The standard for publishing models.</li>
+<li><strong>torch.distributed.checkpoint (DCP)</strong> — for multi-GPU runs: every rank writes its own pieces in parallel, with metadata that lets a different number of GPUs load them later.</li>
+</ul>
+
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Contents of a full training checkpoint: model, optimizer, scheduler, scaler, counters, RNG states, data position and config, versus a weights-only file">
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="20" y="20" width="380" height="265" rx="8" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="210" y="42" text-anchor="middle" style="fill:var(--ink);font-weight:600">training checkpoint (to resume)</text>
+    <rect x="36" y="56" width="170" height="40" rx="5" style="fill:none;stroke:var(--s1)"/><text x="121" y="74" text-anchor="middle" style="fill:var(--ink)">model state_dict</text><text x="121" y="89" text-anchor="middle" style="fill:var(--muted)">4N bytes</text>
+    <rect x="214" y="56" width="170" height="40" rx="5" style="fill:none;stroke:var(--s1)"/><text x="299" y="74" text-anchor="middle" style="fill:var(--ink)">optimiser state_dict</text><text x="299" y="89" text-anchor="middle" style="fill:var(--muted)">8N bytes (AdamW)</text>
+    <rect x="36" y="104" width="170" height="34" rx="5" style="fill:none;stroke:var(--s2)"/><text x="121" y="126" text-anchor="middle" style="fill:var(--ink)">scheduler + GradScaler</text>
+    <rect x="214" y="104" width="170" height="34" rx="5" style="fill:none;stroke:var(--s2)"/><text x="299" y="126" text-anchor="middle" style="fill:var(--ink)">step, epoch, tokens seen</text>
+    <rect x="36" y="146" width="170" height="50" rx="5" style="fill:none;stroke:var(--s3)"/><text x="121" y="166" text-anchor="middle" style="fill:var(--ink)">RNG: torch CPU, CUDA,</text><text x="121" y="182" text-anchor="middle" style="fill:var(--ink)">NumPy, random</text>
+    <rect x="214" y="146" width="170" height="50" rx="5" style="fill:none;stroke:var(--s3)"/><text x="299" y="166" text-anchor="middle" style="fill:var(--ink)">data position</text><text x="299" y="182" text-anchor="middle" style="fill:var(--muted)">sampler / per-worker state</text>
+    <rect x="36" y="204" width="348" height="34" rx="5" style="fill:none;stroke:var(--line-2)"/><text x="210" y="226" text-anchor="middle" style="fill:var(--ink)">config: architecture, hyperparameters, code version</text>
+    <text x="210" y="266" text-anchor="middle" style="fill:var(--ink-2)">≈ 12N bytes + small items; written atomically</text>
+    <rect x="430" y="56" width="190" height="80" rx="8" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="525" y="78" text-anchor="middle" style="fill:var(--ink);font-weight:600">release / inference</text>
+    <text x="525" y="98" text-anchor="middle" style="fill:var(--ink-2)">model weights only</text>
+    <text x="525" y="116" text-anchor="middle" style="fill:var(--ink-2)">bf16 safetensors: 2N bytes</text>
+    <text x="430" y="170" style="fill:var(--crit)">Resume from weights only:</text>
+    <text x="430" y="188" style="fill:var(--crit)">fresh Adam moments, warmup</text>
+    <text x="430" y="206" style="fill:var(--crit)">again, new data order →</text>
+    <text x="430" y="224" style="fill:var(--crit)">a different (worse) run</text>
+  </g>
+</svg>
+<figcaption>Two different artefacts: a training checkpoint holds everything that determines the run's future; a release file holds only weights, in a safe format. Confusing them is the root of most resume bugs.</figcaption>
+</figure>
+
+<p>Every checkpoint design answers three questions, and interview answers are clearest when they take them in order. <strong>What</strong> to save: the complete list of state that affects future steps — not just weights — in types that can be loaded safely. <strong>How</strong> to store it: one file or many, which format, how to make the write atomic, and how the file can be loaded later on different hardware or a different number of GPUs. <strong>When</strong> to save and how many to keep: frequently enough that a failure costs little, rarely enough that saving does not slow training, with old checkpoints retained until new ones are verified. A fourth question appears as soon as anyone else will use the weights: <strong>who</strong> loads it — your own job, which can trust its own files, or the outside world, which must never need to trust a pickle.</p>
+<p>Where the car analogy breaks: on a real journey, small differences in where you restart do not change the destination much. In training they can: neural network training is chaotic in the sense that tiny differences grow (pt6), so "approximately the same state" gives a run that is statistically similar but not identical. Exact resumption is achievable on fixed hardware with deterministic settings, and it is the only way to be sure a resume did not silently change something.</p>
+<p>If you remember one sentence: <em>checkpoint everything that determines the future of the run — weights, optimiser, schedules, scaler, RNGs and data position — write it atomically, load untrusted weights only from safe formats, and test that a resumed run matches an uninterrupted one</em>.</p>
+</section>
+
+<section data-field="body">
+<h4>1. The complete list of training state</h4>
+<p>A resumable checkpoint must capture every piece of state whose value affects future steps:</p>
+<table>
+<thead><tr><th>State</th><th>How to get it</th><th>What breaks without it</th></tr></thead>
+<tr><td>Model parameters and buffers</td><td><code>model.state_dict()</code></td><td>Everything</td></tr>
+<tr><td>Optimiser state</td><td><code>optimizer.state_dict()</code></td><td>Adam restarts with zero moments: a loss jump after resume</td></tr>
+<tr><td>LR scheduler</td><td><code>scheduler.state_dict()</code></td><td>Learning rate restarts warmup or jumps</td></tr>
+<tr><td>GradScaler (fp16)</td><td><code>scaler.state_dict()</code></td><td>Scale resets to 65,536: skipped steps after resume</td></tr>
+<tr><td>Counters</td><td>step, epoch, tokens seen</td><td>Logging, schedules, data position all misaligned</td></tr>
+<tr><td>RNG states</td><td><code>torch.get_rng_state()</code>, <code>torch.cuda.get_rng_state_all()</code>, NumPy, <code>random</code></td><td>Different dropout masks, augmentations, data order</td></tr>
+<tr><td>Data position</td><td>epoch + batch index, or a stateful loader's <code>state_dict()</code></td><td>Repeats or skips data</td></tr>
+<tr><td>EMA weights, if used</td><td>their own state_dict</td><td>Evaluation model reset</td></tr>
+<tr><td>Config and code version</td><td>a dict, a git hash</td><td>Cannot rebuild the same objects</td></tr>
+</table>
+<p>The optimiser's state_dict has two parts, as printed for an AdamW on 2.14: <code>"state"</code>, keyed by parameter <em>index</em> (0, 1, …) with <code>step</code>, <code>exp_avg</code> and <code>exp_avg_sq</code> per parameter; and <code>"param_groups"</code> with the hyperparameters (<code>lr</code>, <code>betas</code>, <code>eps</code>, <code>weight_decay</code>, flags such as <code>foreach</code> and <code>fused</code>) and the list of parameter indices in each group. Keying by index rather than by name means the optimiser must be rebuilt with parameters in the <em>same order</em> before <code>load_state_dict</code>; adding or reordering parameters between save and load silently pairs moments with the wrong tensors if the shapes happen to match. The distributed helpers in section 7 key by name, which avoids this.</p>
+<p>A minimal single-device save and load:</p>
+<pre>def save_ckpt(path, model, opt, sched, scaler, step, loader_state):
+    state = {
+        "model": model.state_dict(), "opt": opt.state_dict(),
+        "sched": sched.state_dict(), "scaler": scaler.state_dict() if scaler else None,
+        "step": step, "loader": loader_state,
+        "rng": {"torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                "numpy": np_state_as_lists(), "python": list(random.getstate()[1])},
+        "config": cfg_dict,
+    }
+    tmp = path + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)              # atomic on POSIX: never a half-written file
+
+def load_ckpt(path, model, opt, sched, scaler):
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    model.load_state_dict(state["model"]); opt.load_state_dict(state["opt"])
+    sched.load_state_dict(state["sched"])
+    if scaler: scaler.load_state_dict(state["scaler"])
+    torch.set_rng_state(state["rng"]["torch"])
+    ...                                 # restore the rest, then rebuild the loader at state["loader"]
+    return state["step"]</pre>
+<p>Restore RNG states <em>last</em>, after building the model, optimiser and data loader, because constructing objects (random initialisation) consumes random numbers and would move the generators past the restored point.</p>
+
+<h4>2. What torch.save writes</h4>
+<p><code>torch.save(obj, f)</code> writes a zip archive. Inside: <code>data.pkl</code>, a pickle of the object structure in which each tensor is replaced by a reference to a storage key; one file per storage containing its raw bytes; and small records for the byte order and format version. Three consequences follow from "one file per storage":</p>
+<ul>
+<li><strong>Shared storages are saved once and stay shared.</strong> Tied weights (pt4) cost nothing extra: on 2.14, saving a dict holding both the tied embedding and head weight produced exactly the same file size as saving one of them. After loading, the two entries again share a storage.</li>
+<li><strong>Views save their whole storage.</strong> Saving the first two elements of a 1,000-element float32 tensor wrote 5,545 bytes on 2.14 — the full 4,000-byte storage plus overhead. Saving a slice of a large activation for debugging can write gigabytes. Clone slices before saving.</li>
+<li><strong>Device is recorded.</strong> A tensor saved from <code>cuda:3</code> loads onto <code>cuda:3</code> by default, which fails on a machine with fewer GPUs and puts every rank's tensors on the same GPU if you are careless. Use <code>map_location</code>.</li>
+</ul>
+
+<p><code>map_location</code> takes a device (<code>"cpu"</code>), a dict remapping device names (<code>{"cuda:3": "cuda:0"}</code>) or a function. The usual patterns: load onto the CPU and let <code>load_state_dict</code> copy into a model that already lives on the right device (safe, costs host memory); or, in a multi-GPU job, load each rank's file with <code>map_location=f"cuda:{local_rank}"</code> so it lands directly on that rank's GPU. Loading every rank's checkpoint without <code>map_location</code> puts them all on the device recorded at save time — typically <code>cuda:0</code> — and the first GPU runs out of memory while the others sit empty.</p>
+<h4>3. torch.load, weights_only, and why the default changed</h4>
+<p>Pickle reconstructs objects by calling functions named in the file. A malicious pickle can name <code>os.system</code> with any argument, so loading it executes code. For years PyTorch loaded checkpoints with the full unpickler, and sharing <code>.pt</code> files on public hubs carried that risk.</p>
+<p>PyTorch 2.6 changed the default of <code>torch.load</code> to <code>weights_only=True</code>. The restricted unpickler only reconstructs tensors, storages, primitive types (int, float, str, bool, None), containers (dict, list, tuple, OrderedDict) and classes you explicitly allow. Try to load anything else and, on 2.14, you get:</p>
+<pre>Weights only load failed. This file can still be loaded, to do so you have two options,
+do those steps only if you trust the source of the checkpoint.
+    (1) In PyTorch 2.6, we changed the default value of the `weights_only` argument in
+    `torch.load` from `False` to `True`. Re-running `torch.load` with `weights_only` set
+    to `False` will likely succeed, but it can result in arbitrary code execution. ...</pre>
+<p>The second option in the message is allow-listing: <code>torch.serialization.add_safe_globals([MyConfig])</code> (or the <code>torch.serialization.safe_globals</code> context manager) lets the restricted loader rebuild that class. A practical trap shows up immediately in checkpoint code: <code>np.random.get_state()</code> returns a tuple containing a NumPy array and NumPy type objects, and a checkpoint containing it fails to load under the default on 2.14. Store NumPy's state as plain Python lists and ints (or as a tensor) so the whole checkpoint loads with <code>weights_only=True</code>.</p>
+<p>The restricted loader is a large improvement, not a guarantee. CVE-2025-32434, recorded in the US National Vulnerability Database, describes a remote command execution vulnerability "when loading a model using torch.load with weights_only=True" in PyTorch 2.5.1 and earlier, patched in 2.6.0. Two lessons: keep PyTorch current on any machine that loads third-party checkpoints, and do not use pickle-based formats for weights from sources you do not control.</p>
+
+<h4>4. safetensors</h4>
+<p>safetensors, from Hugging Face, is the standard for distributing weights. Its README specifies the whole format: the first 8 bytes are N, an unsigned little-endian 64-bit integer giving the header size; the next N bytes are a UTF-8 JSON header mapping each tensor name to its <code>dtype</code>, <code>shape</code> and <code>data_offsets</code> (begin and end within the data buffer), plus an optional <code>__metadata__</code> map of strings; then the raw bytes of all tensors. There is nothing to execute. A reader can parse the header, then memory-map the file and create tensors pointing straight into the mapped bytes (zero-copy), or read only the tensors it needs (lazy loading) — useful when each GPU needs only its shard of a huge model.</p>
+<p>The limits follow from the design: only tensors and string metadata, so optimiser state with nested Python structures and RNG tuples needs flattening, and shared tensors are a problem — the format stores each named tensor's bytes separately, so the library refuses to save tensors that share memory (such as tied weights) unless you deduplicate them, for which its PyTorch helpers provide functions (<code>save_model</code> / <code>load_model</code>) that drop the duplicate name and restore the tie on load. Use safetensors for release and inference weights; training checkpoints can stay in <code>torch.save</code> format (or DCP) as long as only your own jobs load them.</p>
+
+<h4>5. Loading big models without copying everything</h4>
+<p>A naive load of a 70B-parameter bf16 model — 140 GB — allocates the model with random weights (140 GB), reads the checkpoint into RAM (another 140 GB), copies into the model, and then moves to GPUs. Three tools remove the duplicates:</p>
+<ul>
+<li><strong>Meta-device construction</strong>: <code>with torch.device("meta"): model = Model(cfg)</code> builds the module tree with shapes but no storage (pt4), in milliseconds.</li>
+<li><strong>Memory-mapped loading</strong>: <code>torch.load(path, mmap=True, map_location="cpu", weights_only=True)</code> maps the file and creates tensors that read from it on access, instead of reading the whole file into RAM.</li>
+<li><strong>Assigning instead of copying</strong>: <code>model.load_state_dict(sd, assign=True)</code> makes the model's parameters <em>be</em> the loaded tensors, rather than copying into existing ones (which is impossible on meta tensors anyway).</li>
+</ul>
+<pre>with torch.device("meta"):
+    model = GPT(cfg)
+sd = torch.load("model.pt", mmap=True, map_location="cpu", weights_only=True)
+model.load_state_dict(sd, assign=True)    # parameters now map the file
+model.tie_weights()                         # re-tie: assign replaced each Parameter separately
+model.to("cuda", dtype=torch.bfloat16)      # pages are read from disk as they are copied</pre>
+<p>With safetensors the same pattern is shard-by-shard: open each file, read only the tensors this rank needs, and place them directly on the right device. That is how inference servers load models larger than host RAM.</p>
+
+<h4>6. Atomic writes, retention and verification</h4>
+<p>Jobs die mid-write. A preempted spot instance gets a short warning (seconds to minutes) and is terminated; an OOM kill or node failure gives none. If the checkpoint is written directly to its final name, the latest checkpoint may be truncated exactly when you need it. Write to a temporary path and <code>os.replace</code> it into place: on POSIX file systems the rename is atomic, so readers see either the old complete file or the new complete file. On object storage, upload the checkpoint under a new key and then update a small pointer object ("latest → step_120000") only after every piece has been uploaded; resumption reads the pointer.</p>
+<p>Keep the last few checkpoints (and periodic milestones), delete older ones only after a newer one has been verified, and verify by loading: at minimum check the file's size and that it opens; better, have a background process load it on CPU and compare a few tensor checksums with values logged at save time. Corrupt checkpoints are discovered at the worst possible moment otherwise.</p>
+
+<h4>7. Distributed checkpoints and resharding</h4>
+<p>With data parallelism (DDP), every rank has a full copy of the model, and the simple approach — rank 0 saves, everyone else waits at a barrier — works for small models. With sharded training (FSDP, tensor parallelism; pt11), no rank holds the full state, and gathering it onto one rank would need a full copy of the model in one GPU's or host's memory and serialise the write through one process. <code>torch.distributed.checkpoint</code> (DCP) instead has every rank write its own shards in parallel, plus a metadata file recording, for each tensor, its global shape and which chunks each file contains.</p>
+<pre>import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
+model_sd, optim_sd = get_state_dict(model, optimizer)       # sharded, keyed by FQN
+dcp.save({"model": model_sd, "optim": optim_sd, "step": step},
+         checkpoint_id=f"ckpt/step_{step}")
+
+# later, possibly on a different number of GPUs
+model_sd, optim_sd = get_state_dict(model, optimizer)
+state = {"model": model_sd, "optim": optim_sd, "step": 0}
+dcp.load(state, checkpoint_id=f"ckpt/step_{step}")         # fills state in place, resharding
+set_state_dict(model, optimizer, model_state_dict=state["model"], optim_state_dict=state["optim"])</pre>
+<p><code>get_state_dict</code> and <code>set_state_dict</code> hide the differences between plain modules, DDP and FSDP, and key optimiser state by fully qualified parameter name rather than index. Load is "in place": you pass a state dict whose tensors already have the new layout, and DCP's load planner reads, for each local shard, the byte ranges of the saved chunks that overlap it. That is <strong>resharding</strong>: a checkpoint written by 64 ranks loads on 32, or on one for conversion to a release format. On 2.14 DCP also includes storage readers and writers for the Hugging Face safetensors layout, so a distributed checkpoint can be written in, or read from, the format used for publishing.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="DCP: four ranks each write their shard of a tensor plus shared metadata; later two ranks load, each reading the byte ranges that overlap its new shard">
+  <defs><marker id="pt8-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="20" style="fill:var(--ink);font-weight:600">save: 4 ranks write in parallel</text>
+    <rect x="20" y="32" width="120" height="30" style="fill:var(--s1);opacity:0.5"/><text x="80" y="52" text-anchor="middle" style="fill:var(--ink)">rank 0 rows 0–255</text>
+    <rect x="140" y="32" width="120" height="30" style="fill:var(--s2);opacity:0.5"/><text x="200" y="52" text-anchor="middle" style="fill:var(--ink)">rank 1 256–511</text>
+    <rect x="260" y="32" width="120" height="30" style="fill:var(--s3);opacity:0.5"/><text x="320" y="52" text-anchor="middle" style="fill:var(--ink)">rank 2 512–767</text>
+    <rect x="380" y="32" width="120" height="30" style="fill:var(--s4);opacity:0.5"/><text x="440" y="52" text-anchor="middle" style="fill:var(--ink)">rank 3 768–1023</text>
+    <rect x="520" y="32" width="100" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="570" y="52" text-anchor="middle" style="fill:var(--ink)">.metadata</text>
+    <text x="20" y="96" style="fill:var(--ink-2)">metadata: tensor "w" global shape (1024, 4096); chunk offsets per file</text>
+    <text x="20" y="140" style="fill:var(--ink);font-weight:600">load: 2 ranks, new layout</text>
+    <rect x="20" y="152" width="240" height="30" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="140" y="172" text-anchor="middle" style="fill:var(--ink)">new rank 0 needs rows 0–511</text>
+    <rect x="260" y="152" width="240" height="30" style="fill:var(--surface-2);stroke:var(--accent)"/><text x="380" y="172" text-anchor="middle" style="fill:var(--ink)">new rank 1 needs rows 512–1023</text>
+    <line x1="80" y1="62" x2="100" y2="152" marker-end="url(#pt8-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="200" y1="62" x2="180" y2="152" marker-end="url(#pt8-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="320" y1="62" x2="340" y2="152" marker-end="url(#pt8-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="440" y1="62" x2="420" y2="152" marker-end="url(#pt8-arrow)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="20" y="214" style="fill:var(--ink-2)">Each new shard reads the overlapping byte ranges of the old files — no rank ever holds the full tensor.</text>
+    <text x="20" y="234" style="fill:var(--ink-2)">The same mechanism converts a 512-rank checkpoint into one file for release.</text>
+  </g>
+</svg>
+<figcaption>Resharding works because the metadata says which global slice each saved chunk covers; loading becomes a set of range reads, planned per rank.</figcaption>
+</figure>
+
+<h4>8. Asynchronous checkpointing</h4>
+<p>Writing 1 TB of training state to network storage at, say, 10 GB/s aggregate takes 100 seconds; stalling every GPU for that long every 30 minutes wastes about 5% of the run. <code>dcp.async_save</code> splits the work: first each rank copies its state to host memory (fast — GPU to pinned host memory runs at tens of GB/s per GPU, so seconds), then training resumes while a background thread or process writes the host copy to storage, returning a future you check before the next save. The costs are host memory for the staged copy (the size of each rank's state) and some contention for network and CPU during the write. Large training runs combine async saving with frequent checkpoints so a failure costs minutes of compute rather than hours.</p>
+
+<h4>9. The data position</h4>
+<p>For a map-style dataset with a seeded sampler, the position is "epoch e, next batch b". On resume, call <code>sampler.set_epoch(e)</code> (pt5) and skip the first b batches of <em>indices</em> — iterating the batch sampler, not the DataLoader, so no samples are loaded and skipping is nearly free. For a DataLoader with workers and an IterableDataset, the position is spread across processes: which shard each worker was reading, at what offset, and the contents of any shuffle buffer. The torchdata project's <code>StatefulDataLoader</code> is a drop-in replacement for <code>torch.utils.data.DataLoader</code> that provides <code>state_dict()</code> and <code>load_state_dict()</code>, asking each worker for its dataset's state when you checkpoint. Your IterableDataset must implement <code>state_dict</code>/<code>load_state_dict</code> itself for this to be exact.</p>
+
+<h4>10. Fine-tuning and adapter checkpoints</h4>
+<p>Fine-tuning changes the calculus. With full fine-tuning the checkpoint is as large as for pretraining, but the base model is usually available elsewhere, so the release artefact can be the full fine-tuned weights or, for parameter-efficient methods such as LoRA (lm11), only the adapter matrices — often a few megabytes to a few hundred megabytes instead of tens of gigabytes. The adapter checkpoint is useless without the exact base weights it was trained against, so it must record which base model (name, revision or a checksum of the weights) and the adapter configuration (rank, target modules, scaling). A common failure is loading an adapter onto a different revision of the "same" base model: everything loads, shapes match, and quality drops. Training state for adapter runs is small too — optimiser moments only for the adapter parameters — which makes frequent checkpoints cheap.</p>
+
+<h4>11. Versioning, compatibility and key mapping</h4>
+<p>Checkpoints outlive the code that wrote them. A month later, someone renames <code>self.attn</code> to <code>self.attention</code>, fuses Q, K and V into one projection, or upgrades a library whose module names changed, and every old checkpoint fails strict loading. Three habits keep checkpoints loadable. Store a format version and the code version (a git commit hash) in every checkpoint. Keep a small, tested function that maps old state-dict keys and shapes to new ones — splitting a fused QKV weight into three, renaming prefixes — and run it automatically based on the stored version. And add a test that loads a stored checkpoint from each old format and checks outputs on a fixed input. This is the same discipline databases apply to schema migrations, and for the same reason: data lives longer than code.</p>
+<h4>12. Testing that resume is exact</h4>
+<p>The only convincing test is a comparison. Under deterministic settings (pt6) on one fixed machine, run N + M steps uninterrupted and record the loss at every step. Separately, run N steps, checkpoint, start a fresh process, resume, and run M steps. The two loss sequences should match bitwise, or within floating-point noise if some kernels are non-deterministic. If they diverge, the step where they first differ tells you what was missed: immediately (model or optimiser state), at the first dropout (RNG), at the next learning-rate change (scheduler), at the first skipped fp16 step (scaler), or at the data-dependent step (loader position). Run this test in CI on a tiny model; it catches the most expensive class of silent training bugs for the cost of a few seconds.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why the optimiser state is keyed by index, and what that breaks</h4>
+<p><code>torch.optim.Optimizer.state_dict()</code> identifies parameters by their position in the order the optimiser received them, because an optimiser has no access to parameter names. Loading pairs saved state with parameters by position. If between save and load you add a parameter, freeze one and leave it out of the optimiser, wrap the model differently, or construct parameter groups in a different order, the moments attach to the wrong tensors. When shapes differ, the load or the first step fails; when shapes coincide (two layers of the same size), it silently succeeds with swapped moments. The distributed state-dict helpers key optimiser state by fully qualified parameter name, and many training frameworks do the same conversion even for single-GPU runs, which makes checkpoints robust to refactors.</p>
+
+<h4>Consistency across ranks</h4>
+<p>A distributed checkpoint is only valid if every rank saved state from the same step. If one rank is preempted after writing step 1,200 while others wrote step 1,180's shards and crashed, a naive "latest" directory mixes steps. Robust schemes write each checkpoint to a directory named by step, have each rank write its shards, synchronise with a barrier, and only then have rank 0 write a completion marker (DCP's metadata file plays a similar role: it is written after the shards). Resumption ignores any directory without the marker. With asynchronous saving, the marker must wait until every rank's background write has finished, not just staged.</p>
+
+<h4>Checkpoint frequency as an optimisation problem</h4>
+<p>Checkpointing costs time; not checkpointing risks losing work. A classic first-order answer, Young's approximation, sets the interval to about √(2 × C × M), where C is the cost of one checkpoint (the stall it causes) and M the mean time between failures. With a 30-second effective stall and one failure every 24 hours (86,400 seconds), √(2 × 30 × 86,400) ≈ 2,280 seconds — about 38 minutes. Asynchronous saving shrinks C, which pushes the optimum toward more frequent checkpoints. At thousands of GPUs, failures become frequent (the mean time between failures of the whole job falls roughly in proportion to the number of components), which is why large runs checkpoint every few minutes and invest heavily in fast, async, sharded saving.</p>
+
+<h4>Format conversions and the release path</h4>
+<p>Training checkpoints and release artefacts differ: training state in float32 with optimiser moments and sharded by rank; release weights in bf16, consolidated or split into evenly sized safetensors shards with an index file mapping tensor names to files, and with tied weights deduplicated. The conversion is a separate, tested step: load the DCP checkpoint (resharding to one process or to a few CPU processes), cast, rename keys to the public architecture's names, save as safetensors, then load the result into a fresh model and compare outputs against the training model on a fixed batch. Errors here — a missed transpose in a fused QKV weight, a forgotten tie — produce models that load without complaint and generate nonsense.</p>
+
+<h4>Averaging checkpoints</h4>
+<p>Saved checkpoints are not only for resuming. Averaging the weights of the last few checkpoints of a run (or keeping an exponential moving average, pt6) often gives a slightly better model than any single one, because the average sits nearer the centre of the region the optimiser was bouncing around in at the end of training. Averaging fine-tuned models that share a base ("model soups") can combine their strengths. Mechanically it is simple — load state dicts and average tensors key by key, in float32, skipping integer buffers such as BatchNorm's <code>num_batches_tracked</code> — but it only works for checkpoints in the same basin: averaging two independently trained models from different random initialisations generally produces garbage, because their hidden units are permuted relative to each other.</p>
+
+<h4>Resuming with a different configuration</h4>
+<p>Sometimes a resume deliberately changes things: more GPUs, a different micro-batch size or accumulation, a new learning-rate schedule for a continued-training phase, or a new dataset mixture. Each needs a decision about which saved state to keep. The weights and optimiser moments carry over (DCP reshards them); the scheduler is usually rebuilt with an explicit starting step; the data position may no longer mean anything if the dataset changed, so continued training logs the tokens seen per source rather than an index. When the global batch size changes, the effective learning rate changes too (pt6), and continuing with the old schedule unmodified is a common cause of a loss bump right after an "upgrade" restart.</p>
+<h4>Pickle risk beyond torch.load</h4>
+<p>Many formats in the ML ecosystem are pickles in disguise: <code>joblib</code> and <code>pickle</code> files for scikit-learn models, NumPy's <code>np.load(..., allow_pickle=True)</code>, and older PyTorch tooling that unpickles configs or tokenizers. The defences are the same: treat any pickle from outside your organisation as code, scan model repositories for pickle opcodes that import dangerous modules, and prefer data-only formats (safetensors, JSON, Arrow, ONNX's protobuf). Inside your organisation, the restricted loader and allow-listing still help: they catch accidental dependence on classes that will not exist after a refactor.</p>
+</section>
+
+<section data-field="prod">
+<h4>Failure mode: the loss jumps after resume</h4>
+<p>Symptom: a visible spike or plateau right after every restart. Diagnose by what the run looks like in the first steps after resume: a large jump that decays over a few hundred steps is fresh optimiser state; the learning rate in the logs dropping back toward warmup is scheduler state; several "skipped step" messages with fp16 is GradScaler state; a change in the training curve's noise pattern without a jump is RNG or data order. Fix by saving the full state and adding the resume-equivalence test to CI.</p>
+
+<h4>Failure mode: the checkpoint will not load</h4>
+<p>"Weights only load failed" after upgrading to PyTorch 2.6 or later — the checkpoint contains arbitrary objects (config dataclasses, NumPy RNG state, an argparse Namespace); convert them to plain types, allow-list them, or load trusted legacy files with <code>weights_only=False</code> once and re-save. "Missing key(s) … Unexpected key(s)" — prefixes from DDP or <code>torch.compile</code> (pt4), or a refactor that renamed modules; a key-mapping function in the loader, tested against old checkpoints, solves it permanently. "CUDA error: invalid device ordinal" — saved on more GPUs than the loading machine has; use <code>map_location</code>.</p>
+
+<h4>Failure mode: corrupt or inconsistent checkpoints</h4>
+<p>Symptom: resume fails with a zip or unpickling error, or loads but produces NaNs. Causes: a write interrupted by preemption (no atomic rename), a full disk, a distributed checkpoint mixing steps across ranks, or a background async write not finished when the job exited. Prevention: atomic rename or completion markers, waiting on async save futures before exit (and on preemption notice), retention of several checkpoints, and a verifier that loads each new checkpoint off the critical path.</p>
+
+<h4>Failure mode: checkpoints that are far too big or too slow</h4>
+<p>Symptom: checkpoint size is several times the expected 12–16 bytes per parameter, or saving stalls training for minutes. Causes: views of large tensors saved with their whole storages (debug tensors, cached activations attached to the model), saving every rank's full DDP replica instead of rank 0's, float32 copies of things that could be bf16, or synchronous writes to slow storage. Fixes: audit the state dict's tensor sizes, save once per replica group, use DCP with async saving, and write to fast local disk first if the cluster has it, uploading in the background.</p>
+
+<h4>Handling the preemption notice</h4>
+<p>Cloud providers and cluster schedulers usually announce a preemption before killing a job — by sending the process <code>SIGTERM</code> and waiting a grace period, or through a metadata endpoint the job can poll. A training script can install a signal handler that sets a flag; the training loop checks the flag at the end of each step and, if set, writes an emergency checkpoint (or waits for an in-flight async save to finish) and exits cleanly. The handler itself should only set the flag: doing I/O or touching CUDA inside a signal handler is unsafe. In distributed jobs every rank must agree to stop at the same step, so the decision is shared with an all-reduce of the flag before saving. The grace period bounds what you can write: if it is 30 seconds and a synchronous checkpoint takes 60, the emergency save must be an async stage-to-host that a sidecar finishes, or the job must rely on its last periodic checkpoint.</p>
+<h4>Observability for checkpoints</h4>
+<p>Treat checkpoints as a monitored service. Emit metrics for checkpoint age (time since the last successful, verified checkpoint — alert if it exceeds two intervals), save duration and training stall per save, checkpoint size (a sudden increase usually means something unintended is being saved), and verification results. Log at resume time which checkpoint was loaded, its step, and the learning rate and GradScaler scale after loading, so a bad resume is visible in the first lines of the log rather than in a loss curve a day later.</p>
+<h4>The public case: CVE-2025-32434</h4>
+<p>The NVD entry for CVE-2025-32434 is short and worth quoting in an interview: in PyTorch 2.5.1 and prior, "a Remote Command Execution (RCE) vulnerability exists in PyTorch when loading a model using torch.load with weights_only=True", patched in 2.6.0 — the same release that made <code>weights_only=True</code> the default. It is a precise illustration of defence in depth: the restricted loader was the right mitigation for pickle's design, it had an implementation flaw, and the robust position for production systems is to load third-party weights only from a format with no code path at all (safetensors), keep frameworks patched, and run model-loading services with least privilege.</p>
+</section>
+
+<section data-field="lab">
+<p>CPU, PyTorch 2.14 in <code>gpt_env</code>; about 15 minutes. Save as <code>pt8_lab.py</code>. It checks that a resume is exact, then shows the <code>weights_only</code> behaviour.</p>
+<pre>import os, io, random, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+torch.use_deterministic_algorithms(True)
+def build(seed=0):
+    torch.manual_seed(seed)
+    m = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Dropout(0.1), nn.Linear(32, 4))
+    o = torch.optim.AdamW(m.parameters(), lr=1e-2)
+    s = torch.optim.lr_scheduler.LinearLR(o, start_factor=0.1, total_iters=20)
+    return m, o, s
+data = [(torch.randn(8, 16, generator=torch.Generator().manual_seed(i)),
+         torch.randint(0, 4, (8,), generator=torch.Generator().manual_seed(1000 + i))) for i in range(40)]
+def run(m, o, s, steps):
+    out = []
+    for x, y in steps:
+        loss = F.cross_entropy(m(x), y); loss.backward(); o.step(); s.step(); o.zero_grad()
+        out.append(loss.item())
+    return out
+
+m, o, s = build(); ref = run(m, o, s, data)                       # 40 steps straight
+m, o, s = build(); first = run(m, o, s, data[:20])
+ckpt = {"model": m.state_dict(), "opt": o.state_dict(), "sched": s.state_dict(),
+        "rng": torch.get_rng_state(), "step": 20}
+torch.save(ckpt, "ck.tmp"); os.replace("ck.tmp", "ck.pt")          # atomic write
+m, o, s = build(seed=123)                                           # a "new process"
+st = torch.load("ck.pt", weights_only=True)
+m.load_state_dict(st["model"]); o.load_state_dict(st["opt"]); s.load_state_dict(st["sched"])
+torch.set_rng_state(st["rng"])                                      # restore last
+resumed = first + run(m, o, s, data[20:])
+print("exact resume:", resumed == ref)
+
+# what if we forget the optimiser state?
+m2, o2, s2 = build(seed=123); m2.load_state_dict(st["model"]); s2.load_state_dict(st["sched"])
+torch.set_rng_state(st["rng"])
+bad = first + run(m2, o2, s2, data[20:])
+print("step 21 loss, full vs weights-only:", round(resumed[20], 4), round(bad[20], 4))
+
+buf = io.BytesIO(); torch.save({"np": np.random.get_state()}, buf); buf.seek(0)
+try: torch.load(buf)
+except Exception as e: print("weights_only refused:", str(e).splitlines()[0][:60])</pre>
+<ol>
+<li>"exact resume: True" — the 40 losses match bitwise. Remove the <code>set_rng_state</code> line and rerun: dropout masks change and it prints False.</li>
+<li>The weights-only resume gives a different loss from step 21 on; plot both lists to see the jump.</li>
+<li>The NumPy RNG state is refused by the default loader. Convert it to plain lists and ints and confirm it loads.</li>
+<li>Stretch: save a 2-element slice of <code>torch.zeros(10**6)</code> and compare the file size with saving its <code>.clone()</code>.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Find the bug: a checkpoint routine for preemptible training</b>
+<p>This routine runs every 2,000 steps on a single-GPU fp16 job on spot instances. After each preemption the loss jumps, the learning rate in the logs restarts at the warmup value, and once the job could not restart at all because the checkpoint file was "not a zip archive". Find the bugs.</p>
+<pre>def save(step):
+    torch.save({"model": model.state_dict(), "step": step,
+                "np_rng": np.random.get_state(), "cfg": cfg},     # cfg is a dataclass
+               "/ckpt/latest.pt")
+
+def resume():
+    st = torch.load("/ckpt/latest.pt", weights_only=False)
+    model.load_state_dict(st["model"])
+    torch.manual_seed(st["step"])
+    return st["step"]</pre>
+<details><summary>Answer</summary>
+<p><strong>Bug 1 — the optimiser, scheduler and GradScaler are not saved.</strong> Adam restarts with empty moments (the loss jump), the scheduler restarts at step 0 (the learning rate back at its warmup value), and the GradScaler restarts at 65,536 (skipped steps). Fix: save and restore <code>optimizer.state_dict()</code>, <code>scheduler.state_dict()</code> and <code>scaler.state_dict()</code>, plus the data position.</p>
+<p><strong>Bug 2 — non-atomic write to a single file.</strong> A preemption during <code>torch.save</code> left a truncated <code>latest.pt</code> — "not a zip archive" — and there was no older checkpoint to fall back on. Fix: write to <code>latest.pt.tmp</code> and <code>os.replace</code> it, keep the last few checkpoints, and verify after writing.</p>
+<p><strong>Bug 3 — RNG "restore" by reseeding.</strong> <code>torch.manual_seed(step)</code> creates a new stream rather than continuing the old one, and the CUDA and NumPy states are not restored at all (NumPy's is saved but never set). Fix: save <code>torch.get_rng_state()</code> and <code>torch.cuda.get_rng_state_all()</code> and restore them, together with NumPy and Python's states, after building all objects.</p>
+<p><strong>Bug 4 — the checkpoint needs weights_only=False.</strong> The dataclass config and NumPy RNG tuple force full unpickling. It works for this team's own files, but it makes the checkpoint loadable only with the unsafe loader and fragile under refactors (the dataclass's import path is baked in). Fix: store <code>dataclasses.asdict(cfg)</code> and NumPy's state as plain lists and ints, and load with the default <code>weights_only=True</code>.</p>
+</details>
+<b>Estimate: how long does a checkpoint take?</b>
+<p>A 13B-parameter model trains with AdamW and float32 master weights, sharded with FSDP across 64 GPUs. Storage sustains 20 GB/s aggregate writes; GPU-to-host copies run at about 20 GB/s per GPU. How big is a full training checkpoint, how long does a synchronous save stall training, and how long with async saving?</p>
+<details><summary>Answer</summary>
+<p>State ≈ 12 bytes per parameter for weights and Adam moments (gradients need not be saved): 13×10⁹ × 12 ≈ 156 GB, about 2.4 GB per GPU. Synchronous write: 156 GB ÷ 20 GB/s ≈ 7.8 s of stall plus coordination — call it 10 s. Async: the stall is only the device-to-host staging, 2.4 GB ÷ 20 GB/s ≈ 0.12 s per GPU in parallel, plus overhead; the 8 s of writing then overlaps with training. With saves every 15 minutes, synchronous saving costs about 1.1% of training time, async under 0.1%, at the price of 2.4 GB of extra host memory per GPU.</p>
+</details>
+</section>

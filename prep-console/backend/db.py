@@ -67,6 +67,40 @@ CREATE TABLE IF NOT EXISTS mock_logs (
     notes   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS mock_logs_user ON mock_logs (user_id, at);
+CREATE TABLE IF NOT EXISTS chat_threads (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id    TEXT NOT NULL DEFAULT '',     -- the topic it is about; '' for a page without one
+    title      TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_threads_user ON chat_threads (user_id, item_id, updated_at);
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role      TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    text      TEXT NOT NULL,
+    selection TEXT NOT NULL DEFAULT '',     -- the highlighted passage a question was about
+    day       TEXT NOT NULL,                -- YYYY-MM-DD, for the daily limit
+    at        REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_messages_thread ON chat_messages (thread_id, id);
+CREATE INDEX IF NOT EXISTS chat_messages_day ON chat_messages (user_id, day);
+CREATE TABLE IF NOT EXISTS pins (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id    TEXT NOT NULL,                -- the topic the passage is in
+    quote      TEXT NOT NULL,                -- the highlighted passage
+    prefix     TEXT NOT NULL DEFAULT '',     -- text just before and after it, to find the right
+    suffix     TEXT NOT NULL DEFAULT '',     -- occurrence when the passage appears more than once
+    question   TEXT NOT NULL,
+    answer     TEXT NOT NULL,
+    thread_id  INTEGER REFERENCES chat_threads(id) ON DELETE SET NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pins_user ON pins (user_id, item_id);
 """
 
 
@@ -156,7 +190,7 @@ def set_disabled(c: sqlite3.Connection, uid: int, disabled: bool) -> bool:
 
 
 def delete_user(c: sqlite3.Connection, uid: int) -> None:
-    for t in PROGRESS_TABLES:
+    for t in (*PROGRESS_TABLES, "pins", "chat_messages", "chat_threads"):
         c.execute(f"DELETE FROM {t} WHERE user_id = ?", (uid,))
     c.execute("UPDATE invites SET invited_by = NULL WHERE invited_by = ?", (uid,))
     c.execute("DELETE FROM users WHERE id = ?", (uid,))
@@ -279,3 +313,84 @@ def merge_state(c: sqlite3.Connection, uid: int, s: dict) -> dict:
                       (uid, log["round"], at, int(log.get("used") or 1), str(log.get("notes") or "")))
             counts["logs"] += 1
     return counts
+
+
+# ---------------------------------------------------------------- tutor chats
+
+def chat_threads(c: sqlite3.Connection, uid: int, item_id: str | None = None, limit: int = 50) -> list[dict]:
+    sql = ("SELECT t.id, t.item_id, t.title, t.updated_at, COUNT(m.id) AS messages FROM chat_threads t "
+           "LEFT JOIN chat_messages m ON m.thread_id = t.id WHERE t.user_id = ?")
+    args: list = [uid]
+    if item_id is not None:
+        sql += " AND t.item_id = ?"
+        args.append(item_id)
+    sql += " GROUP BY t.id ORDER BY t.updated_at DESC LIMIT ?"
+    return [dict(r) for r in c.execute(sql, (*args, limit))]
+
+
+def chat_thread(c: sqlite3.Connection, uid: int, thread_id: int) -> dict | None:
+    row = c.execute("SELECT id, item_id, title, updated_at FROM chat_threads WHERE id = ? AND user_id = ?",
+                    (thread_id, uid)).fetchone()
+    if row is None:
+        return None
+    msgs = c.execute("SELECT id, role, text, selection, at FROM chat_messages WHERE thread_id = ? ORDER BY id",
+                     (thread_id,))
+    return {**dict(row), "messages": [dict(m) for m in msgs]}
+
+
+def new_chat_thread(c: sqlite3.Connection, uid: int, item_id: str, title: str) -> int:
+    now = time.time()
+    cur = c.execute("INSERT INTO chat_threads (user_id, item_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (uid, item_id, title, now, now))
+    return int(cur.lastrowid)
+
+
+def add_chat_message(c: sqlite3.Connection, uid: int, thread_id: int, role: str, text: str,
+                     selection: str, today: str) -> int:
+    now = time.time()
+    cur = c.execute("INSERT INTO chat_messages (thread_id, user_id, role, text, selection, day, at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)", (thread_id, uid, role, text, selection, today, now))
+    c.execute("UPDATE chat_threads SET updated_at = ? WHERE id = ?", (now, thread_id))
+    return int(cur.lastrowid)
+
+
+def delete_chat_thread(c: sqlite3.Connection, uid: int, thread_id: int) -> bool:
+    return c.execute("DELETE FROM chat_threads WHERE id = ? AND user_id = ?", (thread_id, uid)).rowcount > 0
+
+
+def chat_questions_on(c: sqlite3.Connection, uid: int, day: str) -> int:
+    return c.execute("SELECT COUNT(*) FROM chat_messages WHERE user_id = ? AND day = ? AND role = 'user'",
+                     (uid, day)).fetchone()[0]
+
+
+def export_chats(c: sqlite3.Connection, uid: int) -> list[dict]:
+    threads = c.execute("SELECT id, item_id, title, created_at FROM chat_threads WHERE user_id = ? ORDER BY id", (uid,))
+    out = []
+    for t in threads:
+        msgs = c.execute("SELECT role, text, selection, at FROM chat_messages WHERE thread_id = ? ORDER BY id", (t["id"],))
+        out.append({"item": t["item_id"], "title": t["title"], "at": t["created_at"], "messages": [dict(m) for m in msgs]})
+    return out
+
+
+# ---------------------------------------------------------------- tutor answers pinned into lessons
+
+PIN_FIELDS = "id, item_id, quote, prefix, suffix, question, answer, thread_id, created_at"
+
+
+def pins(c: sqlite3.Connection, uid: int) -> list[dict]:
+    return [dict(r) for r in c.execute(f"SELECT {PIN_FIELDS} FROM pins WHERE user_id = ? ORDER BY id", (uid,))]
+
+
+def add_pin(c: sqlite3.Connection, uid: int, item_id: str, quote: str, prefix: str, suffix: str,
+            question: str, answer: str, thread_id: int | None) -> dict:
+    if thread_id is not None and not c.execute("SELECT 1 FROM chat_threads WHERE id = ? AND user_id = ?",
+                                                (thread_id, uid)).fetchone():
+        thread_id = None
+    cur = c.execute("INSERT INTO pins (user_id, item_id, quote, prefix, suffix, question, answer, thread_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (uid, item_id, quote, prefix, suffix, question, answer, thread_id, time.time()))
+    return dict(c.execute(f"SELECT {PIN_FIELDS} FROM pins WHERE id = ?", (cur.lastrowid,)).fetchone())
+
+
+def delete_pin(c: sqlite3.Connection, uid: int, pin_id: int) -> bool:
+    return c.execute("DELETE FROM pins WHERE id = ? AND user_id = ?", (pin_id, uid)).rowcount > 0

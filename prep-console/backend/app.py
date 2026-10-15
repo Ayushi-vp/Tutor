@@ -21,6 +21,16 @@ been built, serves it too — so `python backend/app.py` is the whole app.
     POST   /api/admin/invites           admins: {"email"}
     DELETE /api/admin/invites/<email>   admins
 
+    GET    /api/chat/config             is the tutor on, and how many questions are left today
+    GET    /api/chat/threads?item=<id>  the user's tutor chats, newest first (optionally for one topic)
+    GET    /api/chat/threads/<id>       one chat with its messages
+    DELETE /api/chat/threads/<id>
+    POST   /api/chat                    {"question", "selection"?, "itemId"?, "page"?, "threadId"?}
+                                        -> text/event-stream: meta, delta..., then done or error
+    GET    /api/pins                    tutor answers pinned to passages in lessons
+    POST   /api/pins                    {"itemId", "quote", "prefix"?, "suffix"?, "question", "answer", "threadId"?}
+    DELETE /api/pins/<id>
+
     GET  /auth/login/<google|github>    start OAuth; /auth/callback/<provider> finishes it
     POST /auth/dev-login                {"email"} — only with DEV_LOGIN=1, only from localhost
     POST /auth/logout
@@ -31,6 +41,7 @@ grants), so this blocks cross-site request forgery alongside the SameSite cookie
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -39,11 +50,12 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, abort, g, jsonify, request, send_from_directory, session
+from flask import Flask, Response, abort, g, jsonify, request, send_from_directory, session, stream_with_context
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import auth
+import chat
 import db
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,6 +87,14 @@ def load_config() -> dict:
         "DEV_LOGIN": _env_flag("DEV_LOGIN"),
         "BEHIND_PROXY": _env_flag("BEHIND_PROXY") or base.startswith("https://"),
         "SESSION_COOKIE_SECURE": base.startswith("https://"),
+        "CONTENT_DIR": os.environ.get("CONTENT_DIR") or str(ROOT / "content"),
+        # The page tutor: any OpenAI-compatible chat API. Off until LLM_BASE_URL and LLM_MODEL are set.
+        "LLM_PROVIDER": os.environ.get("LLM_PROVIDER", ""),
+        "LLM_BASE_URL": os.environ.get("LLM_BASE_URL", ""),
+        "LLM_API_KEY": os.environ.get("LLM_API_KEY", ""),
+        "LLM_MODEL": os.environ.get("LLM_MODEL", ""),
+        "LLM_MAX_TOKENS": os.environ.get("LLM_MAX_TOKENS", ""),
+        "CHAT_DAILY_LIMIT": int(os.environ.get("CHAT_DAILY_LIMIT") or 50),
     }
 
 
@@ -101,6 +121,7 @@ def create_app(db_path: str | os.PathLike | None = None, config: dict | None = N
 
     db.init(app.config["DB_PATH"])
     auth.init_app(app)
+    content = chat.ContentIndex(Path(app.config["CONTENT_DIR"]))
 
     @contextmanager
     def conn():
@@ -213,7 +234,7 @@ def create_app(db_path: str | os.PathLike | None = None, config: dict | None = N
     @auth.login_required
     def export():
         with conn() as c:
-            resp = jsonify(db.read_state(c, uid()))
+            resp = jsonify({**db.read_state(c, uid()), "chats": db.export_chats(c, uid()), "pins": db.pins(c, uid())})
         resp.headers["Content-Disposition"] = f"attachment; filename=prep-progress-{_today()}.json"
         return resp
 
@@ -240,6 +261,155 @@ def create_app(db_path: str | os.PathLike | None = None, config: dict | None = N
         with conn() as c:
             db.delete_user(c, uid())
         session.clear()
+        return {"ok": True}
+
+    # ------------------------------------------------------------ the page tutor
+
+    def chat_limit() -> int | None:
+        """Questions allowed per day; None means no limit (admins, or CHAT_DAILY_LIMIT=0)."""
+        n = app.config["CHAT_DAILY_LIMIT"]
+        return None if n <= 0 or auth.is_admin(g.user["email"]) else n
+
+    @app.get("/api/chat/config")
+    @auth.login_required
+    def chat_config():
+        on = chat.is_enabled(app.config)
+        with conn() as c:
+            used = db.chat_questions_on(c, uid(), _today())
+        return {"enabled": on, "model": app.config["LLM_MODEL"] if on else "", "limit": chat_limit(), "used": used}
+
+    @app.get("/api/chat/threads")
+    @auth.login_required
+    def chat_threads():
+        item = request.args.get("item")
+        with conn() as c:
+            return jsonify(db.chat_threads(c, uid(), item_id(item) if item else None))
+
+    @app.get("/api/chat/threads/<int:tid>")
+    @auth.login_required
+    def chat_thread(tid: int):
+        with conn() as c:
+            t = db.chat_thread(c, uid(), tid)
+        if t is None:
+            abort(404, "no such chat")
+        return jsonify(t)
+
+    @app.delete("/api/chat/threads/<int:tid>")
+    @auth.login_required
+    def chat_delete(tid: int):
+        with conn() as c:
+            if not db.delete_chat_thread(c, uid(), tid):
+                abort(404, "no such chat")
+        return {"ok": True}
+
+    @app.post("/api/chat")
+    @auth.login_required
+    def chat_ask():
+        body = request.get_json(silent=True) or {}
+        question = str(body.get("question") or "").strip()
+        selection = str(body.get("selection") or "").strip()[:chat.MAX_SELECTION]
+        if not question:
+            abort(400, "a question is required")
+        if len(question) > chat.MAX_QUESTION:
+            abort(400, f"questions are limited to {chat.MAX_QUESTION} characters")
+        if not chat.is_enabled(app.config):
+            abort(503, "The tutor is not set up on this server yet.")
+        me, today, limit = uid(), _today(), chat_limit()
+        raw_item = body.get("itemId")
+        topic = content.resolve(str(raw_item)) if raw_item else None
+        page = str(body.get("page") or "")[:200]
+        thread_id = body.get("threadId")
+        with conn() as c:
+            if limit is not None and db.chat_questions_on(c, me, today) >= limit:
+                abort(429, f"You have used all {limit} tutor questions for today. The limit resets at midnight.")
+            if thread_id is not None:
+                t = db.chat_thread(c, me, int(thread_id)) if str(thread_id).isdigit() else None
+                if t is None:
+                    abort(404, "no such chat")
+                topic = topic or content.resolve(t["item_id"])
+                history = [{"role": m["role"],
+                            "content": chat.user_turn(m["text"], m["selection"]) if m["role"] == "user" else m["text"]}
+                           for m in t["messages"]]
+                new_thread = False
+            else:
+                title = re.sub(r"\s+", " ", question)[:80]
+                thread_id = db.new_chat_thread(c, me, topic or "", title)
+                history, new_thread = [], True
+            question_id = db.add_chat_message(c, me, int(thread_id), "user", question, selection, today)
+        messages = chat.build_messages(content, topic, page, history, question, selection)
+        tid = int(thread_id)
+
+        def save_answer(text: str) -> int:
+            with conn() as c:
+                return db.add_chat_message(c, me, tid, "assistant", text, "", today)
+
+        def forget_question() -> None:
+            """A request that produced nothing does not count against the limit or clutter the chat."""
+            with conn() as c:
+                c.execute("DELETE FROM chat_messages WHERE id = ?", (question_id,))
+                if new_thread:
+                    c.execute("DELETE FROM chat_threads WHERE id = ?", (tid,))
+
+        def events():
+            parts: list[str] = []
+            settled = False
+            try:
+                yield _sse("meta", {"threadId": tid, "itemId": topic or "", "questionId": question_id})
+                error = None
+                try:
+                    for piece in chat.stream_answer(app.config, messages):
+                        parts.append(piece)
+                        yield _sse("delta", {"t": piece})
+                except chat.ProviderError as e:
+                    error = str(e)
+                except Exception:  # noqa: BLE001 - the stream must end with an event the UI understands
+                    app.logger.exception("tutor request failed")
+                    error = "The tutor hit an unexpected error. Try again in a moment."
+                settled = True
+                answer_id = save_answer("".join(parts)) if parts else None
+                if answer_id is None:
+                    forget_question()
+                yield _sse("error", {"error": error, "answerId": answer_id}) if error else _sse("done", {"answerId": answer_id})
+            finally:
+                # The reader went away mid-answer (Stop, or closed the tab): keep what arrived.
+                if not settled:
+                    if parts:
+                        save_answer("".join(parts))
+                    else:
+                        forget_question()
+
+        return Response(stream_with_context(events()), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
+
+    # ------------------------------------------------------------ answers pinned into lessons
+
+    @app.get("/api/pins")
+    @auth.login_required
+    def list_pins():
+        with conn() as c:
+            return jsonify(db.pins(c, uid()))
+
+    @app.post("/api/pins")
+    @auth.login_required
+    def add_pin():
+        body = request.get_json(silent=True) or {}
+        text = lambda k, n: str(body.get(k) or "").strip()[:n]  # noqa: E731
+        quote, question, answer = text("quote", chat.MAX_SELECTION), text("question", chat.MAX_QUESTION), text("answer", MAX_NOTE)
+        if not quote or not question or not answer:
+            abort(400, "quote, question and answer are required")
+        thread = body.get("threadId")
+        with conn() as c:
+            pin = db.add_pin(c, uid(), item_id(str(body.get("itemId") or "")), quote,
+                             str(body.get("prefix") or "")[:200], str(body.get("suffix") or "")[:200],
+                             question, answer, thread if isinstance(thread, int) else None)
+        return jsonify(pin), 201
+
+    @app.delete("/api/pins/<int:pin_id>")
+    @auth.login_required
+    def delete_pin(pin_id: int):
+        with conn() as c:
+            if not db.delete_pin(c, uid(), pin_id):
+                abort(404, "no such pin")
         return {"ok": True}
 
     # ------------------------------------------------------------ admin
@@ -312,6 +482,10 @@ def create_app(db_path: str | os.PathLike | None = None, config: dict | None = N
 
 def _today() -> str:
     return date.today().isoformat()
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 if __name__ == "__main__":

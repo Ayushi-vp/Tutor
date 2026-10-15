@@ -22,6 +22,9 @@ if (-not (Test-Path .env)) {
     exit 1
 }
 
+# When output is redirected (the background task uses *>>), Windows PowerShell turns every stderr line from
+# npm or python into an error record, and "Stop" would make a mere warning kill the app. Check exit codes instead.
+$ErrorActionPreference = "Continue"
 $dist = "frontend\dist\index.html"
 $newest = Get-ChildItem frontend\src, content -Recurse -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not (Test-Path $dist) -or $newest.LastWriteTime -gt (Get-Item $dist).LastWriteTime) {
@@ -29,7 +32,10 @@ if (-not (Test-Path $dist) -or $newest.LastWriteTime -gt (Get-Item $dist).LastWr
     Push-Location frontend
     if (-not (Test-Path node_modules)) { npm install --no-audit --no-fund }
     npm run build
+    $built = $LASTEXITCODE -eq 0
     Pop-Location
+    if (-not $built) { throw "Frontend build failed" }
 }
 
+$env:PYTHONUNBUFFERED = "1"  # so logs\app.log shows server output as it happens
 & $py backend\app.py

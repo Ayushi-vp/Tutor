@@ -1,0 +1,652 @@
+<!-- topic source for lld/ld24; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "ld24",
+  "t": "Token-budgeted conversation memory",
+  "tag": "AI systems",
+  "sum": "Fit a growing chat into a model's context: a pluggable tokenizer, per-message overhead and an output reserve, a pinned system prompt, tool calls and their results kept together as one unit, the oldest units dropped or folded into an incremental summary that keeps the prefix stable, and a property test that checks every invariant on hundreds of random conversations.",
+  "prereq": [
+    ["ag5", "Context engineering: what goes into the window each step, compaction, and why long contexts degrade."],
+    ["ag6", "Agent memory: working memory is the context window; long-term memory lives outside it and is retrieved."],
+    ["ld21", "In the agent loop, every tool_use must be answered by a tool_result with the same id."],
+    ["mc19", "A BPE tokenizer splits text into subword tokens; token counts differ by tokenizer and are not word counts."],
+    ["ae2", "LLM cost scales with input and output tokens; long histories make every turn more expensive."],
+    ["py6", "Dataclasses and Protocols: structural typing lets any object with the right method serve as a tokenizer."]
+  ],
+  "myths": [
+    ["Counting words or characters is close enough to counting tokens.", "Token counts depend on the tokenizer: code, numbers, non-English text and unusual words can take several tokens each, and chat formats add per-message overhead. A budget computed with the wrong counter overflows the real limit, and the API rejects the request. Use the model's own token counter for the real budget (providers expose token-counting endpoints) and keep a cheap estimator only for rough planning."],
+    ["Dropping the oldest messages one at a time is always safe.", "Messages are not independent. An assistant message that requested tools and the tool results that answer it must stay together: keeping a result without its call, or a call without its results, produces a history the API rejects or the model misreads. The unit of dropping is a group, not a message."],
+    ["The system prompt is just the first message, so it ages out like the rest.", "The system prompt defines the assistant's role, rules and tools for every turn. Dropping it changes behaviour silently — the model forgets its constraints mid-conversation. It, and anything the user explicitly asked to remember, must be pinned and counted before anything else."],
+    ["Summarising the whole history every turn keeps the best context.", "It costs a model call per turn, its output changes every time, and changing early content invalidates the provider's prompt cache for everything after it. Incremental summarisation folds only newly dropped turns into the existing summary, so the beginning of the context stays byte-identical turn after turn."],
+    ["Filling the context window exactly to the limit is efficient.", "The response also needs room: the output tokens count against the same window in many APIs, and a request with no room for a reply fails or truncates. Reserve the maximum output length, and leave headroom for estimation error and per-message formatting overhead."]
+  ],
+  "recap": [
+    "Conversation memory chooses which messages to send so the request fits the model's context, cost and latency budget.",
+    "The budget is the context limit minus the reserved output, minus per-message overhead, measured with a pluggable tokenizer.",
+    "The system prompt and pinned messages are always included and counted first.",
+    "Messages are grouped into units: an assistant message with tool calls plus all of its tool results form one unit; other messages are units on their own.",
+    "The window keeps the longest suffix of units that fits, so the latest message is always present and order is preserved.",
+    "If even the newest unit does not fit, the memory raises instead of sending a broken history.",
+    "Dropped units can be folded into a summary with its own token budget; once folded, a unit never comes back verbatim.",
+    "Incremental summarisation calls the summariser only for newly dropped units, which keeps the prefix stable for prompt caching and saves calls.",
+    "When the summary must shrink, the oldest details go first because recent context matters more.",
+    "Property tests over random conversations check the invariants: within budget, system first, no orphaned tool messages, a suffix in order, deterministic output."
+  ],
+  "glossary": [
+    ["Context window", "The maximum number of tokens a model can take as input (and, in many APIs, input plus output) in one request."],
+    ["Incremental summarisation", "Updating a running summary with only the newly dropped messages instead of re-summarising the whole history."],
+    ["Orphaned tool message", "A tool call without its results, or a tool result without its call, left by dropping half of a pair."],
+    ["Output reserve", "Tokens held back from the input budget so the model has room to write its reply."],
+    ["Per-message overhead", "Tokens a chat format adds around each message (role markers, separators) beyond its content."],
+    ["Pinned message", "A message that is never dropped or summarised, such as the system prompt or a user's standing instruction."],
+    ["Prompt cache", "A provider feature that reuses the computation for an unchanged prefix of a request, making repeated prefixes cheaper and faster."],
+    ["Property test", "A test that checks invariants over many randomly generated inputs instead of a few hand-written examples."],
+    ["Suffix", "The last part of a sequence; keeping a suffix of the conversation means keeping the most recent messages, in order."],
+    ["Token", "The unit a model reads and writes; a word may be one token or several, depending on the tokenizer."],
+    ["Tokenizer", "The component that splits text into tokens; here an interface with a count method so different counters can be plugged in."],
+    ["Unit", "The smallest group of messages that can be kept or dropped together without breaking the conversation's structure."]
+  ],
+  "qa": [
+    ["E", "What has to be counted in a conversation's token budget?", "The content of every message sent, the per-message formatting overhead, the system prompt and tool definitions, and the room reserved for the reply. Available input = context limit − output reserve − fixed parts (system prompt, pinned messages, tools); the history gets what is left."],
+    ["E", "Why must a tool call and its results be dropped together?", "Because the API pairs them by id: a tool result whose call is missing, or a call whose results are missing, is either rejected or misread by the model. Group an assistant message that made calls with all the tool results that answer it into one unit, and keep or drop the unit as a whole."],
+    ["E", "Why keep a suffix rather than the most important messages?", "Conversations depend on order and recency: the latest messages are almost always needed, and removing messages from the middle creates confusing gaps (an answer to a question that is no longer there). Keeping the longest suffix that fits, plus pinned messages and a summary of what came before, is simple, predictable and preserves local coherence."],
+    ["M", "Walk through fitting the travel conversation into 80 tokens.", "Costs (words plus 4 overhead): system 13, then units of 15, 11, 16, the tool unit 34 (10 + 12 + 12), 16 and 13. Available after the system prompt is 67. From the newest: 13 (total 13), 16 (29), the tool unit 34 (63) fits, the next 16 would make 79 > 67, so stop. The window is the system prompt, the tool unit, the assistant's answer and the latest user message: 76 tokens. At 70 tokens, 57 are available and the tool unit no longer fits, so only the last two units are kept.", "Follow-up: What if the tool unit were 60 tokens? — It would be dropped as a whole, and the assistant's answer about the weather would be kept without the results it drew on; a summary should mention the lookup."],
+    ["M", "How does incremental summarisation work and why is it better?", "Keep a running summary and a count of units already folded into it. When a build must drop units, pass the previous summary and only the newly dropped units to the summariser, store the result, and never consider those units again. It calls the summariser only when something new is dropped, keeps old content's representation stable, and leaves the start of the context unchanged between turns, so the provider's prompt cache keeps hitting.", "Follow-up: What is the risk? — Errors compound: a detail the summariser dropped or got wrong is gone for good. Pin facts that must survive and evaluate summaries on what later turns need."],
+    ["M", "Which tokenizer should the memory use?", "For the budget that must not be exceeded, the model's own tokenizer or the provider's token-counting endpoint, because counts differ between tokenizers and providers add formatting tokens. For planning or quick estimates, a cheap heuristic like four characters per token. The memory takes the tokenizer as a parameter so both work, and the test shows the two producing different windows (8 versus 7 messages at 105 tokens)."],
+    ["M", "What happens if the newest message alone is larger than the budget?", "No valid window exists, so raise an error rather than send a truncated or orphaned history. The caller can then ask the user to shorten the input, chunk a large document and process it in pieces, summarise the large tool result before adding it, or move to a model with a larger context."],
+    ["M", "Where do pinned user facts go in the output?", "After the system prompt and before the summary and recent messages, in their original order. That keeps them visible regardless of how much history is dropped. The trade-off is that they move out of their original position, so they should read as standing instructions ('Remember: my partner is vegetarian'), not as replies to earlier turns."],
+    ["H", "How would you reduce how often the summariser runs in a long chat?", "Add hysteresis: when the window overflows, drop not just enough to fit but down to a low-water mark (say 60% of the budget), so the next several turns fit without another drop. The summariser runs once per several turns instead of every turn, at the cost of keeping slightly less verbatim history. Also batch: summarise when at least N units are pending.", "Follow-up: Does hysteresis affect caching? — Positively: the prefix (system, pinned, summary) stays identical for longer, so more turns hit the prompt cache."],
+    ["H", "How does this interact with provider prompt caching?", "Caching reuses an identical prefix, and render order is typically tools, system, then messages. The memory keeps the system prompt and pinned messages first and unchanged, and the summary changes only when units are folded in. Recent messages are appended. So most turns share a long identical prefix. Re-summarising the whole history every turn, or rewriting old messages, would change the prefix and lose the cache every time.", "Follow-up: How do you check it is working? — The API reports cached input tokens per request; if they are near zero on long conversations, something early in the context is changing."],
+    ["H", "When is a sliding window plus summary the wrong memory design?", "When the conversation refers back to precise details from long ago (a number, a code snippet, a document) that a summary cannot preserve, or when sessions span days. Then store messages and facts outside the window — in a database or vector store — and retrieve the relevant ones per turn (ag6), keeping the window for recent turns. For agents, also consider clearing old tool results rather than dropping whole turns, since tool outputs are usually the bulk of the tokens."],
+    ["H", "How would you test that the memory never sends a broken history?", "State the invariants and check them on random inputs: the output fits within the budget minus the reserve; the system prompt is first; every tool call in the output has its results and every result its call; the non-pinned, non-summary messages are a suffix of the conversation in the original order; and building twice gives the same result. The solution's property test runs 300 random conversations with random sizes, budgets, tokenizers, tool calls, pinned messages and summarisation on or off, checking all five after every turn."]
+  ],
+  "refs": [
+    ["docs", "Claude API: token counting", "Counting a request's tokens (messages, system prompt, tools) with the model's own tokenizer before sending it.", "https://platform.claude.com/docs/en/build-with-claude/token-counting"],
+    ["docs", "Claude API: context windows", "How input and output share the context window, and how extended context and conversation growth are handled.", "https://platform.claude.com/docs/en/build-with-claude/context-windows"],
+    ["docs", "Claude API: prompt caching", "Caching an unchanged prefix (tools, system, messages in that order); why stable early content matters.", "https://platform.claude.com/docs/en/build-with-claude/prompt-caching"],
+    ["post", "Effective context engineering for AI agents (Anthropic, 2025)", "Context as a finite resource, compaction of conversation history, and clearing old tool results.", "https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A travel assistant works beautifully in testing, where conversations are five turns long. In production, a user plans a two-week trip over an evening: forty turns, a dozen tool calls to flight and hotel search returning long lists, and a pasted itinerary. On turn 31 the request fails with "prompt is too long". The quick fix — drop the oldest messages until it fits — makes turn 32 fail differently: the oldest message dropped was the assistant's flight-search call, but its results stayed, and the API rejects a tool result whose call is missing. The next fix drops whole messages from the start until the error goes away, and that removes the system prompt: the assistant stops following its formatting rules and its safety instructions halfway through the evening. Meanwhile every turn costs more than the last, because every turn resends the whole history.</p>
+<p>Every chat product and every agent needs a component that decides what goes into the context window on each call. It sounds like a list truncation, and machine-coding rounds for AI-engineer roles use it precisely because the naive version breaks in instructive ways. The constraints interact: the budget must be measured in the model's tokens, not characters; the reply needs room; the system prompt must never be dropped; tool calls and their results are inseparable; dropped history can be summarised, but summarising badly is expensive and destroys prompt caching; and the result must be deterministic so it can be tested and cached.</p>
+<p>This lesson builds that component in stages: requirements, the entities (messages, a pluggable tokenizer, units), a naive truncation and its failures, then the correct design — pinned messages, units that keep tool calls with their results, keeping the longest suffix that fits, an explicit error when nothing fits, and an incremental summary with its own budget that trims its oldest details first. A worked example fits a nine-message travel conversation into 80 and 70 tokens by hand. The full solution is a runnable Python 3.12 file with eleven tests, including a property test that checks five invariants on 300 random conversations.</p>
+</section>
+
+<section data-field="primer">
+<h4>The analogy: packing a suitcase with a weight limit</h4>
+<p>You are flying with a 20 kg limit and a pile of things to take. Some items are non-negotiable — passport, medication — so they go in first and their weight comes off the top. Some things only make sense together — a camera and its charger, a suit and its shoes — so you pack both or neither. You leave space for souvenirs on the way back. Then you add the rest in order of how recently you will need them, until the next item would break the limit. What does not fit, you leave at home, perhaps with a note listing what you left so you can buy replacements.</p>
+<p>The suitcase is the <strong>context window</strong>, the weight limit is the <strong>token budget</strong>, and the scale is the <strong>tokenizer</strong> — the wrong scale (counting items instead of weighing them) gets you stopped at the airport. The passport is the <strong>system prompt</strong> and other <strong>pinned messages</strong>. The camera-and-charger pair is a <strong>unit</strong>: an assistant message that called tools plus the tool results answering it. The souvenir space is the <strong>output reserve</strong>. "Most recently needed first" is keeping the <strong>suffix</strong> of the conversation. The note is the <strong>summary</strong>.</p>
+<p>The analogy breaks in two places worth knowing. Suitcase items are packed in any order, but messages must stay in conversational order. And a suitcase is packed once, while a conversation is repacked every turn — so the packing should change as little as possible between turns, both to save summarisation calls and because model providers cache the unchanged beginning of a request.</p>
+
+<figure>
+<svg viewBox="0 0 640 260" width="100%" role="img" aria-label="Layout of the built context. The budget is split into the output reserve, the fixed part (system prompt and pinned messages), the summary of dropped units with its own budget, and the kept suffix of units. The full conversation's units are shown below: the oldest units are folded into the summary, a tool unit containing an assistant call and two tool results is kept or dropped as one block, and the newest units are kept.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="22" style="fill:var(--ink);font-weight:600">what is sent (budget = context limit)</text>
+    <rect x="20" y="32" width="90" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="65" y="50" text-anchor="middle" style="fill:var(--ink)">system</text>
+    <text x="65" y="65" text-anchor="middle" style="fill:var(--muted)">+ pinned</text>
+    <rect x="114" y="32" width="100" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--s4)"/>
+    <text x="164" y="50" text-anchor="middle" style="fill:var(--ink)">summary</text>
+    <text x="164" y="65" text-anchor="middle" style="fill:var(--muted)">≤ summary_budget</text>
+    <rect x="218" y="32" width="270" height="40" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="353" y="50" text-anchor="middle" style="fill:var(--ink)">kept suffix of units (newest last)</text>
+    <text x="353" y="65" text-anchor="middle" style="fill:var(--muted)">longest that fits</text>
+    <rect x="492" y="32" width="128" height="40" rx="3" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 3"/>
+    <text x="556" y="50" text-anchor="middle" style="fill:var(--ink)">output reserve</text>
+    <text x="556" y="65" text-anchor="middle" style="fill:var(--muted)">room for the reply</text>
+    <text x="20" y="112" style="fill:var(--ink);font-weight:600">the conversation, grouped into units</text>
+    <rect x="20" y="124" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="50" y="143" text-anchor="middle" style="fill:var(--muted)">user</text>
+    <rect x="84" y="124" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="114" y="143" text-anchor="middle" style="fill:var(--muted)">asst</text>
+    <rect x="148" y="124" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="178" y="143" text-anchor="middle" style="fill:var(--muted)">user</text>
+    <rect x="212" y="118" width="190" height="42" rx="4" style="fill:none;stroke:var(--crit);stroke-width:1.5"/>
+    <rect x="218" y="124" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="248" y="143" text-anchor="middle" style="fill:var(--ink)">asst calls</text>
+    <rect x="282" y="124" width="56" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="310" y="143" text-anchor="middle" style="fill:var(--ink)">tool c1</text>
+    <rect x="342" y="124" width="56" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="370" y="143" text-anchor="middle" style="fill:var(--ink)">tool c2</text>
+    <text x="307" y="176" text-anchor="middle" style="fill:var(--crit)">one unit: kept or dropped whole</text>
+    <rect x="406" y="124" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="436" y="143" text-anchor="middle" style="fill:var(--ink)">asst</text>
+    <rect x="470" y="124" width="60" height="30" rx="3" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="500" y="143" text-anchor="middle" style="fill:var(--ink)">user</text>
+    <text x="500" y="176" text-anchor="middle" style="fill:var(--accent)">newest: always kept</text>
+    <path d="M114,160 C114,210 164,210 164,76" style="fill:none;stroke:var(--s4);stroke-dasharray:4 3"/>
+    <text x="40" y="225" style="fill:var(--s4)">oldest units folded into the summary (once, incrementally)</text>
+    <path d="M436,160 C436,200 353,200 353,76" style="fill:none;stroke:var(--accent);stroke-dasharray:4 3"/>
+  </g>
+</svg>
+<figcaption>The budget is spent in a fixed order — reserve, pinned, summary, then as much recent history as fits — and the history is cut only between units, never inside one. The red box is why: half of a tool exchange is worse than none.</figcaption>
+</figure>
+
+<h4>Three budgets inside one number</h4>
+<p>It helps to see the limit as three separate claims on the same space. The <strong>reply</strong> claims its share first, because a request with no room to answer is useless. The <strong>fixed context</strong> — system prompt, tool definitions, pinned facts — claims its share next, because it defines who the assistant is on every turn. Only what is left — the remainder — is the <strong>history budget</strong>, and that is the only part this component negotiates. A surprising amount of trouble in production comes from forgetting one of the first two: a long tool list that silently eats a fifth of the window, or a maximum output length raised without anyone shrinking the history.</p>
+
+<h4>What the round expects</h4>
+<p>A <code>Message</code> type with roles and tool ids; a tokenizer interface with two implementations; a <code>ConversationMemory</code> with <code>add</code> (which rejects broken tool sequences) and <code>build</code> (which returns the window); grouping into units; the suffix-that-fits algorithm; pinned messages; an output reserve and per-message overhead; a clear failure when nothing fits; optional incremental summarisation with a capped summary; and deterministic tests, ideally including a property test. Strong candidates also explain the interaction with prompt caching.</p>
+</section>
+
+<section data-field="body">
+<div class="clock"><div class="ck"><span class="ck-m">0–5</span><span class="ck-t">Clarify</span></div><div class="ck"><span class="ck-m">5–10</span><span class="ck-t">Entities &amp; API</span></div><div class="ck"><span class="ck-m">10–14</span><span class="ck-t">Naive truncation</span></div><div class="ck"><span class="ck-m">14–28</span><span class="ck-t">Units, suffix, pinning</span></div><div class="ck"><span class="ck-m">28–37</span><span class="ck-t">Summaries, tests</span></div><div class="ck"><span class="ck-m">37–45</span><span class="ck-t">Extensions</span></div></div>
+
+<h4>1 · Clarify the requirements</h4>
+<p>Ask: what is the model's context limit, and does output share it? How much output must be reserved? Which tokenizer — is there an exact counter, or must we estimate? What message roles exist, and can the assistant call several tools at once? Are there messages that must never be dropped (system prompt, user preferences)? Is summarisation available, at what cost and latency? Does the provider cache prompts (which rewards a stable prefix)? Must the output be deterministic for tests and caching?</p>
+<p>Agreed scope: roles system, user, assistant and tool; assistant messages may carry several tool-call ids, each answered by one tool message; a pluggable tokenizer; per-message overhead; an output reserve; pinned messages; keep the longest suffix of whole units that fits; optional incremental summarisation with a summary budget; raise if the newest unit cannot fit; deterministic. Out of scope: retrieval of old messages from long-term storage (an extension).</p>
+
+<h4>2 · Entities and the interface</h4>
+<pre>Tokenizer (Protocol): count(text) -&gt; int        WordTokenizer, CharTokenizer (≈ 4 chars/token)
+Message(role, content, tool_call_ids=(), tool_call_id=None, pinned=False)   # frozen
+ConversationMemory(budget, tokenizer, reserve_output=0, per_message_overhead=4,
+                   summariser=None, summary_budget=0)
+  .add(message)            # validates structure: one system message; tool results answer open calls
+  .build() -&gt; list[Message] # the window to send; raises BudgetTooSmall
+  .last_stats               # tokens, kept and dropped units, whether a summary is present</pre>
+<p>The tokenizer is a <code>Protocol</code> — any object with a <code>count</code> method works — so tests use a deterministic word counter while production passes the model's real counter. <code>Message</code> is frozen, so built windows can be compared and cached safely. The summariser is a plain function <code>(previous_summary, newly_dropped) → new_summary</code>, so tests inject a deterministic stub and production wraps a model call.</p>
+
+<h4>3 · Stage one: naive truncation, and how it breaks</h4>
+<pre>def build(messages, budget):
+    while sum(count(m.content) for m in messages) &gt; budget:
+        messages = messages[1:]                 # drop the oldest
+    return messages</pre>
+<p>Four failures, each from the opening story. It drops the <strong>system prompt</strong> first, since it is the oldest message. It splits <strong>tool exchanges</strong>: dropping an assistant message that called tools while keeping its results produces an orphaned result. It counts only content, ignoring <strong>per-message overhead</strong> (role markers and separators that every chat format adds), and leaves <strong>no room for the reply</strong>, so requests near the limit fail. And it uses whatever counter was handy, so its idea of the budget is not the model's. It is also quadratic — re-summing the list after every drop — though that is the least of its problems.</p>
+
+<h4>4 · Stage two: validating structure on the way in</h4>
+<p>Correct output is easier if broken input is impossible. <code>add</code> enforces three rules: there is at most one system message; a tool message must answer a call that is still open — made by the most recent assistant message with calls and not yet answered; and no other message may arrive while calls are open, because providers expect the results immediately after the call. The test <code>test_add_rejects_broken_tool_sequences</code> checks a result for an unknown id, an unknown role, and a user message interrupting an open call. With these rules, every assistant call is followed directly by its results, which is what makes grouping simple.</p>
+
+<h4>5 · Stage three: units</h4>
+<p>Group messages into <strong>units</strong>: walk the history, skip the system and pinned messages, start a new unit at every user or assistant message, and append each tool message to the current unit (which <code>add</code> guarantees is the assistant message that made the call). An assistant message with two tool calls plus the two results is therefore a single unit of three messages. Every other message is a unit of one. Dropping and keeping now happen in whole units, so orphans cannot occur by construction — and the property test checks that over thousands of random builds anyway.</p>
+
+<h4>6 · Stage four: the longest suffix that fits</h4>
+<p>Compute the space: <em>available = budget − output reserve − cost(system and pinned messages)</em>, where a message's cost is its token count plus the per-message overhead (4 here). Then walk the units from newest to oldest, adding each unit's cost while it fits; the first unit that would overflow — and everything older — is dropped. Keeping a <em>suffix</em> rather than choosing "important" messages keeps the conversation coherent: there are no gaps where an answer refers to a question that is no longer there.</p>
+<p><strong>Worked by hand.</strong> The test conversation, with the word tokenizer and 4 tokens of overhead per message, costs: system "You are a travel assistant. Be brief." 13; units: "I want to visit Lisbon in May with my partner." 15; "Great choice. How many days?" 11; "Five days, mid budget, we love food and museums." 16; the tool unit — "Let me check the weather." 10 + "Lisbon May: 22C, mostly sunny." 12 + "Porto May: 19C, some rain." 12 — 34; "Lisbon will be warm and sunny; Porto cooler with rain." 16; "Book a food tour for day two please." 13.</p>
+<p>With a budget of <strong>80</strong>: available = 80 − 13 = 67. From the newest: 13 (total 13), 16 (29), the tool unit 34 (63 ≤ 67, kept), the next unit costs 16 and 63 + 16 = 79 &gt; 67, so stop. The window is the system prompt, the tool unit, the assistant's weather answer and the latest request: <strong>76 tokens, 3 units kept, 3 dropped</strong>. With a budget of <strong>70</strong>: available = 57; 13 + 16 = 29, then 29 + 34 = 63 &gt; 57, so the tool unit and everything older go: the system prompt plus the last two units, 42 tokens. Notice that at 70 the assistant's message about the weather survives while the results it was based on do not — a reason to add a summary. At 95 and 105 the window grows to 4 and 5 units.</p>
+<p><strong>When nothing fits.</strong> If even the newest unit exceeds the available space, there is no valid window: <code>build</code> raises <code>BudgetTooSmall</code> with the sizes, rather than sending a truncated message or an orphaned result. The caller decides — ask the user to shorten, chunk a large paste, summarise a large tool result before adding it, or switch to a larger-context model.</p>
+
+<h4>7 · Stage five: pinned messages and the output reserve</h4>
+<p>The system prompt and any message marked <code>pinned</code> — for example "Remember: my partner is vegetarian" — are counted first and always included, placed after the system prompt in their original order, so they survive any amount of history being dropped. The test pins a preference among twenty messages in a 60-token budget and checks it is second in every window. The <strong>output reserve</strong> comes off the top: with a 120-token budget, reserving 40 for the reply visibly shortens the window (<code>test_reserve_for_output_shrinks_the_window</code>). In production the reserve is at least the request's maximum output tokens, plus a margin for estimation error when the tokenizer is approximate.</p>
+
+<h4>8 · Stage six: incremental summaries</h4>
+<p>Dropping history loses information; a summary keeps some of it. The design that works across many turns is <strong>incremental</strong>: the memory keeps a running summary and a count of units already folded into it. When a build must drop units, it passes the previous summary and only the <em>newly</em> dropped units to the summariser, stores the result, advances the count, and never considers those units again. The summary is placed after the pinned messages as a user message labelled "[Summary of earlier conversation]", and it has its own <strong>summary budget</strong>, reserved from the available space as soon as summarisation begins.</p>
+<p>Three details make it robust. <strong>Stable prefix</strong>: once folded, units never reappear verbatim and the summary changes only when new units are folded in, so between folds the start of the context is byte-identical — what prompt caching rewards. <strong>Bounded calls</strong>: the summariser runs only when something new is dropped; a second build with nothing new makes no call (the test checks the call count is unchanged). <strong>Capped, newest-preserving</strong>: if the summariser's output exceeds its budget, the memory trims it — dropping the <em>oldest</em> words first, because summaries append newer material at the end and recent context matters more. Traced with an 80-token budget, a 20-token summary budget and eight short exchanges: builds 1-4 fit without dropping (25, 43, 61, 79 tokens); at build 5 the window overflows, five units are folded into the summary and the window is 71 tokens; from then on each new turn folds the oldest two units, the summary's oldest notes are trimmed ("Topic0" disappears, "Topic5" appears), and every window stays at 74 tokens or less.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Bar chart of window size over eight builds with an 80-token budget. Builds one to four grow 25, 43, 61, 79 tokens with no summary. At build five the window overflows: five units are folded into a summary and the window is 71 tokens. Builds six to eight stay at 74 tokens, each folding the two oldest units. A dashed line marks the 80-token budget.">
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="60" y1="210" x2="620" y2="210" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="60" y1="50" x2="620" y2="50" style="fill:none;stroke:var(--crit);stroke-dasharray:5 3"/>
+    <text x="64" y="44" style="fill:var(--crit)">budget 80</text>
+    <rect x="80" y="160" width="44" height="50" style="fill:var(--s1)"/>
+    <rect x="148" y="124" width="44" height="86" style="fill:var(--s1)"/>
+    <rect x="216" y="88" width="44" height="122" style="fill:var(--s1)"/>
+    <rect x="284" y="52" width="44" height="158" style="fill:var(--s1)"/>
+    <rect x="352" y="68" width="44" height="142" style="fill:var(--s1)"/>
+    <rect x="352" y="100" width="44" height="40" style="fill:var(--s4)"/>
+    <rect x="420" y="62" width="44" height="148" style="fill:var(--s1)"/>
+    <rect x="420" y="100" width="44" height="40" style="fill:var(--s4)"/>
+    <rect x="488" y="62" width="44" height="148" style="fill:var(--s1)"/>
+    <rect x="488" y="100" width="44" height="40" style="fill:var(--s4)"/>
+    <rect x="556" y="62" width="44" height="148" style="fill:var(--s1)"/>
+    <rect x="556" y="100" width="44" height="40" style="fill:var(--s4)"/>
+    <text x="102" y="155" text-anchor="middle" style="fill:var(--ink)">25</text>
+    <text x="170" y="119" text-anchor="middle" style="fill:var(--ink)">43</text>
+    <text x="238" y="83" text-anchor="middle" style="fill:var(--ink)">61</text>
+    <text x="306" y="47" text-anchor="middle" style="fill:var(--ink)">79</text>
+    <text x="374" y="63" text-anchor="middle" style="fill:var(--ink)">71</text>
+    <text x="442" y="57" text-anchor="middle" style="fill:var(--ink)">74</text>
+    <text x="510" y="57" text-anchor="middle" style="fill:var(--ink)">74</text>
+    <text x="578" y="57" text-anchor="middle" style="fill:var(--ink)">74</text>
+    <text x="102" y="228" text-anchor="middle" style="fill:var(--muted)">1</text>
+    <text x="170" y="228" text-anchor="middle" style="fill:var(--muted)">2</text>
+    <text x="238" y="228" text-anchor="middle" style="fill:var(--muted)">3</text>
+    <text x="306" y="228" text-anchor="middle" style="fill:var(--muted)">4</text>
+    <text x="374" y="228" text-anchor="middle" style="fill:var(--muted)">5</text>
+    <text x="442" y="228" text-anchor="middle" style="fill:var(--muted)">6</text>
+    <text x="510" y="228" text-anchor="middle" style="fill:var(--muted)">7</text>
+    <text x="578" y="228" text-anchor="middle" style="fill:var(--muted)">8</text>
+    <text x="340" y="246" text-anchor="middle" style="fill:var(--muted)">build (one per turn)</text>
+    <text x="374" y="125" text-anchor="middle" style="fill:var(--ink)">sum</text>
+    <text x="374" y="168" text-anchor="middle" style="fill:var(--ink)">5 units folded</text>
+    <text x="510" y="168" text-anchor="middle" style="fill:var(--ink)">2 folded per turn</text>
+  </g>
+</svg>
+<figcaption>Without a summary the window simply grows until it nearly fills the budget (build 4: 79 of 80). The first fold makes room in one step; after that each turn folds the oldest exchange into the summary (the orange band, capped at 20 tokens) and the window stays flat. Hysteresis would make the folds bigger and rarer.</figcaption>
+</figure>
+
+
+<h4>9 · Stage seven: testing with invariants</h4>
+<p>Hand-written examples catch the cases you thought of. The property test generates 300 random conversations — random message lengths, random tool calls with one to three results each, occasional pinned messages, word or character tokenizer, budgets from 40 to 200, output reserve on or off, summarisation on or off — and after <em>every</em> added message checks five invariants: the window fits within budget minus reserve; the system prompt is first; there are no orphaned tool messages; the non-pinned, non-summary messages are a suffix of the conversation in the original order; and building again returns exactly the same window. Any violation pinpoints a seed and a turn to replay.</p>
+
+<h4>10 · The full solution</h4>
+<p>Eleven tests, Python 3.12, standard library only, about a second.</p>
+<pre>"""Token-budgeted conversation memory: fit a chat history into a token budget with a pluggable
+tokenizer, pin the system prompt (and other pinned messages), keep an assistant tool call and its
+tool results together as one unit, drop or summarise the oldest units, summarise incrementally so
+the kept prefix stays stable, and test it all deterministically.
+Python 3.12, standard library only.  Run: python memory.py"""
+from __future__ import annotations
+
+import math
+import random
+import re
+from dataclasses import dataclass, field
+from typing import Callable, Protocol
+
+
+# ---------------------------------------------------------------- tokenizers (pluggable)
+class Tokenizer(Protocol):
+    def count(self, text: str) -&gt; int: ...
+
+
+class WordTokenizer:
+    """Words and punctuation marks each count as one token. Deterministic, good enough for tests."""
+    _pat = re.compile(r"\w+|[^\w\s]")
+
+    def count(self, text: str) -&gt; int:
+        return len(self._pat.findall(text))
+
+
+class CharTokenizer:
+    """The common rule of thumb: about four characters per token."""
+
+    def count(self, text: str) -&gt; int:
+        return math.ceil(len(text) / 4)
+
+
+# ---------------------------------------------------------------- messages
+@dataclass(frozen=True)
+class Message:
+    role: str                                   # system | user | assistant | tool
+    content: str
+    tool_call_ids: tuple[str, ...] = ()         # on an assistant message that calls tools
+    tool_call_id: str | None = None             # on a tool result
+    pinned: bool = False                        # never dropped or summarised
+
+
+class BudgetTooSmall(ValueError):
+    pass
+
+
+@dataclass
+class BuildStats:
+    tokens: int
+    kept_units: int
+    dropped_units: int
+    summarised: bool
+
+
+Summariser = Callable[[str, list[Message]], str]   # (previous summary, newly dropped) -&gt; new summary
+
+
+class ConversationMemory:
+    def __init__(self, budget: int, tokenizer: Tokenizer, reserve_output: int = 0,
+                 per_message_overhead: int = 4, summariser: Summariser | None = None,
+                 summary_budget: int = 0) -&gt; None:
+        if summariser is not None and summary_budget &lt;= 0:
+            raise ValueError("a summariser needs a positive summary_budget")
+        self.budget, self.tok, self.reserve = budget, tokenizer, reserve_output
+        self.overhead, self.summariser, self.summary_budget = per_message_overhead, summariser, summary_budget
+        self.messages: list[Message] = []
+        self._summary = ""
+        self._summarised_units = 0              # units [0, n) are folded into the summary for good
+        self.summariser_calls = 0
+        self.last_stats: BuildStats | None = None
+
+    # ---- input
+    def add(self, m: Message) -&gt; None:
+        if m.role not in ("system", "user", "assistant", "tool"):
+            raise ValueError(f"unknown role {m.role!r}")
+        if m.role == "system" and any(x.role == "system" for x in self.messages):
+            raise ValueError("only one system message")
+        if m.role == "tool":
+            # a tool result must answer a call made by the most recent assistant message with calls
+            open_calls = self._open_calls()
+            if m.tool_call_id not in open_calls:
+                raise ValueError(f"tool result {m.tool_call_id!r} does not answer an open tool call")
+        elif self._open_calls():
+            raise ValueError(f"tool calls {sorted(self._open_calls())} still need results")
+        self.messages.append(m)
+
+    def _open_calls(self) -&gt; set[str]:
+        for i in range(len(self.messages) - 1, -1, -1):
+            m = self.messages[i]
+            if m.role == "assistant" and m.tool_call_ids:
+                answered = {x.tool_call_id for x in self.messages[i + 1:] if x.role == "tool"}
+                return set(m.tool_call_ids) - answered
+            if m.role != "tool":
+                return set()
+        return set()
+
+    # ---- structure
+    def cost(self, m: Message) -&gt; int:
+        return self.tok.count(m.content) + self.overhead
+
+    def _units(self) -&gt; list[list[Message]]:
+        """Non-pinned, non-system messages grouped so that an assistant message with tool calls
+        and all its tool results form one unit. Other messages are units on their own."""
+        units: list[list[Message]] = []
+        for m in self.messages:
+            if m.role == "system" or m.pinned:
+                continue
+            if m.role == "tool":
+                units[-1].append(m)                 # add() guarantees the call precedes it
+            else:
+                units.append([m])
+        return units
+
+    # ---- output
+    def build(self) -&gt; list[Message]:
+        system = [m for m in self.messages if m.role == "system"]
+        pinned = [m for m in self.messages if m.pinned and m.role != "system"]
+        fixed = sum(self.cost(m) for m in system + pinned)
+        avail = self.budget - self.reserve - fixed
+        units = self._units()[self._summarised_units:]
+        if not units:
+            self.last_stats = BuildStats(fixed, 0, 0, bool(self._summary))
+            return system + pinned + self._summary_msgs()
+        unit_cost = [sum(self.cost(m) for m in u) for u in units]
+
+        def suffix_that_fits(space: int) -&gt; int:
+            """Index of the first unit kept when keeping the longest suffix that fits in space."""
+            start, used = len(units), 0
+            while start &gt; 0 and used + unit_cost[start - 1] &lt;= space:
+                start -= 1
+                used += unit_cost[start]
+            return start
+
+        summary_space = self.summary_budget + self.overhead if (self.summariser or self._summary) else 0
+        start = suffix_that_fits(avail - (summary_space if self._summary else 0))
+        if start &gt; 0 and self.summariser is not None and not self._summary:
+            start = suffix_that_fits(avail - summary_space)      # dropping now: make room for a summary
+        if start == len(units):
+            raise BudgetTooSmall(f"the newest unit needs {unit_cost[-1]} tokens; "
+                                 f"only {avail - (summary_space if self.summariser else 0)} available")
+        if start &gt; 0 and self.summariser is not None:
+            dropped = [m for u in units[:start] for m in u]
+            self._summary = self._cap(self.summariser(self._summary, dropped))
+            self.summariser_calls += 1
+            self._summarised_units += start
+            units, dropped_now, start = units[start:], start, 0
+        else:
+            dropped_now = start
+        kept = [m for u in units[start:] for m in u]
+        out = system + pinned + self._summary_msgs() + kept
+        self.last_stats = BuildStats(sum(self.cost(m) for m in out), len(units) - start, dropped_now,
+                                     bool(self._summary))
+        assert self.last_stats.tokens &lt;= self.budget - self.reserve
+        return out
+
+    def _summary_msgs(self) -&gt; list[Message]:
+        return [Message("user", f"[Summary of earlier conversation] {self._summary}")] if self._summary else []
+
+    def _cap(self, text: str) -&gt; str:
+        """Trim a summary to its budget (counting the prefix). Drop the OLDEST words first: the
+        summariser appends newer material at the end, and recent context matters more."""
+        prefix = "[Summary of earlier conversation] "
+        words = text.split()
+        while words and self.tok.count(prefix + " ".join(words)) &gt; self.summary_budget:
+            words.pop(0)
+        return " ".join(words)
+
+
+# ---------------------------------------------------------------- tests
+WT = WordTokenizer()
+
+
+def stub_summariser(previous: str, dropped: list[Message]) -&gt; str:
+    """Deterministic stand-in for a model: keeps the first three words of each dropped user message."""
+    notes = [" ".join(m.content.split()[:3]) for m in dropped if m.role == "user"]
+    return "; ".join(x for x in [previous] + notes if x)
+
+
+def convo(mem: ConversationMemory) -&gt; ConversationMemory:
+    mem.add(Message("system", "You are a travel assistant. Be brief."))
+    mem.add(Message("user", "I want to visit Lisbon in May with my partner."))
+    mem.add(Message("assistant", "Great choice. How many days?"))
+    mem.add(Message("user", "Five days, mid budget, we love food and museums."))
+    mem.add(Message("assistant", "Let me check the weather.", tool_call_ids=("c1", "c2")))
+    mem.add(Message("tool", "Lisbon May: 22C, mostly sunny.", tool_call_id="c1"))
+    mem.add(Message("tool", "Porto May: 19C, some rain.", tool_call_id="c2"))
+    mem.add(Message("assistant", "Lisbon will be warm and sunny; Porto cooler with rain."))
+    mem.add(Message("user", "Book a food tour for day two please."))
+    return mem
+
+
+def no_orphans(msgs: list[Message]) -&gt; bool:
+    calls = {c for m in msgs if m.role == "assistant" for c in m.tool_call_ids}
+    results = {m.tool_call_id for m in msgs if m.role == "tool"}
+    return calls == results
+
+
+def test_everything_fits() -&gt; None:
+    mem = convo(ConversationMemory(1000, WT))
+    assert mem.build() == mem.messages and mem.last_stats.dropped_units == 0
+
+
+def test_drops_oldest_units_and_keeps_the_latest() -&gt; None:
+    mem = convo(ConversationMemory(70, WT))
+    out = mem.build()
+    assert out[0].role == "system" and out[-1].content == "Book a food tour for day two please."
+    assert mem.last_stats.tokens &lt;= 70 and mem.last_stats.dropped_units &gt; 0
+    assert out[1:] == mem.messages[len(mem.messages) - len(out) + 1:]       # a suffix, in order
+
+
+def test_tool_call_and_results_stay_together() -&gt; None:
+    for budget in range(30, 140):
+        mem = convo(ConversationMemory(budget, WT))
+        try:
+            out = mem.build()
+        except BudgetTooSmall:
+            continue
+        assert no_orphans(out), budget
+        has_call = any(m.tool_call_ids for m in out)
+        assert has_call == any(m.role == "tool" for m in out)
+
+
+def test_system_and_pinned_messages_are_never_dropped() -&gt; None:
+    mem = ConversationMemory(60, WT)
+    mem.add(Message("system", "You are a travel assistant."))
+    mem.add(Message("user", "Remember: my partner is vegetarian.", pinned=True))
+    for i in range(10):
+        mem.add(Message("user", f"Question number {i} about something long enough to matter here."))
+        mem.add(Message("assistant", f"Answer number {i}."))
+    out = mem.build()
+    assert out[0].role == "system" and out[1].content.startswith("Remember")
+    assert out[-1].content == "Answer number 9." and mem.last_stats.tokens &lt;= 60
+
+
+def test_reserve_for_output_shrinks_the_window() -&gt; None:
+    a = convo(ConversationMemory(120, WT)).build()
+    b = convo(ConversationMemory(120, WT, reserve_output=40)).build()
+    assert len(b) &lt; len(a)
+
+
+def test_summary_replaces_dropped_units_incrementally() -&gt; None:
+    mem = ConversationMemory(80, WT, summariser=stub_summariser, summary_budget=20)
+    mem.add(Message("system", "Be brief."))
+    outs = []
+    for i in range(8):
+        mem.add(Message("user", f"Topic{i} details here please and thanks."))
+        mem.add(Message("assistant", f"Noted topic{i}."))
+        outs.append(mem.build())
+        assert mem.last_stats.tokens &lt;= 80
+    last = outs[-1]
+    assert last[1].content.startswith("[Summary of earlier conversation]")
+    assert "Topic5" in last[1].content and "Topic0" not in last[1].content   # oldest detail trimmed first
+    assert mem.summariser_calls &lt; 8                     # not called on every build
+    calls = mem.summariser_calls
+    mem.build()
+    assert mem.summariser_calls == calls                # nothing new dropped: no new call
+    # once folded into the summary, a unit never reappears verbatim
+    assert not any(m.content.startswith("Topic0") for m in last[2:])
+
+
+def test_summary_is_capped_to_its_budget() -&gt; None:
+    long_summary = lambda prev, dropped: "word " * 500
+    mem = ConversationMemory(60, WT, summariser=long_summary, summary_budget=15)
+    mem.add(Message("system", "Be brief."))
+    for i in range(10):
+        mem.add(Message("user", f"Message {i} with several words in it to use tokens."))
+    out = mem.build()
+    assert WT.count(out[1].content) &lt;= 15 and mem.last_stats.tokens &lt;= 60
+
+
+def test_tokenizer_is_pluggable() -&gt; None:
+    a = convo(ConversationMemory(105, WT)).build()                 # words: 8 messages fit
+    b = convo(ConversationMemory(105, CharTokenizer())).build()    # ~4 chars/token: 7 fit
+    assert (len(a), len(b)) == (8, 7) and no_orphans(a) and no_orphans(b)
+
+
+def test_budget_too_small_for_the_newest_unit() -&gt; None:
+    mem = convo(ConversationMemory(20, WT))
+    try:
+        mem.build()
+    except BudgetTooSmall as e:
+        assert "newest unit needs" in str(e)
+    else:
+        raise AssertionError("built an impossible window")
+
+
+def test_add_rejects_broken_tool_sequences() -&gt; None:
+    mem = ConversationMemory(100, WT)
+    mem.add(Message("user", "hi"))
+    for bad in (Message("tool", "x", tool_call_id="nope"), Message("narrator", "x")):
+        try:
+            mem.add(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+    mem.add(Message("assistant", "calling", tool_call_ids=("a",)))
+    try:
+        mem.add(Message("user", "interrupting before the result"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("allowed a message between a call and its result")
+
+
+def test_property_random_conversations() -&gt; None:
+    rng = random.Random(7)
+    for trial in range(300):
+        summarise = rng.random() &lt; 0.5
+        mem = ConversationMemory(rng.randint(40, 200), rng.choice([WT, CharTokenizer()]),
+                                 reserve_output=rng.choice([0, 10]),
+                                 summariser=stub_summariser if summarise else None,
+                                 summary_budget=15 if summarise else 0)
+        mem.add(Message("system", "System prompt " * rng.randint(1, 4)))
+        n_call = 0
+        for _ in range(rng.randint(1, 25)):
+            r = rng.random()
+            words = " ".join(rng.choice(["alpha", "beta", "gamma", "delta"]) for _ in range(rng.randint(1, 12)))
+            if r &lt; 0.15:
+                ids = tuple(f"c{n_call + k}" for k in range(rng.randint(1, 3)))
+                n_call += len(ids)
+                mem.add(Message("assistant", words, tool_call_ids=ids))
+                for cid in ids:
+                    mem.add(Message("tool", words, tool_call_id=cid))
+            else:
+                mem.add(Message(rng.choice(["user", "assistant"]), words, pinned=rng.random() &lt; 0.05))
+            try:
+                out = mem.build()
+            except BudgetTooSmall:
+                continue
+            assert out[0].role == "system"
+            assert no_orphans(out)
+            assert mem.last_stats.tokens &lt;= mem.budget - mem.reserve
+            body = [m for m in out if m.role != "system" and not m.pinned and not m.content.startswith("[Summary")]
+            nonpinned = [m for m in mem.messages if m.role != "system" and not m.pinned]
+            assert body == nonpinned[len(nonpinned) - len(body):]           # always a suffix, in order
+            assert out == mem.build()                                       # deterministic, idempotent
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
+    for t in tests:
+        t()
+        print("ok ", t.__name__)
+    print(f"{len(tests)} tests passed")</pre>
+
+<h4>11 · Edge cases</h4>
+<p><strong>No messages yet</strong>: the window is just the system prompt and pinned messages. <strong>A pinned set larger than the budget</strong>: available space is negative and the newest unit cannot fit, so <code>BudgetTooSmall</code> — pinned content must itself be budgeted. <strong>A huge tool result</strong>: one 50,000-token search result makes its whole unit unaffordable; truncate or summarise tool results before adding them, keeping the full output elsewhere. <strong>Pending tool calls at build time</strong>: the solution's <code>add</code> rejects other messages while calls are open, but a build in the middle of executing tools would send a call without results; build only between complete exchanges. <strong>Summariser failure</strong>: fall back to plain dropping for that build rather than failing the request. <strong>Tokenizer mismatch</strong>: when the counter is an estimate, keep a safety margin, and on a "prompt too long" error from the API, shrink the budget and rebuild.</p>
+
+<h4>12 · Extensions the interviewer will ask for</h4>
+<p><strong>Hysteresis</strong>: when overflowing, drop down to a low-water mark (say 60% of the budget) so several turns fit before the next fold, cutting summariser calls and keeping the prefix stable longer. <strong>Clearing old tool results</strong> instead of whole turns: tool outputs are usually most of the tokens, and replacing an old result's content with "[result cleared]" keeps the structure and the reasoning while freeing space — the approach provider-side context editing takes. <strong>Retrieval memory</strong>: store all messages and extracted facts outside the window and retrieve the relevant ones per turn. <strong>Exact counting</strong>: call the provider's token-counting endpoint for the final check before sending, with the heuristic for planning. <strong>Per-role budgets</strong>: cap the share of the window tool results may take. <strong>Server-side compaction</strong>: some APIs can summarise the history themselves when it nears a threshold, which moves this logic to the provider.</p>
+
+<h4>13 · Complexity</h4>
+<p><code>add</code> is O(k) to find open calls, where k is the distance back to the last assistant message with calls (small). <code>build</code> is O(n) to group and cost n messages, plus O(u) to scan u units for the suffix — linear per call, so O(n) per turn and O(n²) over a conversation if every turn rebuilds from scratch; caching per-message costs (they never change) makes the per-turn cost a cheap sum. Summarisation calls are bounded by the number of fold events, and the summary's size is bounded by its budget. Memory: O(n) for the full history.</p>
+</section>
+
+<section data-field="deep">
+<h4>Why the prefix must stay stable</h4>
+<p>Providers cache the computation for a request's prefix: tools first, then the system prompt, then the messages in order. When the next request begins with the same bytes, the cached part is far cheaper and faster to process. A memory design that rewrites early content every turn — re-summarising everything, reordering, renumbering — breaks the prefix at its first change and pays full price for everything after it, on every turn. The design here changes the prefix only at fold events: system and pinned messages never change, the summary changes only when units are folded in, and kept messages are appended in order. Hysteresis makes fold events rarer still. On a long agent run, the difference between a stable and an unstable prefix can be most of the input cost.</p>
+
+<h4>Summaries lose information, and errors compound</h4>
+<p>A summary is a lossy compression written by a model. Details it drops are gone for good under incremental summarisation, and mistakes it makes are carried into every later summary. Mitigations: pin facts that must survive (the user's constraints, decisions made, identifiers); ask the summariser for a structured summary (goals, decisions, open questions, key facts with values) rather than prose; evaluate summaries by whether later turns that needed old information still get it right; and for precise data, keep it in external storage and retrieve it rather than trusting the summary.</p>
+
+<h4>Long contexts are not free even when they fit</h4>
+<p>Models with very large context windows make it tempting to send everything. Three costs remain. Price scales with input tokens on every turn, so a long history makes each turn expensive. Latency grows with input length, mostly in time to first token. And quality can fall: models attend less reliably to information buried in the middle of long contexts, and irrelevant history distracts. A budget well below the maximum, chosen per product, is often better on all three axes; the memory component is where that choice is enforced.</p>
+
+<h4>Tool results dominate agent contexts</h4>
+<p>In agents, a single file read, search result or API response can be thousands of tokens, while the reasoning around it is short. Dropping whole old turns throws away the reasoning along with the bulky result. Clearing just the content of old tool results — keeping the call, the result's id and a placeholder — preserves the structure the API requires and the model's chain of decisions while reclaiming most of the space. Anthropic's context-engineering guidance describes this kind of tool-result clearing as one of the safest forms of compaction, and its API offers context editing that clears old tool results server-side.</p>
+
+<h4>Choosing what to pin automatically</h4>
+<p>Asking users to mark messages as pinned does not scale; most never will. Production systems detect standing instructions ("always answer in Spanish", "I'm allergic to nuts", "use metric units") and decisions ("we chose the 9:40 flight") and lift them into a pinned profile or a structured memory block that is rendered after the system prompt. Detection can be a cheap classifier or a model call run when a turn is added, off the critical path. The profile then has its own budget and its own update rules (a later "actually, imperial is fine" replaces the earlier entry), which keeps the history free to be dropped or summarised without losing what the user expects the assistant to remember. Getting this wrong is visible to users in a way most memory failures are not, because forgetting a stated preference feels like not listening.</p>
+
+<h4>Measuring memory quality</h4>
+<p>Unit tests prove the window is well-formed; they cannot prove it contains what the model needs. For that, build long-session evaluations: scripted conversations of 30-100 turns where late questions depend on early facts ("what was the budget I mentioned?", "which hotel did we rule out and why?"). Run them with different budgets, summarisation settings and pinning rules, and score whether answers use the early information correctly. This turns the knobs in this lesson — budget, summary budget, hysteresis — into measured trade-offs between cost and recall, rather than guesses.</p>
+
+<h4>Determinism is a feature</h4>
+<p>Given the same messages, the same budget and the same tokenizer, <code>build</code> returns the same window — the property test checks it. Determinism makes the memory testable, makes prompt caching effective, and makes bugs reproducible: a failing conversation can be replayed exactly. It rules out tempting heuristics such as random sampling of history or time-based decisions inside <code>build</code>; anything that varies (a summary) is computed once and stored.</p>
+</section>
+
+<section data-field="prod">
+<h4>How conversation memory fails in production</h4>
+<p><strong>"Prompt is too long" errors on long sessions.</strong> Cause: an estimating tokenizer undercounting (code and non-English text) or ignoring overhead and tool definitions. Detection: API rejections by session length. Fix: exact counting for the final check, a safety margin, and rebuild with a smaller budget on rejection.</p>
+<p><strong>Rejected histories after trimming.</strong> Cause: a tool result kept without its call. Detection: API validation errors mentioning tool ids. Fix: unit-based dropping and structural validation on add.</p>
+<p><strong>Assistant forgets its rules mid-conversation.</strong> Cause: the system prompt was dropped or summarised. Fix: pin it, and test that it is first in every window.</p>
+<p><strong>Assistant forgets user constraints.</strong> Cause: a constraint stated early was summarised away. Fix: detect and pin standing instructions, or extract them to a profile that is always included.</p>
+<p><strong>Costs rising per turn and low cache hits.</strong> Cause: an unstable prefix — re-summarising every turn, timestamps or counters injected early in the context. Detection: cached input tokens per request near zero. Fix: incremental summaries, hysteresis, nothing volatile before the history.</p>
+<p><strong>Summaries drift.</strong> Symptom: late in long sessions the assistant contradicts earlier decisions. Cause: compounding summary errors. Fix: structured summaries with explicit decisions and facts, and pinning.</p>
+
+<p><strong>Mismatch between estimate and bill.</strong> Symptom: per-session token counts in your logs disagree with the provider's usage reports. Cause: logging the estimator's count rather than the API's reported usage. Fix: log the usage the API returns on every response, and compare it with the estimate to tune the safety margin from real data rather than intuition.</p>
+
+<h4>What to measure</h4>
+<p>Input tokens per turn and their growth over a session; cached input tokens per turn; units dropped and summariser calls per session; summary length; <code>BudgetTooSmall</code> occurrences; API rejections for length or structure; and quality on long sessions, measured by evaluations that ask about information from early turns.</p>
+
+<p>Two of these deserve dashboards rather than logs: input tokens per turn plotted against turn number (a straight line rising without bound means the memory is not trimming; a sawtooth means folding is working), and cached input tokens as a share of input (a sudden drop after a deploy points straight at a prefix change).</p>
+
+<h4>Knobs</h4>
+<p>Total budget (well below the model's maximum, per product); output reserve; per-message overhead estimate; summary budget; low-water mark for hysteresis; maximum size of a single tool result before it is truncated or summarised on add; which messages are pinned automatically.</p>
+
+<h4>The real references</h4>
+<p>Anthropic's API documentation provides the pieces this component sits on: a token-counting endpoint that counts a request — messages, system prompt and tools — with the model's own tokenizer; documentation of how input and output share the context window; and prompt caching, which caches the request prefix in the order tools, system, messages, which is why the memory keeps early content stable. Anthropic's engineering post on context engineering for agents frames context as a finite resource with diminishing returns, and describes compaction — summarising a conversation nearing its limit and continuing with the summary — and clearing old tool results as the main techniques for long-running agents.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run the solution, then break it, measure it and extend it. Python 3.12, standard library only. After each break, run the property test as well as the named tests: it usually finds the same bug from a different direction, which is the best evidence that the invariants are the right ones.</p>
+<ol>
+<li>Save the full solution as <code>memory.py</code> and run it. Eleven tests pass in about a second.</li>
+<li><strong>Reproduce the worked example.</strong> Build the travel conversation at budgets 70, 80, 95 and 105 and print <code>last_stats</code> and the first words of each kept message. Check the numbers against section 6.</li>
+<li><strong>Break the units.</strong> Make <code>_units</code> put every message in its own unit. Which test fails first, and what does the failing window look like?</li>
+<li><strong>Break the cap.</strong> Change <code>_cap</code> to trim from the end. Which test fails, and what information does the summary lose?</li>
+<li><strong>Measure prefix stability.</strong> Simulate 50 turns with summarisation on. After each build, record the length of the common prefix (in messages) with the previous window. Then add hysteresis — drop to 60% of the budget when folding — and compare how many turns keep an identical prefix.</li>
+<li><strong>Extend it: clear tool results.</strong> Before dropping a unit, try replacing the content of its tool results with "[result cleared]" and recompute; only drop the unit if it still does not fit. Add a test that a cleared unit keeps its ids.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Work it out</b>
+<p>A model has a 32,000-token context shared by input and output. Your system prompt and tool definitions take 2,500 tokens; the user pinned a 200-token preference; replies may be up to 4,000 tokens; you keep a 10% safety margin because you estimate tokens at four characters each; the summary budget is 1,000. Each turn adds about 600 tokens, and every fifth turn calls a tool that returns about 3,000 tokens. How much history fits, and after roughly how many turns does the first fold happen?</p>
+<details><summary>Answer</summary>
+<p>Usable input: 32,000 − 4,000 reply = 28,000, minus the 10% margin (2,800) = 25,200; minus fixed parts 2,500 + 200 = 22,500 for history. Once folding starts, reserve 1,000 for the summary: 21,500. Five turns cost 5 × 600 + 3,000 = 6,000 tokens, so 22,500 holds about 3.75 five-turn blocks: the first fold happens at turn 20 (3 blocks = 15 turns = 18,000 tokens; turns 16-18 add 1,800 more to 19,800; turn 19 adds 600 more to 20,400; the tool turn 20 adds 3,600 and overflows). After that, each new turn folds the oldest unit(s); with hysteresis to 60% (13,500), the fold drops about 9,000 tokens at once and the next fold is about 13-15 turns later.</p>
+</details>
+<b>Diagnose it</b>
+<p>An agent's per-turn input cost doubled after a refactor, though windows look the same size. The API reports cached input tokens near zero on every turn, where they used to be most of the input. What changed?</p>
+<details><summary>Answer</summary>
+<p>The prefix is no longer stable. Likely culprits: the summary is now regenerated from the whole history every turn (so its text changes every turn), something volatile was added early in the context (a timestamp, a turn counter, a random request id in the system prompt), pinned messages are re-ordered (for example sorted by a dict whose order changed), or tool definitions are serialised in a non-deterministic order. Diff two consecutive requests byte by byte to find the first difference. Fix by making everything before the recent history deterministic and unchanged between folds: incremental summaries, no volatile values in the system prompt, stable ordering of tools and pinned messages.</p>
+</details>
+</section>

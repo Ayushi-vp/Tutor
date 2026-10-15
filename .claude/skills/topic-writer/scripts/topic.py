@@ -30,7 +30,7 @@ def content_file(name: str) -> Path:
     sys.exit(f"no content/tracks/{name}.json or content/designs/{name}.json")
 
 HTML_FIELDS = ["why", "primer", "body", "deep", "prod", "lab", "drill"]
-FIELD_ORDER = ["id", "t", "tag", "sum", "prereq", "why", "primer", "body", "deep", "prod",
+FIELD_ORDER = ["id", "t", "tag", "difficulty", "sum", "prereq", "why", "primer", "body", "deep", "prod",
                "myths", "lab", "recap", "glossary", "viz", "drill", "qa", "refs"]
 # Minimum words per HTML field. Below these the section is almost certainly a summary, not teaching.
 MIN_WORDS = {"why": 250, "primer": 500, "body": 1800, "deep": 700, "prod": 500, "lab": 250}
@@ -69,12 +69,17 @@ def all_ids() -> set[str]:
     return ids
 
 
-def check(topic: dict) -> tuple[list[str], list[str]]:
+def check(topic: dict, is_track: bool = True) -> tuple[list[str], list[str]]:
     errors, warns = [], []
     for k in ["id", "t", "tag", "sum", "why", "primer", "body", "deep", "prod", "lab", "drill",
               "myths", "recap", "glossary", "qa", "refs"]:
         if k not in topic:
             errors.append(f"missing field: {k}")
+    # Track topics earn XP by difficulty; design cases have none yet.
+    if is_track and "difficulty" not in topic:
+        errors.append("missing field: difficulty (E, M or H; sets the topic's XP)")
+    elif "difficulty" in topic and topic["difficulty"] not in ("E", "M", "H"):
+        errors.append(f"difficulty: must be E, M or H, not {topic['difficulty']!r}")
 
     total = 0
     for k in HTML_FIELDS:
@@ -145,7 +150,7 @@ def cmd_export(track: str, tid: str) -> None:
     t = next((x for x in topics if x["id"] == tid), None)
     if not t:
         sys.exit(f"{tid} not in {path.name}")
-    meta = {k: t.get(k) for k in ["id", "t", "tag", "sum", "viz", "prereq", "myths", "recap",
+    meta = {k: t.get(k) for k in ["id", "t", "tag", "difficulty", "sum", "viz", "prereq", "myths", "recap",
                                   "glossary", "qa", "refs"] if t.get(k) is not None}
     out = [f"<!-- topic source for {track}/{tid}; build with topic.py merge -->",
            '<script type="application/json" id="meta">',
@@ -160,7 +165,15 @@ def cmd_export(track: str, tid: str) -> None:
 
 def cmd_check(src: Path) -> tuple[dict, list[str]]:
     topic = parse(src)
-    errors, warns = check(topic)
+    track_json = TRACKS / f"{src.parent.name}.json"
+    if "difficulty" not in topic and track_json.exists():
+        # Source files exported before difficulty existed: keep the one already in the track JSON.
+        old = next((x for x in json.loads(track_json.read_text(encoding="utf-8"))
+                    if x["id"] == topic.get("id")), {})
+        if old.get("difficulty"):
+            topic["difficulty"] = old["difficulty"]
+            topic = {k: topic[k] for k in FIELD_ORDER if k in topic}
+    errors, warns = check(topic, is_track=not (DESIGNS / f"{src.parent.name}.json").exists())
     counts = {k: words(topic.get(k, "")) for k in HTML_FIELDS}
     print(f"{topic.get('id')}: " + ", ".join(f"{k} {n}" for k, n in counts.items())
           + f" | qa {len(topic.get('qa', []))}, glossary {len(topic.get('glossary', []))}")

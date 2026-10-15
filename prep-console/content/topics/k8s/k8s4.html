@@ -1,0 +1,389 @@
+<!-- topic source for k8s/k8s4; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "k8s4",
+  "t": "Docker networking, volumes and Docker Compose",
+  "tag": "Containers",
+  "sum": "How a container gets an IP address (network namespace, veth pair, bridge), a published port traced packet by packet through iptables DNAT and conntrack, container DNS on user-defined networks, the network drivers, bind mounts versus named volumes versus tmpfs, and a multi-service app in Docker Compose with health-gated start-up.",
+  "prereq": [
+    ["k8s1", "docker run creates a network namespace and a veth pair attached to the docker0 bridge, and a container's writable layer disappears when it is removed."],
+    ["k8s2", "Image layers are read-only lower directories under OverlayFS; writes to the writable layer pay copy-up and are slow for heavy I/O."],
+    ["net13", "A socket is bound to an IP address and port; a server listens and accepts connections, and the kernel demultiplexes packets to sockets by address and port."]
+  ],
+  "myths": [
+    ["EXPOSE 80 in a Dockerfile makes port 80 reachable.", "EXPOSE is documentation in the image config. Nothing is opened. A port becomes reachable from outside the host only when you publish it with -p (or Compose ports:), which makes Docker add NAT rules. Containers on the same user-defined network can reach each other's listening ports whether or not they are exposed."],
+    ["My host firewall (ufw) protects published container ports.", "Docker inserts its own iptables rules, and traffic to a published port is rewritten in the nat table's PREROUTING chain and then forwarded, so it never passes through the INPUT rules that ufw manages. Docker's docs warn that ufw and Docker are incompatible in this way. Publish to 127.0.0.1 when only the host needs access, or add rules to the DOCKER-USER chain."],
+    ["Containers can find each other by name on any Docker network.", "Only on user-defined networks (and in Compose, which creates one per project). Containers on the default bridge network get no automatic name resolution and can only reach each other by IP or the legacy --link option."],
+    ["localhost inside a container is the host.", "Each container has its own network namespace, so localhost (127.0.0.1) is the container itself. To reach a service on the host, use the bridge gateway address, host.docker.internal (Docker Desktop, or --add-host host.docker.internal:host-gateway on Linux), or host networking."],
+    ["A bind mount and a named volume are the same thing with different syntax.", "A bind mount maps a specific host path into the container, with the host's ownership and permissions, and hides whatever the image had at that path. A named volume is a directory Docker creates and manages under its data root; if it is empty when first mounted, Docker copies the image's files at that path into it. Volumes are portable between hosts' configurations; bind mounts depend on the host's directory layout."],
+    ["depends_on makes Compose wait until the database is ready.", "Plain depends_on only orders container start-up: the database container is started before the app, not made ready. Use depends_on with condition: service_healthy and a healthcheck on the database, and still make the app retry connections, because readiness can change later."]
+  ],
+  "recap": [
+    "A container on the default bridge driver has its own network namespace with an eth0 that is one end of a veth pair; the other end is attached to a Linux bridge on the host, such as docker0 with gateway 172.17.0.1.",
+    "Outgoing traffic from containers is source-NATed (masqueraded) to the host's address, and replies are translated back by connection tracking.",
+    "Publishing a port (-p 8080:80) adds a DNAT rule that rewrites the destination of packets arriving at the host's port 8080 to the container's IP and port 80; conntrack reverses it on replies.",
+    "Published ports bind to all host addresses by default and bypass ufw's INPUT rules; bind to 127.0.0.1 or filter in DOCKER-USER to restrict them.",
+    "User-defined networks give containers DNS resolution of each other's names through Docker's embedded DNS server at 127.0.0.11; the default bridge does not.",
+    "Other drivers trade isolation for speed or reach: host shares the host's network namespace, none gives only loopback, macvlan and ipvlan put containers directly on the physical network, and overlay spans hosts.",
+    "Bind mounts map a host path, named volumes are Docker-managed directories that are pre-populated from the image when empty, and tmpfs mounts live in memory; all three bypass the overlay file system.",
+    "Docker Compose describes services, networks and volumes in compose.yaml, creates a project network where services resolve each other by service name, and with healthchecks and depends_on conditions can start dependencies in a safe order."
+  ],
+  "glossary": [
+    ["bind mount", "A mount that makes an existing host file or directory appear at a path inside the container."],
+    ["bridge (Linux)", "A virtual network switch inside the kernel. Interfaces attached to it can exchange Ethernet frames as if plugged into the same switch."],
+    ["Compose file", "A YAML file (compose.yaml) following the Compose Specification that declares an application's services, networks, volumes, configs and secrets."],
+    ["conntrack", "The kernel's connection-tracking table, which remembers each flow so that NAT rewrites applied to the first packet are applied consistently to the rest and reversed on replies."],
+    ["DNAT", "Destination network address translation: rewriting a packet's destination IP and/or port, used to forward a host port to a container."],
+    ["DOCKER-USER chain", "An iptables chain Docker creates and never modifies, evaluated before Docker's own forwarding rules, where administrators add filtering for container traffic."],
+    ["embedded DNS server", "A resolver Docker runs for containers on user-defined networks, reachable at 127.0.0.11 inside the container, that answers container and service names."],
+    ["host network mode", "Running a container in the host's network namespace, so it uses the host's interfaces and ports directly with no NAT and no isolation."],
+    ["masquerade", "A form of source NAT that rewrites outgoing packets' source address to the address of the interface they leave by, so containers with private IPs can reach the internet."],
+    ["MTU", "Maximum transmission unit: the largest packet size an interface sends without fragmentation, commonly 1500 bytes on Ethernet."],
+    ["named volume", "Storage created and managed by Docker (by default a directory under /var/lib/docker/volumes), referred to by name and independent of any container's life."],
+    ["network namespace", "A kernel namespace with its own interfaces, IP addresses, routing table, firewall rules and port space."],
+    ["overlay network", "A Docker network that spans several hosts by encapsulating container traffic (VXLAN) between them, used by Docker Swarm."],
+    ["publish (a port)", "Asking Docker to make a container port reachable on a host address and port, implemented with NAT rules and, in some cases, a user-space proxy."],
+    ["tmpfs mount", "A mount backed by memory rather than disk; its contents vanish when the container stops."],
+    ["veth pair", "Two virtual Ethernet interfaces connected back to back: a frame sent into one comes out of the other. Used to link a network namespace to the host."]
+  ],
+  "qa": [
+    ["E", "How does a container get network access by default?", "Docker creates a network namespace for it and a veth pair. One end becomes the container's eth0 with an address on the bridge's subnet, typically 172.17.0.x, and a default route via the bridge gateway 172.17.0.1. The other end is attached to the docker0 bridge on the host. Outgoing packets are masqueraded to the host's IP so they can reach the internet, and replies come back through connection tracking."],
+    ["E", "What is the difference between EXPOSE and -p?", "EXPOSE only records in the image config which ports the app listens on; it opens nothing. -p host:container publishes a port: Docker adds NAT rules so connections to the host's port are forwarded to the container's IP and port. Containers on the same network can reach each other's ports either way."],
+    ["E", "How do containers in a Compose project find each other?", "Compose creates a user-defined network for the project and attaches every service to it. Docker's embedded DNS server, at 127.0.0.11 inside each container, resolves service names to the containers' IPs, so the app connects to db:5432. If a service has several replicas, the name returns all of their addresses."],
+    ["M", "Trace a packet from a client on the internet to a container published with -p 8080:80.", "The packet arrives at the host's eth0 with destination host-IP:8080. In the nat table's PREROUTING chain, Docker's DOCKER chain matches port 8080 and DNATs it to 172.17.0.2:80, and conntrack records the flow. The routing decision now says forward, so it goes through the FORWARD chain, where Docker's rules accept it, out through docker0 and the veth to the container's eth0. The reply from 172.17.0.2:80 goes to the client's address; conntrack recognises the flow and rewrites the source back to host-IP:8080 before it leaves.", "Follow-up: Why doesn't ufw block it? — ufw filters the INPUT chain, but after DNAT the packet is forwarded, not delivered to a host socket, so it goes through FORWARD and Docker's chains instead."],
+    ["M", "Your containerised app can't reach a database running on the host at localhost:5432. Why, and how do you fix it?", "Inside the container, localhost is the container's own loopback in its own network namespace, not the host. Connect to the host's bridge address or host.docker.internal (add --add-host=host.docker.internal:host-gateway on Linux), and make sure the database listens on that interface, not only on 127.0.0.1. Alternatively run the app with --network host, giving up isolation."],
+    ["M", "When would you use host networking?", "When NAT and the bridge add measurable overhead or break something: very high packet rates, many ports or port ranges, protocols that embed addresses, or tools that must see the host's interfaces such as monitoring agents and network plugins. The cost is no isolation: the container shares the host's ports, so two copies can't both bind 8080. In Kubernetes, hostNetwork: true is used mainly for system DaemonSets."],
+    ["M", "Compare bind mounts, named volumes and tmpfs.", "A bind mount maps a host path in; it is ideal for development source code and for host files like sockets, but it depends on the host's layout and permissions. A named volume is managed by Docker, survives container removal, is pre-populated from the image if empty, and is the right choice for database data on a single host. tmpfs lives in RAM, disappears on stop, and suits scratch space and secrets that should never touch disk. All three bypass the overlay file system, so writes are fast."],
+    ["M", "Why does a Postgres container lose its data after docker compose down and up?", "If the data directory was not on a volume, it was in the container's writable layer, which is deleted when compose down removes the container. Mount a named volume at /var/lib/postgresql/data (the path the image expects). Note that docker compose down -v also deletes named volumes, which is a common accident."],
+    ["H", "Containers on a cloud VM can resolve names and open TCP connections, but HTTPS requests to some sites hang. What might be wrong?", "An MTU mismatch. If the VM's network or a VPN has an MTU below 1500 (some clouds use 1460, tunnels less), but the Docker bridge uses 1500, large packets such as a TLS certificate chain are too big; if ICMP 'fragmentation needed' messages are blocked, path MTU discovery fails and the connection stalls after the handshake starts. Small packets like DNS and SYNs work. Set the bridge MTU (com.docker.network.driver.mtu, or the daemon's mtu option) to match.", "Follow-up: How would you confirm it? — ping with the do-not-fragment flag and decreasing sizes from inside the container, or capture with tcpdump and look for retransmitted large segments."],
+    ["H", "How would you restrict which external clients can reach a published container port on a Linux host?", "Add rules to the DOCKER-USER chain, which Docker evaluates before its own forwarding rules and never overwrites, matching on the original destination port with conntrack (--ctorigdstport) because the packet has already been DNATed. Or avoid the problem by publishing only on 127.0.0.1 and putting a reverse proxy in front, or using a user-defined network with no published ports and letting only the proxy publish."],
+    ["H", "Design the local development environment for a service with Postgres, Redis and a worker, using Compose.", "Define four services. Postgres and Redis use pinned images, named volumes for data and healthchecks. The API and worker build from the same Dockerfile target, bind-mount the source for live reload, read configuration from an env file and connect to db and redis by service name. They use depends_on with condition: service_healthy, and still retry connections at start-up. Publish only the API port, bound to 127.0.0.1. Use profiles for optional tools like an admin UI, and docker compose watch or bind mounts for fast iteration.", "Follow-up: How does this map to Kubernetes later? — Services become Deployments or StatefulSets, service names become Kubernetes Service DNS names, volumes become PersistentVolumeClaims, and healthchecks become readiness probes (k8s7-k8s9)."]
+  ],
+  "refs": [
+    ["docs", "Docker docs — Port publishing and mapping", "Default 0.0.0.0/[::] binding, the security warning, localhost-only publishing and the Docker 28 change for same-LAN access.", "https://docs.docker.com/engine/network/port-publishing/"],
+    ["docs", "Docker docs — Bridge network driver", "User-defined versus default bridges: DNS resolution, isolation, options such as MTU.", "https://docs.docker.com/engine/network/drivers/bridge/"],
+    ["docs", "Docker docs — Docker with iptables", "The chains Docker creates (DOCKER-USER, DOCKER-FORWARD, DOCKER, nat DOCKER) and how to add your own rules.", "https://docs.docker.com/engine/network/firewall-iptables/"],
+    ["docs", "Docker docs — Packet filtering and firewalls", "IP forwarding, firewalld integration and why ufw does not see published container traffic.", "https://docs.docker.com/engine/network/packet-filtering-firewalls/"],
+    ["docs", "Docker docs — Volumes", "Named volumes, population from the image, drivers, and backup and restore.", "https://docs.docker.com/engine/storage/volumes/"],
+    ["docs", "Compose Specification — services", "depends_on conditions, healthcheck, networks, volumes and profiles.", "https://docs.docker.com/reference/compose-file/services/"]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A developer containerises a web API and a Postgres database on a laptop. The API cannot connect: it is configured for <code>localhost:5432</code>, which worked when both ran directly on the laptop. They try <code>172.17.0.2</code>, which works until the database container is recreated and gets a different address. They publish the database port with <code>-p 5432:5432</code> to "make it reachable", which works — and also makes the database reachable from the coffee shop's Wi-Fi, because the laptop's firewall never sees the traffic. They restart everything the next morning and all the data is gone.</p>
+<p>In production the problems look different but come from the same place. A team runs containers on cloud VMs with <code>ufw</code> blocking everything except SSH, and later discovers their Redis was open to the internet for months because published container ports bypass <code>ufw</code>. Another team sees HTTPS calls from containers hang on one cloud while working on another, which turns out to be a packet-size mismatch between the VM network and the container bridge. A third finds their database running ten times slower in a container than outside it, because the data was being written into the container's writable layer.</p>
+<p>Every one of these is explained by a few mechanisms that Docker sets up quietly: a network namespace per container joined to the host by a virtual cable and a virtual switch; address translation rules that rewrite packets on their way in and out; an embedded DNS server that only some networks get; and three kinds of mounts that put data outside the container's disposable layer.</p>
+<p>This lesson builds those mechanisms from the bottom. It starts with how a single container gets an IP address, follows a packet to a published port and back with every rewrite shown, explains container-to-container naming, compares the network drivers, then turns to storage — bind mounts, volumes and tmpfs — and finishes by putting a three-service application together in Docker Compose. Kubernetes networking (k8s8) and storage (k8s9) build directly on these ideas, so the time spent here pays off twice.</p>
+</section>
+
+<section data-field="primer">
+<h4>Flats, a corridor switch and a front desk</h4>
+<p>Picture a building of flats. Each flat (a container) has its own phone line with its own internal number (a private IP address such as <code>172.17.0.2</code>); nobody outside the building can dial it directly. All the lines run to a switchboard in the corridor (a <strong>bridge</strong>, <code>docker0</code>), so flats can call each other. The building has one public phone number (the host's IP). When someone outside calls the public number and asks for extension 8080, the front desk (the host's <strong>NAT rules</strong>) has a note: "extension 8080 goes to flat 2, port 80". It connects the call and remembers it, so the reply goes back through the same desk. When a flat calls out, the desk makes the call from the building's public number, so the world never sees the private ones.</p>
+<p>That is almost exactly how Docker's default networking works:</p>
+<ul>
+<li>Each container gets a <strong>network namespace</strong> (os13): its own interfaces, routes, firewall rules and ports. Its <code>localhost</code> is its own.</li>
+<li>A <strong>veth pair</strong> — two virtual network interfaces wired back to back — links the namespace to the host. One end is <code>eth0</code> inside the container; the other is plugged into the <code>docker0</code> bridge on the host.</li>
+<li><strong>NAT rules</strong> in the host's firewall rewrite addresses: outgoing traffic leaves as the host's IP (masquerade), and incoming traffic to a published port is redirected to the right container (DNAT).</li>
+<li>On networks you create yourself, an <strong>embedded DNS server</strong> lets containers find each other by name instead of by address.</li>
+</ul>
+<figure>
+<svg viewBox="0 0 640 280" width="100%" role="img" aria-label="Host with eth0, iptables NAT, the docker0 bridge and two containers linked by veth pairs">
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="10" y="10" width="620" height="260" rx="8" style="fill:none;stroke:var(--line-2)"/>
+    <text x="24" y="30" style="fill:var(--ink);font-weight:600">Host (root network namespace)</text>
+    <rect x="30" y="50" width="150" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="105" y="68" text-anchor="middle" style="fill:var(--ink)">eth0</text>
+    <text x="105" y="83" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">198.51.100.10</text>
+    <rect x="230" y="50" width="180" height="40" rx="5" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="320" y="68" text-anchor="middle" style="fill:var(--ink)">iptables nat + filter</text>
+    <text x="320" y="83" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">:8080 → 172.17.0.2:80</text>
+    <line x1="180" y1="70" x2="230" y2="70" style="fill:none;stroke:var(--ink-2)"/>
+    <rect x="200" y="130" width="240" height="36" rx="5" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="320" y="153" text-anchor="middle" style="fill:var(--ink)">docker0 bridge  172.17.0.1/16</text>
+    <line x1="320" y1="90" x2="320" y2="130" style="fill:none;stroke:var(--ink-2)"/>
+    <line x1="260" y1="166" x2="160" y2="200" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <line x1="380" y1="166" x2="480" y2="200" style="fill:none;stroke:var(--ink-2);stroke-dasharray:4 3"/>
+    <text x="175" y="185" style="fill:var(--muted)">veth pair</text>
+    <text x="440" y="185" style="fill:var(--muted)">veth pair</text>
+    <rect x="60" y="200" width="200" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="160" y="220" text-anchor="middle" style="fill:var(--ink);font-weight:600">container "web"</text>
+    <text x="160" y="240" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">eth0 172.17.0.2  :80</text>
+    <rect x="380" y="200" width="200" height="56" rx="6" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="480" y="220" text-anchor="middle" style="fill:var(--ink);font-weight:600">container "db"</text>
+    <text x="480" y="240" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">eth0 172.17.0.3  :5432</text>
+  </g>
+</svg>
+<figcaption>Each dashed line is a virtual cable: one end inside a container's namespace, the other plugged into docker0. Only the NAT rule connects the outside world to a container, and only for the ports you published.</figcaption>
+</figure>
+<p>Notice what the picture does <em>not</em> contain: no virtual network card emulated in software, no second operating system's network stack, no tunnel. Every box is an ordinary kernel object — a namespace, an interface, a bridge, a firewall rule — that you can list with standard Linux tools. That is why container networking is fast, and why debugging it is mostly a matter of knowing which object to look at.</p>
+<h4>Storage, in the same picture</h4>
+<p>The container's own files live in its writable layer, which is slow for heavy writes (copy-up, k8s2) and deleted with the container. To keep data, or to share it with the host, you <strong>mount</strong> something into the container at a path: a host directory (a <strong>bind mount</strong>), a Docker-managed directory (a <strong>named volume</strong>), or a piece of memory (<strong>tmpfs</strong>). In the flats analogy, that is a storage unit outside the flat, reached through a door in the wall: if the flat is demolished and rebuilt, the storage unit is still there.</p>
+<h4>And Compose ties it together</h4>
+<p><strong>Docker Compose</strong> describes a multi-container application in one YAML file: which images, which networks, which volumes, which ports, in which order to start. <code>docker compose up</code> turns that description into exactly the namespaces, bridges, NAT rules and mounts described above. Where the analogy breaks: NAT and bridges cost almost nothing per packet, unlike a human front desk, but they do change addresses — and anything that depends on seeing the original address or on the host firewall's view of traffic has to account for that.</p>
+</section>
+
+<section data-field="body">
+<h4>1. One container's network, built by hand</h4>
+<p>When Docker starts a container on the default <strong>bridge</strong> network, it does the following, which you could reproduce with the <code>ip</code> command:</p>
+<ol>
+<li>Create a new <strong>network namespace</strong>. Inside it there is only a loopback interface, <code>lo</code>, which is down.</li>
+<li>Create a <strong>veth pair</strong>, for example <code>vethab12cd</code> and its peer. A frame sent into one end comes out of the other, like a cable.</li>
+<li>Move the peer into the container's namespace and rename it <code>eth0</code>. Leave the other end in the host namespace and attach it to the bridge <code>docker0</code>.</li>
+<li>Assign <code>eth0</code> an address from the bridge's subnet. Docker's IP address manager (IPAM) picks the next free one: on a default install the subnet is usually <code>172.17.0.0/16</code>, the bridge itself has <code>172.17.0.1</code>, and the first container gets <code>172.17.0.2</code>.</li>
+<li>Add a default route inside the container: <code>default via 172.17.0.1 dev eth0</code>. Bring up <code>lo</code> and <code>eth0</code>.</li>
+<li>Write <code>/etc/resolv.conf</code>, <code>/etc/hosts</code> and <code>/etc/hostname</code> for the container (k8s1's bind-mounted files).</li>
+</ol>
+<p>A <strong>Linux bridge</strong> is a software switch in the kernel. It learns which MAC address is behind which attached interface and forwards Ethernet frames between them, so two containers on <code>docker0</code> talk to each other directly at layer 2, never leaving the host. The bridge also has an IP address (<code>172.17.0.1</code>), which makes the host a router for the containers: packets for anywhere else go to the bridge, and the host decides what to do with them.</p>
+
+<h4>2. Getting out: masquerade</h4>
+<p>Container addresses like <code>172.17.0.2</code> are private; nothing on the internet can route back to them. So when a container connects out, the host rewrites the source address. The host must have IP forwarding enabled (Docker turns it on), and Docker adds a rule to the <code>nat</code> table's POSTROUTING chain that says, in effect, "packets from 172.17.0.0/16 leaving by any interface other than docker0: <strong>MASQUERADE</strong>". Masquerade is source NAT to whatever address the outgoing interface has.</p>
+<p>Trace a container fetching a web page:</p>
+<table>
+<thead><tr><th>Where</th><th>Source</th><th>Destination</th><th>What happened</th></tr></thead>
+<tbody>
+<tr><td>Leaves container eth0</td><td>172.17.0.2:40312</td><td>93.184.215.14:443</td><td>Normal connect()</td></tr>
+<tr><td>Leaves host eth0</td><td>198.51.100.10:40312</td><td>93.184.215.14:443</td><td>MASQUERADE; conntrack records the mapping</td></tr>
+<tr><td>Reply arrives at host</td><td>93.184.215.14:443</td><td>198.51.100.10:40312</td><td>conntrack matches the flow</td></tr>
+<tr><td>Delivered to container</td><td>93.184.215.14:443</td><td>172.17.0.2:40312</td><td>Destination rewritten back</td></tr>
+</tbody>
+</table>
+<p>The bookkeeping is done by <strong>conntrack</strong>, the kernel's connection-tracking table. NAT rules are consulted only for the first packet of a flow; conntrack records the translation and applies it, in both directions, to every later packet. (If the source port is already in use on the host, the kernel picks a different one and records that too.) You can see these entries with <code>conntrack -L</code>.</p>
+
+<h4>3. Getting in: a published port, packet by packet</h4>
+<p>Now the reverse. The container runs nginx on port 80 and was started with <code>-p 8080:80</code>. A client at <code>203.0.113.5</code> connects to <code>198.51.100.10:8080</code>. Docker has added a <strong>DNAT</strong> rule (destination NAT) to its <code>DOCKER</code> chain in the <code>nat</code> table: TCP to port 8080 on any local address, not arriving from docker0, has its destination changed to <code>172.17.0.2:80</code>. It has also added a rule to its filter chains to accept forwarded traffic to <code>172.17.0.2:80</code> on docker0.</p>
+<figure>
+<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Sequence of a SYN to a published port: DNAT in PREROUTING, forward through filter chains, delivery to the container, and the reply translated back by conntrack">
+  <defs><marker id="k8s4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="70" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Client</text>
+    <text x="320" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Host kernel</text>
+    <text x="570" y="20" text-anchor="middle" style="fill:var(--ink);font-weight:600">Container</text>
+    <line x1="70" y1="30" x2="70" y2="290" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="320" y1="30" x2="320" y2="290" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="570" y1="30" x2="570" y2="290" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="70" y1="48" x2="316" y2="68" marker-end="url(#k8s4-arrow)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+    <text x="190" y="46" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">SYN 203.0.113.5:51000 → .10:8080</text>
+    <rect x="236" y="76" width="168" height="44" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+    <text x="320" y="94" text-anchor="middle" style="fill:var(--ink)">PREROUTING: DNAT</text>
+    <text x="320" y="110" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">dst → 172.17.0.2:80</text>
+    <rect x="236" y="126" width="168" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="320" y="146" text-anchor="middle" style="fill:var(--ink)">FORWARD: DOCKER-USER, DOCKER</text>
+    <line x1="324" y1="160" x2="566" y2="182" marker-end="url(#k8s4-arrow)" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>
+    <text x="450" y="160" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">203.0.113.5:51000 → 172.17.0.2:80</text>
+    <line x1="566" y1="206" x2="324" y2="228" marker-end="url(#k8s4-arrow)" style="fill:none;stroke:var(--good);stroke-width:1.5"/>
+    <text x="450" y="205" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">SYN-ACK 172.17.0.2:80 → .5:51000</text>
+    <rect x="236" y="232" width="168" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--good)"/>
+    <text x="320" y="252" text-anchor="middle" style="fill:var(--ink)">conntrack: un-DNAT src</text>
+    <line x1="316" y1="266" x2="74" y2="284" marker-end="url(#k8s4-arrow)" style="fill:none;stroke:var(--good);stroke-width:1.5"/>
+    <text x="190" y="270" text-anchor="middle" style="fill:var(--ink-2);font-family:var(--mono)">SYN-ACK .10:8080 → 203.0.113.5:51000</text>
+  </g>
+</svg>
+<figcaption>The client only ever sees 198.51.100.10:8080; the container sees the client's real address. The translation happens once, on the first packet, and conntrack applies it to everything after — including reversing it on the reply.</figcaption>
+</figure>
+<ol>
+<li><strong>SYN arrives</strong> at the host's <code>eth0</code>: <code>203.0.113.5:51000 → 198.51.100.10:8080</code>.</li>
+<li><strong>PREROUTING (nat).</strong> Before any routing decision, the packet passes Docker's <code>DOCKER</code> chain, which matches port 8080 and rewrites the destination: now <code>203.0.113.5:51000 → 172.17.0.2:80</code>. conntrack creates an entry recording both versions.</li>
+<li><strong>Routing.</strong> The destination is no longer a local address but one on the docker0 subnet, so the kernel will <em>forward</em> the packet rather than deliver it to a local socket. This is the key fact: the packet never passes through the INPUT chain.</li>
+<li><strong>FORWARD (filter).</strong> The packet passes <code>DOCKER-USER</code> (empty unless an administrator added rules), then Docker's forwarding chains, which accept it because the port is published.</li>
+<li><strong>Delivery.</strong> Out of <code>docker0</code>, through the veth pair, into the container's <code>eth0</code>. nginx's listening socket on port 80 accepts it. Note that nginx sees the client's real address <code>203.0.113.5</code>.</li>
+<li><strong>Reply.</strong> nginx answers <code>172.17.0.2:80 → 203.0.113.5:51000</code>. On the way out of the host, conntrack recognises the flow and rewrites the source back to <code>198.51.100.10:8080</code>, so the client sees a reply from the address it called.</li>
+</ol>
+<p>Two consequences matter in practice. First, <strong>published ports bypass the host firewall's INPUT rules</strong>. Tools like <code>ufw</code> and many hand-written firewalls filter INPUT, because that is where traffic for the host's own services goes. Container traffic goes through FORWARD instead, where Docker's rules accept it. Docker's documentation says plainly that Docker and ufw are incompatible in this way. Second, by default <code>-p 8080:80</code> publishes on <strong>all host addresses</strong> (<code>0.0.0.0</code> and <code>[::]</code>), and Docker's docs call that "insecure by default". Write <code>-p 127.0.0.1:8080:80</code> when only the host itself should connect, and put filtering for container traffic in the <code>DOCKER-USER</code> chain, which Docker creates, evaluates first and never modifies.</p>
+<p>Two more details. Traffic from the host to its own published port (<code>curl localhost:8080</code>) does not come in through PREROUTING on eth0, so Docker also handles it — historically with a small user-space forwarder, <code>docker-proxy</code>, which is still enabled by default for cases NAT cannot cover. And Docker 28.0 tightened a long-standing gap: in older releases, hosts on the same local network segment could reach ports published only to the Docker host's localhost; from 28.0 that is blocked by default.</p>
+
+<h4>4. Names: the embedded DNS server</h4>
+<p>Container IPs change whenever a container is recreated, so applications should use names. Here the default bridge is a trap: containers on <code>docker0</code> get the host's DNS settings and no way to resolve each other's names (except the legacy <code>--link</code> flag). On a <strong>user-defined network</strong> (<code>docker network create appnet</code>), Docker provides an <strong>embedded DNS server</strong>. Inside each container, <code>/etc/resolv.conf</code> says <code>nameserver 127.0.0.11</code>, and Docker intercepts queries to that address in the container's namespace:</p>
+<ul>
+<li>A query for another container's name or network alias on the same network is answered with its current IP, for example <code>db → 172.18.0.3</code>.</li>
+<li>Anything else is forwarded to the host's upstream resolvers.</li>
+</ul>
+<p>User-defined networks also isolate: containers on <code>appnet</code> cannot reach containers on another user-defined network unless connected to both. The default bridge connects every container that did not ask for a network, which is why Docker's docs recommend user-defined networks for anything real. Each one gets its own bridge (<code>br-&lt;id&gt;</code>) and subnet (often <code>172.18.0.0/16</code>, <code>172.19.0.0/16</code> and so on).</p>
+
+<h4>5. The other network drivers</h4>
+<p>The bridge driver is the default, but Docker has others, each a different trade-off between isolation, performance and reach.</p>
+<table>
+<thead><tr><th>Driver</th><th>What the container gets</th><th>Use it for</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td>bridge</td><td>Own namespace, private IP behind NAT</td><td>The default for single-host apps</td><td>NAT, port mapping</td></tr>
+<tr><td>host</td><td>The host's own network namespace</td><td>High packet rates, many ports, node agents</td><td>No network isolation; port clashes</td></tr>
+<tr><td>none</td><td>Loopback only</td><td>Batch jobs that must not talk to the network</td><td>No networking</td></tr>
+<tr><td>macvlan / ipvlan</td><td>An address directly on the physical LAN</td><td>Legacy apps that need to look like a machine on the LAN</td><td>Needs LAN cooperation; host-to-container quirks</td></tr>
+<tr><td>overlay</td><td>A private network spanning several hosts (VXLAN)</td><td>Docker Swarm services</td><td>Encapsulation overhead; Swarm only</td></tr>
+</tbody>
+</table>
+<p><strong>Host networking</strong> deserves a note because Kubernetes uses it too (<code>hostNetwork: true</code>): the container shares the host's interfaces and port space, so there is no NAT, no veth hop and no port mapping, and also no isolation. It is the choice for network plugins, node monitoring agents and occasionally extreme-throughput services. Kubernetes networking (k8s8) replaces Docker's bridge-plus-NAT model with a flat one in which every pod has a routable IP; the veth pair per pod survives, the per-host NAT for incoming traffic does not.</p>
+
+<h4>6. Container to container, and across networks</h4>
+<p>Put the pieces together and trace the Compose-style case: an <code>api</code> container (<code>172.18.0.4</code>) calls a <code>db</code> container (<code>172.18.0.3</code>) on the same user-defined network <code>appnet</code>, whose bridge is <code>br-7a1c</code> with gateway <code>172.18.0.1</code>.</p>
+<ol>
+<li>The app resolves <code>db</code>: its resolver sends a query to <code>127.0.0.11</code>, Docker's embedded DNS server answers <code>172.18.0.3</code>.</li>
+<li>The kernel in <code>api</code>'s namespace sees that <code>172.18.0.3</code> is on the directly connected subnet of <code>eth0</code>, so it sends an ARP request ("who has 172.18.0.3?") out of <code>eth0</code>. The frame crosses the veth pair to the bridge, which floods it to its ports; <code>db</code>'s <code>eth0</code> answers with its MAC address.</li>
+<li>The SYN goes from <code>api</code>'s <code>eth0</code>, through its veth, across the bridge (which has now learned which port leads to which MAC), through <code>db</code>'s veth, to <code>db</code>'s <code>eth0</code>. No NAT, no published port, no routing through the host's IP stack beyond the bridge's forwarding (bridged traffic can still be filtered by iptables when the <code>br_netfilter</code> module is loaded, which Docker relies on for isolation rules).</li>
+<li>Postgres sees the real source address <code>172.18.0.4</code>, so its access rules can match on the network's subnet.</li>
+</ol>
+<p>Two containers on <em>different</em> user-defined networks cannot talk at all: Docker installs isolation rules that drop traffic between its bridges. To let a container reach both, connect it to both networks (<code>docker network connect</code>); it then gets an interface and an address on each. This is how a reverse proxy can sit on a "frontend" network with published ports and also on a "backend" network with the databases, while the databases have no route to the outside at all — a small-scale version of the network segmentation that Kubernetes NetworkPolicy provides (k8s8).</p>
+<p>The default bridge has one more legacy knob: inter-container communication (<code>icc</code>) can be disabled daemon-wide, so containers on <code>docker0</code> cannot reach each other except through published ports. User-defined networks make that unnecessary, because isolation is the default between them and sharing is explicit.</p>
+
+<h4>7. Storage: three kinds of mounts</h4>
+<p>Everything a container writes to its own file system goes to its writable layer: slowed by copy-up, tied to that container, deleted with it (k8s2). Data that must persist, be shared, or be written heavily goes into a <strong>mount</strong> instead. All three kinds bypass OverlayFS entirely, so I/O runs at the speed of the underlying file system.</p>
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img" aria-label="Three kinds of mounts: bind mount from a host path, named volume from Docker's data directory, tmpfs from memory, all bypassing the overlay root">
+  <defs><marker id="k8s4-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <rect x="190" y="14" width="260" height="190" rx="8" style="fill:none;stroke:var(--good);stroke-width:1.5"/>
+    <text x="320" y="34" text-anchor="middle" style="fill:var(--ink);font-weight:600">Container file system view</text>
+    <rect x="205" y="46" width="230" height="30" rx="4" style="fill:var(--surface-2);stroke:var(--line-2)"/>
+    <text x="320" y="66" text-anchor="middle" style="fill:var(--ink-2)">/ (overlay: image + writable layer)</text>
+    <rect x="205" y="90" width="230" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="320" y="109" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">/src</text>
+    <rect x="205" y="128" width="230" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="320" y="147" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">/var/lib/postgresql/data</text>
+    <rect x="205" y="166" width="230" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="320" y="185" text-anchor="middle" style="fill:var(--ink);font-family:var(--mono)">/tmp</text>
+    <rect x="10" y="88" width="150" height="32" rx="4" style="fill:var(--surface-2);stroke:var(--s1)"/>
+    <text x="85" y="108" text-anchor="middle" style="fill:var(--ink)">host ~/code/api</text>
+    <line x1="160" y1="104" x2="203" y2="104" marker-end="url(#k8s4-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="85" y="80" text-anchor="middle" style="fill:var(--muted)">bind mount</text>
+    <rect x="480" y="126" width="150" height="32" rx="4" style="fill:var(--surface-2);stroke:var(--s2)"/>
+    <text x="555" y="146" text-anchor="middle" style="fill:var(--ink)">volume "pgdata"</text>
+    <line x1="480" y1="142" x2="437" y2="142" marker-end="url(#k8s4-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+    <text x="555" y="118" text-anchor="middle" style="fill:var(--muted)">named volume</text>
+    <text x="555" y="174" text-anchor="middle" style="fill:var(--muted);font-family:var(--mono)">/var/lib/docker/volumes/</text>
+    <rect x="480" y="182" width="150" height="28" rx="4" style="fill:var(--surface-2);stroke:var(--s3)"/>
+    <text x="555" y="200" text-anchor="middle" style="fill:var(--ink)">RAM (tmpfs)</text>
+    <line x1="480" y1="192" x2="437" y2="184" marker-end="url(#k8s4-arrow2)" style="fill:none;stroke:var(--ink-2)"/>
+  </g>
+</svg>
+<figcaption>Only the top box is the container's own, disposable layer. The three mounted paths come from outside it and survive (or, for tmpfs, deliberately don't) independently of the container.</figcaption>
+</figure>
+<p><strong>Bind mounts</strong> map an existing host path: <code>-v ~/code/api:/src</code> or <code>--mount type=bind,src=…,dst=/src</code>. The container sees the host's files, with the host's ownership and permissions, and anything the image had at <code>/src</code> is hidden while the mount is in place. They are perfect for development (edit on the host, the container reloads) and for host resources like <code>/var/run/docker.sock</code> (dangerous: whoever has the socket controls Docker, which means root on the host). Their weakness is that they depend on the host's directory layout and user IDs; a container running as UID 10001 writing into a directory owned by your laptop user gets "permission denied". On Docker Desktop, bind mounts cross the VM boundary and are slower; on Windows with WSL 2, keep source inside the Linux file system for speed.</p>
+<p><strong>Named volumes</strong> are created and managed by Docker: <code>-v pgdata:/var/lib/postgresql/data</code>. By default they are directories under <code>/var/lib/docker/volumes/pgdata/_data</code>, owned by Docker, independent of any container. Two behaviours set them apart. If a new, empty volume is mounted at a path where the image has files, Docker <em>copies the image's files into the volume</em> first, so a database image's default configuration or ownership is preserved. And volume drivers can put the data elsewhere — NFS, cloud block storage — without changing the container. Volumes survive <code>docker rm</code> and <code>docker compose down</code>, and are deleted only by <code>docker volume rm</code> or <code>docker compose down -v</code>.</p>
+<p><strong>tmpfs mounts</strong> (<code>--tmpfs /tmp:size=64m</code>) are backed by memory and vanish when the container stops. They are ideal for scratch files and for secrets you do not want on disk, and they are the usual companion to a read-only root file system (k8s3). Their contents count toward the container's memory limit.</p>
+<p>A worked comparison: Postgres writing 2 GB of data. In the writable layer, every write goes through OverlayFS, the first write to each preexisting file copies it up, and removing the container loses everything. In a named volume, writes go straight to the host's ext4 or XFS at native speed, and the data survives upgrades of the Postgres container. That is the difference between the "ten times slower" team in the opening and a normal one.</p>
+
+<h4>8. Docker Compose: the whole app in one file</h4>
+<p>Running three containers with the right networks, volumes, environment and ordering by hand is tedious and error-prone. <strong>Docker Compose</strong> describes it declaratively in a <strong>Compose file</strong> (<code>compose.yaml</code>), following the open <strong>Compose Specification</strong>, and the <code>docker compose</code> command creates, updates and removes it. (The old top-level <code>version:</code> key is obsolete and ignored.)</p>
+<pre>services:
+  api:
+    build: .
+    ports: ["127.0.0.1:8000:8000"]          # host-only
+    environment:
+      DATABASE_URL: postgresql://app:app@db:5432/app
+      REDIS_URL: redis://cache:6379/0
+    depends_on:
+      db:    { condition: service_healthy }
+      cache: { condition: service_started }
+  db:
+    image: postgres:17
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: app }
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      retries: 10
+  cache:
+    image: redis:8
+volumes:
+  pgdata: {}</pre>
+<p>What <code>docker compose up</code> does with this, in terms of everything above, for a project directory named <code>shop</code>:</p>
+<ol>
+<li>Creates a user-defined bridge network <code>shop_default</code> (for example <code>172.18.0.0/16</code>) and a named volume <code>shop_pgdata</code>. The project name prefixes everything, so two projects on one host do not collide.</li>
+<li>Builds the <code>api</code> image from the Dockerfile in <code>.</code> and pulls <code>postgres:17</code> and <code>redis:8</code>.</li>
+<li>Starts <code>db</code> and <code>cache</code> first, because <code>api</code> depends on them. Each joins <code>shop_default</code> with its service name as a DNS alias. <code>db</code> mounts <code>shop_pgdata</code>; because the volume is new and empty, Docker copies the image's files at that path into it first.</li>
+<li>Runs <code>db</code>'s healthcheck every 5 s until <code>pg_isready</code> succeeds, marking the container <em>healthy</em>. Only then starts <code>api</code>, because its dependency on <code>db</code> has <code>condition: service_healthy</code>; for <code>cache</code> it only waits for the container to start.</li>
+<li>Starts <code>api</code> with the environment shown. When it connects to <code>db:5432</code>, its resolver asks <code>127.0.0.11</code>, which answers with <code>db</code>'s current IP on <code>shop_default</code>. Port 8000 is published on <code>127.0.0.1</code> only, via the DNAT path from section 3.</li>
+</ol>
+<p>Three Compose features are worth knowing beyond the basics. <strong>Healthchecks with depends_on conditions</strong> give a safe start order — but they only cover start-up, so apps should still retry connections, because a database can restart later. <strong>Profiles</strong> mark optional services (an admin UI, a load generator) that start only when asked for with <code>--profile</code>. And <code>docker compose watch</code> syncs source changes into running containers or rebuilds them, for a fast development loop without bind-mount permission problems. <code>docker compose down</code> removes containers and the network but keeps named volumes; <code>down -v</code> removes those too.</p>
+<p>Compose is a single-host tool. It is the right tool for development, tests in CI and small deployments; it has no scheduler across machines, no self-healing beyond restart policies, and no rolling updates. Those are what Kubernetes adds, and its concepts map closely: services become Deployments, service names become Service DNS names, named volumes become PersistentVolumeClaims, healthchecks become probes.</p>
+
+<h4>9. A worked debugging session: no internet from a container</h4>
+<p>Put the mechanisms to work on a common report: "<code>pip install</code> works on the host but times out inside the container." Check in the order the packet travels. Inside the container, <code>ip route</code> should show a default route via the bridge gateway (<code>172.17.0.1</code>); <code>cat /etc/resolv.conf</code> shows which resolver it uses. <code>ping -c1 1.1.1.1</code> tests routing without DNS; <code>getent hosts pypi.org</code> tests DNS without HTTP. If IP works but names do not, the host's resolver is a local stub the container cannot reach (deep section), or a corporate DNS is unreachable from the bridge. If nothing leaves at all, look on the host: is IP forwarding on (<code>sysctl net.ipv4.ip_forward</code> must be 1)? Does <code>iptables -t nat -L POSTROUTING -n -v</code> show the masquerade rule for <code>172.17.0.0/16</code>, and do its counters increase when you retry? Has a firewall tool flushed Docker's rules (restarting Docker recreates them)? Does the bridge subnet overlap a VPN route, sending replies the wrong way? If small requests work and large downloads stall, it is the MTU. Each check isolates one stage — routing, NAT, DNS, packet size — and in practice the answer appears within five commands.</p>
+</section>
+
+<section data-field="deep">
+<h4>How the embedded DNS server is wired</h4>
+<p>The address 127.0.0.11 is inside each container's own namespace, so it cannot be a single server on the host. Docker installs NAT rules inside the container's network namespace that redirect UDP and TCP port 53 traffic for 127.0.0.11 to a random port where dockerd's resolver listens through a socket it opened inside that namespace. The resolver answers names it knows from the network's service registry and forwards the rest to the upstream servers taken from the host's configuration. Two practical consequences: if the host's <code>/etc/resolv.conf</code> points at a local stub such as systemd-resolved's 127.0.0.53, Docker cannot forward to that loopback from a container and substitutes the real upstreams or public defaults; and DNS failures inside containers are often dockerd problems rather than network ones.</p>
+<h4>Hairpin NAT and the userland proxy</h4>
+<p>When a container connects to the host's public IP on a published port — common when the app is configured with a public URL — the packet goes out of the container, gets DNATed back to a container on the same bridge, and the reply would go directly between the two containers, bypassing the translation and confusing TCP. This is hairpin NAT. Docker handles it either with the user-space <code>docker-proxy</code> or by enabling hairpin mode on bridge ports plus an extra masquerade rule. Disabling the userland proxy (<code>"userland-proxy": false</code>) removes a process per published port and preserves client addresses in more cases, but depends on kernel features like <code>route_localnet</code> for localhost access. It is a good example of how much plumbing hides behind <code>-p</code>.</p>
+<h4>MTU and encapsulation</h4>
+<p>The bridge driver defaults to an MTU of 1500 bytes. Many cloud networks and VPN tunnels carry less (1460 on some clouds, around 1400 or lower over tunnels), and overlay networks subtract another 50 bytes of VXLAN header. If a container sends a 1500-byte packet that will not fit, the network should return an ICMP "fragmentation needed" message so the sender lowers its segment size (path MTU discovery). When those messages are filtered, large packets vanish silently: DNS and TCP handshakes work, then the first large response — often a TLS certificate chain — stalls. The fix is to set the bridge or overlay MTU explicitly to match the path.</p>
+<h4>Volume ownership and the first-mount copy</h4>
+<p>The copy-into-empty-volume behaviour also copies ownership and permissions, which is why official database images "just work" with a fresh named volume even when they run as a non-root user. Bind mounts do not do this, so the same image on a bind-mounted host directory fails with permission errors unless the directory's owner matches the container's UID. Rootless Docker and user namespaces add another mapping layer: a file owned by UID 999 in the container is owned by a large sub-UID on the host. In Kubernetes the equivalent problems are solved with <code>fsGroup</code> and volume ownership changes (k8s9).</p>
+<h4>Restart policies: the single-host version of self-healing</h4>
+<p>Docker can restart a container when it exits, according to its restart policy: <code>no</code> (the default), <code>on-failure[:max-retries]</code> (only after a non-zero exit), <code>always</code>, or <code>unless-stopped</code> (like always, but not after you stopped it manually). Between restarts Docker waits an increasing delay, starting at 100 ms and doubling each time, which prevents a crashing container from spinning the CPU; the delay resets once a container has run successfully for a while. This is the same back-off idea as Kubernetes' CrashLoopBackOff (k8s13), without the rest of Kubernetes: no rescheduling to another machine if the host dies, no replacement of a container that hangs without exiting, and no health-based restart (a Docker <code>HEALTHCHECK</code> marks a container unhealthy but does not restart it on its own). Compose exposes the same policies with <code>restart:</code>.</p>
+<h4>IPv6</h4>
+<p>Default bridge networks are IPv4-only unless IPv6 is enabled on the network (<code>docker network create --ipv6</code>, with a subnet or an address pool). Two behaviours surprise people. Published ports listen on <code>[::]</code> as well as <code>0.0.0.0</code>, so on an IPv4-only network an IPv6 client connection is accepted and relayed by <code>docker-proxy</code>, and the container sees the proxy's address rather than the client's. And with IPv6 enabled, containers can get globally routable addresses that need no NAT at all — so the firewall, not address translation, is what keeps them private. In both cases the right mental model is the one from section 3: follow the packet through the stages and ask which rule it meets.</p>
+<h4>nftables and the future of the firewall rules</h4>
+<p>Docker historically programs iptables. Modern distributions implement the iptables commands on top of nftables, the newer kernel packet-filtering framework, and Docker Engine 29 added experimental native nftables support. The concepts in this lesson — a nat stage that DNATs published ports before routing, a forward stage with a user-controlled hook evaluated first, masquerade for outbound traffic, conntrack underneath — stay the same; the chain names and commands differ, so scripts that grep for <code>DOCKER-USER</code> need revisiting on hosts that switch.</p>
+</section>
+
+<section data-field="prod">
+<h4>The case: published ports and host firewalls</h4>
+<p>Docker's own documentation on packet filtering states that when you publish a container's ports with Docker on a host using ufw, the container's traffic is diverted before it reaches ufw's rules, so ufw cannot be used to block it; its port-publishing page adds that publishing is "insecure by default" because ports bind to all addresses. The mechanism is section 3's routing step: after DNAT in PREROUTING, packets to a published port are forwarded, not delivered locally, so they traverse FORWARD (where Docker accepts them) and never INPUT (where ufw filters). For years this produced a steady stream of exposed services: teams ran Redis, Elasticsearch, MongoDB or Postgres in containers with <code>-p 6379:6379</code> "so the app can reach it", believed ufw's default-deny protected them, and found the service open to the internet, often after it had been scanned and abused. Docker 28.0 additionally closed a related gap in which machines on the same LAN segment could reach ports published only on the host's localhost.</p>
+<p>The lessons generalise. Do not publish ports that only other containers need: put them on a user-defined network and let them talk by name. Bind host-only ports to <code>127.0.0.1</code>. Put any filtering for container traffic in <code>DOCKER-USER</code>, matching on the original port with conntrack. Scan your own hosts from outside. And in production prefer an orchestrator whose networking model and policies (Kubernetes NetworkPolicy, cloud security groups) are designed for this.</p>
+<h4>Failure modes and their symptoms</h4>
+<ul>
+<li><strong>"Connection refused" to a published port</strong>: the app listens on 127.0.0.1 inside the container, which is the container's own loopback. Make it listen on 0.0.0.0.</li>
+<li><strong>Containers can't resolve each other</strong>: they are on the default bridge. Use a user-defined network or Compose.</li>
+<li><strong>App can't reach a service on the host via localhost</strong>: different namespace. Use <code>host.docker.internal</code> with <code>host-gateway</code>, or the bridge gateway IP.</li>
+<li><strong>Subnet clash</strong>: Docker picks <code>172.17.0.0/16</code> and friends, which can collide with a corporate VPN or VPC range; hosts in that range become unreachable from containers. Set <code>default-address-pools</code> in the daemon config.</li>
+<li><strong>HTTPS hangs, DNS works</strong>: MTU mismatch (deep section).</li>
+<li><strong>Data loss after <code>compose down</code></strong>: data in the writable layer instead of a volume, or <code>down -v</code>.</li>
+<li><strong>Permission denied on a bind mount</strong>: host directory ownership does not match the container's UID.</li>
+<li><strong>conntrack table full</strong> ("nf_conntrack: table full, dropping packet" in the kernel log) on hosts with many short connections through NAT; raise <code>nf_conntrack_max</code> or reduce NAT.</li>
+</ul>
+<h4>Knobs worth setting on every Docker host</h4>
+<p>In <code>/etc/docker/daemon.json</code>: <code>default-address-pools</code> to keep container subnets away from your VPC and VPN ranges; <code>mtu</code> if the underlying network is smaller than 1500; <code>"ip": "127.0.0.1"</code> to change the default bind address for published ports, so a forgotten <code>-p</code> exposes nothing; log rotation (k8s1); and <code>live-restore</code> so daemon upgrades keep containers running. In Compose files: bind published ports to <code>127.0.0.1</code> unless they are meant to be public, separate frontend and backend networks, and give every stateful service a named volume.</p>
+<h4>Tools for looking</h4>
+<p><code>docker network inspect</code> (subnets, attached containers and their IPs), <code>docker port</code>, <code>iptables -t nat -L DOCKER -n -v</code> (packet counters per rule show whether traffic matched), <code>conntrack -L</code>, <code>nsenter -t &lt;pid&gt; -n ss -tlnp</code> to see what a container is listening on from the host, and <code>tcpdump -i docker0</code> to watch packets on the bridge. <code>docker volume inspect</code> shows where a volume's data lives.</p>
+</section>
+
+<section data-field="lab">
+<p>Steps 1-3 need Docker on Linux (on Docker Desktop, run the host-side commands inside the VM or skip them). Step 4 runs here with Python 3.12.</p>
+<ol>
+<li><strong>The plumbing (Needs Docker).</strong>
+<pre>docker run -d --name web -p 8080:80 nginx:1.27
+docker exec web cat /etc/resolv.conf     # host's resolvers (default bridge)
+docker inspect -f '{{.NetworkSettings.IPAddress}}' web   # e.g. 172.17.0.2
+ip link show master docker0              # the host end of the veth pair
+sudo iptables -t nat -L DOCKER -n -v     # DNAT tcp dpt:8080 to:172.17.0.2:80
+curl -s localhost:8080 | head -4</pre>
+Run the <code>iptables</code> command again after the curl: the packet counter on the DNAT rule increases.</li>
+<li><strong>Names need a user-defined network (Needs Docker).</strong>
+<pre>docker run -d --name a nginx:1.27; docker run --rm busybox:1.37 nslookup a   # fails
+docker network create appnet
+docker run -d --name b --network appnet nginx:1.27
+docker run --rm --network appnet busybox:1.37 nslookup b   # Server: 127.0.0.11, answers 172.18.0.x</pre></li>
+<li><strong>Compose with health-gated start (Needs Docker).</strong> Save the Compose file from body section 7 with a trivial API image (or replace <code>build: .</code> with <code>image: nginx:1.27</code>), run <code>docker compose up -d</code>, then <code>docker compose ps</code>: <code>db</code> shows <code>(healthy)</code> before <code>api</code> starts. <code>docker compose down</code> then <code>up</code>: data in <code>pgdata</code> survives; <code>down -v</code> deletes it.</li>
+<li><strong>NAT and conntrack, simulated (runs here).</strong> Save as <code>natsim.py</code>:
+<pre>DNAT = {("198.51.100.10", 8080): ("172.17.0.2", 80)}     # -p 8080:80
+HOST, BRIDGE_NET = "198.51.100.10", "172.17."
+conntrack = {}   # original tuple -> translated tuple
+def inbound(src, dst):
+    if (src, dst) in conntrack: return conntrack[(src, dst)]
+    new = (src, DNAT.get(dst, dst)); conntrack[(src, dst)] = new
+    conntrack[("reply",) + (new[1], new[0])] = (dst, src)   # how replies are un-NATed
+    return new
+def outbound(src, dst):
+    key = ("reply", src, dst)
+    if key in conntrack: return conntrack[key]                # reply to a DNATed flow
+    if src[0].startswith(BRIDGE_NET): return ((HOST, src[1]), dst)   # MASQUERADE
+    return (src, dst)
+c = ("203.0.113.5", 51000)
+print("SYN    ", c, "->", ("198.51.100.10", 8080), "becomes", inbound(c, ("198.51.100.10", 8080)))
+print("SYN-ACK", ("172.17.0.2", 80), "->", c, "becomes", outbound(("172.17.0.2", 80), c))
+print("egress ", ("172.17.0.2", 40312), "->", ("93.184.215.14", 443), "becomes",
+      outbound(("172.17.0.2", 40312), ("93.184.215.14", 443)))</pre>
+Expect the SYN's destination rewritten to <code>172.17.0.2:80</code>, the SYN-ACK's source rewritten back to <code>198.51.100.10:8080</code>, and the egress source masqueraded to the host IP: the three rewrites from sections 2-3.</li>
+</ol>
+</section>
+
+<section data-field="drill">
+<b>Diagnose: the Redis that was open to the internet</b>
+<p>A small company runs its app on one cloud VM with Docker. <code>ufw</code> is set to deny incoming traffic except SSH (22) and HTTPS (443). The app and Redis run as separate containers on the default bridge, started with <code>docker run -d -p 6379:6379 redis:8</code> and <code>docker run -d -p 443:8443 --link redis app:4.2</code>. A security scan reports Redis reachable from the internet on port 6379. The team insists the firewall blocks it. Explain what happened and fix it properly.</p>
+<details><summary>Answer</summary>
+<p>Publishing 6379 made Docker add a DNAT rule in the nat table's PREROUTING path and an accept rule in its forwarding chains, binding on all addresses. Packets to <code>VM-IP:6379</code> are rewritten to Redis's container IP before routing, so they are forwarded through FORWARD and Docker's chains and never pass INPUT, where ufw's deny rules live. ufw never sees them; Docker's documentation describes exactly this incompatibility.</p>
+<p>Fix: Redis does not need to be published at all — only the app talks to it. Create a user-defined network (<code>docker network create appnet</code>), run Redis on it with no <code>-p</code>, run the app on it and connect to <code>redis:6379</code> by name (dropping the legacy <code>--link</code>). Keep only the app's 443 published. Add Redis authentication anyway, as defence in depth. If some container port must be published but restricted, bind it to <code>127.0.0.1</code> or add rules to <code>DOCKER-USER</code> matching <code>--ctorigdstport</code>. Verify by scanning the VM's public IP from outside, and check <code>iptables -t nat -L DOCKER -n</code> shows no rule for 6379. Then rotate any data Redis held, since it may have been read or modified.</p>
+</details>
+</section>

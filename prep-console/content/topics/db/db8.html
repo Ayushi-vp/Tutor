@@ -1,0 +1,518 @@
+<!-- topic source for db/db8; build with topic.py merge -->
+<script type="application/json" id="meta">
+{
+  "id": "db8",
+  "t": "Transactions and ACID internals: WAL, checkpoints and ARIES-style recovery",
+  "tag": "Internals",
+  "sum": "How a database keeps atomicity and durability through crashes: the buffer pool's steal/no-force policies, redo and undo logging, the write-ahead rule and LSNs, group commit and fsync, fuzzy checkpoints and torn pages, ARIES's analysis, redo and undo passes traced on a real crash, and how PostgreSQL and InnoDB differ.",
+  "prereq": [
+    [
+      "sc5",
+      "ACID: atomicity, consistency, isolation, durability; isolation levels and anomalies are covered there at the system level."
+    ],
+    [
+      "db5",
+      "Data lives in fixed-size pages cached in a buffer pool; each page header stores the LSN of its last change; full-page writes protect against torn pages."
+    ],
+    [
+      "os10",
+      "Writes go to the OS page cache; only fsync forces them to stable storage, and what fsync guarantees depends on the file system and device."
+    ]
+  ],
+  "myths": [
+    [
+      "COMMIT writes my changed rows to the data files.",
+      "COMMIT only has to make the log durable: it writes a commit record and flushes the write-ahead log up to that point. The changed data pages stay dirty in memory and reach the data files later, during checkpoints or background writes. Recovery can always rebuild them from the log, which is why commits can be fast even when the changed pages are scattered."
+    ],
+    [
+      "A crash can leave a transaction half-applied on disk, and that is a corruption.",
+      "Half-applied changes on disk are normal: with a steal policy, pages containing uncommitted changes may be written before the transaction ends, and committed changes may not be on disk yet. Recovery uses the log to redo the committed work and undo the rest, so the logical state is always all-or-nothing."
+    ],
+    [
+      "fsync returning success means the data is safe forever.",
+      "It means the OS and device claim the data reached stable storage. Devices with volatile write caches that lie about flushes, and OS behaviour on write errors, can break that. In 2018 PostgreSQL discovered that after a failed fsync, Linux could mark the dirty pages clean and a retried fsync would report success although the data was lost; PostgreSQL now treats an fsync failure as a reason to crash and recover from the WAL."
+    ],
+    [
+      "Checkpoints are what make transactions durable.",
+      "The WAL flush at commit makes them durable. Checkpoints only bound how much log must be replayed after a crash and allow old WAL to be recycled. More frequent checkpoints mean faster recovery but more page writes and, with full-page writes, more WAL."
+    ],
+    [
+      "Asynchronous commit can corrupt the database.",
+      "With PostgreSQL's synchronous_commit = off, a crash can lose the last few hundred milliseconds of commits that clients were told succeeded, but the database remains consistent: those transactions are simply absent, as if they had never committed. It trades a bounded window of durability for latency, not integrity."
+    ]
+  ],
+  "recap": [
+    "Atomicity and durability are implemented by logging: every change is described in an append-only write-ahead log before the changed page may reach disk, and a transaction commits when its commit record is durable in the log.",
+    "Buffer managers use steal (dirty pages of uncommitted transactions may be written) and no-force (committed pages need not be written at commit), which is fast but requires undo and redo information in the log.",
+    "Every log record has a log sequence number; each page stores the LSN of the last change applied to it, so recovery can tell whether a logged change is already in the page.",
+    "Group commit lets many concurrent transactions share one log flush, so commit throughput is not limited to one fsync per transaction.",
+    "A checkpoint records where recovery may start and writes dirty pages in the background; it bounds recovery time and lets old log be recycled.",
+    "Full-page writes log a whole page image on its first change after a checkpoint, so a page torn by a crash mid-write can be restored before redo.",
+    "ARIES recovery runs three passes: analysis finds the losers and dirty pages, redo repeats history for every logged change, and undo rolls back losers while writing compensation log records.",
+    "PostgreSQL's WAL is redo-only because MVCC leaves old row versions in place, so aborted changes are simply invisible; InnoDB has a redo log plus undo logs.",
+    "Archived WAL plus a base backup allows point-in-time recovery; the same log stream feeds replication."
+  ],
+  "glossary": [
+    [
+      "ARIES",
+      "Algorithm for Recovery and Isolation Exploiting Semantics (Mohan et al., 1992): WAL-based recovery with analysis, redo and undo passes."
+    ],
+    [
+      "Autocommit",
+      "A client mode in which every statement is its own transaction, committed immediately."
+    ],
+    [
+      "Buffer pool",
+      "The database's in-memory cache of pages; changes are made there and written to disk later."
+    ],
+    [
+      "Checkpoint",
+      "A point recorded in the log from which recovery can start, after which older log is no longer needed for crash recovery."
+    ],
+    [
+      "Compensation log record (CLR)",
+      "A log record describing an undo action, so undo work is never repeated if recovery itself crashes."
+    ],
+    [
+      "Dirty page",
+      "A page in the buffer pool that has been changed since it was last written to disk."
+    ],
+    [
+      "Dirty page table",
+      "In ARIES, the list of pages that may be dirty at the crash, each with the earliest LSN that might need redo (recLSN)."
+    ],
+    [
+      "Doublewrite buffer",
+      "InnoDB's area where pages are written and flushed before their real location, so a torn page can be repaired."
+    ],
+    [
+      "Force / no-force",
+      "Whether a transaction's changed pages must be written to disk at commit (force) or may be written later (no-force)."
+    ],
+    [
+      "fsync",
+      "The system call that asks the OS to flush a file's data to stable storage and returns when it has."
+    ],
+    [
+      "Full-page write",
+      "Logging an entire page image on its first change after a checkpoint, to repair torn pages."
+    ],
+    [
+      "Group commit",
+      "Flushing the log once for many transactions that committed at about the same time."
+    ],
+    [
+      "LSN",
+      "Log sequence number: the position of a record in the write-ahead log, increasing over time."
+    ],
+    [
+      "MVCC",
+      "Multi-version concurrency control: keeping several versions of a row so readers see a consistent snapshot (db9)."
+    ],
+    [
+      "pageLSN",
+      "The LSN of the last log record whose change is reflected in a page, stored in the page header."
+    ],
+    [
+      "Point-in-time recovery (PITR)",
+      "Restoring a base backup and replaying archived WAL up to a chosen moment."
+    ],
+    [
+      "Redo",
+      "Reapplying a logged change to a page to bring it forward to a later state."
+    ],
+    [
+      "Repeating history",
+      "ARIES's rule that redo replays every logged change, including those of transactions that will be undone, so the database returns to its exact pre-crash state first."
+    ],
+    [
+      "Steal / no-steal",
+      "Whether a page containing uncommitted changes may be written to disk (steal) or must wait until commit (no-steal)."
+    ],
+    [
+      "Torn page",
+      "A page only partly written when power failed, so it mixes old and new bytes."
+    ],
+    [
+      "Transaction table",
+      "In ARIES, the list of transactions active at the crash and the LSN of each one's last log record."
+    ],
+    [
+      "Two-phase commit (2PC)",
+      "A protocol in which participants first durably prepare a transaction and then commit it on the coordinator's decision."
+    ],
+    [
+      "Undo",
+      "Reversing a logged change using the old value recorded in the log or an undo log."
+    ],
+    [
+      "Write-ahead logging (WAL)",
+      "The rule that the log record describing a change must reach stable storage before the changed page does, and before commit is acknowledged."
+    ]
+  ],
+  "qa": [
+    [
+      "E",
+      "What does write-ahead logging guarantee?",
+      "That the log record describing a change is on stable storage before the changed page can be written, and that all of a transaction's log records, including its commit record, are durable before the commit is acknowledged. Then any crash can be repaired from the log: committed changes can be redone and uncommitted ones undone."
+    ],
+    [
+      "E",
+      "What happens on disk when a transaction commits?",
+      "The database appends a commit record to the WAL and flushes the WAL up to and including it, usually with fsync or an equivalent. The modified data pages typically remain dirty in memory and are written later. Once the flush returns, the commit is durable and the client is told it succeeded."
+    ],
+    [
+      "E",
+      "Why do databases need checkpoints?",
+      "Without them, recovery would have to replay the log from the beginning of time, and old log could never be deleted. A checkpoint ensures that changes before a certain log position have reached the data files, so recovery can start there and earlier WAL can be recycled. It bounds recovery time at the cost of extra page writes."
+    ],
+    [
+      "M",
+      "Explain steal and no-force and why databases choose them.",
+      "Steal lets the buffer pool write a dirty page even if the transaction that changed it has not committed, so memory is not held hostage by long transactions; it requires undo information. No-force lets a transaction commit without writing its pages, so commit costs one sequential log flush instead of many random page writes; it requires redo information. Together they give the best runtime performance, and the log carries both kinds of information to make recovery possible."
+    ],
+    [
+      "M",
+      "What is group commit and why does it matter?",
+      "A log flush costs roughly the same whether it contains one commit record or a hundred, often hundreds of microseconds to milliseconds. Group commit makes concurrent committers wait briefly and share one flush, so a disk that can do 2,000 flushes per second can commit far more than 2,000 transactions per second. It is why throughput rises with concurrency while single-transaction commit latency stays at about one flush."
+    ],
+    [
+      "M",
+      "What are full-page writes and what do they cost?",
+      "If power fails while an 8 KB page is being written, the page can be torn, part old and part new, and a redo record that only describes a small change cannot fix it. So PostgreSQL logs the entire page image the first time a page is modified after each checkpoint, and recovery restores that image before replaying later changes. The cost is extra WAL volume, which grows with random-key writes and frequent checkpoints.",
+      "Follow-up: How can you reduce it? — Longer checkpoint intervals, sequential keys so changes concentrate on fewer pages, WAL compression, or storage that guarantees atomic 8 KB writes so full_page_writes can be safely turned off."
+    ],
+    [
+      "M",
+      "What does synchronous_commit = off do in PostgreSQL?",
+      "Commit returns before the WAL is flushed; the WAL writer flushes within a short interval (up to three times wal_writer_delay, 200 ms by default). A crash can lose the most recent commits that clients were told succeeded, but never corrupts data or splits a transaction. It suits high-volume, low-value writes such as analytics events or LLM call logs, and can be set per transaction so critical writes stay synchronous."
+    ],
+    [
+      "M",
+      "Walk through ARIES's three recovery passes.",
+      "Analysis reads the log forward from the last checkpoint to rebuild the transaction table (which transactions were active, the losers) and the dirty page table (which pages may need redo and from which LSN). Redo reads forward from the smallest recLSN and reapplies every logged change whose LSN is greater than the page's stored pageLSN, for winners and losers alike. Undo walks the losers' log records backwards, reversing each change and writing a compensation log record, until every loser is rolled back."
+    ],
+    [
+      "H",
+      "Why does ARIES redo the changes of transactions it is about to undo?",
+      "Repeating history makes the database return to its exact state at the crash, with the same page contents and pageLSNs, before any undo runs. Undo can then work like a normal rollback, record by record, and it supports fine-grained record locking: other transactions may have modified the same page after the loser did, and those committed changes must be in place before the loser's change is reversed logically. Skipping the losers' redo would leave pages in states the undo logic never saw.",
+      "Follow-up: Why write CLRs during undo? — If the system crashes during recovery, the CLRs show which undo steps were already done, and each CLR points to the next record to undo, so recovery never undoes the same change twice and the log stays bounded."
+    ],
+    [
+      "H",
+      "PostgreSQL has no undo log. How does it roll back?",
+      "Its MVCC keeps old row versions in the heap and marks each version with the transaction ids that created and deleted it. An aborted transaction's new versions stay on disk but are invisible because its id is recorded as aborted in the commit log (pg_xact); vacuum later removes them. So the WAL only needs redo information, and recovery is a single redo pass from the checkpoint. The trade-off is that dead versions accumulate in tables and need vacuuming (db10)."
+    ],
+    [
+      "H",
+      "What was 'fsyncgate' in 2018 and what changed?",
+      "PostgreSQL developers found that when a buffered write failed on Linux, the kernel could report the error to one fsync call and then mark the pages clean, so PostgreSQL's retry of fsync at the next checkpoint succeeded and the checkpoint completed with data silently lost. PostgreSQL changed to PANIC on any fsync failure, crashing and recovering from the WAL, which still has the data; the fix was backpatched to all supported versions, and Linux 4.13 had improved error reporting."
+    ],
+    [
+      "H",
+      "Estimate recovery time after a crash with checkpoint_timeout = 5 min and 50 MB/s of WAL.",
+      "Recovery starts at the last checkpoint's redo point, which can be up to about one checkpoint interval old plus the time to complete a spread checkpoint, so roughly 5 to 10 minutes of WAL: 15 to 30 GB. Replay speed is often limited by random page reads; at, say, 100-300 MB/s replay, that is one to five minutes. Raising checkpoint_timeout to 30 minutes reduces checkpoint writes and full-page images but could stretch recovery toward half an hour.",
+      "Follow-up: How does a hot standby change this? — Failing over to a replica that is already replaying WAL avoids most crash recovery time on the primary path; the old primary recovers in the background."
+    ],
+    [
+      "H",
+      "You log every LLM call and its token cost. Finance needs the cost data never lost; the debug payloads can be. How would you configure durability?",
+      "Write cost records in normal synchronous transactions, possibly with synchronous replication to a standby so a single machine loss cannot lose them. Write the large debug payloads in separate transactions with synchronous_commit = off, or to an unlogged or separate store, accepting that a crash may lose the last fraction of a second. Keeping the two in different transactions prevents the cheap path from weakening the critical one, and batching debug inserts reduces WAL flushes further."
+    ]
+  ],
+  "refs": [
+    [
+      "paper",
+      "Mohan et al. — ARIES: A Transaction Recovery Method (ACM TODS, 1992)",
+      "The recovery algorithm behind DB2, SQL Server and many others: repeating history, pageLSNs, CLRs and fuzzy checkpoints.",
+      "https://cs.stanford.edu/people/chrismre/cs345/rl/aries.pdf"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Write-Ahead Logging (WAL)",
+      "Why WAL allows no-force commits and fewer writes.",
+      "https://www.postgresql.org/docs/current/wal-intro.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — WAL Configuration",
+      "Checkpoints, checkpoint_timeout (5 min) and max_wal_size (1 GB) defaults, completion target and full-page writes.",
+      "https://www.postgresql.org/docs/current/wal-configuration.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Asynchronous Commit",
+      "What synchronous_commit = off risks and what it never risks.",
+      "https://www.postgresql.org/docs/current/wal-async-commit.html"
+    ],
+    [
+      "post",
+      "LWN — PostgreSQL's fsync() surprise (2018)",
+      "How Linux error handling after failed writeback could silently lose data that PostgreSQL believed was flushed.",
+      "https://lwn.net/Articles/752063/"
+    ],
+    [
+      "docs",
+      "PostgreSQL wiki — Fsync Errors",
+      "Current status: PostgreSQL now PANICs on fsync failure; the fix was backpatched to 9.4-11.",
+      "https://wiki.postgresql.org/wiki/Fsync_Errors"
+    ],
+    [
+      "docs",
+      "SQLite — Atomic Commit In SQLite",
+      "A readable step-by-step account of a rollback-journal commit and what each fsync protects.",
+      "https://www.sqlite.org/atomiccommit.html"
+    ],
+    [
+      "docs",
+      "PostgreSQL — Continuous Archiving and Point-in-Time Recovery",
+      "Base backups plus archived WAL for restoring to any moment.",
+      "https://www.postgresql.org/docs/current/continuous-archiving.html"
+    ]
+  ]
+}
+</script>
+
+<section data-field="why">
+<p>A payment service moves 50 from account A to account B. That is two writes: subtract 50 from A's row, add 50 to B's row. Those rows live on two different 8 KB pages in the database's memory, and eventually on two different places on disk. Now pull the power plug at the worst possible moment: A's page has been written to disk with the new balance, B's has not. When the machine restarts, 50 has vanished. Or the opposite: the client was told "transfer complete", but neither page had reached disk, and on restart the transfer never happened. Either outcome is unacceptable for a database, and both are exactly what would happen if a database simply wrote changed pages to disk in whatever order was convenient.</p>
+<p>The guarantees that rule this out are two of the four letters of ACID (sc5). <strong>Atomicity</strong>: a transaction's changes happen entirely or not at all. <strong>Durability</strong>: once a commit is acknowledged, it survives crashes. The engineering problem is that disks write one page at a time, crashes can happen between any two writes (or in the middle of one), and writing every changed page synchronously at commit would make every transaction wait for many scattered disk writes.</p>
+<p>The solution, used by essentially every serious database, is a log. Before changing anything on disk, the database writes a description of the change to an append-only <strong>write-ahead log</strong> (WAL), and a transaction counts as committed the moment its commit record is safely in that log. After a crash, the database reads the log and repairs the data files: it re-applies committed changes that had not reached disk and reverses uncommitted ones that had. The definitive form of this recovery algorithm is <strong>ARIES</strong>, published by C. Mohan and colleagues at IBM in 1992 and used, in variants, by DB2, SQL Server and many other systems; PostgreSQL and InnoDB use their own versions of the same ideas.</p>
+<p>This lesson builds the machinery from the problem upward: the choices a buffer pool makes about when to write pages, what must therefore be logged, the write-ahead rule and log sequence numbers, how commit is made both durable and fast, what checkpoints are for, how torn pages are repaired, and ARIES's three recovery passes traced on a crash. It ends with what goes wrong in production, including the 2018 discovery that fsync on Linux did not always mean what PostgreSQL thought it meant.</p>
+</section>
+
+<section data-field="primer">
+<h4>The ledger and the diary</h4>
+<p>Picture a shop that keeps its accounts in a big ledger book, but writing in the ledger is slow because the pages are scattered around a large office. So the shopkeeper also carries a small diary. Every time money moves, they first write a line in the diary: "10:02, transfer 50 from A to B, A was 100 now 50, B was 200 now 250". Only then do they update the copy of the ledger page they keep on their desk. They walk to the office and file updated ledger pages whenever convenient, perhaps once an hour. When a customer asks "is my transfer done?", the shopkeeper says yes as soon as the diary line ending "transfer complete" is written.</p>
+<p>If the shopkeeper faints and loses their desk papers, nothing is lost: the diary says exactly what happened, in order. On recovery they read the diary from the last time they knew the ledger was up to date, re-apply every completed transfer the ledger is missing, and reverse any half-done transfer that has no "complete" line. The diary is the write-ahead log, the ledger is the data files, and the desk copies are the buffer pool.</p>
+<p>The analogy breaks in two useful places. A diary line is cheap because it is written at the end of a single sequential notebook, whereas ledger pages are scattered; on real storage, sequential appends are also much cheaper than scattered page writes, which is the whole performance case for the log. And real "fainting" can happen mid-word: a page can be half written when power fails, which the diary must also be able to repair.</p>
+<h4>Two rules make it work</h4>
+<p>The whole scheme rests on two ordering rules. First, the <strong>write-ahead rule</strong>: the log record describing a change must be on stable storage before the changed page is. Otherwise a page could reach disk with a change the log knows nothing about, and recovery could not undo it. Second, the <strong>commit rule</strong>: all of a transaction's log records, ending with its commit record, must be on stable storage before the commit is acknowledged. Otherwise the client could be told "done" about a change that a crash then erases.</p>
+<figure>
+<svg viewBox="0 0 640 230" width="100%" role="img" aria-label="Timeline: change made in buffer, log record appended, commit record flushed with fsync, client acknowledged; data page written much later by a checkpoint">
+  <defs><marker id="db8-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <text x="20" y="40" style="fill:var(--ink);font-weight:600">buffer pool</text>
+    <text x="20" y="100" style="fill:var(--ink);font-weight:600">WAL on disk</text>
+    <text x="20" y="160" style="fill:var(--ink);font-weight:600">data files</text>
+    <line x1="120" y1="36" x2="620" y2="36" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="120" y1="96" x2="620" y2="96" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <line x1="120" y1="156" x2="620" y2="156" style="fill:none;stroke:var(--line-2);stroke-dasharray:4 4"/>
+    <circle cx="150" cy="36" r="6" style="fill:var(--s1)"/>
+    <text x="140" y="22" style="fill:var(--ink-2)">A −50, B +50</text>
+    <circle cx="190" cy="96" r="6" style="fill:var(--s2)"/>
+    <text x="160" y="118" style="fill:var(--ink-2)">update records</text>
+    <circle cx="280" cy="96" r="7" style="fill:var(--accent)"/>
+    <text x="250" y="82" style="fill:var(--accent);font-weight:600">COMMIT + fsync</text>
+    <line x1="280" y1="96" x2="330" y2="60" marker-end="url(#db8-arrow)" style="fill:none;stroke:var(--accent)"/>
+    <text x="335" y="60" style="fill:var(--good);font-weight:600">client told "OK"</text>
+    <circle cx="560" cy="156" r="6" style="fill:var(--s3)"/>
+    <text x="470" y="180" style="fill:var(--ink-2)">checkpoint writes pages A, B</text>
+    <line x1="150" y1="42" x2="555" y2="150" style="fill:none;stroke:var(--s3);stroke-dasharray:3 4"/>
+    <text x="120" y="210" style="fill:var(--muted)">time →  A crash anywhere between "OK" and the checkpoint loses nothing: the log has the changes.</text>
+  </g>
+</svg>
+<figcaption>Commit waits only for the sequential log flush; the scattered page writes happen minutes later. Notice the order on the middle line: update records strictly before the commit record, and both before any data page.</figcaption>
+</figure>
+<h4>What recovery has to do</h4>
+<p>Because pages are written lazily and in any order, at the moment of a crash the data files can contain a mixture: some committed changes missing (their pages never written) and some uncommitted changes present (their pages written early to free memory). Recovery therefore has two jobs, <strong>redo</strong> (bring forward committed changes the data files are missing) and <strong>undo</strong> (remove uncommitted changes the data files contain). The log must hold enough information for both, and each page must record which log records it already reflects, so recovery does not apply a change twice. The rest of this lesson is how those requirements are met efficiently.</p>
+</section>
+
+<section data-field="body">
+<h4>1. Buffer pool policies: steal and force</h4>
+<p>All changes happen in the <strong>buffer pool</strong>, the database's cache of pages (db5). Two policy decisions about when changed (<strong>dirty</strong>) pages may or must be written determine what recovery has to handle.</p>
+<p><strong>Steal or no-steal:</strong> may the buffer pool write a dirty page to disk while a transaction that changed it is still running? With <em>no-steal</em>, uncommitted changes never reach disk, so recovery never needs to undo anything, but a long transaction that changes many pages pins them all in memory, and a transaction bigger than memory is impossible. With <em>steal</em>, the buffer pool may evict any dirty page when it needs room, so uncommitted changes can be on disk at a crash and must be undoable.</p>
+<p><strong>Force or no-force:</strong> must all of a transaction's dirty pages be written to disk at commit? With <em>force</em>, committed changes are always on disk, so recovery never needs to redo anything, but every commit waits for many random page writes, and a page changed by a hundred transactions in a second is written a hundred times. With <em>no-force</em>, commit writes only the log, and pages are written later, but committed changes may be missing from disk at a crash and must be redoable.</p>
+<table>
+<thead><tr><th></th><th>Force</th><th>No-force</th></tr></thead>
+<tr><td><strong>No-steal</strong></td><td>no undo, no redo; slowest, memory-limited</td><td>redo only</td></tr>
+<tr><td><strong>Steal</strong></td><td>undo only</td><td>undo and redo; fastest; what real systems use</td></tr>
+</table>
+<p>Real databases choose <strong>steal / no-force</strong>: it gives the buffer pool freedom to manage memory and makes commit cost one sequential log flush. The price is that the log must carry both redo information (the new value, or how to compute it) and undo information (the old value, or how to reverse the change), and recovery must do both. ARIES is designed for exactly this combination.</p>
+
+<h4>2. Log records and LSNs</h4>
+<p>Every change produces a <strong>log record</strong> appended to the WAL. A typical update record holds: the transaction id; the page id; what changed (for redo, the new bytes or a logical description such as "insert this tuple at slot 5"); how to reverse it (for undo, the old bytes or the inverse operation); and a pointer to the same transaction's previous log record, so a transaction's records can be walked backwards for rollback. There are also records for transaction begin, commit and abort, and for checkpoints.</p>
+<p>Each record is identified by its <strong>log sequence number</strong> (LSN), its position in the log, which only ever increases. In PostgreSQL an LSN is a 64-bit byte offset into the WAL stream, displayed as two hexadecimal halves such as <code>0/16B3748</code>; <code>SELECT pg_current_wal_lsn()</code> shows the current one. The crucial link between log and data is the <strong>pageLSN</strong>: every page header (db5) stores the LSN of the last log record whose change has been applied to that page. When the page is written to disk, its pageLSN goes with it. During recovery, comparing a log record's LSN with the on-disk page's pageLSN answers "is this change already in the page?" without guessing: if pageLSN ≥ record LSN, it is; otherwise it must be redone.</p>
+<p>The write-ahead rule is enforced with LSNs too. The log manager tracks <code>flushedLSN</code>, how far the log is durable. Before the buffer pool writes a dirty page, it checks that the page's pageLSN ≤ flushedLSN, flushing the log first if not. That one check guarantees that no page reaches disk carrying a change the durable log does not describe.</p>
+
+<h4>3. Commit: durability without waiting for pages</h4>
+<p>To commit, the database appends a commit record and flushes the log through that record's LSN, typically with <code>fsync</code> or <code>fdatasync</code> on the WAL file (or an O_DSYNC write). When the flush returns, the transaction is durable: whatever happens next, the log contains every record of the transaction and recovery will redo it. The client is told "committed" only now.</p>
+<p>A log flush has a fixed cost, from tens of microseconds on enterprise NVMe drives with power-loss protection to several milliseconds on a disk or a cloud volume. If every commit needed its own flush, a device capable of 1,000 flushes per second would cap the database at 1,000 commits per second regardless of CPU. <strong>Group commit</strong> removes the cap: when a transaction wants to flush, it either starts a flush or, if one is in progress, waits for the next one, which will cover every commit record appended in the meantime. Under load, one flush may carry dozens of commits. PostgreSQL's <code>commit_delay</code> setting can even wait a few microseconds deliberately to gather more commits per flush. The result is the characteristic behaviour of OLTP databases: single-transaction commit latency is about one flush, while throughput scales with concurrency.</p>
+<p>Some applications do not need every commit to be durable. PostgreSQL's <strong>asynchronous commit</strong> (<code>synchronous_commit = off</code>) returns success as soon as the commit record is in the in-memory WAL buffer; the background WAL writer flushes it shortly afterwards. The documentation is precise about the risk: a crash can lose transactions committed in roughly the last three <code>wal_writer_delay</code> periods (200 ms by default, so up to about 600 ms), but cannot corrupt the database or apply part of a transaction, because the WAL is still replayed in order and simply ends earlier. It can be set per transaction, so a system can make payment commits synchronous and analytics inserts asynchronous.</p>
+
+<h4>4. Checkpoints</h4>
+<p>With no-force, data files lag behind the log indefinitely, so after a crash recovery would have to replay the log from the beginning of time, and no log could ever be deleted. A <strong>checkpoint</strong> bounds both. The simplest form would stop all activity, write every dirty page, and log "everything before here is on disk"; that is a <em>sharp</em> checkpoint, and stopping the database for it is unacceptable. Real systems use <strong>fuzzy checkpoints</strong>, which run while transactions continue.</p>
+<p>In PostgreSQL, a checkpoint notes the current WAL position as its <strong>redo point</strong>, writes out every page that was dirty at that moment, spreading the writes over time to avoid an I/O spike, then fsyncs the data files and writes a checkpoint record pointing back to the redo point. Once complete, every change logged before the redo point is guaranteed to be in the data files, so crash recovery starts replay at the redo point and WAL segments older than it can be recycled (unless needed for archiving or replication). Checkpoints are triggered every <code>checkpoint_timeout</code> (5 minutes by default) or when WAL since the last checkpoint approaches <code>max_wal_size</code> (1 GB by default), whichever comes first, and <code>checkpoint_completion_target</code> (0.9) spreads the page writes over 90% of the interval.</p>
+<p>The trade-off is direct. Frequent checkpoints mean less WAL to replay after a crash (faster recovery) but more page writes, because a page changed every second is written once per checkpoint instead of once per hour, and, with full-page writes, more WAL. Infrequent checkpoints mean fewer writes and less WAL but longer recovery. ARIES's checkpoints are even lighter: they write no pages at all, only the current transaction table and dirty page table to the log, and rely on background writing to keep the dirty page table short.</p>
+
+<h4>5. Torn pages and full-page writes</h4>
+<p>A database page is 8 KB (PostgreSQL) or 16 KB (InnoDB), but storage devices and file systems often guarantee atomicity only for smaller units, such as 4 KB sectors or blocks. If power fails while a page is being written, the page on disk can be <strong>torn</strong>: the first half new, the second half old. Redo cannot fix a torn page from a small log record, because the record says something like "set slot 5 to these bytes", which assumes the rest of the page is intact and consistent.</p>
+<p>PostgreSQL's solution is <strong>full-page writes</strong>, on by default: the first time a page is modified after each checkpoint, the WAL record includes a complete image of the page. During recovery, replay restores that full image first, which overwrites any torn version, and then applies subsequent records normally. Because the image is logged only on the first change per checkpoint cycle, a page changed a thousand times between checkpoints costs one 8 KB image plus a thousand small records. The cost is significant when changes are scattered across many pages (random keys, db5) and checkpoints are frequent; that is why the documentation notes that shorter checkpoint intervals partly defeat themselves by increasing WAL volume. InnoDB solves the same problem differently, with a <strong>doublewrite buffer</strong>: pages are first written to a dedicated area, fsynced, then written to their real location, so a torn page can be repaired from its doublewrite copy. Both mechanisms can be disabled on storage that guarantees atomic page-sized writes.</p>
+
+<h4>6. ARIES recovery, traced</h4>
+<p>ARIES recovers in three passes over the log. Trace them on the lab's tiny example: pages A, B and C start on disk as 100, 200 and 300, with pageLSN −1 (no changes yet).</p>
+<table>
+<thead><tr><th>LSN</th><th>Record</th><th>Notes</th></tr></thead>
+<tr><td>0</td><td>T1 update A: 100 → 150</td><td></td></tr>
+<tr><td>1</td><td>T1 update B: 200 → 250</td><td></td></tr>
+<tr><td>2</td><td>T1 COMMIT</td><td>log flushed: T1 durable</td></tr>
+<tr><td>3</td><td>T2 update C: 300 → 999</td><td>page C then stolen to disk (pageLSN 3)</td></tr>
+<tr><td>4</td><td>T2 update A: 150 → 0</td><td>— crash —</td></tr>
+</table>
+<p>At the crash, disk holds A = 100, B = 200 (T1 committed but its pages were never written: no-force) and C = 999 (T2's uncommitted change was written: steal). This is the worst case: both a missing committed change and a present uncommitted one.</p>
+<p><strong>Analysis pass.</strong> Read the log forward from the last checkpoint (here, the start) and rebuild two tables. The <strong>transaction table</strong>: T1 has a commit record, so it is a <em>winner</em>; T2 has updates but no commit, so it is a <em>loser</em> that must be rolled back. The <strong>dirty page table</strong>: pages A, B and C were changed, each with a recLSN, the earliest LSN that might not be on disk (A: 0, B: 1, C: 3). Redo will start from the smallest recLSN.</p>
+<p><strong>Redo pass: repeat history.</strong> Read forward from LSN 0 and reapply every update, winners and losers alike, unless the page already has it. LSN 0: page A's pageLSN is −1 &lt; 0, so apply: A = 150. LSN 1: B = 250. LSN 3: page C's pageLSN is 3, not less than 3, so skip; the change is already there. LSN 4: A's pageLSN is now 0 &lt; 4, apply: A = 0. The lab prints the state after redo: A = 0, B = 250, C = 999, exactly the state in memory at the moment of the crash, including T2's uncommitted changes.</p>
+<p><strong>Undo pass.</strong> Roll back the losers by walking their records backwards, newest first. LSN 4 (T2, A: 150 → 0): restore A = 150, and append a <strong>compensation log record</strong> (CLR) saying "undid LSN 4". LSN 3 (T2, C: 300 → 999): restore C = 300, append a CLR "undid LSN 3". T2 has no earlier records, so it is fully rolled back; an abort record is written. Final state: A = 150, B = 250, C = 300. T1's transfer is fully present, T2 has vanished without trace, and the lab's output matches line for line.</p>
+<figure>
+<svg viewBox="0 0 640 250" width="100%" role="img" aria-label="Log timeline with LSNs 0 to 4, crash after LSN 4; analysis scans forward from checkpoint, redo scans forward repeating all updates, undo scans backward over T2's records writing CLRs">
+  <defs><marker id="db8-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs>
+  <g style="font-family:var(--sans);font-size:12px">
+    <line x1="40" y1="60" x2="560" y2="60" style="fill:none;stroke:var(--ink-2)"/>
+    <g style="font-family:var(--mono)">
+      <circle cx="80" cy="60" r="5" style="fill:var(--s1)"/><text x="62" y="45" style="fill:var(--ink)">0 T1</text>
+      <circle cx="170" cy="60" r="5" style="fill:var(--s1)"/><text x="152" y="45" style="fill:var(--ink)">1 T1</text>
+      <circle cx="260" cy="60" r="6" style="fill:var(--good)"/><text x="230" y="45" style="fill:var(--good)">2 COMMIT</text>
+      <circle cx="350" cy="60" r="5" style="fill:var(--crit)"/><text x="332" y="45" style="fill:var(--ink)">3 T2</text>
+      <circle cx="440" cy="60" r="5" style="fill:var(--crit)"/><text x="422" y="45" style="fill:var(--ink)">4 T2</text>
+    </g>
+    <text x="490" y="45" style="fill:var(--crit);font-weight:600">✕ crash</text>
+    <line x1="500" y1="52" x2="500" y2="70" style="stroke:var(--crit);stroke-width:2"/>
+    <line x1="60" y1="100" x2="490" y2="100" marker-end="url(#db8-r)" style="fill:none;stroke:var(--s2);stroke-width:2"/>
+    <text x="70" y="94" style="fill:var(--ink)">1 analysis: winners {T1}, losers {T2}, dirty pages A, B, C</text>
+    <line x1="60" y1="140" x2="490" y2="140" marker-end="url(#db8-r)" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+    <text x="70" y="134" style="fill:var(--ink)">2 redo: reapply 0, 1, 4 (skip 3: pageLSN of C already 3)</text>
+    <line x1="490" y1="180" x2="330" y2="180" marker-end="url(#db8-r)" style="fill:none;stroke:var(--crit);stroke-width:2"/>
+    <text x="70" y="176" style="fill:var(--ink)">3 undo T2: reverse 4, then 3 →</text>
+    <g style="font-family:var(--mono)">
+      <rect x="520" y="165" width="50" height="22" rx="3" style="fill:var(--s4);fill-opacity:.15;stroke:var(--s4)"/><text x="527" y="181" style="fill:var(--ink)">CLR 5</text>
+      <rect x="575" y="165" width="50" height="22" rx="3" style="fill:var(--s4);fill-opacity:.15;stroke:var(--s4)"/><text x="582" y="181" style="fill:var(--ink)">CLR 6</text>
+    </g>
+    <text x="40" y="225" style="fill:var(--ink-2)">Result: A = 150, B = 250, C = 300. T1 present, T2 gone. CLRs make the undo itself restartable.</text>
+  </g>
+</svg>
+<figcaption>Two forward passes and one backward pass. The surprising step is the middle one: redo deliberately reapplies T2's change to A even though undo will remove it moments later, so that undo starts from the exact pre-crash state.</figcaption>
+</figure>
+
+<h4>7. Why repeat history, and why CLRs</h4>
+<p>It might seem wasteful for redo to reapply T2's changes only for undo to reverse them. ARIES's paper calls this <strong>repeating history</strong> and makes it the central idea, for two reasons. First, it makes recovery simple and uniform: after redo, every page is exactly as it was at the crash, so undo can use the same code as a normal rollback. Second, it is required for fine-grained locking: if T2 and a committed T3 both modified different rows on the same page, the page's state after T3's change depends on T2's change having happened (slot positions, free space). Reversing T2 correctly means reversing it <em>logically</em> on a page that includes both changes, which needs the page in its real pre-crash state.</p>
+<p><strong>Compensation log records</strong> make undo itself crash-safe. Each CLR records one undo action and points to the next record of the same transaction still to be undone (its undoNextLSN). If the system crashes during recovery, the next recovery's redo pass reapplies the CLRs like any other change (repeating history again), and its undo pass follows the undoNextLSN pointers, skipping work already done. CLRs are never themselves undone. This guarantees that the log grows by a bounded amount however many times recovery is interrupted, a property the ARIES authors explicitly designed for.</p>
+<p>The same machinery handles ordinary rollbacks while the system is running, including <strong>partial rollbacks to savepoints</strong>: <code>ROLLBACK TO SAVEPOINT s</code> walks the transaction's records backwards to the savepoint's LSN, writing CLRs, and the transaction continues. ARIES's title mentions partial rollbacks precisely because supporting them cleanly with fine-grained locking was one of its contributions.</p>
+
+<h4>8. PostgreSQL: redo-only recovery thanks to MVCC</h4>
+<p>PostgreSQL implements the same principles with a twist that removes the undo pass. Its MVCC design (db9) never overwrites a row in place: an update writes a <em>new</em> row version and marks the old one as superseded, each version carrying the id of the transaction that created it. Whether a version is visible depends on whether its creating transaction committed, which is recorded in a separate structure, the commit log (<code>pg_xact</code>). An aborted transaction's row versions remain physically in the heap but are invisible to everyone, because the commit log says the transaction aborted; vacuum later reclaims the space (db10).</p>
+<p>So PostgreSQL's WAL only needs redo information, and crash recovery is a single forward pass from the checkpoint's redo point, replaying every record. Transactions in progress at the crash have no commit record; after recovery they are simply treated as aborted, and their row versions are invisible. Abort during normal operation is nearly free: mark the transaction aborted in the commit log. The trade-off is the one PostgreSQL users know well: dead row versions accumulate and must be vacuumed, and the table holds old versions that an undo-log design would keep elsewhere.</p>
+
+<h4>9. InnoDB: redo log plus undo logs</h4>
+<p>MySQL's InnoDB is closer to the classical ARIES design. It updates rows in place in its clustered index (db6) and keeps the previous versions in separate <strong>undo logs</strong>, which serve both rollback and MVCC (readers needing an older version reconstruct it from undo records). Changes to data pages and to undo pages are both protected by the <strong>redo log</strong>, InnoDB's WAL. Crash recovery replays the redo log from the last checkpoint, which restores data pages and undo pages to their pre-crash state (repeating history), and then rolls back uncommitted transactions using their undo logs, often in the background after the server is already accepting connections. Torn pages are repaired from the doublewrite buffer. The <code>innodb_flush_log_at_trx_commit</code> setting plays the role of PostgreSQL's synchronous_commit: 1 (the default) flushes the redo log at every commit; 2 writes to the OS at commit and flushes about once a second; 0 does both about once a second.</p>
+
+<h4>10. Where C and I fit</h4>
+<p>This lesson is about the A and D of ACID, which the log implements. The other two letters use different machinery, and it helps to place them. <strong>Consistency</strong> in ACID means that each transaction takes the database from one state satisfying all declared constraints (keys, foreign keys, checks, db1) to another. The database enforces the declared ones, either per statement or, for deferred constraints, at commit; anything else (that debits equal credits, say) is the application's responsibility, which atomicity makes possible by ensuring the transaction's multiple writes stand or fall together. <strong>Isolation</strong> governs what concurrent transactions see of each other, implemented with locks and MVCC (sc5, db9). The two mechanisms meet at commit: a transaction's commit record is the single moment at which its changes become both durable and, for other transactions' new snapshots, visible. In PostgreSQL that moment is literally the update of its status in the commit log after the WAL flush.</p>
+<p>A practical consequence: atomicity is per transaction, so the unit of all-or-nothing is whatever you put between BEGIN and COMMIT. Code that runs each statement in autocommit mode (the default in many drivers and ORMs) gets atomic statements, not atomic business operations. A transfer written as two autocommitted UPDATEs can still lose money in a crash between them, because each one committed on its own. The log can only protect the boundaries you declare.</p>
+
+<h4>11. Seeing the log in a running system</h4>
+<p>PostgreSQL exposes enough to watch this machinery work. <code>SELECT pg_current_wal_lsn()</code> before and after a batch, passed to <code>pg_wal_lsn_diff()</code>, gives the bytes of WAL the batch generated: inserting 100,000 narrow rows into a table with two indexes typically generates tens of megabytes, several times the logical data size, because every heap and index change is logged and full-page images appear for newly touched pages. <code>pg_stat_wal</code> reports WAL records, full-page images and bytes since the last reset, so the share of WAL that is full-page images is directly visible; a high share points at random-key writes or short checkpoint intervals. <code>pg_waldump</code> prints individual records: resource manager (Heap, Btree, Transaction), LSN, transaction id and description, which makes the abstract "log record" concrete. And commit latency is visible from the client: a single-row insert in its own transaction costs about one WAL flush, so timing a few thousand of them on a laptop SSD versus a cloud volume shows the flush latency that group commit and asynchronous commit exist to hide.</p>
+<p>InnoDB exposes the equivalent through <code>SHOW ENGINE INNODB STATUS</code> (the LOG section lists the current LSN, the flushed LSN and the last checkpoint LSN) and performance-schema counters. In both systems, the gap between "current LSN" and "checkpoint LSN" is exactly the amount of log that crash recovery would replay right now, which is the number to watch when reasoning about recovery time.</p>
+
+<h4>12. Beyond crashes: archiving, PITR and replication</h4>
+<p>Crash recovery replays the WAL since the last checkpoint. Keep <em>all</em> WAL and you can do much more. <strong>Point-in-time recovery</strong> combines a <strong>base backup</strong> (a copy of the data files taken while the database runs, which may be internally inconsistent because pages changed during the copy) with the archived WAL from the start of the backup onwards. Restoring means putting the backup in place and replaying WAL, exactly like crash recovery, up to any chosen moment, such as one second before someone ran <code>DELETE FROM orders</code> without a WHERE clause. And <strong>replication</strong> (sc6) is the same stream sent continuously to standbys, which replay it as it arrives: a physical standby is a server in permanent recovery. The log is the database's single source of truth; the data files are a cache of it, rebuilt on demand.</p>
+</section>
+
+<section data-field="deep">
+<h4>Physical, logical and physiological logging</h4>
+<p>Log records can describe changes at different levels. <strong>Physical</strong> (value) logging records byte ranges of a page: "bytes 120-180 of page 7 were X, are now Y". It is simple and idempotent with pageLSNs, but large, and it cannot undo a change correctly if other changes have since moved things on the page. <strong>Logical</strong> logging records operations: "insert row (42, 'Ana') into table T". It is compact, but replaying it requires the database's structures to be consistent, and one logical operation may touch many pages (the heap, every index), so a crash mid-operation leaves partial state that logical replay cannot recognise. ARIES and most real systems use <strong>physiological</strong> logging: physical to a page, logical within it, such as "insert this tuple into slot 5 of page 7". Each record affects exactly one page, so pageLSN comparisons decide redo per page, while the in-page description stays compact and can be reversed logically even after the page has been reorganised. B-tree splits, which touch several pages, are logged as several page-level records, often as a "nested top action" that is never undone once complete, even if its transaction aborts, because other transactions may already be using the new pages.</p>
+
+<h4>What durability really depends on</h4>
+<p>Everything above assumes that when <code>fsync</code> returns, the data is on stable storage. That assumption has three layers of risk. The <strong>device</strong>: many drives have volatile write caches and may acknowledge writes before they reach persistent media; enterprise SSDs have capacitors to flush the cache on power loss, while some consumer drives do not and have historically ignored or mishandled flush commands. The <strong>file system and kernel</strong>: fsync semantics on errors were underspecified until recently, which the next section's incident exposed. The <strong>virtualisation layer</strong>: cloud block volumes replicate writes before acknowledging them, which is why a single fsync on a network volume may take a millisecond or more. PostgreSQL ships <code>pg_test_fsync</code> to measure flush latency on a given system, and a result that looks implausibly fast (tens of thousands of flushes per second on a consumer disk) usually means a cache is lying. Durability is a property of the whole stack, and a database can only be as durable as the cheapest component that claims a write is safe.</p>
+
+<h4>Checkpoint tuning as a write-amplification problem</h4>
+<p>Checkpoint frequency is really a write-amplification knob (db5). Each checkpoint must write every page dirtied since the previous one, once, however many times it was changed. A hot page updated 10,000 times in five minutes costs one page write per checkpoint, so longer intervals absorb more updates per write. Meanwhile, each checkpoint resets the full-page-write cycle, so the first change to each page afterwards logs 8 KB. A workload touching a million distinct pages per interval writes about 8 GB of full-page images per checkpoint whatever its logical change volume. Lengthening <code>checkpoint_timeout</code> from 5 to 30 minutes and raising <code>max_wal_size</code> accordingly can cut both page writes and WAL volume severalfold on write-heavy systems, at the cost of up to six times more WAL to replay after a crash. PostgreSQL logs a warning when checkpoints are triggered by WAL volume more often than <code>checkpoint_warning</code> (30 s by default), a sign <code>max_wal_size</code> is too small.</p>
+
+<h4>Commit latency, replication and the speed of light</h4>
+<p>With <strong>synchronous replication</strong> (sc6), a commit waits not only for the local WAL flush but also for one or more standbys to confirm they have received (or flushed, or applied, depending on <code>synchronous_commit</code> level) the commit record. Commit latency then includes a network round trip: under a millisecond within a data centre, tens of milliseconds across regions. Group commit still applies, so throughput can remain high, but each client sees the round trip. This is the physical root of the latency-versus-durability trade-off in PACELC (sc9): a commit that must survive the loss of a whole region must wait for another region to hear about it.</p>
+
+<h4>Distributed transactions and two-phase commit</h4>
+<p>Atomicity across two databases needs another layer. <strong>Two-phase commit</strong> (2PC) has a coordinator ask each participant to <em>prepare</em>: write all the transaction's records and a prepare record to its log and promise it can commit. Once all have voted yes, the coordinator logs its decision and tells everyone to commit. The protocol relies on the same WAL machinery: a prepared transaction must survive a participant crash, so its prepare record is flushed, and after recovery it is neither committed nor aborted until the coordinator says which. PostgreSQL supports this with <code>PREPARE TRANSACTION</code>. The weakness is blocking: if the coordinator fails after participants prepare, they hold locks until it returns. That is why large systems prefer to avoid distributed transactions (using sagas, outbox tables and idempotent consumers) or build them on consensus-replicated logs (sc9), as Spanner and CockroachDB do.</p>
+</section>
+
+<section data-field="prod">
+<h4>fsyncgate, 2018</h4>
+<p>In March 2018, Craig Ringer reported to the PostgreSQL hackers list a problem that shook assumptions about durability. PostgreSQL writes data pages through the OS page cache and relies on fsync at checkpoint time to make them durable, and it assumed, as LWN's write-up put it, that a successful fsync meant all data written since the last successful fsync had reached storage. But when a buffered write failed at the device level (a failing disk, a thin-provisioned volume that ran out of space), Linux file systems typically reported the error once and marked the affected pages clean, discarding the data. PostgreSQL's checkpointer saw the fsync error, logged it, and retried the checkpoint later; the retry's fsync succeeded, because there was nothing dirty left to fail, and the checkpoint completed. WAL older than that checkpoint could then be recycled, so the only copy of the lost changes disappeared too.</p>
+<p>The fix, as the PostgreSQL wiki records, was to treat any fsync failure as fatal: PostgreSQL now PANICs, crashes, and on restart performs crash recovery from the last successful checkpoint, replaying WAL that still contains the changes. The change was backpatched to versions 9.4 through 11. Linux 4.13 had separately improved how writeback errors are tracked and reported. The incident is a sharp illustration of the deep section's point: the recovery algorithm was correct, but its foundation, the meaning of "flushed", was not what everyone thought.</p>
+
+<h4>Checkpoint spikes and WAL growth</h4>
+<p>Checkpoint-related production problems have recognisable shapes. <strong>I/O spikes every few minutes</strong> that hurt query latency usually mean checkpoints are triggered by WAL volume faster than they can spread their writes; the server log shows "checkpoints are occurring too frequently", and <code>pg_stat_checkpointer</code> (PostgreSQL 17+, previously <code>pg_stat_bgwriter</code>) shows many requested rather than timed checkpoints. Raising <code>max_wal_size</code> fixes it. <strong>WAL directory filling the disk</strong> means something is preventing WAL recycling: a failing <code>archive_command</code>, an inactive replication slot holding WAL for a standby that disappeared, or a very long checkpoint. This is one of the few ways a healthy PostgreSQL can stop entirely, since it cannot write WAL without space; monitor WAL directory size and replication slot lag, and set <code>max_slot_wal_keep_size</code> to bound what a dead slot can retain.</p>
+
+<h4>Long recovery after a crash</h4>
+<p>Crash recovery time is roughly WAL since the redo point divided by replay speed, and replay is single-threaded in PostgreSQL and often limited by random reads of pages not in cache. A database with a 30-minute checkpoint interval and heavy writes may need tens of minutes to start after a crash, during which it accepts no connections. The usual production answer is not faster recovery but avoiding the wait: a hot standby that is continuously replaying WAL can be promoted in seconds, and the crashed primary recovers at leisure. Plan checkpoint settings together with the failover design and measure recovery time in a drill rather than discovering it during an outage.</p>
+
+<h4>Durability settings that quietly weaken guarantees</h4>
+<p>Several settings trade durability for speed and are sometimes left on by accident. <code>fsync = off</code> in PostgreSQL disables flushing entirely and can corrupt the database on a crash; it is only for throwaway test instances. <code>full_page_writes = off</code> risks unrecoverable torn pages unless the storage guarantees atomic 8 KB writes. <code>synchronous_commit = off</code> is safe for integrity but loses recent commits. In MySQL, <code>innodb_flush_log_at_trx_commit = 2</code> and <code>sync_binlog = 0</code> can lose up to a second of transactions on an OS crash. Audit these as part of production readiness, and use the per-transaction forms (async commit for logs and metrics only) rather than weakening the whole server.</p>
+
+<h4>WAL as an integration point</h4>
+<p>Because the WAL is a complete, ordered record of changes, it has become the integration point for much of the modern data stack. Logical decoding in PostgreSQL turns WAL into a stream of row-level inserts, updates and deletes that change-data-capture tools such as Debezium publish to Kafka, feeding search indexes, caches, warehouses and, increasingly, vector indexes that must stay in sync with source documents for retrieval-augmented generation. The same ordering guarantees that make recovery correct make these consumers correct: they see committed changes, in commit order, exactly once if they track the LSN they have processed. The operational cost is the same as for replication: a consumer that stops consuming holds its replication slot and makes WAL accumulate.</p>
+</section>
+
+<section data-field="lab">
+<p><strong>Goal:</strong> run a toy steal/no-force engine through a crash and recover it with ARIES's three passes, reproducing the trace in section 6. Python 3.12 standard library. Save as <code>db8.py</code>.</p>
+<pre>"""A toy steal/no-force engine with a WAL and ARIES-style recovery (analysis, redo, undo)."""
+
+log = []            # the WAL: list of dicts, index = LSN
+disk = {"A": 100, "B": 200, "C": 300}       # values on 'disk' pages
+disk_lsn = {"A": -1, "B": -1, "C": -1}      # pageLSN: last log record applied to the disk copy
+
+def write(txn, page, new, buffer):
+    old = buffer.get(page, disk[page])
+    log.append({"lsn": len(log), "txn": txn, "type": "update", "page": page, "old": old, "new": new})
+    buffer[page] = new
+
+def commit(txn):
+    log.append({"lsn": len(log), "txn": txn, "type": "commit"})   # flushed before we say OK
+
+def flush_page(page, buffer):            # 'steal': a dirty page may hit disk before commit
+    disk[page] = buffer[page]
+    disk_lsn[page] = max(r["lsn"] for r in log if r.get("page") == page)
+
+# ---- normal operation, then a crash ----
+buf = {}
+write("T1", "A", 150, buf)               # T1: move 50 from A to B
+write("T1", "B", 250, buf)
+commit("T1")
+write("T2", "C", 999, buf)               # T2 starts, never commits
+flush_page("C", buf)                     # uncommitted change stolen to disk
+write("T2", "A", 0, buf)
+print("disk at crash :", disk, "| T1 committed but its pages never reached disk")
+
+# ---- recovery ----
+committed = {r["txn"] for r in log if r["type"] == "commit"}
+losers = {r["txn"] for r in log if r["type"] == "update"} - committed
+print("analysis      : winners", sorted(committed), "losers", sorted(losers))
+
+for r in log:                             # redo: repeat history for ALL updates
+    if r["type"] == "update" and disk_lsn[r["page"]] &lt; r["lsn"]:
+        disk[r["page"]] = r["new"]; disk_lsn[r["page"]] = r["lsn"]
+print("after redo    :", disk)
+
+for r in reversed(log[:]):                # undo losers, newest first, logging CLRs
+    if r["type"] == "update" and r["txn"] in losers:
+        disk[r["page"]] = r["old"]
+        log.append({"lsn": len(log), "txn": r["txn"], "type": "CLR", "page": r["page"], "undid": r["lsn"]})
+print("after undo    :", disk)
+print("CLRs written  :", [(r["lsn"], r["page"], "undid", r["undid"]) for r in log if r["type"] == "CLR"])</pre>
+<p><strong>What to look for.</strong></p>
+<ol>
+<li><code>disk at crash</code> shows A = 100 and B = 200 even though T1 committed (no-force: its pages were never written) and C = 999 although T2 never committed (steal: the page was evicted early).</li>
+<li>Analysis finds winners <code>['T1']</code> and losers <code>['T2']</code>.</li>
+<li>After redo, A = 0: redo repeated T2's change to A (LSN 4) as well as T1's. C was skipped because its pageLSN (3) showed the change was already on disk.</li>
+<li>After undo, A = 150, B = 250, C = 300, with CLRs at LSNs 5 and 6 recording the two undo steps.</li>
+</ol>
+<p><strong>Try next.</strong> Simulate a crash during recovery: stop the undo loop after the first CLR, then run analysis and redo again on the extended log. Add an <code>undo_next</code> field to each CLR pointing to the next record to undo, and make undo skip records already compensated; confirm the final state is identical. Then add a checkpoint record after LSN 2 that stores <code>disk_lsn</code>, flush pages A and B at that point, and start redo from the checkpoint: notice that records 0 and 1 no longer need to be read at all.</p>
+</section>
+
+<section data-field="drill">
+<b>Diagnose and design: losing the last second of orders</b>
+<p>An e-commerce team runs PostgreSQL on a cloud VM with a network block volume. To cut commit latency from 4 ms to 0.3 ms during a sale, someone set <code>synchronous_commit = off</code> server-wide months ago. After a host failure, the database restarted cleanly, but 37 customers have payment confirmations from the payment provider with no matching order rows. (1) Explain exactly what happened. (2) Was the database corrupted? (3) Propose a configuration that keeps most of the latency win without losing paid orders.</p>
+<details><summary>Answer</summary>
+<p><strong>(1)</strong> With asynchronous commit, the server acknowledged each order as committed once its commit record was in the in-memory WAL buffer; the WAL writer flushed it to the volume a fraction of a second later. The host failed inside that window, so the most recent commits, which clients had been told succeeded and which had triggered payment capture, were never on durable storage. Crash recovery replayed the WAL that was durable and stopped where it ended. The window is bounded, roughly up to three times <code>wal_writer_delay</code> (about 600 ms with defaults), which at sale traffic was enough for 37 orders.</p>
+<p><strong>(2)</strong> No. Recovery replayed a consistent prefix of history: every transaction is either fully present or fully absent, constraints hold, indexes match tables. The data is consistent; it is just missing the last few acknowledged commits. That is the documented contract of asynchronous commit.</p>
+<p><strong>(3)</strong> Restore <code>synchronous_commit = on</code> as the server default and use <code>SET LOCAL synchronous_commit = off</code> only in transactions that can be lost (page-view events, recommendation logs, LLM debug payloads). Keep orders and payments synchronous. Recover most of the latency by other means: group commit already amortises flushes under load (throughput was never the problem, latency per order was); use a volume type with lower flush latency or provisioned IOPS; make the payment flow idempotent with an outbox: write the order and an "awaiting capture" row in one synchronous transaction before calling the payment provider, so a crash can never leave a captured payment without an order. Finally, reconcile: a job comparing provider confirmations with order rows would have caught the 37 the same day.</p>
+</details>
+</section>

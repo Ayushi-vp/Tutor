@@ -8,7 +8,7 @@ import { mountViz, VIZ, vizHTML } from "../legacy/viz.js";
 afterEach(cleanup);
 
 const routes = ["/", "/roadmap", "/mock", "/cards", "/account", "/data", "/admin", "/dsa", "/bank", "/search?q=attention",
-  "/ml", "/dl", "/llm", "/aieng", "/ts", "/swe", "/gpu", "/rs", "/mm", "/net", "/scale", "/py", "/classic", "/infra", "/hld", "/lld", "/mlc"];
+  "/ml", "/dl", "/llm", "/aieng", "/ts", "/swe", "/algo", "/product", "/safety", "/dataeng", "/torch", "/cloud", "/auth", "/recsys", "/agent", "/evals", "/beh", "/k8s", "/math", "/db", "/os", "/gpu", "/rs", "/mm", "/net", "/scale", "/py", "/classic", "/infra", "/hld", "/lld", "/mlc"];
 
 describe("pages", () => {
   it.each(routes)("%s renders", async route => {
@@ -29,6 +29,16 @@ describe("pages", () => {
     expect(screen.getByText("0/12 learned")).toBeTruthy();
     fireEvent.click(screen.getAllByLabelText("Mark done")[0]);
     expect(screen.getByText("1/12 learned")).toBeTruthy();
+  });
+
+  it("desktop navigation can switch to compact mode", async () => {
+    localStorage.removeItem("apc.rail.compact");
+    const { container } = render(<MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }} initialEntries={["/ts"]}><App /></MemoryRouter>);
+    await act(async () => {});
+    fireEvent.click(screen.getByLabelText("Minimise navigation"));
+    expect(container.querySelector(".shell")?.classList.contains("rail-compact")).toBe(true);
+    expect(screen.getByLabelText("Expand navigation")).toBeTruthy();
+    localStorage.removeItem("apc.rail.compact");
   });
 
   it("the ML coding round draws one problem plus follow-ups", async () => {
